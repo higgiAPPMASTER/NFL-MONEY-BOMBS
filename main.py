@@ -31,9 +31,7 @@ def make_token(u: str) -> str:
     return hashlib.sha256(f"{u}:{SECRET}".encode()).hexdigest()
 
 def get_user(request: Request) -> Optional[str]:
-    t = request.cookies.get("session")
-    for u in USERS:
-        if t == make_token(u): return u
+    return 'higgi'  # Auth handled by Money Picks Arena hub
     return None
 
 # ─── Stat Config ──────────────────────────────────────────────────────────────
@@ -288,8 +286,7 @@ async def run_analysis(selected_date: str = None) -> Dict:
         team_sched[game['home_name']] = {'side': 'HOME', 'opponent': game['away_name']}
         team_sched[game['away_name']] = {'side': 'AWAY', 'opponent': game['home_name']}
 
-    # Run NFL Props (lines vs history)
-    nfl_props_result = {'picks': [], 'all': [], 'error': 'disabled'}
+    nfl_props_result = {'picks': [], 'all': []}
     if _NFL_PROPS_ENABLED:
         try:
             nfl_props_result = await run_nfl_props(team_sched)
@@ -341,7 +338,29 @@ input::placeholder{color:#374151}
     <button class="btn-in" type="submit">Access Picks →</button>
     {error}
   </form>
-  <p class="tagline">Patterns + Live Lines · 75% Threshold</p>
+  <p class="tagline">No Lines · Just Patterns · 75% Threshold</p>
+
+<div id="props-section" style="display:none;margin-top:28px">
+  <div class="section-title" style="margin-bottom:12px">⚡ Player Props vs Opponent History</div>
+  <div style="overflow-x:auto">
+    <table style="width:100%;border-collapse:collapse;font-size:.82rem">
+      <thead><tr style="border-bottom:1px solid rgba(34,197,94,.2)">
+        <th style="padding:7px 10px;text-align:left;color:#4ade80;font-size:.72rem">#</th>
+        <th style="padding:7px 10px;text-align:left;color:#4ade80;font-size:.72rem">Player</th>
+        <th style="padding:7px 10px;text-align:left;color:#4ade80;font-size:.72rem">H/A</th>
+        <th style="padding:7px 10px;text-align:left;color:#4ade80;font-size:.72rem">Opponent</th>
+        <th style="padding:7px 10px;text-align:left;color:#4ade80;font-size:.72rem">Prop</th>
+        <th style="padding:7px 10px;text-align:left;color:#4ade80;font-size:.72rem">Line</th>
+        <th style="padding:7px 10px;text-align:left;color:#4ade80;font-size:.72rem">Avg vs Opp</th>
+        <th style="padding:7px 10px;text-align:left;color:#4ade80;font-size:.72rem">Gap</th>
+        <th style="padding:7px 10px;text-align:left;color:#4ade80;font-size:.72rem">Games</th>
+        <th style="padding:7px 10px;text-align:left;color:#4ade80;font-size:.72rem">History</th>
+        <th style="padding:7px 10px;text-align:left;color:#4ade80;font-size:.72rem">Pick</th>
+      </tr></thead>
+      <tbody id="props-body"></tbody>
+    </table>
+  </div>
+</div>
 </div>
 </body>
 </html>"""
@@ -671,35 +690,29 @@ function renderProps(props) {
   const section = document.getElementById('props-section');
   const body    = document.getElementById('props-body');
   if (!props || !props.all || props.all.length === 0) {
-    section.style.display = 'none';
+    if(section) section.style.display = 'none';
     return;
   }
-  section.style.display = '';
-  const picks   = props.picks || [];
-  const noPick  = (props.no_pick || []).filter(p => p.games > 0);
-  const all     = [...picks, ...noPick];
-  body.innerHTML = all.map((p, i) => {
-    const isOver  = p.pick === 'OVER';
-    const isUnder = p.pick === 'UNDER';
-    const clr     = isOver ? '#4ade80' : isUnder ? '#f87171' : '#9ca3af';
-    const gap     = p.gap != null ? (p.gap > 0 ? '+' : '') + p.gap : '—';
-    const sideCls = p.side === 'HOME' ? 'rgba(34,197,94,.15)' : 'rgba(99,102,241,.15)';
-    const odds    = p.pick === 'OVER'
-      ? (p.over_odds  != null ? (p.over_odds  > 0 ? '+':'') + p.over_odds  : '')
-      : (p.under_odds != null ? (p.under_odds > 0 ? '+':'') + p.under_odds : '');
+  if(section) section.style.display = '';
+  const all = [...(props.picks||[]), ...(props.no_pick||[]).filter(p=>p.games>0)];
+  if(!body) return;
+  body.innerHTML = all.map((p,i) => {
+    const isOver = p.pick==='OVER', isUnder = p.pick==='UNDER';
+    const clr  = isOver?'#4ade80':isUnder?'#f87171':'#9ca3af';
+    const gap  = p.gap!=null?(p.gap>0?'+':'')+p.gap:'—';
+    const odds = p.pick==='OVER'?(p.over_odds!=null?(p.over_odds>0?'+':'')+p.over_odds:''):(p.under_odds!=null?(p.under_odds>0?'+':'')+p.under_odds:'');
     return `<tr style="border-bottom:1px solid rgba(34,197,94,.07)">
-      <td style="padding:9px 12px;color:#6b7280">${i+1}</td>
-      <td style="padding:9px 12px;font-weight:700">${p.name}</td>
-      <td style="padding:9px 12px"><span style="background:${sideCls};padding:2px 8px;border-radius:4px;font-size:.75rem">${p.side}</span></td>
-      <td style="padding:9px 12px;color:#9ca3af;font-size:.82rem">${p.opp}</td>
-      <td style="padding:9px 12px;color:#4ade80;font-size:.82rem">${p.label}</td>
-      <td style="padding:9px 12px;font-family:monospace;font-weight:700">${p.line}</td>
-      <td style="padding:9px 12px;font-family:monospace;font-weight:700;color:${clr}">${p.avg != null ? p.avg : '—'}</td>
-      <td style="padding:9px 12px;font-family:monospace;color:${clr};font-weight:700">${gap}</td>
-      <td style="padding:9px 12px;color:#6b7280">${p.games}g</td>
-      <td style="padding:9px 12px;font-family:monospace;font-size:.72rem;color:#6b7280;max-width:140px">${p.history || '—'}</td>
-      <td style="padding:9px 12px"><span style="color:${clr};font-weight:900;font-size:.95rem">${p.pick || '—'}</span>
-          <span style="color:#6b7280;font-size:.65rem;display:block">${odds}</span></td>
+      <td style="padding:8px 10px;color:#6b7280">${i+1}</td>
+      <td style="padding:8px 10px;font-weight:700">${p.name}</td>
+      <td style="padding:8px 10px;font-size:.78rem">${p.side}</td>
+      <td style="padding:8px 10px;color:#9ca3af;font-size:.8rem">${p.opp}</td>
+      <td style="padding:8px 10px;color:#4ade80;font-size:.8rem">${p.label}</td>
+      <td style="padding:8px 10px;font-family:monospace;font-weight:700">${p.line}</td>
+      <td style="padding:8px 10px;font-family:monospace;font-weight:700;color:${clr}">${p.avg??'—'}</td>
+      <td style="padding:8px 10px;font-family:monospace;color:${clr};font-weight:700">${gap}</td>
+      <td style="padding:8px 10px;color:#6b7280">${p.games}g</td>
+      <td style="padding:8px 10px;font-family:monospace;font-size:.7rem;color:#6b7280">${p.history||'—'}</td>
+      <td style="padding:8px 10px"><span style="color:${clr};font-weight:900">${p.pick||'—'}</span><br><span style="color:#6b7280;font-size:.65rem">${odds}</span></td>
     </tr>`;
   }).join('');
 }
@@ -710,7 +723,7 @@ function renderProps(props) {
 # ─── Routes ───────────────────────────────────────────────────────────────────
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
-    if not get_user(request): return RedirectResponse("/login")
+    # Auth removed
     return HTMLResponse(MAIN_HTML.replace("__TODAY__", date.today().isoformat()))
 
 @app.get("/login", response_class=HTMLResponse)
