@@ -29,7 +29,7 @@ PROP_LABELS = {
     "player_pass_yds":"Pass Yds", "player_anytime_td":"Anytime TD",
     "player_receptions":"Receptions", "player_pass_tds":"Pass TDs",
 }
-# nfl_data_py column names
+# nfl-verse column names
 PROP_TO_COL = {
     "player_rush_yds":       "rushing_yards",
     "player_reception_yds":  "receiving_yards",
@@ -89,26 +89,45 @@ def _cache_set(date_key, result):
 _nfl_df = None
 _nfl_df_lock = asyncio.Lock()
 
+# Direct nfl-verse CSV URLs (no package needed)
+_NFL_CSV_URL = "https://github.com/nflverse/nflverse-data/releases/download/player_stats/player_stats_{year}.csv"
+_KEEP_COLS   = ["player_display_name","recent_team","opponent_team","home_team","away_team",
+                "season","week","season_type","rushing_yards","receiving_yards","passing_yards",
+                "receptions","targets","passing_tds","rushing_tds","receiving_tds"]
+
 def _load_nfl_stats_sync():
-    """Synchronous load — run in executor so it doesn't block event loop."""
+    """Download CSV files from nfl-verse GitHub — no package needed, just pandas."""
     global _nfl_df
     if _nfl_df is not None:
         return _nfl_df
-    print("[NFL Data] Downloading stats from nfl-verse...")
+    print("[NFL Data] Downloading from nfl-verse GitHub...")
     try:
-        import nfl_data_py as nfl
-        df = nfl.import_weekly_data(NFL_SEASONS)
-        # Add computed anytime_td column
+        import pandas as pd, io, urllib.request
+        frames = []
+        for year in NFL_SEASONS:
+            url = _NFL_CSV_URL.format(year=year)
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(req, timeout=45) as r:
+                    df_yr = pd.read_csv(io.BytesIO(r.read()), low_memory=False)
+                    # Regular season only
+                    if "season_type" in df_yr.columns:
+                        df_yr = df_yr[df_yr["season_type"]=="REG"]
+                    keep = [c for c in _KEEP_COLS if c in df_yr.columns]
+                    frames.append(df_yr[keep])
+                    print(f"[NFL Data] {year}: {len(df_yr)} rows")
+            except Exception as e:
+                print(f"[NFL Data] {year} failed: {e}")
+        if not frames:
+            return None
+        import pandas as pd
+        df = pd.concat(frames, ignore_index=True)
+        # Compute anytime TD
         td_cols = [c for c in ["rushing_tds","receiving_tds","passing_tds"] if c in df.columns]
         if td_cols:
             df["anytime_td"] = df[td_cols].sum(axis=1)
-        # Keep only what we need
-        keep = ["player_display_name","recent_team","opponent_team","home_team","away_team",
-                "season","week","rushing_yards","receiving_yards","passing_yards",
-                "receptions","targets","passing_tds","rushing_tds","receiving_tds","anytime_td"]
-        keep = [c for c in keep if c in df.columns]
-        _nfl_df = df[keep].copy()
-        print(f"[NFL Data] Loaded {len(_nfl_df):,} rows across {len(NFL_SEASONS)} seasons")
+        _nfl_df = df
+        print(f"[NFL Data] Total: {len(_nfl_df):,} rows")
     except Exception as e:
         print(f"[NFL Data] Error: {e}")
         _nfl_df = None
@@ -225,7 +244,7 @@ async def get_prop_lines(event_id: str, date_str: str) -> List[Dict]:
 
 # ── Analysis using nfl_data_py ─────────────────────────────────────────────────
 def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str) -> Optional[Dict]:
-    """Analyze a single prop line using nfl_data_py dataframe."""
+    """Analyze a single prop line using nfl-verse dataframe."""
     name     = pl["name"]
     line     = pl["line"]
     label    = pl["label"]
