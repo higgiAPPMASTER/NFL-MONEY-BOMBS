@@ -541,7 +541,7 @@ footer{text-align:center;padding:32px 24px;color:#4b5563;font-size:.78rem;border
     <h2 style="font-family:'Playfair Display',serif;font-size:1.5rem;font-weight:700;color:#fff;margin-bottom:20px">Run Today's Picks</h2>
     <div style="display:flex;align-items:center;justify-content:center;gap:12px;margin-bottom:20px">
       <label style="color:#9ca3af;font-weight:600;font-size:.85rem;letter-spacing:.08em;text-transform:uppercase">Date</label>
-      <input type="date" id="datePicker" class="date-input" style="max-width:200px">
+      <input type="date" id="datePicker" class="date-input" style="max-width:200px" value="__TODAY__" max="__TODAY__">
     </div>
     <div style="text-align:center">
       <button class="btn" id="runBtn" onclick="runPicks()">Run Picks</button>
@@ -680,4 +680,6 @@ function renderResults(data){
 </html>"""
 
 @app.get("/", response_class=HTMLResponse)
-async def index(): return HTML
+async def index():
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    return HTMLResponse(HTML.replace("__TODAY__", today))
