@@ -230,7 +230,10 @@ async def find_espn_pid(name: str) -> Optional[str]:
     return info.get("pid") if info else None
 
 async def find_espn_player(name: str) -> Optional[Dict]:
-    """Returns {pid, team} for an NFL player."""
+    """Returns {pid, team_abbr, team_name} for an NFL player.
+    Gets team from actual gamelog (reliable) not search API (returns 'NFL')."""
+    # Step 1: find PID from search
+    pid = None
     try:
         async with httpx.AsyncClient(timeout=10) as c:
             r = await c.get("https://site.web.api.espn.com/apis/search/v2",
@@ -238,22 +241,65 @@ async def find_espn_player(name: str) -> Optional[Dict]:
             for result in r.json().get("results",[]):
                 if result.get("type")!="player": continue
                 for item in result.get("contents",[]):
-                    if _norm(item.get("displayName",""))==_norm(name):
-                        uid=item.get("uid","")
-                        m=re.search(r"a:(\d+)",uid)
-                        pid = m.group(1) if m else None
-                        if not pid:
-                            m2=re.search(r"/id/(\d+)",item.get("link",{}).get("web",""))
-                            pid = m2.group(1) if m2 else None
-                        team = (item.get("teamDisplayName","") or
-                                item.get("teamName","") or
-                                item.get("team","") or "")
-                        if pid:
-                            return {"pid": pid, "team": team}
+                    dn = item.get("displayName","")
+                    # Exact or close match
+                    if _norm(dn)==_norm(name):
+                        uid = item.get("uid","")
+                        m   = re.search(r"a:(\d+)", uid)
+                        if m:
+                            pid = m.group(1)
+                            break
+                        m2  = re.search(r"/id/(\d+)", item.get("link",{}).get("web",""))
+                        if m2:
+                            pid = m2.group(1)
+                            break
+                if pid: break
     except Exception: pass
-    return None
 
-async def get_logs_vs_opp(pid: str, opp: str, is_home: bool, stat_key: str) -> List[float]:
+    if not pid:
+        return None
+
+    # Step 2: get team from most recent gamelog entry (much more reliable)
+    team_abbr = ""
+    team_name = ""
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            for season in ESPN_SEASONS[:2]:
+                r = await c.get(f"{ESPN_BASE}/athletes/{pid}/gamelog",
+                                params={"season": season})
+                if not r.is_success: continue
+                events = r.json().get("events", {})
+                for eid, ev in events.items():
+                    t = ev.get("team", {})
+                    if t.get("abbreviation"):
+                        team_abbr = t.get("abbreviation","")
+                        # Build full name from abbr
+                        team_name = _abbr_to_name(team_abbr)
+                        break
+                if team_abbr: break
+    except Exception: pass
+
+    return {"pid": pid, "team_abbr": team_abbr, "team": team_name}
+
+# NFL team abbreviation → display name mapping
+_NFL_TEAMS = {
+    "ARI":"Arizona Cardinals","ATL":"Atlanta Falcons","BAL":"Baltimore Ravens",
+    "BUF":"Buffalo Bills","CAR":"Carolina Panthers","CHI":"Chicago Bears",
+    "CIN":"Cincinnati Bengals","CLE":"Cleveland Browns","DAL":"Dallas Cowboys",
+    "DEN":"Denver Broncos","DET":"Detroit Lions","GB":"Green Bay Packers",
+    "HOU":"Houston Texans","IND":"Indianapolis Colts","JAX":"Jacksonville Jaguars",
+    "KC":"Kansas City Chiefs","LAC":"Los Angeles Chargers","LAR":"Los Angeles Rams",
+    "LV":"Las Vegas Raiders","MIA":"Miami Dolphins","MIN":"Minnesota Vikings",
+    "NE":"New England Patriots","NO":"New Orleans Saints","NYG":"New York Giants",
+    "NYJ":"New York Jets","PHI":"Philadelphia Eagles","PIT":"Pittsburgh Steelers",
+    "SEA":"Seattle Seahawks","SF":"San Francisco 49ers","TB":"Tampa Bay Buccaneers",
+    "TEN":"Tennessee Titans","WSH":"Washington Commanders",
+}
+def _abbr_to_name(abbr: str) -> str:
+    return _NFL_TEAMS.get(abbr.upper(), abbr)
+
+async def get_logs_vs_opp(pid: str, opp: str, is_home, stat_key: str) -> List[float]:
+    """is_home=True/False for H/A filter; None = all games vs opp."""
     """
     Uses ESPN gamelog for event metadata (opponent, H/A) then fetches
     box score per matching game for actual stat values.
@@ -276,7 +322,7 @@ async def get_logs_vs_opp(pid: str, opp: str, is_home: bool, stat_key: str) -> L
                     team_id    = str(ev.get("team", {}).get("id", ""))
                     home_id    = str(ev.get("homeTeamId", ""))
                     player_home = (team_id == home_id and team_id != "")
-                    if player_home != is_home:
+                    if is_home is not None and player_home != is_home:
                         continue
                     opp_name = ev.get("opponent", {}).get("displayName", "")
                     if opp and not _match(opp_name, opp):
@@ -346,19 +392,35 @@ async def run_pipeline(date_str: str) -> Dict:
         if not player_info or not player_info.get("pid"):
             return
         pid = player_info["pid"]
-        player_team = player_info.get("team","")
-        # Determine if player is HOME or AWAY based on their team
-        if player_team and _match(player_team, pl.get("home_team","")):
-            side = "HOME"
-            opp  = pl.get("away_team","")
-        else:
-            side = "AWAY"
-            opp  = pl.get("home_team","")
-        values = await get_logs_vs_opp(pid, opp, (side=="HOME"), pl.get("stat_key",""))
+        # Use full team name OR abbreviation for matching
+        player_team      = player_info.get("team","")
+        player_team_abbr = player_info.get("team_abbr","")
+        home_team = pl.get("home_team","")
+        away_team = pl.get("away_team","")
+        # Determine home/away using both name and abbreviation
+        is_home = (
+            (player_team and _match(player_team, home_team)) or
+            (player_team_abbr and _match(player_team_abbr, home_team))
+        )
+        opp  = away_team if is_home else home_team
+        side = "HOME" if is_home else "AWAY"
+
+        # Sanity check: player cannot play FOR the opponent — corrupted Odds API data
+        if player_team and _match(player_team, opp):
+            print(f"[NFL] Skip {name} — plays for opponent {opp} (corrupted event data)")
+            return
+        if player_team_abbr and _match(player_team_abbr, opp):
+            print(f"[NFL] Skip {name} — plays for opponent {opp} (abbr match)")
+            return
+
+        values = await get_logs_vs_opp(pid, opp, is_home, pl.get("stat_key",""))
+        if not values:
+            # Fallback: try ALL games vs opponent (ignore H/A filter)
+            values = await get_logs_vs_opp(pid, opp, None, pl.get("stat_key",""))
         if not values:
             all_results.append({"name":name,"label":label,"line":line,"side":side,
                 "opp":opp,"game":pl.get("game",""),"avg":None,"games":0,"history":"—",
-                "pick":None,"pick_note":f"No H/A history vs {opp} ({side})",
+                "pick":None,"pick_note":f"No career history vs {opp}",
                 "side":side,
                 "over_odds":pl.get("over_odds"),"under_odds":pl.get("under_odds")})
             return
@@ -559,33 +621,58 @@ function renderResults(data){
   var el=document.getElementById('results');
   if(!data){el.style.display='none';return;}
   if(data.error){
-    el.innerHTML='<div class="card no-games"><div class="icon"></div><h3>'+data.error+'</h3><p style="color:#4b5563;font-size:13px">NFL season runs September through February</p></div>';
+    el.innerHTML='<div class="card" style="text-align:center;padding:40px"><h3 style="color:#6b7280;font-family:\'Playfair Display\',serif">'+data.error+'</h3><p style="color:#4b5563;font-size:13px;margin-top:8px">NFL season runs September through February</p></div>';
     el.style.display='block';return;
   }
-  var picks=data.picks||[],all=data.all||[];
-  var nopick=all.filter(r=>!r.pick);
+  var all=data.all||[];
   var html='';
-  if(!picks.length){
-    html='<div class="card no-games"><div class="icon"></div><h3>No strong picks found</h3><p style="color:#4b5563;font-size:13px">No clear over/under signals for this date</p></div>';
-  }else{
-    html+='<div class="card"><div class="section-hdr"> Money Bombs — '+picks.length+' picks</div><div class="picks-grid">';
-    for(var p of picks){
-      var isOver=p.pick==='OVER';
-      var cls=isOver?'over':'under';
-      var odds=isOver?fmtOdds(p.over_odds):fmtOdds(p.under_odds);
-      html+='<div class="pick-card"><div><div class="pick-name">'+p.name+'</div>';
-      html+='<div class="pick-detail">'+p.label+' &nbsp;·&nbsp; '+p.game+'&nbsp;·&nbsp; Line: <strong>'+p.line+'</strong> &nbsp;·&nbsp; Avg: <strong>'+p.avg+'</strong> &nbsp;·&nbsp; <span class="history-tag">'+p.history+'</span> ('+p.games+'g)</div></div>';
-      html+='<div><div class="pick-badge '+cls+'">'+p.pick+(odds?'<span class="odds-pill">'+odds+'</span>':'')+'</div><div class="pick-note">'+p.pick_note+'</div></div></div>';
-    }
-    html+='</div></div>';
+
+  // Props vs Opponent History table
+  html+='<div style="background:#161616;border:1px solid #262626;border-radius:14px;overflow:hidden;margin-bottom:16px">';
+  html+='<div style="padding:14px 20px;border-bottom:1px solid #262626">';
+  html+='<span style="color:#f59e0b;font-size:.72rem;font-weight:900;letter-spacing:.18em;text-transform:uppercase"> Player Props vs Opponent History</span>';
+  html+='</div>';
+  html+='<div style="overflow-x:auto">';
+  html+='<table style="width:100%;border-collapse:collapse;font-size:.82rem;background:#161616">';
+  html+='<thead><tr style="border-bottom:1px solid rgba(245,158,11,.2)">';
+  ['#','Player','Stat','H/A','Opponent','Line','Avg vs Opp','Gap','Games','History','Pick'].forEach(function(c){
+    html+='<th style="padding:11px 12px;text-align:left;color:#f59e0b;font-size:.7rem;font-weight:700;text-transform:uppercase;letter-spacing:.1em;background:#1a1a1a;white-space:nowrap">'+c+'</th>';
+  });
+  html+='</tr></thead><tbody>';
+
+  if(!all.length){
+    html+='<tr><td colspan="11" style="text-align:center;padding:28px;color:#4b5563">No prop lines available yet &mdash; check back closer to tip-off.</td></tr>';
+  } else {
+    all.forEach(function(p,i){
+      var isO=p.pick==='OVER'||p.pick==='O';
+      var isU=p.pick==='UNDER'||p.pick==='U';
+      var clr=isO?'#4ade80':isU?'#f87171':'#4b5563';
+      var pickTxt=p.pick==='OVER'?'O':p.pick==='UNDER'?'U':(p.pick||'—');
+      var gap=p.gap!=null?(p.gap>0?'+':'')+p.gap:'—';
+      var sideBg=p.side==='HOME'?'rgba(245,158,11,.12)':'rgba(99,102,241,.12)';
+      var sideClr=p.side==='HOME'?'#f59e0b':'#818cf8';
+      var rowBg=i%2===0?'#161616':'#141414';
+      html+='<tr style="border-bottom:1px solid #1c1c1c;background:'+rowBg+'">';
+      html+='<td style="padding:9px 12px;color:#4b5563">'+(i+1)+'</td>';
+      html+='<td style="padding:9px 12px;font-weight:700;color:#fff;white-space:nowrap">'+p.name+'</td>';
+      html+='<td style="padding:9px 12px;color:#f59e0b;font-size:.78rem;white-space:nowrap">'+p.label+'</td>';
+      html+='<td style="padding:9px 12px"><span style="background:'+sideBg+';color:'+sideClr+';padding:2px 8px;border-radius:4px;font-size:.72rem;font-weight:700">'+(p.side||'—')+'</span></td>';
+      html+='<td style="padding:9px 12px;color:#9ca3af;font-size:.78rem;white-space:nowrap">'+(p.opp||'—')+'</td>';
+      html+='<td style="padding:9px 12px;font-family:monospace;font-weight:700;color:#fff">'+p.line+'</td>';
+      html+='<td style="padding:9px 12px;font-family:monospace;font-weight:700;font-size:1rem;color:'+clr+'">'+(p.avg!=null?p.avg:'—')+'</td>';
+      html+='<td style="padding:9px 12px;font-family:monospace;color:'+clr+';font-weight:700">'+gap+'</td>';
+      html+='<td style="padding:9px 12px;color:#4b5563">'+(p.games||0)+'g</td>';
+      html+='<td style="padding:9px 12px;font-family:monospace;font-size:.7rem;color:#4b5563;max-width:140px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">'+(p.history||'—')+'</td>';
+      html+='<td style="padding:9px 12px"><span style="color:'+clr+';font-weight:900;font-size:.95rem">'+pickTxt+'</span></td>';
+      html+='</tr>';
+    });
   }
-  if(nopick.length){
-    html+='<div class="card"><div class="section-hdr">No Clear Signal ('+nopick.length+')</div><div style="display:flex;flex-wrap:wrap;gap:8px">';
-    for(var p of nopick){
-      html+='<div style="background:#0a0a0a;border:1px solid #222;border-radius:8px;padding:7px 11px;font-size:11px"><span style="font-weight:700">'+p.name+'</span><span style="color:#4b5563;margin-left:6px">'+p.label+' '+p.line+'</span><span style="color:#374151;margin-left:6px">'+p.pick_note+'</span></div>';
-    }
-    html+='</div></div>';
-  }
+  html+='</tbody></table></div>';
+  html+='<p style="padding:8px 16px 12px;font-size:.72rem;color:#4b5563">';
+  html+='<strong style="color:#f59e0b">Avg vs Opp</strong> = career H/A avg vs today\'s opponent &nbsp;|&nbsp;';
+  html+='<strong style="color:#f59e0b">Pick</strong> = O (Over) if avg &gt; line, U (Under) if avg &lt; line';
+  html+='</p></div>';
+
   el.innerHTML=html; el.style.display='block';
 }
 </script>
