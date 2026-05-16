@@ -91,7 +91,7 @@ _nfl_df_lock = asyncio.Lock()
 
 # Direct nfl-verse CSV URLs (no package needed)
 _NFL_CSV_URL = "https://github.com/nflverse/nflverse-data/releases/download/player_stats/player_stats_{year}.csv"
-_KEEP_COLS   = ["player_display_name","recent_team","opponent_team","home_team","away_team",
+_KEEP_COLS   = ["player_display_name","recent_team","opponent_team",
                 "season","week","season_type","rushing_yards","receiving_yards","passing_yards",
                 "receptions","targets","passing_tds","rushing_tds","receiving_tds"]
 
@@ -128,12 +128,15 @@ def _load_nfl_stats_sync():
             df["anytime_td"] = df[td_cols].sum(axis=1)
         _nfl_df = df
         print(f"[NFL Data] Total: {len(_nfl_df):,} rows")
+        # H/A will be added after ESPN lookup is built
     except Exception as e:
         print(f"[NFL Data] Error: {e}")
         _nfl_df = None
     return _nfl_df
 
 async def get_nfl_stats():
+    # Ensure H/A lookup is built (runs concurrently with stat download)
+    await _build_ha_lookup()
     async with _nfl_df_lock:
         if _nfl_df is not None:
             return _nfl_df
@@ -244,7 +247,7 @@ async def get_prop_lines(event_id: str, date_str: str) -> List[Dict]:
 
 # ── Analysis using nfl_data_py ─────────────────────────────────────────────────
 def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str) -> Optional[Dict]:
-    """Analyze a single prop line using nfl-verse dataframe."""
+    """Analyze a prop using nfl-verse data. Shows career avg vs opponent."""
     name     = pl["name"]
     line     = pl["line"]
     label    = pl["label"]
@@ -253,60 +256,52 @@ def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str) -> Optional[Dict
     if not stat_col or stat_col not in df.columns:
         return None
 
-    # Find player — try exact match first, then last name
+    # Find player — exact match first, then last name
     mask = df["player_display_name"].str.lower() == name.lower()
     pdf  = df[mask]
     if pdf.empty:
         last = name.split()[-1].lower()
-        mask = df["player_display_name"].str.lower().str.endswith(last)
-        pdf  = df[mask]
-        # If multiple, pick most common team
+        pdf  = df[df["player_display_name"].str.lower().str.endswith(last)]
     if pdf.empty:
         return {"name":name,"label":label,"line":line,"side":"—","opp":"—",
                 "game":pl.get("game",""),"avg":None,"games":0,"history":"—",
                 "gap":None,"pick":None,"pick_note":"Player not found in NFL data",
                 "over_odds":pl.get("over_odds"),"under_odds":pl.get("under_odds")}
 
-    # Get player's current team
+    # Get player current team
     recent_team = pdf["recent_team"].mode().iloc[0] if not pdf.empty else ""
 
-    # Sanity: player cannot be on the opponent's team
-    if recent_team in (home_abbr, away_abbr):
-        if recent_team == home_abbr:
-            is_home  = True
-            opp_abbr = away_abbr
-        else:
-            is_home  = False
-            opp_abbr = home_abbr
+    # Determine opponent abbreviation
+    if recent_team == home_abbr:
+        opp_abbr = away_abbr; side = "HOME"
+    elif recent_team == away_abbr:
+        opp_abbr = home_abbr; side = "AWAY"
     else:
-        # Team not recognized — default to away
-        is_home  = False
-        opp_abbr = home_abbr
+        opp_abbr = home_abbr; side = "—"
 
-    # Sanity: player's team = opponent is corrupted data
-    if recent_team == opp_abbr:
+    # Sanity: player cannot play FOR the opponent
+    if recent_team and recent_team == opp_abbr:
         return None
 
-    side = "HOME" if is_home else "AWAY"
+    # Career games vs opponent — filter by H/A using ESPN lookup
+    vs_opp = pdf[pdf["opponent_team"] == opp_abbr] if opp_abbr else pdf
 
-    # Filter: career H/A games vs opponent
-    vs_opp = pdf[pdf["opponent_team"] == opp_abbr].copy()
-    if is_home:
-        ha_mask = vs_opp["home_team"] == vs_opp["recent_team"]
-    else:
-        ha_mask = vs_opp["away_team"] == vs_opp["recent_team"]
-    vs_ha = vs_opp[ha_mask]
+    # Apply H/A filter using our ESPN lookup
+    def _is_home_row(row):
+        key = (int(row["season"]), int(row["week"]), str(row["recent_team"]))
+        return _HA_LOOKUP.get(key)
 
-    # Fallback: all games vs opponent (no H/A filter)
-    target = vs_ha if not vs_ha.empty else vs_opp
+    if not vs_opp.empty and side in ("HOME","AWAY") and _HA_LOADED:
+        vs_ha = vs_opp[vs_opp.apply(_is_home_row, axis=1) == side]
+        vs_opp = vs_ha if not vs_ha.empty else vs_opp  # fallback to all if no H/A match
 
-    if target.empty:
-        return {"name":name,"label":label,"line":line,"side":side,"opp":opp_abbr,
+    if vs_opp.empty:
+        return {"name":name,"label":label,"line":line,"side":side,"opp":opp_abbr or "—",
                 "game":pl.get("game",""),"avg":None,"games":0,"history":"—",
-                "gap":None,"pick":None,"pick_note":f"No history vs {opp_abbr}",
+                "gap":None,"pick":None,"pick_note":f"No career games vs {opp_abbr}",
                 "over_odds":pl.get("over_odds"),"under_odds":pl.get("under_odds")}
 
-    values = target[stat_col].dropna().tolist()
+    values = vs_opp[stat_col].dropna().tolist()
     if not values:
         return {"name":name,"label":label,"line":line,"side":side,"opp":opp_abbr,
                 "game":pl.get("game",""),"avg":None,"games":0,"history":"—",
@@ -317,7 +312,7 @@ def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str) -> Optional[Dict
     gap  = round(avg - line, 1)
     pick = "OVER" if avg > line else ("UNDER" if avg < line else None)
     hist = ", ".join(str(int(v)) for v in values[:8])
-    note = f"avg {avg} {'>' if avg > line else '<'} line {line} ({'+' if gap > 0 else ''}{gap})"
+    note = f"avg {avg} vs line {line} ({'+' if gap > 0 else ''}{gap})"
 
     return {"name":name,"label":label,"line":line,"side":side,"opp":opp_abbr,
             "game":pl.get("game",""),"avg":avg,"games":len(values),
@@ -577,7 +572,7 @@ function renderResults(data){
   html+='<div class="tbl-wrap">';
   html+='<table>';
   html+='<thead><tr>';
-  ["#","Player","Stat","H/A","Opponent","Line","Avg vs Opp","Gap","Games","History","Pick"].forEach(function(c){
+  ["#","Player","Stat","H/A","Opp","Line","Avg vs Opp","Gap","Games","History","Pick"].forEach(function(c){
     html+='<th>'+c+'</th>';
   });
   html+='</tr></thead><tbody>';
@@ -609,7 +604,7 @@ function renderResults(data){
   }
   html+='</tbody></table></div>';
   html+='<p style="padding:8px 16px 12px;font-size:.72rem;color:#4b5563">';
-  html+='<strong style="color:#f59e0b">Avg vs Opp</strong> = career H/A avg vs opponent &nbsp;|&nbsp;';
+  html+='<strong style="color:#f59e0b">Career Avg</strong> = career avg vs today opponent &nbsp;|&nbsp;';
   html+='<strong style="color:#f59e0b">Pick</strong> = O if avg &gt; line, U if avg &lt; line';
   html+='</p></div>';
   el.innerHTML=html;
