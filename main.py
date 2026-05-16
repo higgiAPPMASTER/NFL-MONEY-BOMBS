@@ -591,57 +591,114 @@ async function pollJob(){
   }catch(e){}
 }
 
-function renderResults(data){
-  var el=document.getElementById('results');
-  if(!data){el.innerHTML='';return;}
-  if(data.error){
-    el.innerHTML='<div class="err-card"><h3 style="font-family:Playfair Display,serif;margin-bottom:8px">'+data.error+'</h3><p style="font-size:13px">NFL season runs September through February</p></div>';
+function buildRow(p, i) {
+  var isO = p.pick==='OVER'||p.pick==='O';
+  var isU = p.pick==='UNDER'||p.pick==='U';
+  var clr = isO?'#4ade80':isU?'#f87171':'#4b5563';
+  var pt  = p.pick==='OVER'?'O':p.pick==='UNDER'?'U':(p.pick||'--');
+  var gap = p.gap!=null?(p.gap>0?'+':'')+p.gap:'--';
+  var sBg = p.side==='HOME'?'rgba(245,158,11,.12)':'rgba(99,102,241,.12)';
+  var sClr= p.side==='HOME'?'#f59e0b':'#818cf8';
+  var rBg = i%2===0?'#161616':'#141414';
+  return '<tr style="background:'+rBg+'">'+
+    '<td style="color:#4b5563">'+(i+1)+'</td>'+
+    '<td style="font-weight:700;color:#fff">'+p.name+'</td>'+
+    '<td style="color:#f59e0b;font-size:.78rem">'+p.label+'</td>'+
+    '<td><span style="background:'+sBg+';color:'+sClr+';padding:2px 8px;border-radius:4px;font-size:.72rem;font-weight:700">'+(p.side||'--')+'</span></td>'+
+    '<td style="color:#9ca3af;font-size:.78rem">'+(p.opp||'--')+'</td>'+
+    '<td style="font-family:monospace;font-weight:700">'+p.line+'</td>'+
+    '<td style="font-family:monospace;font-weight:700;font-size:1rem;color:'+clr+'">'+(p.avg!=null?p.avg:'--')+'</td>'+
+    '<td style="font-family:monospace;color:'+clr+';font-weight:700">'+gap+'</td>'+
+    '<td style="color:#4b5563">'+(p.games||0)+'g</td>'+
+    '<td style="font-family:monospace;font-size:.7rem;color:#4b5563;max-width:130px;overflow:hidden;text-overflow:ellipsis">'+(p.history||'--')+'</td>'+
+    '<td><span style="color:'+clr+';font-weight:900;font-size:.95rem">'+pt+'</span></td>'+
+    '</tr>';
+}
+
+function buildTable(rows, caption) {
+  var h = '<div class="card" style="padding:0;overflow:hidden;margin-bottom:16px">';
+  h += '<div style="padding:14px 20px;border-bottom:1px solid #262626">';
+  h += '<span style="color:#f59e0b;font-size:.72rem;font-weight:900;letter-spacing:.18em;text-transform:uppercase">'+caption+'</span>';
+  h += '</div><div class="tbl-wrap"><table><thead><tr>';
+  ["#","Player","Stat","H/A","Opp","Line","Avg vs Opp","Gap","Games","History","Pick"].forEach(function(c){ h+='<th>'+c+'</th>'; });
+  h += '</tr></thead><tbody>';
+  if (!rows.length) {
+    h += '<tr><td colspan="11" style="text-align:center;padding:20px;color:#4b5563">No data available</td></tr>';
+  } else {
+    rows.forEach(function(p,i){ h += buildRow(p,i); });
+  }
+  h += '</tbody></table></div>';
+  h += '<p style="padding:6px 16px 10px;font-size:.72rem;color:#4b5563"><strong style="color:#f59e0b">Avg vs Opp</strong> = career H/A avg vs opponent &nbsp;|&nbsp;<strong style="color:#f59e0b">Pick</strong> = O if avg &gt; line, U if avg &lt; line</p>';
+  h += '</div>';
+  return h;
+}
+
+function toggleGame(id) {
+  var el  = document.getElementById(id);
+  var btn = document.getElementById(id+'_btn');
+  if (!el) return;
+  var hidden = el.style.display === 'none';
+  el.style.display = hidden ? 'block' : 'none';
+  if (btn) btn.textContent = hidden ? 'Collapse' : 'Expand';
+}
+
+function renderResults(data) {
+  var el = document.getElementById('results');
+  if (!data) { el.innerHTML=''; return; }
+  if (data.error) {
+    el.innerHTML = '<div class="err-card"><h3 style="font-family:Playfair Display,serif;margin-bottom:8px">'+data.error+'</h3><p style="font-size:13px">NFL season runs September through February</p></div>';
     return;
   }
-  var all=data.all||[];
-  var html='<div class="card" style="padding:0;overflow:hidden">';
-  html+='<div style="padding:16px 20px;border-bottom:1px solid #262626">';
-  html+='<span style="color:#f59e0b;font-size:.72rem;font-weight:900;letter-spacing:.18em;text-transform:uppercase">Player Props vs Opponent History</span>';
-  html+='</div>';
-  html+='<div class="tbl-wrap">';
-  html+='<table>';
-  html+='<thead><tr>';
-  ["#","Player","Stat","H/A","Opp","Line","Avg vs Opp","Gap","Games","History","Pick"].forEach(function(c){
-    html+='<th>'+c+'</th>';
-  });
-  html+='</tr></thead><tbody>';
-  if(!all.length){
-    html+='<tr><td colspan="11" style="text-align:center;padding:28px;color:#4b5563">No prop lines available yet &mdash; check back closer to game time.</td></tr>';
-  }else{
-    all.forEach(function(p,i){
-      var isO=p.pick==='OVER'||p.pick==='O';
-      var isU=p.pick==='UNDER'||p.pick==='U';
-      var clr=isO?'#4ade80':isU?'#f87171':'#4b5563';
-      var pickTxt=p.pick==='OVER'?'O':p.pick==='UNDER'?'U':(p.pick||'--');
-      var gap=p.gap!=null?(p.gap>0?'+':'')+p.gap:'--';
-      var sideBg=p.side==='HOME'?'rgba(245,158,11,.12)':'rgba(99,102,241,.12)';
-      var sideClr=p.side==='HOME'?'#f59e0b':'#818cf8';
-      html+='<tr>';
-      html+='<td style="color:#4b5563">'+(i+1)+'</td>';
-      html+='<td style="font-weight:700;color:#fff">'+p.name+'</td>';
-      html+='<td style="color:#f59e0b;font-size:.78rem">'+p.label+'</td>';
-      html+='<td><span style="background:'+sideBg+';color:'+sideClr+';padding:2px 8px;border-radius:4px;font-size:.72rem;font-weight:700">'+(p.side||'--')+'</span></td>';
-      html+='<td style="color:#9ca3af;font-size:.78rem">'+(p.opp||'--')+'</td>';
-      html+='<td style="font-family:monospace;font-weight:700">'+p.line+'</td>';
-      html+='<td style="font-family:monospace;font-weight:700;font-size:1rem;color:'+clr+'">'+(p.avg!=null?p.avg:'--')+'</td>';
-      html+='<td style="font-family:monospace;color:'+clr+';font-weight:700">'+gap+'</td>';
-      html+='<td style="color:#4b5563">'+(p.games||0)+'g</td>';
-      html+='<td style="font-family:monospace;font-size:.7rem;color:#4b5563;max-width:140px;overflow:hidden;text-overflow:ellipsis">'+(p.history||'--')+'</td>';
-      html+='<td><span style="color:'+clr+';font-weight:900;font-size:.95rem">'+pickTxt+'</span></td>';
-      html+='</tr>';
-    });
+  var all = data.all || [];
+  if (!all.length) {
+    el.innerHTML = '<div class="err-card">No prop lines found for this date.</div>';
+    return;
   }
-  html+='</tbody></table></div>';
-  html+='<p style="padding:8px 16px 12px;font-size:.72rem;color:#4b5563">';
-  html+='<strong style="color:#f59e0b">Career Avg</strong> = career avg vs today opponent &nbsp;|&nbsp;';
-  html+='<strong style="color:#f59e0b">Pick</strong> = O if avg &gt; line, U if avg &lt; line';
-  html+='</p></div>';
-  el.innerHTML=html;
+
+  // Top 10: picks with data sorted by |gap|
+  var withData = all.filter(function(p){ return p.avg!=null && p.pick; });
+  withData.sort(function(a,b){ return Math.abs(b.gap||0)-Math.abs(a.gap||0); });
+  var top10 = withData.slice(0,10);
+
+  var html = '';
+
+  // Section 1: Top 10 Money Bombs
+  html += buildTable(top10, 'Top 10 Money Bombs');
+
+  // Section 2: All Plays by Game (collapsible)
+  html += '<div style="display:flex;align-items:center;gap:10px;font-size:.78rem;font-weight:700;color:#f59e0b;text-transform:uppercase;letter-spacing:.15em;margin:24px 0 12px">';
+  html += 'All Plays by Game<span style="flex:1;height:1px;background:rgba(245,158,11,.15);display:inline-block;margin-left:8px"></span></div>';
+
+  // Group by game
+  var games = {}, order = [];
+  all.forEach(function(p) {
+    var g = p.game || 'Unknown Game';
+    if (!games[g]) { games[g]=[]; order.push(g); }
+    games[g].push(p);
+  });
+
+  order.forEach(function(game, gi) {
+    var gPlays = games[game];
+    var gPicks = gPlays.filter(function(p){ return p.pick; }).length;
+    var gid    = 'game_'+gi;
+    html += '<div style="margin-bottom:10px">';
+    // Clickable header
+    html += '<div onclick="toggleGame(\''+gid+'\')" style="background:#161616;border:1px solid #262626;border-radius:12px;padding:12px 18px;cursor:pointer;display:flex;align-items:center;justify-content:space-between" onmouseover="this.style.borderColor=\'rgba(245,158,11,.3)\'" onmouseout="this.style.borderColor=\'#262626\'">';
+    html += '<span style="font-weight:700;color:#fff;font-size:.92rem">'+game+'</span>';
+    html += '<div style="display:flex;align-items:center;gap:10px">';
+    html += '<span style="background:rgba(245,158,11,.1);color:#f59e0b;padding:3px 12px;border-radius:999px;font-size:.75rem;font-weight:700">'+gPlays.length+' props &nbsp; '+gPicks+' picks</span>';
+    html += '<button id="'+gid+'_btn" style="background:none;border:1px solid #374151;color:#9ca3af;border-radius:6px;padding:3px 12px;font-size:.72rem;cursor:pointer;font-family:Source Sans Pro,sans-serif">Expand</button>';
+    html += '</div></div>';
+    // Collapsible content
+    html += '<div id="'+gid+'" style="display:none;margin-top:6px;border-radius:12px;overflow:hidden;border:1px solid #262626">';
+    html += '<table style="width:100%;border-collapse:collapse;font-size:.82rem;background:#161616"><thead><tr style="border-bottom:1px solid rgba(245,158,11,.2)">';
+    ["#","Player","Stat","H/A","Opp","Line","Avg vs Opp","Gap","Games","History","Pick"].forEach(function(c){ html+='<th style="padding:10px 12px;text-align:left;color:#f59e0b;font-size:.7rem;font-weight:700;text-transform:uppercase;letter-spacing:.1em;background:#1a1a1a;white-space:nowrap">'+c+'</th>'; });
+    html += '</tr></thead><tbody>';
+    gPlays.forEach(function(p,i){ html += buildRow(p,i); });
+    html += '</tbody></table></div></div>';
+  });
+
+  el.innerHTML = html;
 }
 </script>
 </body>
