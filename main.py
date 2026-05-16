@@ -669,7 +669,7 @@ function renderResults(data){
   }
   html+='</tbody></table></div>';
   html+='<p style="padding:8px 16px 12px;font-size:.72rem;color:#4b5563">';
-  html+='<strong style="color:#f59e0b">Avg vs Opp</strong> = career H/A avg vs today\'s opponent &nbsp;|&nbsp;';
+  html+='<strong style="color:#f59e0b">Avg vs Opp</strong> = career H/A avg vs opponent &nbsp;|&nbsp;';
   html+='<strong style="color:#f59e0b">Pick</strong> = O (Over) if avg &gt; line, U (Under) if avg &lt; line';
   html+='</p></div>';
 
