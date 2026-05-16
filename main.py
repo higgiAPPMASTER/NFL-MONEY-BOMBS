@@ -280,8 +280,17 @@ async def get_prop_lines(event_id: str, date_str: str) -> List[Dict]:
         print(f"[OddsAPI props] {e}"); return []
 
 # ── Analysis using nfl_data_py ─────────────────────────────────────────────────
+def _ha_side(row, is_home):
+    if not _HA_LOADED:
+        return True
+    key = (int(row["season"]), int(row["week"]), str(row["recent_team"]))
+    val = _HA_LOOKUP.get(key)
+    if val is None:
+        return True
+    return val == ("HOME" if is_home else "AWAY")
+
 def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str) -> Optional[Dict]:
-    """Analyze a prop using nfl-verse data. Shows career avg vs opponent."""
+    """NHL-style: career vs opp + last 10 H/A + hit rates vs line."""
     name     = pl["name"]
     line     = pl["line"]
     label    = pl["label"]
@@ -290,68 +299,70 @@ def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str) -> Optional[Dict
     if not stat_col or stat_col not in df.columns:
         return None
 
-    # Find player — exact match first, then last name
+    # Find player
     mask = df["player_display_name"].str.lower() == name.lower()
     pdf  = df[mask]
     if pdf.empty:
         last = name.split()[-1].lower()
         pdf  = df[df["player_display_name"].str.lower().str.endswith(last)]
     if pdf.empty:
-        return {"name":name,"label":label,"line":line,"side":"—","opp":"—",
-                "game":pl.get("game",""),"avg":None,"games":0,"history":"—",
-                "gap":None,"pick":None,"pick_note":"Player not found in NFL data",
-                "over_odds":pl.get("over_odds"),"under_odds":pl.get("under_odds")}
+        return None
 
-    # Get player current team
     recent_team = pdf["recent_team"].mode().iloc[0] if not pdf.empty else ""
-
-    # Determine opponent abbreviation
     if recent_team == home_abbr:
-        opp_abbr = away_abbr; side = "HOME"
+        opp_abbr = away_abbr; is_home = True;  side = "HOME"
     elif recent_team == away_abbr:
-        opp_abbr = home_abbr; side = "AWAY"
+        opp_abbr = home_abbr; is_home = False; side = "AWAY"
     else:
-        opp_abbr = home_abbr; side = "—"
+        opp_abbr = home_abbr; is_home = None;  side = "--"
 
-    # Sanity: player cannot play FOR the opponent
     if recent_team and recent_team == opp_abbr:
         return None
 
-    # Career games vs opponent — filter by H/A using ESPN lookup
-    vs_opp = pdf[pdf["opponent_team"] == opp_abbr] if opp_abbr else pdf
+    # Career vs opponent (H/A filtered)
+    vs_opp_all = pdf[pdf["opponent_team"] == opp_abbr] if opp_abbr else pdf
+    if is_home is not None and _HA_LOADED and not vs_opp_all.empty:
+        vs_ha = vs_opp_all[vs_opp_all.apply(lambda r: _ha_side(r, is_home), axis=1)]
+        vs_opp = vs_ha if not vs_ha.empty else vs_opp_all
+    else:
+        vs_opp = vs_opp_all
 
-    # Apply H/A filter using our ESPN lookup
-    def _is_home_row(row):
-        key = (int(row["season"]), int(row["week"]), str(row["recent_team"]))
-        return _HA_LOOKUP.get(key)
+    vs_vals  = vs_opp[stat_col].dropna().tolist() if not vs_opp.empty else []
+    vs_avg   = round(sum(vs_vals)/len(vs_vals), 1) if vs_vals else None
+    vs_hits  = sum(1 for v in vs_vals if v > line)
+    vs_rate  = round(vs_hits/len(vs_vals)*100, 1) if len(vs_vals) >= 2 else None
 
-    if not vs_opp.empty and side in ("HOME","AWAY") and _HA_LOADED:
-        vs_ha = vs_opp[vs_opp.apply(_is_home_row, axis=1) == side]
-        vs_opp = vs_ha if not vs_ha.empty else vs_opp  # fallback to all if no H/A match
+    # Last 10 H/A games (any opponent)
+    if is_home is not None and _HA_LOADED:
+        l10_pool = pdf[pdf.apply(lambda r: _ha_side(r, is_home), axis=1)]
+    else:
+        l10_pool = pdf
+    l10 = l10_pool.sort_values(["season","week"], ascending=False).head(10) if not l10_pool.empty else l10_pool
+    l10_vals = l10[stat_col].dropna().tolist() if not l10.empty else []
+    l10_avg  = round(sum(l10_vals)/len(l10_vals), 1) if l10_vals else None
+    l10_hits = sum(1 for v in l10_vals if v > line)
+    l10_rate = round(l10_hits/len(l10_vals)*100, 1) if len(l10_vals) >= 3 else None
 
-    if vs_opp.empty:
-        return {"name":name,"label":label,"line":line,"side":side,"opp":opp_abbr or "—",
-                "game":pl.get("game",""),"avg":None,"games":0,"history":"—",
-                "gap":None,"pick":None,"pick_note":f"No career games vs {opp_abbr}",
-                "over_odds":pl.get("over_odds"),"under_odds":pl.get("under_odds")}
+    rates = [r for r in [vs_rate, l10_rate] if r is not None]
+    score = round(sum(rates)/len(rates), 1) if rates else 0
 
-    values = vs_opp[stat_col].dropna().tolist()
-    if not values:
-        return {"name":name,"label":label,"line":line,"side":side,"opp":opp_abbr,
-                "game":pl.get("game",""),"avg":None,"games":0,"history":"—",
-                "gap":None,"pick":None,"pick_note":f"No {label} data vs {opp_abbr}",
-                "over_odds":pl.get("over_odds"),"under_odds":pl.get("under_odds")}
+    ref_avg = l10_avg if l10_avg is not None else vs_avg
+    gap     = round(ref_avg - line, 1) if ref_avg is not None else None
+    pick    = "OVER" if (ref_avg and ref_avg > line) else ("UNDER" if (ref_avg and ref_avg < line) else None)
 
-    avg  = round(sum(values) / len(values), 1)
-    gap  = round(avg - line, 1)
-    pick = "OVER" if avg > line else ("UNDER" if avg < line else None)
-    hist = ", ".join(str(int(v)) for v in values[:8])
-    note = f"avg {avg} vs line {line} ({'+' if gap > 0 else ''}{gap})"
-
-    return {"name":name,"label":label,"line":line,"side":side,"opp":opp_abbr,
-            "game":pl.get("game",""),"avg":avg,"games":len(values),
-            "history":hist,"gap":gap,"pick":pick,"pick_note":note,
-            "over_odds":pl.get("over_odds"),"under_odds":pl.get("under_odds")}
+    return {
+        "name": name, "label": label, "line": line,
+        "side": side, "opp": opp_abbr or "--", "game": pl.get("game",""),
+        "team": recent_team,
+        "vs_opp_avg": vs_avg, "vs_opp_games": len(vs_vals),
+        "vs_opp_hits": vs_hits, "vs_opp_rate": vs_rate,
+        "l10_avg": l10_avg, "l10_games": len(l10_vals),
+        "l10_hits": l10_hits, "l10_rate": l10_rate,
+        "score": score, "pick": pick, "gap": gap,
+        "over_odds": pl.get("over_odds"), "under_odds": pl.get("under_odds"),
+        "avg": vs_avg or l10_avg, "games": len(vs_vals),
+        "history": ", ".join(str(int(v)) for v in vs_vals[:8]) or "--",
+    }
 
 # ── Pipeline ───────────────────────────────────────────────────────────────────
 async def run_pipeline(date_str: str) -> Dict:
@@ -591,111 +602,154 @@ async function pollJob(){
   }catch(e){}
 }
 
-function buildRow(p, i) {
-  var isO = p.pick==='OVER'||p.pick==='O';
-  var isU = p.pick==='UNDER'||p.pick==='U';
-  var clr = isO?'#4ade80':isU?'#f87171':'#4b5563';
-  var pt  = p.pick==='OVER'?'O':p.pick==='UNDER'?'U':(p.pick||'--');
-  var gap = p.gap!=null?(p.gap>0?'+':'')+p.gap:'--';
-  var sBg = p.side==='HOME'?'rgba(245,158,11,.12)':'rgba(99,102,241,.12)';
-  var sClr= p.side==='HOME'?'#f59e0b':'#818cf8';
-  var rBg = i%2===0?'#161616':'#141414';
+function rateClass(r){
+  if(r==null) return '#4b5563';
+  return r>=75?'#4ade80':r>=55?'#f59e0b':'#f87171';
+}
+
+function fmtHits(hits, total, rate){
+  if(total<2) return '<span style="color:#4b5563">N/A</span>';
+  var clr=rateClass(rate);
+  return '<span style="color:'+clr+';font-weight:700">'+hits+'/'+total+' ('+rate+'%)</span>';
+}
+
+function buildTopRow(p, i){
+  var clr=rateClass(p.score);
+  var sBg=p.side==='HOME'?'rgba(245,158,11,.12)':'rgba(99,102,241,.12)';
+  var sClr=p.side==='HOME'?'#f59e0b':'#818cf8';
+  var rBg=i%2===0?'#161616':'#141414';
+  var pt=p.pick==='OVER'?'O':p.pick==='UNDER'?'U':(p.pick||'--');
+  var pClr=p.pick==='OVER'||p.pick==='O'?'#4ade80':p.pick==='UNDER'||p.pick==='U'?'#f87171':'#4b5563';
+  var l10Avg=p.l10_avg!=null?'<span style="color:#f59e0b;font-weight:700">'+p.l10_avg+'</span>':'<span style="color:#4b5563">--</span>';
+  var vOppAvg=p.vs_opp_avg!=null?'<span style="font-weight:700">'+p.vs_opp_avg+'</span>':'<span style="color:#4b5563">N/A</span>';
+  return '<tr style="background:'+rBg+'">'
+    +'<td style="color:#4b5563;font-size:.85rem">'+(i+1)+'</td>'
+    +'<td style="font-weight:700;color:#fff;white-space:nowrap">'+p.name+'</td>'
+    +'<td style="color:#9ca3af;font-size:.78rem">'+(p.team||'--')+'</td>'
+    +'<td style="color:#9ca3af;font-size:.78rem">'+(p.opp||'--')+'</td>'
+    +'<td><span style="background:'+sBg+';color:'+sClr+';padding:2px 8px;border-radius:4px;font-size:.72rem;font-weight:700">'+(p.side||'--')+'</span></td>'
+    +'<td style="font-family:monospace;font-weight:700">'+p.line+'</td>'
+    +'<td style="font-family:monospace">'+vOppAvg+'</td>'
+    +'<td style="font-family:monospace">'+l10Avg+'</td>'
+    +'<td>'+fmtHits(p.vs_opp_hits,p.vs_opp_games,p.vs_opp_rate)+'</td>'
+    +'<td>'+fmtHits(p.l10_hits,p.l10_games,p.l10_rate)+'</td>'
+    +'<td style="font-weight:900;color:'+clr+';font-size:1.05rem">'+p.score+'</td>'
+    +'<td><span style="color:'+pClr+';font-weight:900">'+pt+'</span></td>'
+    +'</tr>';
+}
+
+function buildRow(p, i){
+  var isO=p.pick==='OVER'||p.pick==='O';
+  var isU=p.pick==='UNDER'||p.pick==='U';
+  var clr=isO?'#4ade80':isU?'#f87171':'#4b5563';
+  var pt=p.pick==='OVER'?'O':p.pick==='UNDER'?'U':(p.pick||'--');
+  var gap=p.gap!=null?(p.gap>0?'+':'')+p.gap:'--';
+  var sBg=p.side==='HOME'?'rgba(245,158,11,.12)':'rgba(99,102,241,.12)';
+  var sClr=p.side==='HOME'?'#f59e0b':'#818cf8';
+  var rBg=i%2===0?'#161616':'#141414';
   return '<tr style="background:'+rBg+'">'
     +'<td style="color:#4b5563">'+(i+1)+'</td>'
     +'<td style="font-weight:700;color:#fff">'+p.name+'</td>'
+    +'<td style="color:#9ca3af;font-size:.78rem">'+(p.team||'--')+'</td>'
     +'<td style="color:#f59e0b;font-size:.78rem">'+p.label+'</td>'
     +'<td><span style="background:'+sBg+';color:'+sClr+';padding:2px 8px;border-radius:4px;font-size:.72rem;font-weight:700">'+(p.side||'--')+'</span></td>'
     +'<td style="color:#9ca3af;font-size:.78rem">'+(p.opp||'--')+'</td>'
     +'<td style="font-family:monospace;font-weight:700">'+p.line+'</td>'
-    +'<td style="font-family:monospace;font-weight:700;font-size:1rem;color:'+clr+'">'+(p.avg!=null?p.avg:'--')+'</td>'
-    +'<td style="font-family:monospace;color:'+clr+';font-weight:700">'+gap+'</td>'
-    +'<td style="color:#4b5563">'+(p.games||0)+'g</td>'
-    +'<td style="font-family:monospace;font-size:.7rem;color:#4b5563;max-width:130px;overflow:hidden;text-overflow:ellipsis">'+(p.history||'--')+'</td>'
-    +'<td><span style="color:'+clr+';font-weight:900;font-size:.95rem">'+pt+'</span></td>'
+    +'<td style="font-family:monospace;color:#f59e0b;font-weight:700">'+(p.vs_opp_avg!=null?p.vs_opp_avg:'--')+'</td>'
+    +'<td style="font-family:monospace;font-weight:700;color:#f59e0b">'+(p.l10_avg!=null?p.l10_avg:'--')+'</td>'
+    +'<td style="font-family:monospace;color:'+clr+';font-weight:700">'+(p.gap!=null?(p.gap>0?'+':'')+p.gap:'--')+'</td>'
+    +'<td><span style="color:'+clr+';font-weight:900">'+pt+'</span></td>'
     +'</tr>';
 }
 
-function buildTable(rows, caption) {
-  var h = '<div class="card" style="padding:0;overflow:hidden;margin-bottom:16px">';
-  h += '<div style="padding:14px 20px;border-bottom:1px solid #262626">';
-  h += '<span style="color:#f59e0b;font-size:.72rem;font-weight:900;letter-spacing:.18em;text-transform:uppercase">'+caption+'</span>';
-  h += '</div><div class="tbl-wrap"><table><thead><tr>';
-  var cols=['#','Player','Stat','H/A','Opp','Line','Avg vs Opp','Gap','Games','History','Pick'];
-  cols.forEach(function(c){ h+='<th>'+c+'</th>'; });
-  h += '</tr></thead><tbody>';
-  if (!rows.length) {
-    h += '<tr><td colspan="11" style="text-align:center;padding:20px;color:#4b5563">No data available</td></tr>';
-  } else {
-    rows.forEach(function(p,i){ h += buildRow(p,i); });
+function buildTopTable(rows){
+  var h='<div class="card" style="padding:0;overflow:hidden;margin-bottom:16px">';
+  h+='<div style="padding:14px 20px;border-bottom:1px solid #262626;display:flex;align-items:center;justify-content:space-between">';
+  h+='<span style="color:#f59e0b;font-size:.72rem;font-weight:900;letter-spacing:.18em;text-transform:uppercase">Top 10 Money Bombs</span>';
+  h+='<span style="background:rgba(245,158,11,.1);color:#f59e0b;padding:3px 12px;border-radius:999px;font-size:.75rem;font-weight:700">'+rows.length+' picks</span>';
+  h+='</div><div class="tbl-wrap"><table><thead><tr>';
+  var cols=['#','Player','Team','Opp','H/A','Line','Avg vs Opp','L10 H/A Avg','VS OPP HIT%','L10 H/A HIT%','Score','Pick'];
+  cols.forEach(function(c){h+='<th>'+c+'</th>';});
+  h+='</tr></thead><tbody>';
+  if(!rows.length){
+    h+='<tr><td colspan="12" style="text-align:center;padding:28px;color:#4b5563">No qualifying picks (need 3+ H/A games, 55%+ hit rate)</td></tr>';
+  }else{
+    rows.forEach(function(p,i){h+=buildTopRow(p,i);});
   }
-  h += '</tbody></table></div>';
-  h += '<p style="padding:6px 16px 10px;font-size:.72rem;color:#4b5563"><strong style="color:#f59e0b">Avg vs Opp</strong> = career H/A avg vs opponent &nbsp;|&nbsp;<strong style="color:#f59e0b">Pick</strong> = O if avg &gt; line, U if avg &lt; line</p>';
-  h += '</div>';
+  h+='</tbody></table></div>';
+  h+='<p style="padding:6px 16px 10px;font-size:.72rem;color:#4b5563">';
+  h+='<strong style="color:#f59e0b">VS OPP HIT%</strong> = career games vs opponent beating the line &nbsp;|&nbsp;';
+  h+='<strong style="color:#f59e0b">L10 H/A HIT%</strong> = last 10 H/A games (any opp) beating the line &nbsp;|&nbsp;';
+  h+='<strong style="color:#f59e0b">Score</strong> = avg of both hit rates';
+  h+='</p></div>';
   return h;
 }
 
-function toggleGame(n) {
-  var el  = document.getElementById('game_'+n);
-  var btn = document.getElementById('game_btn_'+n);
-  if (!el) return;
-  var hidden = el.style.display === 'none';
-  el.style.display = hidden ? 'block' : 'none';
-  if (btn) btn.textContent = hidden ? 'Collapse' : 'Expand';
+function buildGameTable(rows){
+  var cols=['#','Player','Team','Stat','H/A','Opp','Line','Avg vs Opp','L10 Avg','Gap','Pick'];
+  var h='<table style="width:100%;border-collapse:collapse;background:#161616"><thead><tr style="border-bottom:1px solid rgba(245,158,11,.2)">';
+  cols.forEach(function(c){h+='<th style="padding:10px 12px;text-align:left;color:#f59e0b;font-size:.7rem;font-weight:700;text-transform:uppercase;letter-spacing:.1em;background:#1a1a1a;white-space:nowrap">'+c+'</th>';});
+  h+='</tr></thead><tbody>';
+  rows.forEach(function(p,i){h+=buildRow(p,i);});
+  h+='</tbody></table>';
+  return h;
 }
 
-function renderResults(data) {
-  var el = document.getElementById('results');
-  if (!data) { el.innerHTML=''; return; }
-  if (data.error) {
-    el.innerHTML = '<div class="err-card"><h3 style="font-family:Playfair Display,serif;margin-bottom:8px">'+data.error+'</h3><p style="font-size:13px">NFL season runs September through February</p></div>';
+function toggleGame(n){
+  var el=document.getElementById('game_'+n);
+  var btn=document.getElementById('game_btn_'+n);
+  if(!el) return;
+  var hidden=el.style.display==='none';
+  el.style.display=hidden?'block':'none';
+  if(btn) btn.textContent=hidden?'Collapse':'Expand';
+}
+
+function renderResults(data){
+  var el=document.getElementById('results');
+  if(!data){el.innerHTML='';return;}
+  if(data.error){
+    el.innerHTML='<div class="err-card"><h3 style="font-family:Playfair Display,serif;margin-bottom:8px">'+data.error+'</h3><p style="font-size:13px">NFL season runs September through February</p></div>';
     return;
   }
-  var all = data.all || [];
-  if (!all.length) {
-    el.innerHTML = '<div class="err-card">No prop lines found for this date.</div>';
-    return;
-  }
+  var all=data.all||[];
+  if(!all.length){el.innerHTML='<div class="err-card">No prop lines found.</div>';return;}
 
-  // Top 10: picks with data sorted by |gap|
-  var withData = all.filter(function(p){ return p.avg!=null && p.pick; });
-  withData.sort(function(a,b){ return Math.abs(b.gap||0)-Math.abs(a.gap||0); });
-  var top10 = withData.slice(0,10);
-  var html = buildTable(top10, 'Top 10 Money Bombs');
+  // Top 10: l10 >= 3 games, l10_rate >= 55%, sorted by score
+  var qualified=all.filter(function(p){
+    return p.l10_games>=3 && p.l10_rate!=null && p.l10_rate>=55 && p.pick;
+  });
+  qualified.sort(function(a,b){return b.score-a.score;});
+  var top10=qualified.slice(0,10);
 
-  // All Plays by Game section header
-  html += '<div style="display:flex;align-items:center;gap:10px;font-size:.78rem;font-weight:700;color:#f59e0b;text-transform:uppercase;letter-spacing:.15em;margin:24px 0 12px">';
-  html += 'All Plays by Game<span style="flex:1;height:1px;background:rgba(245,158,11,.15);display:inline-block;margin-left:8px"></span></div>';
+  var html=buildTopTable(top10);
 
-  // Group by game
-  var games = {}, order = [];
-  all.forEach(function(p) {
-    var g = p.game || 'Unknown Game';
-    if (!games[g]) { games[g]=[]; order.push(g); }
+  // All plays by game
+  html+='<div style="display:flex;align-items:center;gap:10px;font-size:.78rem;font-weight:700;color:#f59e0b;text-transform:uppercase;letter-spacing:.15em;margin:24px 0 12px">';
+  html+='All Plays by Game<span style="flex:1;height:1px;background:rgba(245,158,11,.15);display:inline-block;margin-left:8px"></span></div>';
+
+  var games={},order=[];
+  all.forEach(function(p){
+    var g=p.game||'Unknown';
+    if(!games[g]){games[g]=[];order.push(g);}
     games[g].push(p);
   });
 
-  // Render each game group
-  order.forEach(function(game, gi) {
-    var gPlays = games[game];
-    var gPicks = gPlays.filter(function(p){ return p.pick; }).length;
-    // onclick uses numeric gi - no quotes needed
-    html += '<div style="margin-bottom:10px">';
-    html += '<div onclick="toggleGame('+gi+')" style="background:#161616;border:1px solid #262626;border-radius:12px;padding:12px 18px;cursor:pointer;display:flex;align-items:center;justify-content:space-between" onmouseover="this.style.borderColor=&quot;rgba(245,158,11,.3)&quot;" onmouseout="this.style.borderColor=&quot;#262626&quot;">';
-    html += '<span style="font-weight:700;color:#fff;font-size:.92rem">'+game+'</span>';
-    html += '<div style="display:flex;align-items:center;gap:10px">';
-    html += '<span style="background:rgba(245,158,11,.1);color:#f59e0b;padding:3px 12px;border-radius:999px;font-size:.75rem;font-weight:700">'+gPlays.length+' props &nbsp; '+gPicks+' picks</span>';
-    html += '<button id="game_btn_'+gi+'" onclick="event.stopPropagation();toggleGame('+gi+')" style="background:none;border:1px solid #374151;color:#9ca3af;border-radius:6px;padding:3px 12px;font-size:.72rem;cursor:pointer">Expand</button>';
-    html += '</div></div>';
-    html += '<div id="game_'+gi+'" style="display:none;margin-top:6px;border-radius:12px;overflow:hidden;border:1px solid #262626">';
-    html += '<table style="width:100%;border-collapse:collapse;background:#161616"><thead><tr style="border-bottom:1px solid rgba(245,158,11,.2)">';
-    var cols=['#','Player','Stat','H/A','Opp','Line','Avg vs Opp','Gap','Games','History','Pick'];
-    cols.forEach(function(c){ html+='<th style="padding:10px 12px;text-align:left;color:#f59e0b;font-size:.7rem;font-weight:700;text-transform:uppercase;letter-spacing:.1em;background:#1a1a1a;white-space:nowrap">'+c+'</th>'; });
-    html += '</tr></thead><tbody>';
-    gPlays.forEach(function(p,i){ html += buildRow(p,i); });
-    html += '</tbody></table></div></div>';
+  order.forEach(function(game,gi){
+    var gPlays=games[game];
+    var gPicks=gPlays.filter(function(p){return p.pick;}).length;
+    html+='<div style="margin-bottom:10px">';
+    html+='<div onclick="toggleGame('+gi+')" style="background:#161616;border:1px solid #262626;border-radius:12px;padding:12px 18px;cursor:pointer;display:flex;align-items:center;justify-content:space-between">';
+    html+='<span style="font-weight:700;color:#fff;font-size:.92rem">'+game+'</span>';
+    html+='<div style="display:flex;align-items:center;gap:10px">';
+    html+='<span style="background:rgba(245,158,11,.1);color:#f59e0b;padding:3px 12px;border-radius:999px;font-size:.75rem;font-weight:700">'+gPlays.length+' props | '+gPicks+' picks</span>';
+    html+='<button id="game_btn_'+gi+'" onclick="event.stopPropagation();toggleGame('+gi+')" style="background:none;border:1px solid #374151;color:#9ca3af;border-radius:6px;padding:3px 12px;font-size:.72rem;cursor:pointer">Expand</button>';
+    html+='</div></div>';
+    html+='<div id="game_'+gi+'" style="display:none;margin-top:6px;border-radius:12px;overflow:hidden;border:1px solid #262626">';
+    html+=buildGameTable(gPlays);
+    html+='</div></div>';
   });
 
-  el.innerHTML = html;
+  el.innerHTML=html;
 }
 </script>
 </body>
