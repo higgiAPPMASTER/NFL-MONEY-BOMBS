@@ -89,6 +89,40 @@ def _cache_set(date_key, result):
 _nfl_df = None
 _nfl_df_lock = asyncio.Lock()
 
+# ── ESPN H/A Lookup — (season, week, team_abbr) → 'HOME' or 'AWAY' ───────────
+_HA_LOOKUP: dict = {}
+_HA_LOADED = False
+_HA_LOCK   = asyncio.Lock()
+
+async def _build_ha_lookup():
+    """Build home/away lookup from ESPN historical schedules (18 weeks x 5 seasons)."""
+    global _HA_LOOKUP, _HA_LOADED
+    async with _HA_LOCK:
+        if _HA_LOADED:
+            return
+        print("[H/A] Building home/away lookup from ESPN schedules...")
+        sem = asyncio.Semaphore(15)
+        async def fetch_week(season, week):
+            async with sem:
+                try:
+                    async with httpx.AsyncClient(timeout=8) as c:
+                        r = await c.get(
+                            "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard",
+                            params={"seasontype":2,"week":week,"season":season})
+                        for ev in r.json().get("events",[]):
+                            comp = ev.get("competitions",[{}])[0]
+                            for t in comp.get("competitors",[]):
+                                abbr = t["team"].get("abbreviation","")
+                                ha   = "HOME" if t["homeAway"]=="home" else "AWAY"
+                                if abbr:
+                                    _HA_LOOKUP[(season, week, abbr)] = ha
+                except Exception:
+                    pass
+        pairs = [(s, w) for s in NFL_SEASONS for w in range(1, 19)]
+        await asyncio.gather(*[fetch_week(s, w) for s, w in pairs])
+        _HA_LOADED = True
+        print(f"[H/A] Built lookup: {len(_HA_LOOKUP)} entries")
+
 # Direct nfl-verse CSV URLs (no package needed)
 _NFL_CSV_URL = "https://github.com/nflverse/nflverse-data/releases/download/player_stats/player_stats_{year}.csv"
 _KEEP_COLS   = ["player_display_name","recent_team","opponent_team",
