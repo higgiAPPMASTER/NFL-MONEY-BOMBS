@@ -1,6 +1,7 @@
 fastapi
 uvicorn
 httpx
-curl_cffi
 python-jose[cryptography]
-
+nfl_data_py
+pandas
+pyarrow
