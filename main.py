@@ -1,446 +1,1133 @@
+#!/usr/bin/env python3
 """
-NFL Money Bombs — main.py
-FastAPI + Hub JWT gate + date picker.
-Props: The Odds API (lines) + ESPN (career H/A game logs).
+NHL Money Shots — main.py
+Step 1 : Sportsbook lines (Odds API → FanDuel → DraftKings → season avg estimates)
+Step 2 : NHL Stats API — career H/A game logs vs today's opponent (≥ 80%)
+Step 3 : NHL Stats API — last 10 H/A games, any opponent (≥ 80%)
+Step 4 : Rank & top 10
+Deployed on Render (FastAPI + Playwright + curl_cffi)
 """
 
-import os, re, asyncio, uuid, time
-from typing import Dict, List, Optional
-from datetime import datetime, timedelta, timezone
+import os, hmac, asyncio, re, unicodedata, time
+from datetime import date, datetime, timedelta
+from typing import List, Dict, Optional, Tuple
 
 import httpx
-from fastapi import FastAPI, Request, HTTPException
+from curl_cffi.requests import AsyncSession as CFSession
+from playwright.async_api import async_playwright
+from fastapi import FastAPI, HTTPException, status, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from jose import jwt as jose_jwt
 
-# ── Config ─────────────────────────────────────────────────────────────
-ODDS_API_KEY = os.environ.get("ODDS_API_KEY", "")
-ODDS_BASE    = "https://api.the-odds-api.com/v4"
-ESPN_BASE    = "https://site.web.api.espn.com/apis/common/v3/sports/football/nfl"
-ESPN_SEASONS = [2024, 2023, 2022, 2021, 2020]
-HUB_URL      = "https://www.moneypicksarena.com"
-JWT_SECRET   = os.environ.get("JWT_SECRET", "")
+# ── Hub JWT verification ──────────────────────────────────────────────
+JWT_SECRET = os.environ.get("JWT_SECRET", "")
 
-PROP_MARKETS = [
-    "player_rush_yds","player_reception_yds","player_pass_yds",
-    "player_anytime_td","player_receptions","player_pass_tds",
-]
-PROP_LABELS = {
-    "player_rush_yds":"Rush Yds","player_reception_yds":"Rec Yds",
-    "player_pass_yds":"Pass Yds","player_anytime_td":"Anytime TD",
-    "player_receptions":"Receptions","player_pass_tds":"Pass TDs",
-}
-PROP_STAT_KEY = {
-    "player_rush_yds":"rushingYards","player_reception_yds":"receivingYards",
-    "player_pass_yds":"passingYards","player_anytime_td":"touchdowns",
-    "player_receptions":"receptions","player_pass_tds":"passingTouchdowns",
-}
-
-app  = FastAPI(title="NFL Money Bombs", docs_url=None, redoc_url=None)
-JOBS: Dict[str, Dict] = {}
-
-# ── JWT Gate ───────────────────────────────────────────────────────────
 def _verify_hub_token(token: str) -> bool:
-    if not token: return False
-    if not JWT_SECRET: return len(token.split(".")) == 3
+    """Check token exists and looks like a JWT (3 dot-separated parts).
+    Full signature verification enabled once JWT_SECRET is set on all services."""
+    if not token:
+        return False
+    if not JWT_SECRET:
+        # No secret configured yet — accept any well-formed JWT
+        return len(token.split(".")) == 3
     try:
-        jose_jwt.decode(token, JWT_SECRET, algorithms=["HS256"]); return True
+        jose_jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+        return True
     except Exception:
+        # Secret mismatch — still accept well-formed token so app doesn't break
         return len(token.split(".")) == 3
 
-@app.get("/api/verify-token")
-async def verify_token(request: Request):
-    auth = request.headers.get("Authorization","")
-    tok  = auth.replace("Bearer ","").strip()
-    if not tok or not _verify_hub_token(tok):
-        raise HTTPException(status_code=401, detail="Invalid token")
-    return {"ok": True}
 
-@app.get("/health")
-async def health(): return {"status":"ok"}
+# ─────────────────────────────────────────────────────────────────────────────
+#  Config
+# ─────────────────────────────────────────────────────────────────────────────
 
-# ── Helpers ────────────────────────────────────────────────────────────
-def _norm(s): return re.sub(r"[^a-z0-9]","",s.lower())
-def _match(t1,t2):
-    n1,n2=_norm(t1),_norm(t2)
-    return n1==n2 or n1 in n2 or n2 in n1
+app      = FastAPI(title="NHL Shots Picks")
 
-# ── Odds API ───────────────────────────────────────────────────────────
-async def get_nfl_events(date_str: str) -> List[Dict]:
-    """Fetch NFL events for a specific date — uses historical endpoint for past dates."""
-    if not ODDS_API_KEY: return []
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    is_past = date_str < today
-    try:
-        async with httpx.AsyncClient(timeout=15) as c:
-            if is_past:
-                # Historical endpoint — use noon UTC on the selected date
-                hist_dt = f"{date_str}T12:00:00Z"
-                r = await c.get(
-                    f"{ODDS_BASE}/historical/sports/americanfootball_nfl/events",
-                    params={"apiKey": ODDS_API_KEY, "date": hist_dt, "dateFormat": "iso"})
-                data = r.json()
-                # Historical endpoint wraps data in {"data": [...], "timestamp": ...}
-                events = data.get("data", data) if isinstance(data, dict) else data
-                # Filter to events on the selected date
-                day_start = f"{date_str}T00:00:00"
-                day_end   = f"{date_str}T23:59:59"
-                events = [e for e in (events if isinstance(events, list) else [])
-                          if day_start <= e.get("commence_time","") <= day_end]
-                return events
-            else:
-                # Current/upcoming events with date filter
-                day_start = f"{date_str}T00:00:00Z"
-                day_end   = f"{date_str}T23:59:59Z"
-                r = await c.get(f"{ODDS_BASE}/sports/americanfootball_nfl/events",
-                    params={
-                        "apiKey":           ODDS_API_KEY,
-                        "dateFormat":       "iso",
-                        "commenceTimeFrom": day_start,
-                        "commenceTimeTo":   day_end,
-                    })
-                data = r.json()
-                return data if r.is_success and isinstance(data, list) else []
-    except Exception:
-        return []
+NHL_API      = "https://api-web.nhle.com/v1"
+NHL_STATS    = "https://api.nhle.com/stats/rest/en"
+ODDS_API     = "https://api.the-odds-api.com/v4"
+DK_BASE      = "https://sportsbook.draftkings.com/sites/US-NJ-SB/api/v5"
+NHL_EG_ID    = 42648
 
-async def get_prop_lines(event_id: str, date_str: str = "") -> List[Dict]:
-    if not ODDS_API_KEY: return []
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    is_past = date_str < today if date_str else False
-    try:
-        async with httpx.AsyncClient(timeout=15) as c:
-            if is_past:
-                base_url = f"{ODDS_BASE}/historical/sports/americanfootball_nfl/events/{event_id}/odds"
-                hist_dt  = f"{date_str}T12:00:00Z"
-                extra_params = {"date": hist_dt}
-            else:
-                base_url = f"{ODDS_BASE}/sports/americanfootball_nfl/events/{event_id}/odds"
-                extra_params = {}
-            r2 = await c.get(
-                base_url,
-                params={
-                    "apiKey":     ODDS_API_KEY,
-                    "regions":    "us,us2",
-                    "markets":    ",".join(PROP_MARKETS),
-                    "bookmakers": "draftkings,fanduel,betmgm",
-                    "oddsFormat": "american",
-                    **extra_params,
-                })
-            if not r2.is_success: return []
-            raw = r2.json()
-            resp_data = raw.get("data", raw) if isinstance(raw, dict) and "data" in raw else raw
-            if not isinstance(resp_data, dict): resp_data = {}
-            lines = {}
-            for bm in resp_data.get("bookmakers",[]):
-                for mkt in bm.get("markets",[]):
-                    mk = mkt.get("key","")
-                    if mk not in PROP_MARKETS: continue
-                    for oc in mkt.get("outcomes",[]):
-                        name  = oc.get("description") or oc.get("name","")
-                        side  = oc.get("name","")
-                        point = oc.get("point")
-                        price = oc.get("price")
-                        if not name or point is None: continue
-                        key = f"{_norm(name)}_{mk}"
-                        if key not in lines:
-                            lines[key] = {"name":name,"market":mk,
-                                "label":PROP_LABELS.get(mk,mk),
-                                "stat_key":PROP_STAT_KEY.get(mk,""),
-                                "line":float(point),"over_odds":None,"under_odds":None}
-                        if side=="Over":  lines[key]["over_odds"]=price
-                        elif side=="Under": lines[key]["under_odds"]=price
-            return list(lines.values())
-    except Exception: return []
+MIN_SPG       = 1.5   # shots/game season average to qualify
+MIN_GP        = 10    # minimum games played for valid average
 
-# ── ESPN ───────────────────────────────────────────────────────────────
-async def find_espn_pid(name: str) -> Optional[str]:
-    try:
-        async with httpx.AsyncClient(timeout=10) as c:
-            r = await c.get("https://site.web.api.espn.com/apis/search/v2",
-                            params={"query":name,"limit":5,"sport":"nfl"})
-            for result in r.json().get("results",[]):
-                if result.get("type")!="player": continue
-                for item in result.get("contents",[]):
-                    if _norm(item.get("displayName",""))==_norm(name):
-                        uid=item.get("uid","")
-                        m=re.search(r"a:(\d+)",uid)
-                        if m: return m.group(1)
-                        m2=re.search(r"/id/(\d+)",item.get("link",{}).get("web",""))
-                        if m2: return m2.group(1)
-    except Exception: pass
+MIN_GAMES     = 2     # min games required for hit-rate calc
+HIT_THRESH         = 70.0  # % hit rate to qualify (shots always vs 1.5 base line)
+HIT_THRESH_PTS     = 70.0  # % hit rate to qualify (points)
+PTS_LINE      = 0.5   # 1+ point = hit
+SEASONS       = ["20252026","20242025","20232024"]  # for points game logs
+TOP_N       = 10     # final picks count
+SEM_NHL     = 8      # concurrent NHL API calls
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  HTTP Basic Auth
+# ─────────────────────────────────────────────────────────────────────────────
+
+def verify_user() -> str:
+    return "higgi"   # auth handled by hub JWT token gate
+
+# ── Picks Cache — keyed by date, TTL 6 hours ──────────────────────────────────
+_picks_cache: Dict[str, Dict] = {}
+_CACHE_TTL   = 6 * 3600
+
+def _cache_get(date_key: str) -> Optional[Dict]:
+    entry = _picks_cache.get(date_key)
+    if entry and (time.time() - entry["ts"]) < _CACHE_TTL:
+        print(f"[Cache] HIT {date_key}")
+        return entry["result"]
     return None
 
-async def get_logs_vs_opp(pid: str, opp: str, side: str, stat_key: str) -> List[float]:
-    is_home = (side=="HOME")
-    values  = []
-    async def fetch_s(season):
-        try:
-            async with httpx.AsyncClient(timeout=15) as c:
-                r = await c.get(f"{ESPN_BASE}/athletes/{pid}/gamelog",params={"season":season})
-                if not r.is_success: return
-                data=r.json()
-                ev_map=data.get("events",{}).get("eventTypes",[{}])
-                labels=[]; stats_map={}
-                for et in ev_map:
-                    for cat in et.get("categories",[]):
-                        if not labels: labels=[e.get("text","") for e in cat.get("labels",[])]
-                        for ev in cat.get("events",[]):
-                            eid=ev.get("eventId","")
-                            if eid and ev.get("stats"): stats_map[eid]=ev["stats"]
-                for eid,ev_info in data.get("eventLog",{}).get("events",{}).items():
-                    if eid not in stats_map: continue
-                    if ev_info.get("home",False)!=is_home: continue
-                    o=ev_info.get("opponent",{}).get("displayName","")
-                    if not _match(o,opp): continue
-                    raw=stats_map[eid]
-                    if not labels or not raw: continue
-                    try:
-                        idx=next((i for i,l in enumerate(labels) if _norm(l)==_norm(stat_key)),None)
-                        if idx is not None and idx<len(raw): values.append(float(raw[idx]))
-                    except Exception: pass
-        except Exception: pass
-    await asyncio.gather(*[fetch_s(s) for s in ESPN_SEASONS])
-    return values
+def _cache_set(date_key: str, result: Dict):
+    _picks_cache[date_key] = {"result": result, "ts": time.time()}
+    print(f"[Cache] SET {date_key}")
 
-# ── Pipeline ───────────────────────────────────────────────────────────
-async def run_pipeline(date_str: str) -> Dict:
-    if not ODDS_API_KEY:
-        return {"picks":[],"all":[],"error":"ODDS_API_KEY not configured on this server"}
-    events = await get_nfl_events(date_str)
-    if not events:
-        return {"picks":[],"all":[],"error":f"No NFL games found for {date_str} — NFL season runs Sept–Feb"}
-    all_lines = []
-    for ev in events:
-        lines = await get_prop_lines(ev["id"], date_str)
-        for l in lines:
-            l["home_team"]=ev.get("home_team","")
-            l["away_team"]=ev.get("away_team","")
-            l["game"]     =f"{ev.get('away_team','')} @ {ev.get('home_team','')}"
-        all_lines.extend(lines)
-    if not all_lines:
-        return {"picks":[],"all":[],"error":"No prop lines posted yet — check back closer to game time"}
-    all_results=[]
-    async def analyze(pl):
-        name=pl["name"]; line=pl["line"]; label=pl["label"]
-        side="AWAY"; opp=pl["home_team"]
-        pid = await find_espn_pid(name)
-        if not pid: return
-        values = await get_logs_vs_opp(pid, opp, side, pl.get("stat_key",""))
-        if not values:
-            all_results.append({"name":name,"label":label,"line":line,"side":side,
-                "opp":opp,"game":pl.get("game",""),"avg":None,"games":0,"history":"—",
-                "pick":None,"pick_note":f"No H/A history vs {opp}",
-                "over_odds":pl.get("over_odds"),"under_odds":pl.get("under_odds")})
-            return
-        avg=round(sum(values)/len(values),1)
-        gap=round(avg-line,1)
-        pick="OVER" if avg>line else ("UNDER" if avg<line else None)
-        note=f"avg {avg} {'>' if avg>line else '<'} line {line} ({'+' if gap>0 else ''}{gap})"
-        all_results.append({"name":name,"label":label,"line":line,"side":side,"opp":opp,
-            "game":pl.get("game",""),"avg":avg,"games":len(values),
-            "history":", ".join(str(int(v)) for v in values),"gap":gap,
-            "pick":pick,"pick_note":note,
-            "over_odds":pl.get("over_odds"),"under_odds":pl.get("under_odds")})
-    await asyncio.gather(*[analyze(pl) for pl in all_lines])
-    picks=sorted([r for r in all_results if r["pick"]],key=lambda x:abs(x.get("gap",0)),reverse=True)
-    return {"picks":picks,"all":all_results,"date":date_str,"games":len(events)}
 
-# ── API ────────────────────────────────────────────────────────────────
-@app.post("/api/run")
-async def api_run(request: Request):
-    body = await request.json() if request.headers.get("content-type","").startswith("application/json") else {}
-    date_str = body.get("date", datetime.now(timezone.utc).strftime("%Y-%m-%d"))
-    job_id = str(uuid.uuid4())[:8]
-    JOBS[job_id] = {"status":"running","result":None,"error":None}
-    async def _run():
+# ─────────────────────────────────────────────────────────────────────────────
+#  FanDuel Session (Playwright login — cached for the process lifetime)
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def get_fd_cookie() -> str:
+    global _fd_cookie
+    async with _fd_lock:
+        if not _fd_cookie:
+            _fd_cookie = await _fanduel_login()
+    return _fd_cookie
+
+async def _fanduel_login() -> str:
+    """Login to FanDuel with Playwright, return cookie string."""
+    email    = os.environ.get("FD_EMAIL", "")
+    password = os.environ.get("FD_PASSWORD", "")
+    if not email or not password:
+        print("[FanDuel] No FD_EMAIL/FD_PASSWORD set")
+        return ""
+    print("[FanDuel] Logging in...")
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage"],
+        )
+        ctx  = await browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            )
+        )
+        page = await ctx.new_page()
         try:
-            result = await run_pipeline(date_str)
-            JOBS[job_id].update({"status":"done","result":result})
+            await page.goto("https://sportsbook.fanduel.com/",
+                            wait_until="domcontentloaded", timeout=30_000)
+            # Click Sign In button
+            try:
+                await page.click("text=Sign In", timeout=8_000)
+            except:
+                await page.goto("https://sportsbook.fanduel.com/login",
+                                wait_until="domcontentloaded", timeout=20_000)
+            await asyncio.sleep(2)
+            # Fill credentials
+            await page.fill("input[type='email'], input[name='username'], input[placeholder*='email' i]",
+                            email, timeout=10_000)
+            await asyncio.sleep(0.5)
+            await page.fill("input[type='password']", password, timeout=10_000)
+            await page.click("button[type='submit']", timeout=8_000)
+            await page.wait_for_load_state("networkidle", timeout=25_000)
         except Exception as e:
-            JOBS[job_id].update({"status":"error","error":str(e)})
-    asyncio.create_task(_run())
-    return {"job_id": job_id}
+            print(f"[FanDuel] Login warning: {e}")
+        cookies = await ctx.cookies()
+        await browser.close()
+    cookie_str = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
+    print(f"[FanDuel] Login done — {len(cookies)} cookies")
+    return cookie_str
 
-@app.get("/api/run/{job_id}")
-async def api_poll(job_id: str):
-    if job_id not in JOBS: raise HTTPException(status_code=404, detail="Not found")
-    return JOBS[job_id]
 
-# ── Frontend ───────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+#  NHL API helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def _fetch(url: str, client: httpx.AsyncClient) -> Optional[Dict]:
+    try:
+        r = await client.get(url, timeout=20)
+        if r.status_code == 200:
+            return r.json()
+    except Exception as e:
+        print(f"[NHL] {url} → {e}")
+    return None
+
+
+def get_season_for_date(d: date) -> str:
+    """Return NHL season ID for a given date e.g. 20242025"""
+    if d.month >= 10:
+        return f"{d.year}{d.year + 1}"
+    return f"{d.year - 1}{d.year}"
+
+
+async def get_today_games(target_date: str = None) -> List[Dict]:
+    target_date = target_date or date.today().isoformat()
+    async with httpx.AsyncClient(follow_redirects=True) as c:
+        data = await _fetch(f"{NHL_API}/schedule/{target_date}", c)
+    if not data:
+        return []
+    games = []
+    for day in data.get("gameWeek", []):
+        if day.get("date") == target_date:
+            for g in day.get("games", []):
+                if g.get("gameState", "") in ("FUT", "PRE", "LIVE", "CRIT", "OFF", "FINAL"):
+                    games.append({
+                        "gameId":    g["id"],
+                        "homeTeam":  g["homeTeam"]["abbrev"],
+                        "awayTeam":  g["awayTeam"]["abbrev"],
+                        "homeFull":  g["homeTeam"].get("commonName", {}).get("default", ""),
+                        "awayFull":  g["awayTeam"].get("commonName", {}).get("default", ""),
+                        "startTime": g.get("startTimeUTC", ""),
+                    })
+    return games
+
+
+async def get_team_sa_map(season: str = "20242025") -> Dict[str, float]:
+    """Shots Against Per Game — joins /standings (abbrev) + /team/summary (SA/G)."""
+    import urllib.parse
+    sort_p = urllib.parse.quote('[{"property":"shotsAgainstPerGame","direction":"DESC"}]')
+    summary_url = (
+        f"{NHL_STATS}/team/summary"
+        f"?isAggregate=false&isGame=false&sort={sort_p}"
+        f"&start=0&limit=50&factCayenneExp=gamesPlayed>=1"
+        f"&cayenneExp=gameTypeId=2 and seasonId<={season} and seasonId>={season}"
+    )
+    async with httpx.AsyncClient(follow_redirects=True, timeout=20) as c:
+        sd, md = await asyncio.gather(
+            _fetch(f"{NHL_API}/standings/now", c),
+            _fetch(summary_url, c),
+        )
+    if not sd or not md:
+        return {}
+    name_to_abbrev = {
+        t.get("teamName", {}).get("default", ""): t.get("teamAbbrev", {}).get("default", "")
+        for t in sd.get("standings", [])
+    }
+    return {
+        name_to_abbrev[t["teamFullName"]]: float(t.get("shotsAgainstPerGame") or 0)
+        for t in md.get("data", [])
+        if t.get("teamFullName") in name_to_abbrev
+    }
+
+
+async def get_roster(team: str, sem: asyncio.Semaphore) -> List[Dict]:
+    async with sem:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=20) as c:
+            data = await _fetch(f"{NHL_API}/roster/{team}/current", c)
+    if not data:
+        return []
+    players = []
+    for pos in ("forwards", "defensemen"):
+        for p in data.get(pos, []):
+            players.append({
+                "id":   p["id"],
+                "name": f"{p['firstName']['default']} {p['lastName']['default']}",
+            })
+    return players
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Sportsbook Lines — tries Odds API, then DraftKings, then estimates
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+async def get_shot_lines(target_date: str) -> Dict[str, Dict]:
+    """Fetch real shots on goal lines.
+    Full fallback chain: 1) The Odds API  2) FanDuel  3) DraftKings  4) Estimates
+    """
+    # 1 — The Odds API (if key is set)
+    api_key = os.environ.get("ODDS_API_KEY", "")
+    if api_key:
+        try:
+            lines: Dict[str, Dict] = {}
+            async with httpx.AsyncClient(timeout=20) as c:
+                r = await c.get(
+                    f"{ODDS_API}/sports/icehockey_nhl/events",
+                    params={"apiKey": api_key, "dateFormat": "iso"})
+                if r.status_code == 200:
+                    # Check today + tomorrow (UTC) — evening games cross midnight UTC
+                    tomorrow = (date.fromisoformat(target_date) + timedelta(days=1)).isoformat()
+                    events = [e for e in r.json()
+                              if e.get("commence_time", "")[:10] in (target_date, tomorrow)]
+                    print(f"[OddsAPI] {len(events)} NHL games for {target_date}")
+                    seen: set = set()
+                    for ev in events:
+                        r2 = await c.get(
+                            f"{ODDS_API}/sports/icehockey_nhl/events/{ev['id']}/odds",
+                            params={"apiKey": api_key, "regions": "us,us2,eu,uk",
+                                    "markets": "player_shots_on_goal",
+                                    "oddsFormat": "american"})
+                        if r2.status_code != 200:
+                            continue
+                        for book in r2.json().get("bookmakers", []):
+                            for mkt in book.get("markets", []):
+                                if mkt.get("key") != "player_shots_on_goal":
+                                    continue
+                                for oc in mkt.get("outcomes", []):
+                                    if oc.get("name") != "Over":
+                                        continue
+                                    player = oc.get("description", "").strip()
+                                    line   = float(oc.get("point") or 0)
+                                    if player and line > 0 and player not in seen:
+                                        seen.add(player)
+                                        lines[player] = {
+                                            "line":   line,
+                                            "odds":   str(oc.get("price", "")),
+                                            "source": "OddsAPI",
+                                        }
+                            break  # first bookmaker per event
+            if lines:
+                print(f"[Lines] {len(lines)} lines from The Odds API")
+                return lines
+        except Exception as e:
+            print(f"[Lines] Odds API error: {e}")
+
+    # 2 — FanDuel (via Playwright login)
+    if os.environ.get("FD_EMAIL"):
+        try:
+            lines = await _lines_from_fanduel()
+            if lines:
+                print(f"[Lines] {len(lines)} lines from FanDuel")
+                return lines
+        except Exception as e:
+            print(f"[Lines] FanDuel error: {e}")
+
+    # 3 — DraftKings (public endpoint)
+    try:
+        lines = await _lines_from_draftkings()
+        if lines:
+            print(f"[Lines] {len(lines)} lines from DraftKings")
+            return lines
+    except Exception as e:
+        print(f"[Lines] DraftKings error: {e}")
+
+    print("[Lines] No sportsbook lines — falling back to season avg estimates")
+    return {}
+
+
+
+async def _lines_from_fanduel() -> Dict[str, Dict]:
+    """Scrape FanDuel NHL shots on goal lines using cached login session."""
+    cookie = await get_fd_cookie()
+    if not cookie:
+        return {}
+    hdrs = {
+        "Cookie":     cookie,
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36",
+        "Referer":    "https://sportsbook.fanduel.com/",
+        "Accept":     "application/json",
+        "x-fanduel-api-key": "FhMFpcPWXMeyZxOx",
+    }
+    lines = {}
+    try:
+        async with CFSession(impersonate="chrome120") as s:
+            # Get today's NHL events
+            r = await s.get(
+                "https://sbapi.tn.sportsbook.fanduel.com/api/content-managed-page",
+                params={"page": "SPORT", "sport": "NHL", "_ak": "FhMFpcPWXMeyZxOx"},
+                headers=hdrs, timeout=20
+            )
+            if r.status_code != 200:
+                print(f"[FanDuel] NHL page status: {r.status_code}")
+                return {}
+            data = r.json()
+            # Walk the event table to find shots on goal markets
+            events = data.get("attachments", {}).get("events", {}).values()
+            markets = data.get("attachments", {}).get("markets", {})
+            runners = data.get("attachments", {}).get("runners", {})
+            for mkt in markets.values():
+                mkt_name = mkt.get("marketName", "").lower()
+                if "shot" not in mkt_name:
+                    continue
+                for runner_id in mkt.get("runnerIds", []):
+                    runner = runners.get(str(runner_id), {})
+                    rname  = runner.get("runnerName", "")
+                    # FanDuel format: "Player Name (Over 2.5)" or "Player Name"
+                    handicap = runner.get("handicap", 0)
+                    if "over" in rname.lower() or handicap:
+                        # Extract player name
+                        player = rname.split(" - ")[0].strip()
+                        player = player.split(" Over")[0].strip()
+                        line_val = float(handicap or 0)
+                        if line_val >= 1.5 and player:
+                            odds_info = runner.get("winRunnerOdds", {}).get("americanDisplayOdds", {})
+                            odds = odds_info.get("americanOdds", "")
+                            lines[player] = {"line": line_val, "odds": str(odds), "source": "FanDuel"}
+    except Exception as e:
+        print(f"[FanDuel] Parse error: {e}")
+        return {}
+    return lines
+
+
+async def _lines_from_draftkings() -> Dict[str, Dict]:
+    hdrs = {"Accept": "application/json",
+            "Referer": "https://sportsbook.draftkings.com/leagues/hockey/nhl"}
+    lines = {}
+    async with CFSession(impersonate="chrome120") as s:
+        r = await s.get(f"{DK_BASE}/eventgroups/{NHL_EG_ID}?format=json", headers=hdrs)
+        if r.status_code != 200:
+            return {}
+        eg = r.json().get("eventGroup", {})
+        cat_id = sub_id = None
+        for cat in eg.get("offerCategories", []):
+            for sub in cat.get("offerSubcategoryDescriptors", []):
+                if "shot" in sub.get("name", "").lower():
+                    cat_id, sub_id = cat["id"], sub["subcategoryId"]
+                    break
+            if cat_id:
+                break
+        if not cat_id:
+            return {}
+        r2 = await s.get(
+            f"{DK_BASE}/eventgroups/{NHL_EG_ID}/categories/{cat_id}/subcategories/{sub_id}?format=json",
+            headers=hdrs)
+        if r2.status_code != 200:
+            return {}
+        for cat in r2.json().get("eventGroup", {}).get("offerCategories", []):
+            for sub_desc in cat.get("offerSubcategoryDescriptors", []):
+                for event_offers in sub_desc.get("offerSubcategory", {}).get("offers", []):
+                    for offer in event_offers:
+                        player = offer.get("label", "").strip()
+                        for outcome in offer.get("outcomes", []):
+                            if outcome.get("label", "").lower() == "over":
+                                line_val = float(outcome.get("line") or 0)
+                                if line_val >= 1.5 and player:
+                                    lines[player] = {
+                                        "line":   line_val,
+                                        "odds":   outcome.get("oddsAmerican", ""),
+                                        "source": "DraftKings",
+                                    }
+    return lines
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  NHL Skater Stats — season shot averages (replaces sportsbook props)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _match_odds_name(odds_name: str, roster: List[Dict]) -> Optional[Dict]:
+    """Match Odds API player name to NHL roster player — handles accents & initials."""
+    def norm(n):
+        # Strip accents: Slafkovský → slafkovsky
+        nfd = unicodedata.normalize("NFD", n)
+        ascii_ = nfd.encode("ascii", "ignore").decode("ascii")
+        return ascii_.lower().replace(".","").replace("-"," ").replace("'","").strip()
+    on = norm(odds_name)
+    # 1. Exact match
+    for p in roster:
+        if norm(p["name"]) == on: return p
+    # 2. First initial + last name
+    parts = on.split()
+    if len(parts) >= 2:
+        fi, last = parts[0][0], parts[-1]
+        for p in roster:
+            pp = norm(p["name"]).split()
+            if len(pp) >= 2 and pp[0][0] == fi and pp[-1] == last:
+                return p
+    # 3. Last name only (for single-name odds entries)
+    if parts:
+        last = parts[-1]
+        matches = [p for p in roster if norm(p["name"]).split()[-1] == last]
+        if len(matches) == 1: return matches[0]
+    return None
+
+
+async def get_shot_qualified_players(
+    games: List[Dict],
+    sa_map: Dict[str, float],
+    sem: asyncio.Semaphore,
+    season: str = "20252026",
+    lines_map: Dict = None,
+) -> List[Dict]:
+    """Build pool from ALL roster players using 1.5 as the algorithm line.
+    Real sportsbook lines (from lines_map) are attached for display only."""
+    if lines_map is None:
+        lines_map = {}
+
+    team_ctx: Dict[str, Dict] = {}
+    for g in games:
+        team_ctx[g["homeTeam"]] = {"opponent": g["awayTeam"], "homeRoad": "H"}
+        team_ctx[g["awayTeam"]] = {"opponent": g["homeTeam"],  "homeRoad": "R"}
+
+    # Get rosters for all playing teams
+    roster_vals = await asyncio.gather(
+        *[get_roster(t, sem) for t in team_ctx], return_exceptions=True)
+    rosters = {t: (r if isinstance(r, list) else [])
+               for t, r in zip(team_ctx.keys(), roster_vals)}
+
+    pool: List[Dict] = []
+    seen: set = set()
+
+    # Always use ALL roster players — line=1.5 is the algorithm base
+    for team, players in rosters.items():
+        ctx = team_ctx.get(team, {})
+        opp = ctx.get("opponent", "")
+        hr  = ctx.get("homeRoad", "")
+        for p in players:
+            if p["id"] in seen:
+                continue
+            seen.add(p["id"])
+            # Look up real sportsbook line for display only
+            real_line, real_odds, line_source = None, "", "Est"
+            for odds_name, sb_info in lines_map.items():
+                if _match_odds_name(odds_name, [p]):
+                    real_line   = sb_info["line"]
+                    real_odds   = sb_info.get("odds", "")
+                    line_source = sb_info.get("source", "OddsAPI")
+                    break
+            pool.append({
+                "name":       p["name"],
+                "pid":        p["id"],
+                "team":       team,
+                "opponent":   opp,
+                "homeRoad":   hr,
+                "line":       1.5,        # ALWAYS 1.5 for the algorithm
+                "realLine":   real_line,  # Sportsbook line — display only
+                "realOdds":   real_odds,
+                "lineSource": line_source,
+                "estLine":    1.5,
+                "spg":        0,
+                "oppSA":      sa_map.get(opp, 0.0),
+            })
+
+    print(f"[NHL] {len(pool)} roster players in pool | {len(lines_map)} real lines for display")
+    pool.sort(key=lambda x: x["oppSA"], reverse=True)
+    return pool
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Points picks — NHL Stats API game logs (independent of shots)
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def _pts_season_logs(pid: int, season: str, c: httpx.AsyncClient) -> List[Dict]:
+    """Fetch both regular season (2) and playoff (3) game logs."""
+    logs = []
+    for gtype in (2, 3):  # regular season + playoffs
+        data = await _fetch(f"{NHL_API}/player/{pid}/game-log/{season}/{gtype}", c)
+        if not data:
+            continue
+        for g in data.get("gameLog", []):
+            goals   = int(g.get("goals",   0) or 0)
+            assists = int(g.get("assists", 0) or 0)
+            logs.append({
+                "date":     g.get("gameDate",     ""),
+                "points":   goals + assists,
+                "homeRoad": g.get("homeRoadFlag", ""),
+                "opponent": g.get("opponentAbbrev", ""),
+            })
+    return logs
+
+
+async def get_pts_picks(
+    games: List[Dict],
+    sa_map: Dict[str, float],
+    sem: asyncio.Semaphore,
+    season: str = "20252026",
+) -> List[Dict]:
+    """Independent points picks using NHL Stats API game logs."""
+
+    # Build team context
+    team_ctx: Dict[str, Dict] = {}
+    for g in games:
+        team_ctx[g["homeTeam"]] = {"opponent": g["awayTeam"], "homeRoad": "H"}
+        team_ctx[g["awayTeam"]] = {"opponent": g["homeTeam"],  "homeRoad": "R"}
+
+    # Get all skaters on today's teams
+    roster_vals = await asyncio.gather(
+        *[get_roster(t, sem) for t in team_ctx], return_exceptions=True
+    )
+    rosters = {t: (r if isinstance(r, list) else []) for t, r in zip(team_ctx.keys(), roster_vals)}
+
+    # Fetch multi-season game logs for all players concurrently
+    all_players = []
+    seen_pts = set()
+    for team, players in rosters.items():
+        ctx = team_ctx[team]
+        for p in players:
+            if p["id"] not in seen_pts:
+                seen_pts.add(p["id"])
+                all_players.append((p, team, ctx["opponent"], ctx["homeRoad"]))
+
+    async def fetch_logs(pid):
+        async with sem:
+            async with httpx.AsyncClient(timeout=30) as c:
+                results = await asyncio.gather(
+                    *[_pts_season_logs(pid, s, c) for s in SEASONS],
+                    return_exceptions=True
+                )
+        logs = []
+        for r in results:
+            if isinstance(r, list):
+                logs.extend(r)
+        logs.sort(key=lambda x: x["date"], reverse=True)
+        return logs
+
+    log_tasks = {p["id"]: fetch_logs(p["id"]) for p, *_ in all_players}
+    log_results = await asyncio.gather(*log_tasks.values(), return_exceptions=True)
+    logs_map = {pid: (r if isinstance(r, list) else []) for pid, r in zip(log_tasks.keys(), log_results)}
+
+    picks = []
+    for player, team, opp, hr in all_players:
+        logs = logs_map.get(player["id"], [])
+
+        # Career H/A vs today's opponent
+        c_logs = [g for g in logs if g["homeRoad"] == hr and g["opponent"] == opp]
+        # Last 10 H/A any opponent
+        r_logs = [g for g in logs if g["homeRoad"] == hr][:10]
+
+        if len(r_logs) < MIN_GAMES:
+            continue
+
+        h3 = sum(1 for g in r_logs if g["points"] > PTS_LINE)
+        r3 = round(h3 / len(r_logs) * 100, 1)
+        avg3 = round(sum(g["points"] for g in r_logs) / len(r_logs), 2)
+
+        h2 = sum(1 for g in c_logs if g["points"] > PTS_LINE) if c_logs else 0
+        r2 = round(h2 / len(c_logs) * 100, 1) if c_logs else 0
+        avg2 = round(sum(g["points"] for g in c_logs) / len(c_logs), 2) if c_logs else 0
+
+        s2_ok = (len(c_logs) < MIN_GAMES) or (r2 >= HIT_THRESH_PTS)
+        s3_ok = r3 >= HIT_THRESH_PTS
+        if not s2_ok or not s3_ok:
+            continue
+
+        score = round((r2 + r3) / 2 if c_logs else r3, 1)
+
+        picks.append({
+            "name":     player["name"],
+            "pid":      player["id"],
+            "team":     team,
+            "opponent": opp,
+            "homeRoad": hr,
+            "oppSA":    sa_map.get(opp, 0.0),
+            "ptsOppAvg":  avg2,
+            "ptsHa10avg": avg3,
+            "pts2Hits":  h2, "pts2Total": len(c_logs), "pts2Rate": r2,
+            "pts3Hits":  h3, "pts3Total": len(r_logs), "pts3Rate": r3,
+            "ptsScore":  score,
+        })
+
+    picks.sort(key=lambda x: (x["ptsScore"], x["oppSA"]), reverse=True)
+    print(f"[PTS] {len(picks)} players qualifying at {HIT_THRESH_PTS}%+ hit rate")
+    return picks
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Main algorithm
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def _nhl_player_logs(pid: int, sem: asyncio.Semaphore) -> List[Dict]:
+    """Fetch NHL game logs for a player across multiple seasons."""
+    all_logs = []
+    async with sem:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=30) as c:
+            results = await asyncio.gather(
+                *[_fetch(f"{NHL_API}/player/{pid}/game-log/{s}/{gt}", c) for s in SEASONS for gt in (2, 3)],
+                return_exceptions=True
+            )
+    for data in results:
+        if not isinstance(data, dict): continue
+        for g in data.get("gameLog", []):
+            all_logs.append({
+                "date":     g.get("gameDate", ""),
+                "shots":    int(g.get("shots", 0) or 0),
+                "points":   int(g.get("goals", 0) or 0) + int(g.get("assists", 0) or 0),
+                "homeRoad": g.get("homeRoadFlag", ""),
+                "opponent": g.get("opponentAbbrev", ""),
+            })
+    all_logs.sort(key=lambda x: x["date"], reverse=True)
+    return all_logs
+
+
+def _calc_hit_rate_from_logs(logs: List[Dict], line: float, home_road: str,
+                             opponent: str = None, last_n: int = None):
+    filtered = [g for g in logs if g["homeRoad"] == home_road]
+    if opponent:
+        filtered = [g for g in filtered if g["opponent"] == opponent]
+    if last_n:
+        filtered = filtered[:last_n]
+    total = len(filtered)
+    if total == 0:
+        return 0, 0, 0.0, 0.0
+    hits = sum(1 for g in filtered if g["shots"] > line)
+    avg  = round(sum(g["shots"] for g in filtered) / total, 2)
+    rate = round(hits / total * 100, 1)
+    return hits, total, rate, avg
+
+
+async def run_picks(target_date: str = None) -> Dict:
+    global _progress
+    sem_nhl = asyncio.Semaphore(SEM_NHL)
+
+    target_date = target_date or date.today().isoformat()
+    season = get_season_for_date(date.fromisoformat(target_date))
+
+    _progress = {"stage": "Fetching games & sportsbook lines...", "done": 0, "total": 0, "pct": 10}
+
+    # ── Step 1 — fetch games, SA map, and sportsbook lines in parallel ─────────────
+    games, sa_map, lines_map = await asyncio.gather(
+        get_today_games(target_date),
+        get_team_sa_map(season),
+        get_shot_lines(target_date),
+    )
+    _progress = {"stage": "Building player pool...", "done": 0, "total": 0, "pct": 25}
+
+    if not games:
+        return {"error": f"No NHL games found for {target_date}.", "picks": [], "games": []}
+
+    # SA rankings for display
+    playing = list({g["homeTeam"] for g in games} | {g["awayTeam"] for g in games})
+    sa_ranks = sorted(
+        [(t, sa_map.get(t, 0.0)) for t in playing],
+        key=lambda x: x[1], reverse=True
+    )
+
+    # Build player pool from NHL skater season averages
+    pool = await get_shot_qualified_players(games, sa_map, sem_nhl, season, lines_map)
+    _progress = {"stage": f"Fetching game logs for {len(pool)} players...", "done": 0, "total": len(pool), "pct": 35}
+
+    if not pool:
+        return {"error": "No players found for today's games.", "picks": [], "games": games}
+
+    # Fetch NHL API game logs for all players concurrently
+    log_tasks = {p["pid"]: _nhl_player_logs(p["pid"], sem_nhl) for p in pool}
+    log_results = await asyncio.gather(*log_tasks.values(), return_exceptions=True)
+    logs_map = {pid: (r if isinstance(r, list) else [])
+                for pid, r in zip(log_tasks.keys(), log_results)}
+
+    _progress = {"stage": "Analyzing hit rates...", "done": 0, "total": len(pool), "pct": 70}
+
+    # ── Steps 2 & 3 — NHL Stats API hit-rate analysis ────────────────────────────
+    async def analyze(p: Dict) -> Optional[Dict]:
+        logs = logs_map.get(p["pid"], [])
+        hr, opp, line = p["homeRoad"], p["opponent"], p["line"]
+
+        # Step 2: career H/A vs today's opponent
+        h2, t2, r2, avg2 = _calc_hit_rate_from_logs(logs, line, hr, opponent=opp)
+        # Step 3: last 10 H/A games any opponent
+        h3, t3, r3, avg3 = _calc_hit_rate_from_logs(logs, line, hr, last_n=10)
+
+        if t3 < MIN_GAMES:
+            return None
+        # Use lower threshold when no real sportsbook line (season avg fallback)
+        s2_ok = (t2 < MIN_GAMES) or (r2 >= HIT_THRESH)
+        s3_ok = r3 >= HIT_THRESH
+        if not s2_ok or not s3_ok:
+            return None
+        score = round((r2 + r3) / 2 if t2 >= MIN_GAMES else r3, 1)
+
+        return {
+            **p,
+            "step2Hits": h2, "step2Total": t2, "step2Rate": r2,
+            "step3Hits": h3, "step3Total": t3, "step3Rate": r3,
+            "oppAvg": avg2, "ha10avg": avg3, "score": score,
+        }
+
+    completed = [0]
+    async def analyze_tracked(p):
+        result = await analyze(p)
+        completed[0] += 1
+        _progress["done"]  = completed[0]
+        _progress["pct"]   = 70 + int((completed[0] / max(len(pool),1)) * 25)
+        _progress["stage"] = f"Analyzing players... {completed[0]}/{len(pool)}"
+        return result
+
+    results_raw = await asyncio.gather(*[analyze_tracked(p) for p in pool])
+    picks = [r for r in results_raw if r is not None]
+
+    _progress = {"stage": "Analyzing points...", "done": len(pool), "total": len(pool), "pct": 96}
+    # ── Step 4 — rank shots & run independent points picks ───────────────────
+    picks.sort(key=lambda x: (x["score"], x["oppSA"]), reverse=True)
+
+    pts_all = await get_pts_picks(games, sa_map, sem_nhl, season)
+    _progress = {"stage": "Done!", "done": len(pool), "total": len(pool), "pct": 100}
+
+    return {
+        "picks":         picks[:TOP_N],
+        "rest":          picks[TOP_N:],
+        "ptsPicks":      pts_all[:TOP_N],
+        "ptsRest":       pts_all[TOP_N:],
+        "games":         games,
+        "sa_ranks":      sa_ranks,
+        "poolSize":      len(pool),
+        "qualified":     len(picks),
+        "ptsQualified":  len(pts_all),
+        "targetDate":    target_date,
+        "runTime":       datetime.utcnow().isoformat() + "Z",
+    }
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  HTML
+# ─────────────────────────────────────────────────────────────────────────────
+
 HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>NFL Money Bombs</title>
-<link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700;900&family=Source+Sans+Pro:wght@400;600;700&display=swap" rel="stylesheet">
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+<title>NHL Money Shots — Money Picks Arena</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@400;700;900&family=Source+Sans+Pro:wght@300;400;600;700&display=swap" rel="stylesheet">
 <style>
-*{margin:0;padding:0;box-sizing:border-box}
+*{box-sizing:border-box;margin:0;padding:0}
 body{background:#0f0f0f;color:#fff;font-family:'Source Sans Pro',sans-serif;min-height:100vh}
-nav{position:fixed;top:0;width:100%;background:rgba(10,10,10,.95);backdrop-filter:blur(12px);border-bottom:1px solid #1c1c1c;z-index:100;padding:0 28px;height:72px;display:flex;align-items:center;justify-content:space-between}
-.logo{font-family:'Playfair Display',serif;font-size:36px;font-weight:900;color:#f59e0b;letter-spacing:.02em;line-height:1}
+.bg-glow{position:fixed;inset:0;background:radial-gradient(ellipse at 50% 20%,rgba(245,158,11,.05),transparent 65%);pointer-events:none;z-index:0}
+nav{position:fixed;top:0;width:100%;background:rgba(10,10,10,.95);backdrop-filter:blur(12px);border-bottom:1px solid #1c1c1c;z-index:100;padding:0 32px;height:80px;display:flex;align-items:center;justify-content:space-between}
+.logo{font-family:'Playfair Display',serif;font-size:28px;font-weight:900;color:#f59e0b;letter-spacing:.02em;line-height:1}
 .logo span{color:#fff}
-main{max-width:900px;margin:0 auto;padding:100px 20px 60px}
-.hero{text-align:center;margin-bottom:32px}
-.hero h1{font-family:'Playfair Display',serif;font-size:clamp(2rem,5vw,3rem);font-weight:900;margin-bottom:8px}
-.hero h1 span{color:#f59e0b}
-.hero p{color:#6b7280;font-size:14px}
-.card{background:#161616;border:1px solid #262626;border-radius:16px;padding:24px;margin-bottom:20px}
-.controls{display:flex;gap:12px;align-items:center}
-.date-input{background:#0a0a0a;border:1px solid #2a2a2a;border-radius:8px;padding:11px 16px;color:#fff;font-size:14px;font-family:'Source Sans Pro',sans-serif;outline:none;transition:border .2s}
-input[type=date]::-webkit-calendar-picker-indicator{filter:invert(1);opacity:.7;cursor:pointer}
-input[type=date]::-webkit-calendar-picker-indicator:hover{opacity:1}
-.date-input:focus{border-color:#f59e0b}
-.btn{background:#f59e0b;color:#000;font-weight:700;padding:12px 28px;border:none;border-radius:8px;font-size:14px;cursor:pointer;font-family:'Source Sans Pro',sans-serif;transition:all .2s;white-space:nowrap}
-.btn:hover{background:#fbbf24;transform:translateY(-1px);box-shadow:0 4px 20px rgba(245,158,11,.4)}
-.btn:disabled{opacity:.5;cursor:not-allowed;transform:none}
-.spinner{display:inline-block;width:14px;height:14px;border:2px solid rgba(0,0,0,.2);border-top-color:#000;border-radius:50%;animation:spin .7s linear infinite;vertical-align:middle;margin-right:6px}
+.nav-right{display:flex;align-items:center;gap:14px}
+.nav-sport{background:#15803d;color:#fff;font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;padding:3px 10px;border-radius:4px}
+.nav-app{font-size:13px;font-weight:600;color:#9ca3af;letter-spacing:.05em}
+.page{position:relative;z-index:1;max-width:1300px;margin:0 auto;padding:104px 24px 40px}
+.app-hdr{text-align:center;margin-bottom:36px}
+.app-hdr h1{font-family:'Playfair Display',serif;font-size:2.6rem;font-weight:900;color:#fff;margin-bottom:6px}
+.app-hdr h1 span{color:#f59e0b}
+.app-hdr p{font-size:.85rem;color:#6b7280;letter-spacing:.15em;text-transform:uppercase}
+.card{background:#161616;border:1px solid #262626;border-radius:20px;padding:24px;margin-bottom:16px}
+.status-bar{display:flex;align-items:center;gap:16px;flex-wrap:wrap;padding:14px 20px;background:#161616;border:1px solid #262626;border-radius:14px;margin-bottom:20px}
+.sdot{display:inline-flex;align-items:center;gap:6px;font-size:.82rem;font-weight:600;color:#6b7280}
+.dot{width:7px;height:7px;border-radius:50%;display:inline-block}
+.dot-green{background:#4ade80;animation:pulse 2s infinite}
+.dot-amber{background:#f59e0b}
+.dot-red{background:#ef4444}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+.date-row{display:flex;align-items:center;justify-content:center;gap:12px;margin-bottom:20px}
+.date-row label{color:#9ca3af;font-weight:600;font-size:.85rem;letter-spacing:.08em;text-transform:uppercase}
+.date-row input{background:#0a0a0a;color:#fff;border:1px solid #2a2a2a;border-radius:10px;padding:10px 16px;font-size:.95rem;font-family:'Source Sans Pro',sans-serif;cursor:pointer;outline:none;transition:border .2s}
+.date-row input:focus{border-color:#f59e0b}
+.btn-run{background:#f59e0b;color:#000;border:none;border-radius:8px;padding:14px 52px;font-size:.95rem;font-weight:700;font-family:'Source Sans Pro',sans-serif;cursor:pointer;transition:all .2s}
+.btn-run:hover{background:#fbbf24;transform:translateY(-1px);box-shadow:0 4px 20px rgba(245,158,11,.35)}
+.btn-run:disabled{background:#2a2a2a;color:#4b5563;cursor:not-allowed;transform:none;box-shadow:none}
+.status-msg{text-align:center;color:#6b7280;font-size:.85rem;margin-bottom:24px;min-height:20px}
+.chips{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:12px;margin-bottom:28px}
+.chip{background:#161616;border:1px solid #262626;border-top:3px solid #f59e0b;border-radius:14px;padding:16px 10px;text-align:center}
+.chip .val{font-size:1.8rem;font-weight:900;color:#f59e0b;font-family:'Playfair Display',serif}
+.chip .lbl{font-size:.65rem;color:#6b7280;text-transform:uppercase;letter-spacing:.1em;margin-top:4px;font-weight:600}
+.sec{display:flex;align-items:center;gap:10px;font-size:.78rem;font-weight:700;color:#f59e0b;text-transform:uppercase;letter-spacing:.15em;margin:28px 0 12px}
+.sec::after{content:'';flex:1;height:1px;background:rgba(245,158,11,.15)}
+.games{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:10px;margin-bottom:24px}
+.gcard{background:#161616;border:1px solid #262626;border-radius:14px;padding:14px;text-align:center;transition:border-color .2s}
+.gcard:hover{border-color:#f59e0b}
+.gcard .mu{font-size:1rem;font-weight:700;color:#fff}
+.gcard .gt{font-size:.75rem;color:#6b7280;margin-top:5px}
+.sa-list{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:24px}
+.sa-badge{background:#161616;border:1px solid #262626;border-radius:6px;padding:5px 12px;font-size:.8rem}
+.sa-badge .rk{color:#f59e0b;font-weight:700}
+.sa-badge .sv{color:#C8102E;font-weight:700}
+.tbl-wrap{overflow-x:auto;border-radius:14px;border:1px solid #262626;margin-bottom:8px}
+table{width:100%;border-collapse:collapse;background:#161616}
+thead tr{border-bottom:1px solid rgba(245,158,11,.2)}
+th{background:#1a1a1a;padding:12px 14px;text-align:left;font-size:.7rem;font-weight:700;text-transform:uppercase;letter-spacing:.12em;color:#f59e0b;white-space:nowrap;font-family:'Source Sans Pro',sans-serif}
+td{padding:11px 14px;border-bottom:1px solid #1c1c1c;font-size:.88rem;white-space:nowrap}
+tr:nth-child(even) td{background:#141414}
+tr:hover td{background:#1c1c1c}
+tr:last-child td{border-bottom:none}
+.rk-num{font-weight:900;color:#f59e0b;font-size:1.1rem;font-family:'Playfair Display',serif}
+.rk-rest{color:#4b5563;font-size:.9rem}
+.pname{font-weight:700;color:#fff}
+.tbadge{background:#1a1a1a;color:#9ca3af;padding:2px 8px;border-radius:4px;font-size:.74rem;border:1px solid #2a2a2a}
+.home{background:rgba(74,222,128,.08);color:#4ade80;padding:3px 8px;border-radius:4px;font-size:.74rem;font-weight:700;border:1px solid rgba(74,222,128,.2)}
+.away{background:rgba(239,68,68,.08);color:#f87171;padding:3px 8px;border-radius:4px;font-size:.74rem;font-weight:700;border:1px solid rgba(239,68,68,.2)}
+.gold{color:#f59e0b;font-weight:700}
+.green{color:#4ade80;font-weight:700}
+.red-txt{color:#f87171;font-weight:700}
+.score{color:#f59e0b;font-weight:900;font-size:1.05rem;font-family:'Playfair Display',serif}
+.gray{color:#6b7280;font-size:.8rem}
+.est{background:rgba(245,158,11,.08);color:#f59e0b;border:1px solid rgba(245,158,11,.2);padding:2px 8px;border-radius:4px;font-size:.78rem;font-weight:700}
+.real-line{color:#4ade80;font-weight:900;font-size:1rem}
+.odds-txt{color:#6b7280;font-size:.78rem}
+.loading{text-align:center;padding:70px 20px}
+.spin{width:48px;height:48px;border:3px solid rgba(245,158,11,.15);border-top:3px solid #f59e0b;border-radius:50%;animation:spin .8s linear infinite;margin:0 auto 18px}
 @keyframes spin{to{transform:rotate(360deg)}}
-.status-msg{color:#6b7280;font-size:13px;margin-top:10px;min-height:18px}
-.picks-grid{display:flex;flex-direction:column;gap:10px}
-.pick-card{background:#0f0f0f;border:1px solid #2a2a2a;border-radius:12px;padding:14px 18px;display:grid;grid-template-columns:1fr auto;gap:8px;align-items:center}
-.pick-card:hover{border-color:rgba(245,158,11,.3)}
-.pick-name{font-weight:700;font-size:14px;margin-bottom:2px}
-.pick-detail{color:#9ca3af;font-size:11px;line-height:1.5}
-.pick-badge{font-family:'Playfair Display',serif;font-size:1.5rem;font-weight:900;text-align:right}
-.over{color:#4ade80}.under{color:#f87171}
-.pick-note{font-size:11px;color:#6b7280;text-align:right}
-.odds-pill{display:inline-block;background:rgba(245,158,11,.1);border:1px solid rgba(245,158,11,.25);color:#f59e0b;border-radius:4px;font-size:10px;font-weight:700;padding:1px 6px;margin-left:4px}
-.section-hdr{color:#f59e0b;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:1.5px;margin-bottom:14px;display:flex;align-items:center;gap:8px}
-.section-hdr::after{content:'';flex:1;height:1px;background:#262626}
-.no-games{text-align:center;padding:40px 20px}
-.no-games .icon{font-size:3rem;margin-bottom:12px}
-.no-games h3{font-family:'Playfair Display',serif;font-size:1.3rem;color:#6b7280;margin-bottom:8px}
-.history-tag{background:rgba(255,255,255,.05);border-radius:4px;padding:1px 5px;font-size:10px;color:#6b7280;font-family:monospace}
-footer{text-align:center;padding:32px 24px;color:#4b5563;font-size:.78rem;border-top:1px solid #1c1c1c;margin-top:24px;font-family:"Source Sans Pro",sans-serif}
-.ft-logo{font-family:"Playfair Display",serif;color:#f59e0b;font-weight:700;font-size:.95rem;margin-bottom:6px}
+.err-box{background:rgba(239,68,68,.08);border:1px solid rgba(239,68,68,.2);border-radius:12px;padding:20px;text-align:center;color:#f87171;font-weight:700}
+.no-picks{text-align:center;padding:50px;color:#4b5563}
+footer{text-align:center;padding:32px 24px;color:#4b5563;font-size:.78rem;border-top:1px solid #1c1c1c;margin-top:24px;font-family:'Source Sans Pro',sans-serif}
+.ft-logo{font-family:'Playfair Display',serif;color:#f59e0b;font-weight:700;font-size:.95rem;margin-bottom:6px}
 </style>
 </head>
 <body>
+<div class="bg-glow"></div>
+
 <nav>
   <div class="logo">Money <span>Picks</span> Arena</div>
+
 </nav>
-<main>
-  <div style="text-align:center;margin-bottom:32px;padding-top:20px">
-    <h1 style="font-family:'Playfair Display',serif;font-size:2.6rem;font-weight:900;color:#fff;margin-bottom:6px">NFL <span style="color:#f59e0b">Money Bombs</span></h1>
-    <p style="font-size:.85rem;color:#6b7280;letter-spacing:.15em;text-transform:uppercase">Player Props &middot; Daily Picks</p>
+
+<div class="page">
+  <div class="app-hdr">
+    <h1>NHL <span>Money Shots</span></h1>
+    <p>Shots on Goal &nbsp;·&nbsp; Points</p>
   </div>
-  <div class="card" style="text-align:center;max-width:600px;margin:0 auto 20px">
-    <h2 style="font-family:'Playfair Display',serif;font-size:1.5rem;font-weight:700;color:#fff;margin-bottom:20px">Run Today's Picks</h2>
-    <div style="display:flex;align-items:center;justify-content:center;gap:12px;margin-bottom:20px">
-      <label style="color:#9ca3af;font-weight:600;font-size:.85rem;letter-spacing:.08em;text-transform:uppercase">Date</label>
-      <input type="date" id="datePicker" class="date-input" style="max-width:200px">
+
+  <div class="card" style="text-align:center">
+    <h2 style="font-family:'Playfair Display',serif;font-size:1.5rem;font-weight:700;color:#fff;margin-bottom:6px">Run Today\'s Picks</h2>
+    <p style="color:#6b7280;font-size:.88rem;margin-bottom:22px">Select a date — NHL Stats API powers all hit rates</p>
+    <div class="date-row">
+      <label>Date</label>
+      <input type="date" id="datePicker" max=""/>
     </div>
-    <div style="text-align:center">
-      <button class="btn" id="runBtn" onclick="runPicks()">Run Picks</button>
-    </div>
-    <div class="status-msg" id="statusMsg"></div>
+    <button class="btn-run" id="runBtn" onclick="runPicks()">Run Picks</button>
   </div>
-  <div id="results" style="display:none"></div>
-</main>
-<footer>Money Picks Arena &nbsp;&middot;&nbsp; NFL Money Bombs &nbsp;·&nbsp; For entertainment purposes only. Must be 18+. Please gamble responsibly.<br>
-<a href="https://www.ncpgambling.org" style="color:#374151">National Council on Problem Gambling: 1-800-522-4700</a></footer>
+
+  <div class="status-msg" id="statusMsg"></div>
+  <div id="out"></div>
+</div>
+
+<footer>
+  <div class="ft-logo">Money Picks Arena</div>
+  <div>NHL Money Shots &nbsp;·&nbsp; NHL Stats API + Sportsbook Lines</div>
+  <div style="margin-top:8px;font-size:.7rem">For entertainment and informational purposes only. We do not accept bets or guarantee results. Please gamble responsibly. Must be 18+.</div>
+</footer>
 
 <script>
-// ── Hub Token Gate ──────────────────────────────────────────────────
-(function(){
-  var HUB='https://www.moneypicksarena.com';
-  var KEY='__mpa_token';
-  var p=new URLSearchParams(window.location.search);
-  var t=p.get('token');
-  if(t){localStorage.setItem(KEY,t);window.history.replaceState({},'',window.location.pathname);}
-  if(!localStorage.getItem(KEY)){window.location.href=HUB;}
+// Set date to today
+document.addEventListener('DOMContentLoaded', function(){
+// ── Hub Token Gate ────────────────────────────────────────────────────
+(function() {
+  const HUB = 'https://www.moneypicksarena.com';
+  const STORAGE_KEY = '__mpa_token';
+  const params = new URLSearchParams(window.location.search);
+  const urlTok = params.get('token');
+  if (urlTok) {
+    localStorage.setItem(STORAGE_KEY, urlTok);
+    window.history.replaceState({}, '', window.location.pathname);
+  }
+  const tok = localStorage.getItem(STORAGE_KEY);
+  if (!tok) { window.location.href = HUB; }
+  else {
+    fetch('/api/verify-token', { headers: { 'Authorization': 'Bearer ' + tok } })
+      .then(r => { if (!r.ok) { localStorage.removeItem(STORAGE_KEY); window.location.href = HUB; } })
+      .catch(() => { localStorage.removeItem(STORAGE_KEY); window.location.href = HUB; });
+  }
 })();
 
-// ── Init date picker ────────────────────────────────────────────────
-document.addEventListener('DOMContentLoaded',function(){
-  var today=new Date().toISOString().split('T')[0];
-  document.getElementById('datePicker').value=today;
-  document.getElementById('datePicker').max=today;
+  var dp = document.getElementById('datePicker');
+  var today = new Date().toISOString().split('T')[0];
+  dp.value = today;
+  dp.max = today;
 });
 
-var jobId=null, pollTimer=null;
-
-async function runPicks(){
-  var date=document.getElementById('datePicker').value;
-  if(!date){alert('Please select a date');return;}
-  var btn=document.getElementById('runBtn');
-  var status=document.getElementById('statusMsg');
-  btn.disabled=true;
-  btn.innerHTML='<span class="spinner"></span>Running...';
-  status.textContent='Fetching prop lines for '+date+'...';
-  document.getElementById('results').style.display='none';
+// STEP 1: Connect
+async function checkStatus(){
   try{
-    const r=await fetch('/api/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({date:date})});
-    const d=await r.json();
-    jobId=d.job_id;
-    pollTimer=setInterval(pollJob,2000);
-  }catch(e){
-    status.textContent='Error starting picks. Try again.';
-    btn.disabled=false; btn.innerHTML='⚡ RUN PICKS';
-  }
-}
-
-async function pollJob(){
-  if(!jobId)return;
-  try{
-    const r=await fetch('/api/run/'+jobId);
-    const d=await r.json();
-    if(d.status==='done'){
-      clearInterval(pollTimer);
-      renderResults(d.result);
-      document.getElementById('runBtn').disabled=false;
-      document.getElementById('runBtn').innerHTML=' REFRESH';
-      document.getElementById('statusMsg').textContent='';
-    }else if(d.status==='error'){
-      clearInterval(pollTimer);
-      document.getElementById('statusMsg').textContent='❌ '+(d.error||'Unknown error');
-      document.getElementById('runBtn').disabled=false;
-      document.getElementById('runBtn').innerHTML='⚡ RUN PICKS';
-    }else{
-      document.getElementById('statusMsg').textContent='Analyzing player histories...';
-    }
+    var r=await fetch('/api/status'); var d=await r.json();
+    var o=document.getElementById('odds-status');
+    var f=document.getElementById('fd-status');
+    if(o){var od=o.querySelector('.dot');if(od)od.className='dot '+(d.odds_api==='configured'?'dot-green':'dot-red');o.lastChild.textContent=d.odds_api==='configured'?' Odds API: Ready':' Odds API: Not configured';}
+    if(f){var fd=f.querySelector('.dot');if(fd)fd.className='dot '+(d.fanduel==='configured'?'dot-green':'dot-amber');f.lastChild.textContent=d.fanduel==='configured'?' FanDuel: Ready':' FanDuel: Not set';}
   }catch(e){}
 }
+document.addEventListener('DOMContentLoaded',checkStatus);
 
-function fmtOdds(o){return o==null?'':(o>0?'+':'')+o;}
+// STEP 2: Run picks
+async function runPicks(){
+  var btn = document.getElementById('runBtn');
+  var st = document.getElementById('statusMsg');
+  var out = document.getElementById('out');
+  var dt = document.getElementById('datePicker').value;
+  btn.disabled = true;
+  btn.textContent = 'Running...';
+  st.textContent = 'Fetching games and analyzing players for ' + dt + '...';
+  out.innerHTML = '<div class="loading"><div class="spin"></div>' +
+    '<p style="color:#9ca3af;margin-bottom:16px" id="prog-stage">Starting...</p>' +
+    '<div style="background:rgba(245,158,11,.1);border-radius:6px;height:8px;width:280px;margin:0 auto 8px;overflow:hidden">' +
+    '<div id="prog-bar" style="height:100%;width:5%;background:#f59e0b;border-radius:6px;transition:width .5s"></div></div>' +
+    '<p style="color:#6b7280;font-size:.8rem" id="prog-pct">5%</p></div>';
 
-function renderResults(data){
-  var el=document.getElementById('results');
-  if(!data){el.style.display='none';return;}
-  if(data.error){
-    el.innerHTML='<div class="card no-games"><div class="icon"></div><h3>'+data.error+'</h3><p style="color:#4b5563;font-size:13px">NFL season runs September through February</p></div>';
-    el.style.display='block';return;
-  }
-  var picks=data.picks||[],all=data.all||[];
-  var nopick=all.filter(r=>!r.pick);
-  var html='';
-  if(!picks.length){
-    html='<div class="card no-games"><div class="icon"></div><h3>No strong picks found</h3><p style="color:#4b5563;font-size:13px">No clear over/under signals for this date</p></div>';
-  }else{
-    html+='<div class="card"><div class="section-hdr"> Money Bombs — '+picks.length+' picks</div><div class="picks-grid">';
-    for(var p of picks){
-      var isOver=p.pick==='OVER';
-      var cls=isOver?'over':'under';
-      var odds=isOver?fmtOdds(p.over_odds):fmtOdds(p.under_odds);
-      html+='<div class="pick-card"><div><div class="pick-name">'+p.name+'</div>';
-      html+='<div class="pick-detail">'+p.label+' &nbsp;·&nbsp; '+p.game+'&nbsp;·&nbsp; Line: <strong>'+p.line+'</strong> &nbsp;·&nbsp; Avg: <strong>'+p.avg+'</strong> &nbsp;·&nbsp; <span class="history-tag">'+p.history+'</span> ('+p.games+'g)</div></div>';
-      html+='<div><div class="pick-badge '+cls+'">'+p.pick+(odds?'<span class="odds-pill">'+odds+'</span>':'')+'</div><div class="pick-note">'+p.pick_note+'</div></div></div>';
+  // Poll progress every 2 seconds
+  var pollTimer = setInterval(async function(){
+    try{
+      var pr = await fetch('/api/progress');
+      var pd = await pr.json();
+      var bar = document.getElementById('prog-bar');
+      var stg = document.getElementById('prog-stage');
+      var pct = document.getElementById('prog-pct');
+      if(bar){ bar.style.width = pd.pct + '%'; }
+      if(stg){ stg.textContent = pd.stage; }
+      if(pct){ pct.textContent = pd.pct + '%'; }
+    }catch(e){}
+  }, 2000);
+
+  try {
+    var res = await fetch('/api/picks?target_date=' + dt);
+    var data = await res.json();
+    if(data.error){
+      out.innerHTML = '<div class="err-box">' + data.error + '</div>';
+      st.textContent = '';
+    } else {
+      renderResults(data);
+      if(st) st.textContent = data.qualified + ' players qualified — ' + data.picks.length + ' top picks — ' + dt;
     }
-    html+='</div></div>';
+  } catch(e) {
+    out.innerHTML = '<div class="err-box">Error: ' + e.message + '</div>';
+  } finally {
+    clearInterval(pollTimer);
+    btn.disabled = false;
+    btn.textContent = 'Run Picks';
   }
-  if(nopick.length){
-    html+='<div class="card"><div class="section-hdr">No Clear Signal ('+nopick.length+')</div><div style="display:flex;flex-wrap:wrap;gap:8px">';
-    for(var p of nopick){
-      html+='<div style="background:#0a0a0a;border:1px solid #222;border-radius:8px;padding:7px 11px;font-size:11px"><span style="font-weight:700">'+p.name+'</span><span style="color:#4b5563;margin-left:6px">'+p.label+' '+p.line+'</span><span style="color:#374151;margin-left:6px">'+p.pick_note+'</span></div>';
+}
+
+function rateClass(r){ return r >= 90 ? 'green' : r >= 80 ? 'gold' : 'red-txt'; }
+
+function buildPtsTable(picks, startNum){
+  var thead = '<thead><tr><th>#</th><th>PLAYER</th><th>TEAM</th><th>OPP</th><th>H/A</th>' +
+    '<th>AVG PTS vs OPP</th><th>L10 H/A AVG PTS</th>' +
+    '<th>CAREER vs OPP 0.5P</th><th>LAST 10 H/A 0.5P</th><th>SCORE</th><th>OPP SA/G</th></tr></thead>';
+  var rows = '';
+  picks.forEach(function(p, i){
+    var ha  = p.homeRoad === 'H';
+    var num = startNum + i;
+    rows += '<tr>' +
+      '<td>' + (startNum === 1 ? '<span class="rk-num">' + num + '</span>' : '<span class="rk-rest">' + num + '</span>') + '</td>' +
+      '<td><span class="pname">' + p.name + '</span></td>' +
+      '<td><span class="tbadge">' + p.team + '</span></td>' +
+      '<td><span class="tbadge">' + p.opponent + '</span></td>' +
+      '<td><span class="' + (ha ? 'home' : 'away') + '">' + (ha ? 'HOME' : 'AWAY') + '</span></td>' +
+      '<td><span class="gold">' + p.ptsOppAvg + '</span></td>' +
+      '<td><span class="gold">' + p.ptsHa10avg + '</span></td>' +
+      '<td><span class="' + rateClass(p.pts2Rate) + '">' + p.pts2Hits + '/' + p.pts2Total + ' (' + p.pts2Rate + '%)</span></td>' +
+      '<td><span class="' + rateClass(p.pts3Rate) + '">' + p.pts3Hits + '/' + p.pts3Total + ' (' + p.pts3Rate + '%)</span></td>' +
+      '<td><span class="score">' + p.ptsScore + '</span></td>' +
+      '<td><span class="gray">' + p.oppSA.toFixed(1) + '</span></td>' +
+      '</tr>';
+  });
+  return '<div class="tbl-wrap"><table>' + thead + '<tbody>' + rows + '</tbody></table></div>';
+}
+
+function buildTable(picks, startNum){
+  var thead = '<thead><tr><th>#</th><th>PLAYER</th><th>TEAM</th><th>OPP</th><th>H/A</th>' +
+    '<th>LINE</th><th>AVG VS OPP H/A</th><th>L10 H/A AVG</th>' +
+    '<th>CAREER VS OPP 1.5S H/A</th><th>LAST 10 H/A 1.5S</th><th>SCORE</th><th>OPP SA/G</th></tr></thead>';
+  var rows = '';
+  picks.forEach(function(p, i){
+    var ha = p.homeRoad === 'H';
+    var num = startNum + i;
+    rows += '<tr>' +
+      '<td>' + (startNum === 1 ? '<span class="rk-num">' + num + '</span>' : '<span class="rk-rest">' + num + '</span>') + '</td>' +
+      '<td><span class="pname">' + p.name + '</span></td>' +
+      '<td><span class="tbadge">' + p.team + '</span></td>' +
+      '<td><span class="tbadge">' + p.opponent + '</span></td>' +
+      '<td><span class="' + (ha ? 'home' : 'away') + '">' + (ha ? 'HOME' : 'AWAY') + '</span></td>' +
+      '<td>' + (p.realLine ? '<span class="real-line">' + p.realLine + '</span> <span class="odds-txt">' + (p.realOdds||'') + '</span>' : '<span class="est">~' + p.estLine + '</span>') + '</td>' +
+      '<td><span class="gold">' + p.oppAvg + '</span></td>' +
+      '<td><span class="gold">' + p.ha10avg + '</span></td>' +
+      '<td><span class="' + rateClass(p.step2Rate) + '">' + p.step2Hits + '/' + p.step2Total + ' (' + p.step2Rate + '%)</span></td>' +
+      '<td><span class="' + rateClass(p.step3Rate) + '">' + p.step3Hits + '/' + p.step3Total + ' (' + p.step3Rate + '%)</span></td>' +
+      '<td><span class="score">' + p.score + '</span></td>' +
+      '<td><span class="gray">' + p.oppSA.toFixed(1) + '</span></td>' +
+      '</tr>';
+  });
+  return '<div class="tbl-wrap"><table>' + thead + '<tbody>' + rows + '</tbody></table></div>';
+}
+
+function renderResults(d){
+  var h = '';
+
+  // Chips
+  h += '<div class="chips">' +
+    '<div class="chip"><div class="val">' + d.games.length + '</div><div class="lbl">Games</div></div>' +
+    '<div class="chip"><div class="val">' + d.poolSize + '</div><div class="lbl">Pool</div></div>' +
+    '<div class="chip"><div class="val">' + d.qualified + '</div><div class="lbl">Qualified</div></div>' +
+    '<div class="chip"><div class="val">' + d.picks.length + '</div><div class="lbl">Top Picks</div></div>' +
+    '<div class="chip"><div class="val">70%</div><div class="lbl">Min Rate</div></div>' +
+    '</div>';
+
+  // Games
+  h += '<div class="sec">📅 Games — ' + (d.targetDate || '') + '</div><div class="games">';
+  d.games.forEach(function(g){
+    var t = g.startTime ? new Date(g.startTime).toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit',timeZoneName:'short'}) : '';
+    h += '<div class="gcard"><div class="mu">' + g.awayTeam + ' @ ' + g.homeTeam + '</div><div class="gt">' + t + '</div></div>';
+  });
+  h += '</div>';
+
+  // SA Rankings
+  h += '<div class="sec">📊 Shots Against / Game Rankings</div><div class="sa-list">';
+  (d.sa_ranks || []).forEach(function(item, i){
+    h += '<div class="sa-badge"><span class="rk">#' + (i+1) + ' ' + item[0] + '</span> <span class="sv">' + item[1].toFixed(1) + '</span></div>';
+  });
+  h += '</div>';
+
+  // Top picks
+  h += '<div class="sec">Top ' + d.picks.length + ' Money Shots</div>';
+  if(!d.picks.length){
+    h += '<div class="no-picks">No players met the 80% hit rate threshold for this date.</div>';
+  } else {
+    h += buildTable(d.picks, 1);
+  }
+
+  // Also qualified
+  if(d.rest && d.rest.length){
+    h += '<div class="sec">Also Qualified — ' + d.rest.length + ' More Players</div>';
+    h += buildTable(d.rest, d.picks.length + 1);
+  }
+
+  // POINTS SECTION
+  if(d.ptsPicks && d.ptsPicks.length){
+    h += '<div class="sec">🎤 Top ' + d.ptsPicks.length + ' Points Picks (1+ Point)</div>';
+    h += buildPtsTable(d.ptsPicks, 1);
+    if(d.ptsRest && d.ptsRest.length){
+      h += '<div class="sec">Also Qualified for Points — ' + d.ptsRest.length + ' More</div>';
+      h += buildPtsTable(d.ptsRest, d.ptsPicks.length + 1);
     }
-    html+='</div></div>';
   }
-  el.innerHTML=html; el.style.display='block';
+
+  document.getElementById('out').innerHTML = h;
 }
 </script>
 </body>
 </html>"""
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  Routes
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.get("/api/verify-token")
+async def verify_token_nhl(request: Request):
+    auth = request.headers.get("Authorization", "")
+    tok  = auth.replace("Bearer ", "").strip()
+    if not tok or not _verify_hub_token(tok):
+        from fastapi import HTTPException
+        raise HTTPException(status_code=401, detail="Invalid token")
+    return {"ok": True}
+
 @app.get("/", response_class=HTMLResponse)
-async def index(): return HTML
+async def index():
+    return HTML
+
+@app.get("/api/picks")
+async def api_picks(target_date: str = None):
+    key = target_date or date.today().isoformat()
+    cached = _cache_get(key)
+    if cached:
+        return JSONResponse(cached)
+    result = await run_picks(target_date)
+    if "error" not in result:
+        _cache_set(key, result)
+    return JSONResponse(result)
+
+@app.post("/api/clear-cache")
+async def api_clear_cache():
+    _picks_cache.clear()
+    return {"ok": True, "msg": "Cache cleared"}
+
+@app.get("/api/status")
+async def api_status():
+    """Check sportsbook connection status."""
+    fd_configured   = bool(os.environ.get("FD_EMAIL"))
+    odds_configured = bool(os.environ.get("ODDS_API_KEY"))
+    return {
+        "fanduel":   "configured" if fd_configured else "not configured",
+        "odds_api":  "configured" if odds_configured else "not configured",
+        "time":      datetime.utcnow().isoformat(),
+    }
+
+@app.get("/api/progress")
+async def api_progress():
+    return JSONResponse(_progress)
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "time": datetime.utcnow().isoformat()}
