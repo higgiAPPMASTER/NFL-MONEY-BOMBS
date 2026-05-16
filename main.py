@@ -1,50 +1,45 @@
 """
 NFL Money Bombs — main.py
-Pattern-based NFL picks: career H/A performance vs today's opponent.
-Line = Odds API prop (current games) OR season average (past/demo).
-Hit rate shown like NBA Money Buckets.
+FastAPI + Hub JWT gate + date picker.
+Props: The Odds API (lines) + ESPN (career H/A game logs).
 """
 
 import os, re, asyncio, uuid, time
-from typing import Dict, List, Optional, Tuple
-from datetime import datetime, timezone
+from typing import Dict, List, Optional
+from datetime import datetime, timedelta, timezone
 
 import httpx
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 from jose import jwt as jose_jwt
 
-# ── Config ──────────────────────────────────────────────────────────
+# ── Config ─────────────────────────────────────────────────────────────
 ODDS_API_KEY = os.environ.get("ODDS_API_KEY", "")
 ODDS_BASE    = "https://api.the-odds-api.com/v4"
 ESPN_BASE    = "https://site.web.api.espn.com/apis/common/v3/sports/football/nfl"
-ESPN_SITE    = "https://site.api.espn.com/apis/site/v2/sports/football/nfl"
 ESPN_SEASONS = [2024, 2023, 2022, 2021, 2020]
 HUB_URL      = "https://www.moneypicksarena.com"
 JWT_SECRET   = os.environ.get("JWT_SECRET", "")
-HIT_THRESH   = 60.0   # % hit rate to qualify
-MIN_GAMES    = 2      # minimum H/A games vs opponent (NFL teams meet ~1x/season)
 
-SKILL_POS  = {"QB", "RB", "WR", "TE"}
-STAT_DEFS  = [
-    {"key": "passingYards",   "label": "Pass Yds",  "pos": {"QB"},      "min_line": 150.0},
-    {"key": "rushingYards",   "label": "Rush Yds",  "pos": {"RB","QB"}, "min_line": 30.0},
-    {"key": "receivingYards", "label": "Rec Yds",   "pos": {"WR","TE","RB"}, "min_line": 20.0},
-    {"key": "receptions",     "label": "Receptions","pos": {"WR","TE","RB"}, "min_line": 2.0},
+PROP_MARKETS = [
+    "player_rush_yds","player_reception_yds","player_pass_yds",
+    "player_anytime_td","player_receptions","player_pass_tds",
 ]
-
-PROP_MARKETS = {
-    "player_pass_yds":      "passingYards",
-    "player_rush_yds":      "rushingYards",
-    "player_reception_yds": "receivingYards",
-    "player_receptions":    "receptions",
+PROP_LABELS = {
+    "player_rush_yds":"Rush Yds","player_reception_yds":"Rec Yds",
+    "player_pass_yds":"Pass Yds","player_anytime_td":"Anytime TD",
+    "player_receptions":"Receptions","player_pass_tds":"Pass TDs",
+}
+PROP_STAT_KEY = {
+    "player_rush_yds":"rushingYards","player_reception_yds":"receivingYards",
+    "player_pass_yds":"passingYards","player_anytime_td":"touchdowns",
+    "player_receptions":"receptions","player_pass_tds":"passingTouchdowns",
 }
 
 app  = FastAPI(title="NFL Money Bombs", docs_url=None, redoc_url=None)
 JOBS: Dict[str, Dict] = {}
-_SEM = asyncio.Semaphore(8)  # max 8 concurrent ESPN calls
 
-# ── JWT Gate ─────────────────────────────────────────────────────────
+# ── JWT Gate ───────────────────────────────────────────────────────────
 def _verify_hub_token(token: str) -> bool:
     if not token: return False
     if not JWT_SECRET: return len(token.split(".")) == 3
@@ -55,326 +50,221 @@ def _verify_hub_token(token: str) -> bool:
 
 @app.get("/api/verify-token")
 async def verify_token(request: Request):
-    auth = request.headers.get("Authorization", "")
-    tok  = auth.replace("Bearer ", "").strip()
+    auth = request.headers.get("Authorization","")
+    tok  = auth.replace("Bearer ","").strip()
     if not tok or not _verify_hub_token(tok):
         raise HTTPException(status_code=401, detail="Invalid token")
     return {"ok": True}
 
 @app.get("/health")
-async def health(): return {"status": "ok"}
+async def health(): return {"status":"ok"}
 
-# ── Helpers ───────────────────────────────────────────────────────────
-def _norm(s: str) -> str: return re.sub(r"[^a-z0-9]", "", s.lower())
-def _match(t1: str, t2: str) -> bool:
-    n1, n2 = _norm(t1), _norm(t2)
-    return n1 == n2 or n1 in n2 or n2 in n1
+# ── Helpers ────────────────────────────────────────────────────────────
+def _norm(s): return re.sub(r"[^a-z0-9]","",s.lower())
+def _match(t1,t2):
+    n1,n2=_norm(t1),_norm(t2)
+    return n1==n2 or n1 in n2 or n2 in n1
 
-# ── ESPN Schedule ─────────────────────────────────────────────────────
-async def get_espn_schedule(date_str: str) -> List[Dict]:
-    """Get NFL games from ESPN for any date — free, no key needed."""
-    date_nodash = date_str.replace("-", "")
+# ── Odds API ───────────────────────────────────────────────────────────
+async def get_nfl_events(date_str: str) -> List[Dict]:
+    """Fetch NFL events for a specific date — uses historical endpoint for past dates."""
+    if not ODDS_API_KEY: return []
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    is_past = date_str < today
     try:
         async with httpx.AsyncClient(timeout=15) as c:
-            r = await c.get(f"{ESPN_SITE}/scoreboard", params={"dates": date_nodash})
-            games = []
-            for ev in r.json().get("events", []):
-                comps = ev.get("competitions", [{}])[0]
-                home = away = None
-                home_id = away_id = None
-                for t in comps.get("competitors", []):
-                    if t.get("homeAway") == "home":
-                        home    = t["team"]["displayName"]
-                        home_id = t["team"]["id"]
-                    else:
-                        away    = t["team"]["displayName"]
-                        away_id = t["team"]["id"]
-                if home and away:
-                    games.append({
-                        "espn_id":   ev.get("id", ""),
-                        "home_team": home, "home_id": home_id,
-                        "away_team": away, "away_id": away_id,
-                        "game":      f"{away} @ {home}",
+            if is_past:
+                # Historical endpoint — use noon UTC on the selected date
+                hist_dt = f"{date_str}T12:00:00Z"
+                r = await c.get(
+                    f"{ODDS_BASE}/historical/sports/americanfootball_nfl/events",
+                    params={"apiKey": ODDS_API_KEY, "date": hist_dt, "dateFormat": "iso"})
+                data = r.json()
+                # Historical endpoint wraps data in {"data": [...], "timestamp": ...}
+                events = data.get("data", data) if isinstance(data, dict) else data
+                # Filter to events on the selected date
+                day_start = f"{date_str}T00:00:00"
+                day_end   = f"{date_str}T23:59:59"
+                events = [e for e in (events if isinstance(events, list) else [])
+                          if day_start <= e.get("commence_time","") <= day_end]
+                return events
+            else:
+                # Current/upcoming events with date filter
+                day_start = f"{date_str}T00:00:00Z"
+                day_end   = f"{date_str}T23:59:59Z"
+                r = await c.get(f"{ODDS_BASE}/sports/americanfootball_nfl/events",
+                    params={
+                        "apiKey":           ODDS_API_KEY,
+                        "dateFormat":       "iso",
+                        "commenceTimeFrom": day_start,
+                        "commenceTimeTo":   day_end,
                     })
-            return games
+                data = r.json()
+                return data if r.is_success and isinstance(data, list) else []
     except Exception:
         return []
 
-# ── ESPN Roster ───────────────────────────────────────────────────────
-async def get_skill_players(team_id: str) -> List[Dict]:
-    """
-    Get targeted skill players from ESPN depth chart:
-    1 QB, 2 RB, 3 WR, 2 TE = 8 players per team.
-    Falls back to roster if depth chart unavailable.
-    """
-    TARGETS = {"QB": 1, "RB": 2, "WR": 3, "TE": 2}
+async def get_prop_lines(event_id: str, date_str: str = "") -> List[Dict]:
+    if not ODDS_API_KEY: return []
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    is_past = date_str < today if date_str else False
     try:
         async with httpx.AsyncClient(timeout=15) as c:
-            r = await c.get(f"{ESPN_SITE}/teams/{team_id}/depthcharts")
-            if r.is_success:
-                data     = r.json()
-                seen_ids = set()
-                by_pos   = {pos: [] for pos in TARGETS}
-                # depth chart positions is a DICT keyed by lowercase pos
-                for group in data.get("depthchart", []):
-                    positions = group.get("positions", {})
-                    for pos_key, pos_data in positions.items():
-                        pos = pos_data.get("position", {}).get("abbreviation", "").upper()
-                        if pos not in TARGETS: continue
-                        for athlete in pos_data.get("athletes", []):
-                            pid  = str(athlete.get("id", ""))
-                            name = athlete.get("displayName","") or athlete.get("fullName","")
-                            if pid and name and pid not in seen_ids and len(by_pos[pos]) < TARGETS[pos]:
-                                seen_ids.add(pid)
-                                by_pos[pos].append({"id": pid, "name": name, "pos": pos})
-                result = [p for players in by_pos.values() for p in players]
-                if result:
-                    return result
-    except Exception:
-        pass
+            if is_past:
+                base_url = f"{ODDS_BASE}/historical/sports/americanfootball_nfl/events/{event_id}/odds"
+                hist_dt  = f"{date_str}T12:00:00Z"
+                extra_params = {"date": hist_dt}
+            else:
+                base_url = f"{ODDS_BASE}/sports/americanfootball_nfl/events/{event_id}/odds"
+                extra_params = {}
+            r2 = await c.get(
+                base_url,
+                params={
+                    "apiKey":     ODDS_API_KEY,
+                    "regions":    "us,us2",
+                    "markets":    ",".join(PROP_MARKETS),
+                    "bookmakers": "draftkings,fanduel,betmgm",
+                    "oddsFormat": "american",
+                    **extra_params,
+                })
+            if not r2.is_success: return []
+            raw = r2.json()
+            resp_data = raw.get("data", raw) if isinstance(raw, dict) and "data" in raw else raw
+            if not isinstance(resp_data, dict): resp_data = {}
+            lines = {}
+            for bm in resp_data.get("bookmakers",[]):
+                for mkt in bm.get("markets",[]):
+                    mk = mkt.get("key","")
+                    if mk not in PROP_MARKETS: continue
+                    for oc in mkt.get("outcomes",[]):
+                        name  = oc.get("description") or oc.get("name","")
+                        side  = oc.get("name","")
+                        point = oc.get("point")
+                        price = oc.get("price")
+                        if not name or point is None: continue
+                        key = f"{_norm(name)}_{mk}"
+                        if key not in lines:
+                            lines[key] = {"name":name,"market":mk,
+                                "label":PROP_LABELS.get(mk,mk),
+                                "stat_key":PROP_STAT_KEY.get(mk,""),
+                                "line":float(point),"over_odds":None,"under_odds":None}
+                        if side=="Over":  lines[key]["over_odds"]=price
+                        elif side=="Under": lines[key]["under_odds"]=price
+            return list(lines.values())
+    except Exception: return []
 
-    # Fallback: roster, top N per position
+# ── ESPN ───────────────────────────────────────────────────────────────
+async def find_espn_pid(name: str) -> Optional[str]:
     try:
-        async with httpx.AsyncClient(timeout=15) as c:
-            r = await c.get(f"{ESPN_SITE}/teams/{team_id}/roster")
-            by_pos = {pos: [] for pos in TARGETS}
-            for group in r.json().get("athletes", []):
-                for p in group.get("items", []):
-                    pos = p.get("position", {}).get("abbreviation", "").upper()
-                    if pos in TARGETS and len(by_pos[pos]) < TARGETS[pos]:
-                        by_pos[pos].append({
-                            "id":   p["id"],
-                            "name": p.get("fullName", ""),
-                            "pos":  pos,
-                        })
-            return [p for players in by_pos.values() for p in players]
-    except Exception:
-        return []
-
-# ── ESPN Game Logs ────────────────────────────────────────────────────
-async def get_game_logs(player_id: str, season: int) -> List[Dict]:
-    """
-    Fetch NFL game log for one season from ESPN.
-    NFL gamelog structure is flat: names[] + seasonTypes[].categories[].events[{eventId,stats[]}]
-    Game metadata (opponent, home/away) from top-level events{} dict.
-    """
-    try:
-        async with httpx.AsyncClient(timeout=15) as c:
-            r = await c.get(f"{ESPN_BASE}/athletes/{player_id}/gamelog",
-                            params={"season": season})
-            if not r.is_success:
-                return []
-            data       = r.json()
-            labels     = data.get("names", data.get("labels", []))
-            events_meta = data.get("events", {})   # {event_id: game_metadata}
-
-            result = []
-            for season_type in data.get("seasonTypes", []):
-                for cat in season_type.get("categories", []):
-                    for ev in cat.get("events", []):
-                        eid   = ev.get("eventId", "")
-                        stats = ev.get("stats", [])
-                        if not eid or not stats:
-                            continue
-                        meta  = events_meta.get(eid, {})
-                        # Determine home/away: compare player team id to homeTeamId
-                        player_team_id = str(meta.get("team", {}).get("id", ""))
-                        home_team_id   = str(meta.get("homeTeamId", ""))
-                        is_home = (player_team_id == home_team_id) if player_team_id else False
-                        opp = meta.get("opponent", {}).get("displayName", "")
-                        result.append({
-                            "eid":    eid,
-                            "home":   is_home,
-                            "opp":    opp,
-                            "stats":  stats,
-                            "labels": labels,
-                        })
-            return result
-    except Exception:
-        return []
-
-def _get_stat(split: Dict, stat_key: str) -> Optional[float]:
-    labels = split.get("labels", [])
-    stats  = split.get("stats", [])
-    if not labels or not stats: return None
-    idx = next((i for i, l in enumerate(labels) if _norm(l) == _norm(stat_key)), None)
-    if idx is not None and idx < len(stats):
-        try: return float(stats[idx])
-        except Exception: return None
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.get("https://site.web.api.espn.com/apis/search/v2",
+                            params={"query":name,"limit":5,"sport":"nfl"})
+            for result in r.json().get("results",[]):
+                if result.get("type")!="player": continue
+                for item in result.get("contents",[]):
+                    if _norm(item.get("displayName",""))==_norm(name):
+                        uid=item.get("uid","")
+                        m=re.search(r"a:(\d+)",uid)
+                        if m: return m.group(1)
+                        m2=re.search(r"/id/(\d+)",item.get("link",{}).get("web",""))
+                        if m2: return m2.group(1)
+    except Exception: pass
     return None
 
-async def get_all_logs_for_player(player_id: str) -> List[Dict]:
-    """Fetch game logs across all seasons in parallel — one call per season."""
-    all_logs = []
-    async def fetch(season):
-        logs = await get_game_logs(player_id, season)
-        all_logs.extend(logs)
-    await asyncio.gather(*[fetch(s) for s in ESPN_SEASONS])
-    return all_logs
+async def get_logs_vs_opp(pid: str, opp: str, side: str, stat_key: str) -> List[float]:
+    is_home = (side=="HOME")
+    values  = []
+    async def fetch_s(season):
+        try:
+            async with httpx.AsyncClient(timeout=15) as c:
+                r = await c.get(f"{ESPN_BASE}/athletes/{pid}/gamelog",params={"season":season})
+                if not r.is_success: return
+                data=r.json()
+                ev_map=data.get("events",{}).get("eventTypes",[{}])
+                labels=[]; stats_map={}
+                for et in ev_map:
+                    for cat in et.get("categories",[]):
+                        if not labels: labels=[e.get("text","") for e in cat.get("labels",[])]
+                        for ev in cat.get("events",[]):
+                            eid=ev.get("eventId","")
+                            if eid and ev.get("stats"): stats_map[eid]=ev["stats"]
+                for eid,ev_info in data.get("eventLog",{}).get("events",{}).items():
+                    if eid not in stats_map: continue
+                    if ev_info.get("home",False)!=is_home: continue
+                    o=ev_info.get("opponent",{}).get("displayName","")
+                    if not _match(o,opp): continue
+                    raw=stats_map[eid]
+                    if not labels or not raw: continue
+                    try:
+                        idx=next((i for i,l in enumerate(labels) if _norm(l)==_norm(stat_key)),None)
+                        if idx is not None and idx<len(raw): values.append(float(raw[idx]))
+                    except Exception: pass
+        except Exception: pass
+    await asyncio.gather(*[fetch_s(s) for s in ESPN_SEASONS])
+    return values
 
-async def get_career_vs_opp_all_stats(player_id: str, opp: str, is_home: bool) -> Dict[str, List[float]]:
-    """Fetch all career H/A logs vs opponent ONCE, return values for all stats."""
-    all_logs = await get_all_logs_for_player(player_id)
-    relevant = [sp for sp in all_logs
-                if sp.get("home") == is_home and _match(sp.get("opp", ""), opp)]
-    results = {}
-    for stat in STAT_DEFS:
-        sk = stat["key"]
-        values = [v for sp in relevant
-                  if (v := _get_stat(sp, sk)) is not None]
-        results[sk] = values
-    return results
-
-async def get_career_vs_opp(player_id: str, opp: str, is_home: bool,
-                             stat_key: str) -> List[float]:
-    """Legacy single-stat wrapper — use get_career_vs_opp_all_stats instead."""
-    result = await get_career_vs_opp_all_stats(player_id, opp, is_home)
-    return result.get(stat_key, [])
-
-async def get_season_avg(player_id: str, stat_key: str, season: int = 2025) -> Optional[float]:
-    """Player's current season average for a stat."""
-    logs = await get_game_logs(player_id, season)
-    vals = [_get_stat(sp, stat_key) for sp in logs]
-    vals = [v for v in vals if v is not None and v > 0]
-    return round(sum(vals) / len(vals), 1) if vals else None
-
-# ── Odds API Prop Lines ───────────────────────────────────────────────
-async def get_odds_lines(games: List[Dict]) -> Dict[str, Dict]:
-    """Try to get Odds API prop lines for today's games. Returns {norm_name: {stat_key: line}}"""
-    if not ODDS_API_KEY: return {}
-    result: Dict[str, Dict] = {}
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    try:
-        async with httpx.AsyncClient(timeout=15) as c:
-            r = await c.get(f"{ODDS_BASE}/sports/americanfootball_nfl/events",
-                            params={"apiKey": ODDS_API_KEY, "dateFormat": "iso"})
-            if not r.is_success: return {}
-            events = r.json() if isinstance(r.json(), list) else []
-            for ev in events:
-                eid = ev.get("id", "")
-                r2 = await c.get(
-                    f"{ODDS_BASE}/sports/americanfootball_nfl/events/{eid}/odds",
-                    params={"apiKey": ODDS_API_KEY, "regions": "us,us2",
-                            "markets": ",".join(PROP_MARKETS.keys()),
-                            "bookmakers": "draftkings,fanduel,betmgm",
-                            "oddsFormat": "american"})
-                if not r2.is_success: continue
-                for bm in r2.json().get("bookmakers", []):
-                    for mkt in bm.get("markets", []):
-                        sk = PROP_MARKETS.get(mkt.get("key", ""))
-                        if not sk: continue
-                        for oc in mkt.get("outcomes", []):
-                            if oc.get("name") != "Over": continue
-                            name = oc.get("description") or oc.get("name", "")
-                            key  = _norm(name)
-                            if key not in result: result[key] = {}
-                            if sk not in result[key]:
-                                result[key][sk] = float(oc.get("point", 0))
-    except Exception:
-        pass
-    return result
-
-# ── Main Pipeline ─────────────────────────────────────────────────────
+# ── Pipeline ───────────────────────────────────────────────────────────
 async def run_pipeline(date_str: str) -> Dict:
-    today   = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    is_past = date_str < today
-
-    # Get games
-    games = await get_espn_schedule(date_str)
-    if not games:
-        return {"picks": [], "all": [], "no_games": True,
-                "error": f"No NFL games on {date_str} — NFL season runs Sept–Feb"}
-
-    # Try to get Odds API lines for current games
-    odds_lines = {}
-    if not is_past and ODDS_API_KEY:
-        odds_lines = await get_odds_lines(games)
-
-    picks  = []
-    all_results = []
-
-    async def analyze_team(game, side, team_id, opp_name, is_home):
-        """Analyze one team — fetch all player logs in parallel."""
-        players = await get_skill_players(team_id)
-
-        async def analyze_player(player):
-            pid  = player["id"]
-            name = player["name"]
-            pos  = player["pos"]
-
-            # Fetch ALL career logs vs opponent in ONE batch (all seasons, all stats)
-            stat_values = await get_career_vs_opp_all_stats(pid, opp_name, is_home)
-
-            for stat in STAT_DEFS:
-                if pos not in stat["pos"]: continue
-                sk     = stat["key"]
-                values = stat_values.get(sk, [])
-                if len(values) < MIN_GAMES: continue
-
-                odds_key = _norm(name)
-                line     = (odds_lines.get(odds_key, {}).get(sk) if not is_past else None)
-                line_src = "Odds API" if line else "Season Avg"
-                if not line:
-                    line = await get_season_avg(pid, sk)
-                if not line or line < stat["min_line"]: continue
-
-                hits    = sum(1 for v in values if v > line)
-                hit_pct = round(hits / len(values) * 100, 1)
-                avg_val = round(sum(values) / len(values), 1)
-                gap     = round(avg_val - line, 1)
-
-                result = {
-                    "name": name, "pos": pos, "label": stat["label"],
-                    "line": line, "line_src": line_src,
-                    "side": side, "opp": opp_name, "game": game["game"],
-                    "values": values, "games": len(values),
-                    "hits": hits, "hit_pct": hit_pct,
-                    "avg": avg_val, "gap": gap,
-                    "pick": "OVER" if hit_pct >= HIT_THRESH else None,
-                }
-                all_results.append(result)
-                if hit_pct >= HIT_THRESH:
-                    picks.append(result)
-
-        # Analyze top 6 skill players in parallel
-        await asyncio.gather(*[analyze_player(p) for p in players])  # depth chart already limits to 8
-
-    # Process games sequentially to stay within memory limits
-    # (players within each game still run in parallel via semaphore)
-    for game in games:
-        await analyze_team(game, "HOME", game["home_id"], game["away_team"], True)
-        await analyze_team(game, "AWAY", game["away_id"], game["home_team"], False)
-
-    picks.sort(key=lambda x: x["hit_pct"], reverse=True)
-    return {
-        "picks":    picks,
-        "all":      all_results,
-        "date":     date_str,
-        "games":    len(games),
-        "matchups": [g["game"] for g in games],
-        "is_past":  is_past,
-    }
+    if not ODDS_API_KEY:
+        return {"picks":[],"all":[],"error":"ODDS_API_KEY not configured on this server"}
+    events = await get_nfl_events(date_str)
+    if not events:
+        return {"picks":[],"all":[],"error":f"No NFL games found for {date_str} — NFL season runs Sept–Feb"}
+    all_lines = []
+    for ev in events:
+        lines = await get_prop_lines(ev["id"], date_str)
+        for l in lines:
+            l["home_team"]=ev.get("home_team","")
+            l["away_team"]=ev.get("away_team","")
+            l["game"]     =f"{ev.get('away_team','')} @ {ev.get('home_team','')}"
+        all_lines.extend(lines)
+    if not all_lines:
+        return {"picks":[],"all":[],"error":"No prop lines posted yet — check back closer to game time"}
+    all_results=[]
+    async def analyze(pl):
+        name=pl["name"]; line=pl["line"]; label=pl["label"]
+        side="AWAY"; opp=pl["home_team"]
+        pid = await find_espn_pid(name)
+        if not pid: return
+        values = await get_logs_vs_opp(pid, opp, side, pl.get("stat_key",""))
+        if not values:
+            all_results.append({"name":name,"label":label,"line":line,"side":side,
+                "opp":opp,"game":pl.get("game",""),"avg":None,"games":0,"history":"—",
+                "pick":None,"pick_note":f"No H/A history vs {opp}",
+                "over_odds":pl.get("over_odds"),"under_odds":pl.get("under_odds")})
+            return
+        avg=round(sum(values)/len(values),1)
+        gap=round(avg-line,1)
+        pick="OVER" if avg>line else ("UNDER" if avg<line else None)
+        note=f"avg {avg} {'>' if avg>line else '<'} line {line} ({'+' if gap>0 else ''}{gap})"
+        all_results.append({"name":name,"label":label,"line":line,"side":side,"opp":opp,
+            "game":pl.get("game",""),"avg":avg,"games":len(values),
+            "history":", ".join(str(int(v)) for v in values),"gap":gap,
+            "pick":pick,"pick_note":note,
+            "over_odds":pl.get("over_odds"),"under_odds":pl.get("under_odds")})
+    await asyncio.gather(*[analyze(pl) for pl in all_lines])
+    picks=sorted([r for r in all_results if r["pick"]],key=lambda x:abs(x.get("gap",0)),reverse=True)
+    return {"picks":picks,"all":all_results,"date":date_str,"games":len(events)}
 
 # ── API ────────────────────────────────────────────────────────────────
 @app.post("/api/run")
 async def api_run(request: Request):
-    try:    body = await request.json()
-    except: body = {}
+    body = await request.json() if request.headers.get("content-type","").startswith("application/json") else {}
     date_str = body.get("date", datetime.now(timezone.utc).strftime("%Y-%m-%d"))
-    job_id   = str(uuid.uuid4())[:8]
-    JOBS[job_id] = {"status": "running", "result": None, "error": None}
+    job_id = str(uuid.uuid4())[:8]
+    JOBS[job_id] = {"status":"running","result":None,"error":None}
     async def _run():
         try:
             result = await run_pipeline(date_str)
-            JOBS[job_id].update({"status": "done", "result": result})
+            JOBS[job_id].update({"status":"done","result":result})
         except Exception as e:
-            JOBS[job_id].update({"status": "error", "error": str(e)})
+            JOBS[job_id].update({"status":"error","error":str(e)})
     asyncio.create_task(_run())
     return {"job_id": job_id}
 
 @app.get("/api/run/{job_id}")
 async def api_poll(job_id: str):
-    if job_id not in JOBS: raise HTTPException(404, "Not found")
+    if job_id not in JOBS: raise HTTPException(status_code=404, detail="Not found")
     return JOBS[job_id]
 
 # ── Frontend ───────────────────────────────────────────────────────────
@@ -388,79 +278,67 @@ HTML = """<!DOCTYPE html>
 *{margin:0;padding:0;box-sizing:border-box}
 body{background:#0f0f0f;color:#fff;font-family:'Source Sans Pro',sans-serif;min-height:100vh}
 nav{position:fixed;top:0;width:100%;background:rgba(10,10,10,.95);backdrop-filter:blur(12px);border-bottom:1px solid #1c1c1c;z-index:100;padding:0 28px;height:72px;display:flex;align-items:center;justify-content:space-between}
-.logo{font-family:'Playfair Display',serif;font-size:1.5rem;font-weight:900;color:#f59e0b}
+.logo{font-family:'Playfair Display',serif;font-size:36px;font-weight:900;color:#f59e0b;letter-spacing:.02em;line-height:1}
 .logo span{color:#fff}
-
-
-
-
-
-.spinner{display:inline-block;width:12px;height:12px;border:2px solid rgba(0,0,0,.2);border-top-color:#000;border-radius:50%;animation:spin .7s linear infinite;vertical-align:middle;margin-right:5px}
-@keyframes spin{to{transform:rotate(360deg)}}
-main{max-width:960px;margin:0 auto;padding:90px 20px 60px}
+main{max-width:900px;margin:0 auto;padding:100px 20px 60px}
 .hero{text-align:center;margin-bottom:32px}
-.hero h1{font-family:'Playfair Display',serif;font-size:clamp(2rem,5vw,3rem);font-weight:900;margin-bottom:6px}
+.hero h1{font-family:'Playfair Display',serif;font-size:clamp(2rem,5vw,3rem);font-weight:900;margin-bottom:8px}
 .hero h1 span{color:#f59e0b}
-.status-msg{text-align:center;color:#6b7280;font-size:13px;margin:12px 0;min-height:18px}
+.hero p{color:#6b7280;font-size:14px}
+.card{background:#161616;border:1px solid #262626;border-radius:16px;padding:24px;margin-bottom:20px}
+.controls{display:flex;gap:12px;align-items:center}
+.date-input{background:#0a0a0a;border:1px solid #2a2a2a;border-radius:8px;padding:11px 16px;color:#fff;font-size:14px;font-family:'Source Sans Pro',sans-serif;outline:none;transition:border .2s}
+input[type=date]::-webkit-calendar-picker-indicator{filter:invert(1);opacity:.7;cursor:pointer}
+input[type=date]::-webkit-calendar-picker-indicator:hover{opacity:1}
+.date-input:focus{border-color:#f59e0b}
+.btn{background:#f59e0b;color:#000;font-weight:700;padding:12px 28px;border:none;border-radius:8px;font-size:14px;cursor:pointer;font-family:'Source Sans Pro',sans-serif;transition:all .2s;white-space:nowrap}
+.btn:hover{background:#fbbf24;transform:translateY(-1px);box-shadow:0 4px 20px rgba(245,158,11,.4)}
+.btn:disabled{opacity:.5;cursor:not-allowed;transform:none}
+.spinner{display:inline-block;width:14px;height:14px;border:2px solid rgba(0,0,0,.2);border-top-color:#000;border-radius:50%;animation:spin .7s linear infinite;vertical-align:middle;margin-right:6px}
+@keyframes spin{to{transform:rotate(360deg)}}
+.status-msg{color:#6b7280;font-size:13px;margin-top:10px;min-height:18px}
+.picks-grid{display:flex;flex-direction:column;gap:10px}
+.pick-card{background:#0f0f0f;border:1px solid #2a2a2a;border-radius:12px;padding:14px 18px;display:grid;grid-template-columns:1fr auto;gap:8px;align-items:center}
+.pick-card:hover{border-color:rgba(245,158,11,.3)}
+.pick-name{font-weight:700;font-size:14px;margin-bottom:2px}
+.pick-detail{color:#9ca3af;font-size:11px;line-height:1.5}
+.pick-badge{font-family:'Playfair Display',serif;font-size:1.5rem;font-weight:900;text-align:right}
+.over{color:#4ade80}.under{color:#f87171}
+.pick-note{font-size:11px;color:#6b7280;text-align:right}
+.odds-pill{display:inline-block;background:rgba(245,158,11,.1);border:1px solid rgba(245,158,11,.25);color:#f59e0b;border-radius:4px;font-size:10px;font-weight:700;padding:1px 6px;margin-left:4px}
 .section-hdr{color:#f59e0b;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:1.5px;margin-bottom:14px;display:flex;align-items:center;gap:8px}
 .section-hdr::after{content:'';flex:1;height:1px;background:#262626}
-.card{background:#161616;border:1px solid #262626;border-radius:16px;padding:20px;margin-bottom:16px}
-.run-box{background:#161616;border:1px solid #262626;border-radius:16px;padding:28px;text-align:center;margin-bottom:20px;transition:border-color .2s}
-.run-box:hover{border-color:rgba(245,158,11,.3)}
-.run-box h2{font-family:'Playfair Display',serif;font-size:1.1rem;font-weight:700;color:#f59e0b;letter-spacing:1px;margin-bottom:6px}
-.run-box p{color:#6b7280;font-size:.85rem;margin-bottom:18px}
-.date-row{display:flex;align-items:center;justify-content:center;gap:12px;margin-bottom:18px}
-.date-row label{font-size:11px;font-weight:700;color:#6b7280;letter-spacing:1.5px;text-transform:uppercase}
-.date-row input{background:#0f0f0f;color:#f59e0b;border:1px solid #262626;border-radius:8px;padding:9px 14px;font-size:.9rem;font-weight:600;outline:none;cursor:pointer;font-family:'Source Sans Pro',sans-serif}
-.date-row input:focus{border-color:#f59e0b}
-.btn-run{background:#f59e0b;color:#000;border:none;border-radius:8px;padding:14px 48px;font-size:1rem;font-weight:900;cursor:pointer;font-family:'Source Sans Pro',sans-serif;letter-spacing:.5px;transition:all .2s}
-.btn-run:hover{background:#fbbf24;transform:translateY(-1px);box-shadow:0 4px 20px rgba(245,158,11,.4)}
-.btn-run:disabled{background:#333;color:#666;cursor:not-allowed;transform:none}
-.pick-card{background:#0f0f0f;border:1px solid #2a2a2a;border-radius:12px;padding:14px 18px;margin-bottom:10px;display:grid;grid-template-columns:1fr auto;gap:12px;align-items:center}
-.pick-card:hover{border-color:rgba(245,158,11,.3)}
-.pick-name{font-weight:700;font-size:15px;margin-bottom:3px}
-.pick-detail{color:#9ca3af;font-size:11px;line-height:1.6}
-.hit-rate{font-family:'Playfair Display',serif;font-size:2rem;font-weight:900;color:#4ade80;text-align:right;line-height:1}
-.hit-rate.med{color:#f59e0b}
-.hit-rate.low{color:#f87171}
-.hit-sub{font-size:11px;color:#6b7280;text-align:right;margin-top:2px}
-.line-pill{display:inline-block;background:rgba(245,158,11,.1);border:1px solid rgba(245,158,11,.2);color:#f59e0b;border-radius:4px;font-size:10px;font-weight:700;padding:1px 6px;margin-left:4px}
-.avg-pill{display:inline-block;background:rgba(74,222,128,.1);border:1px solid rgba(74,222,128,.2);color:#4ade80;border-radius:4px;font-size:10px;font-weight:700;padding:1px 6px;margin-left:4px}
-.hist-tag{background:rgba(255,255,255,.05);border-radius:4px;padding:1px 5px;font-size:10px;color:#6b7280;font-family:monospace}
-.badge-home{background:rgba(21,101,192,.25);color:#93c5fd;border-radius:4px;padding:1px 6px;font-size:10px;font-weight:700}
-.badge-away{background:rgba(103,58,183,.25);color:#c4b5fd;border-radius:4px;padding:1px 6px;font-size:10px;font-weight:700}
-.game-hdr{font-family:'Playfair Display',serif;font-size:1rem;font-weight:700;color:#fff;margin:20px 0 10px;padding-bottom:8px;border-bottom:1px solid #262626}
 .no-games{text-align:center;padding:40px 20px}
 .no-games .icon{font-size:3rem;margin-bottom:12px}
 .no-games h3{font-family:'Playfair Display',serif;font-size:1.3rem;color:#6b7280;margin-bottom:8px}
-.matchup-chip{display:inline-block;background:#161616;border:1px solid #262626;border-radius:8px;padding:6px 14px;font-size:12px;color:#9ca3af;margin:4px}
-footer{border-top:1px solid #1a1a1a;padding:24px;text-align:center;color:#374151;font-size:11px;margin-top:40px}
+.history-tag{background:rgba(255,255,255,.05);border-radius:4px;padding:1px 5px;font-size:10px;color:#6b7280;font-family:monospace}
+footer{text-align:center;padding:32px 24px;color:#4b5563;font-size:.78rem;border-top:1px solid #1c1c1c;margin-top:24px;font-family:"Source Sans Pro",sans-serif}
+.ft-logo{font-family:"Playfair Display",serif;color:#f59e0b;font-weight:700;font-size:.95rem;margin-bottom:6px}
 </style>
 </head>
 <body>
 <nav>
-  <div class="logo">Money<span>Bombs</span> 🏈</div>
-  <div style="font-size:12px;color:#6b7280">NFL Pattern Picks</div>
+  <div class="logo">Money <span>Picks</span> Arena</div>
 </nav>
-
 <main>
-  <div class="run-box" id="runBox">
-    <h2>Run Picks</h2>
-    <p>Pick a date and run the algorithm.</p>
-    <div class="date-row">
-      <label>DATE</label>
-      <input type="date" id="datePicker" max=""/>
-    </div>
-    <button class="btn-run" id="runBtn" onclick="runPicks()">
-      ⚡ RUN PICKS
-    </button>
+  <div style="text-align:center;margin-bottom:32px;padding-top:20px">
+    <h1 style="font-family:'Playfair Display',serif;font-size:2.6rem;font-weight:900;color:#fff;margin-bottom:6px">NFL <span style="color:#f59e0b">Money Bombs</span></h1>
+    <p style="font-size:.85rem;color:#6b7280;letter-spacing:.15em;text-transform:uppercase">Player Props &middot; Daily Picks</p>
   </div>
-
-  <div class="status-msg" id="statusMsg"></div>
-  <div id="results"></div>
+  <div class="card" style="text-align:center;max-width:600px;margin:0 auto 20px">
+    <h2 style="font-family:'Playfair Display',serif;font-size:1.5rem;font-weight:700;color:#fff;margin-bottom:20px">Run Today's Picks</h2>
+    <div style="display:flex;align-items:center;justify-content:center;gap:12px;margin-bottom:20px">
+      <label style="color:#9ca3af;font-weight:600;font-size:.85rem;letter-spacing:.08em;text-transform:uppercase">Date</label>
+      <input type="date" id="datePicker" class="date-input" style="max-width:200px">
+    </div>
+    <div style="text-align:center">
+      <button class="btn" id="runBtn" onclick="runPicks()">Run Picks</button>
+    </div>
+    <div class="status-msg" id="statusMsg"></div>
+  </div>
+  <div id="results" style="display:none"></div>
 </main>
-
-<footer>Money Picks Arena &nbsp;·&nbsp; NFL Money Bombs &nbsp;·&nbsp; For entertainment purposes only. Must be 18+. Please gamble responsibly.<br>
+<footer>Money Picks Arena &nbsp;&middot;&nbsp; NFL Money Bombs &nbsp;·&nbsp; For entertainment purposes only. Must be 18+. Please gamble responsibly.<br>
 <a href="https://www.ncpgambling.org" style="color:#374151">National Council on Problem Gambling: 1-800-522-4700</a></footer>
 
 <script>
@@ -474,32 +352,32 @@ footer{border-top:1px solid #1a1a1a;padding:24px;text-align:center;color:#374151
   if(!localStorage.getItem(KEY)){window.location.href=HUB;}
 })();
 
+// ── Init date picker ────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded',function(){
   var today=new Date().toISOString().split('T')[0];
-  var dp=document.getElementById('datePicker');
-  if(dp){ dp.value=today; dp.max=today; }
+  document.getElementById('datePicker').value=today;
+  document.getElementById('datePicker').max=today;
 });
 
 var jobId=null, pollTimer=null;
 
 async function runPicks(){
   var date=document.getElementById('datePicker').value;
-  if(!date)return;
+  if(!date){alert('Please select a date');return;}
   var btn=document.getElementById('runBtn');
   var status=document.getElementById('statusMsg');
   btn.disabled=true;
-  btn.innerHTML='<span class="spinner"></span>Scanning...';
-  status.textContent='Getting NFL schedule for '+date+'...';
-  document.getElementById('results').innerHTML='';
-
+  btn.innerHTML='<span class="spinner"></span>Running...';
+  status.textContent='Fetching prop lines for '+date+'...';
+  document.getElementById('results').style.display='none';
   try{
     const r=await fetch('/api/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({date:date})});
     const d=await r.json();
     jobId=d.job_id;
-    pollTimer=setInterval(pollJob,2500);
+    pollTimer=setInterval(pollJob,2000);
   }catch(e){
-    status.textContent='Error starting. Try again.';
-    btn.disabled=false; btn.innerHTML='⚡ Run Picks';
+    status.textContent='Error starting picks. Try again.';
+    btn.disabled=false; btn.innerHTML='⚡ RUN PICKS';
   }
 }
 
@@ -512,68 +390,53 @@ async function pollJob(){
       clearInterval(pollTimer);
       renderResults(d.result);
       document.getElementById('runBtn').disabled=false;
-      document.getElementById('runBtn').innerHTML='🔄 Refresh';
+      document.getElementById('runBtn').innerHTML=' REFRESH';
       document.getElementById('statusMsg').textContent='';
     }else if(d.status==='error'){
       clearInterval(pollTimer);
-      document.getElementById('statusMsg').textContent='❌ '+(d.error||'Error');
+      document.getElementById('statusMsg').textContent='❌ '+(d.error||'Unknown error');
       document.getElementById('runBtn').disabled=false;
-      document.getElementById('runBtn').innerHTML='⚡ Run Picks';
+      document.getElementById('runBtn').innerHTML='⚡ RUN PICKS';
     }else{
-      document.getElementById('statusMsg').textContent='Analyzing career H/A records vs opponent...';
+      document.getElementById('statusMsg').textContent='Analyzing player histories...';
     }
   }catch(e){}
 }
 
-function hitClass(pct){ return pct>=80?'':pct>=70?'med':'low'; }
+function fmtOdds(o){return o==null?'':(o>0?'+':'')+o;}
 
 function renderResults(data){
   var el=document.getElementById('results');
-  if(!data||data.no_games){
-    var chips=(data&&data.matchups||[]).map(m=>'<span class="matchup-chip">🏈 '+m+'</span>').join('');
-    el.innerHTML='<div class="no-games"><div class="icon">🏈</div><h3>'+(data&&data.error||'No NFL games found')+'</h3>'+chips+'</div>';
-    return;
+  if(!data){el.style.display='none';return;}
+  if(data.error){
+    el.innerHTML='<div class="card no-games"><div class="icon"></div><h3>'+data.error+'</h3><p style="color:#4b5563;font-size:13px">NFL season runs September through February</p></div>';
+    el.style.display='block';return;
   }
-
-  var picks=data.picks||[];
+  var picks=data.picks||[],all=data.all||[];
+  var nopick=all.filter(r=>!r.pick);
   var html='';
-
   if(!picks.length){
-    html='<div class="no-games"><div class="icon">🏈</div><h3>No picks hit '+60+'%+ hit rate</h3><p style="color:#4b5563;font-size:13px">Try a different date or check back when more H/A history is available</p></div>';
-  } else {
-    // Group by game
-    var byGame={};
+    html='<div class="card no-games"><div class="icon"></div><h3>No strong picks found</h3><p style="color:#4b5563;font-size:13px">No clear over/under signals for this date</p></div>';
+  }else{
+    html+='<div class="card"><div class="section-hdr"> Money Bombs — '+picks.length+' picks</div><div class="picks-grid">';
     for(var p of picks){
-      if(!byGame[p.game]) byGame[p.game]=[];
-      byGame[p.game].push(p);
+      var isOver=p.pick==='OVER';
+      var cls=isOver?'over':'under';
+      var odds=isOver?fmtOdds(p.over_odds):fmtOdds(p.under_odds);
+      html+='<div class="pick-card"><div><div class="pick-name">'+p.name+'</div>';
+      html+='<div class="pick-detail">'+p.label+' &nbsp;·&nbsp; '+p.game+'&nbsp;·&nbsp; Line: <strong>'+p.line+'</strong> &nbsp;·&nbsp; Avg: <strong>'+p.avg+'</strong> &nbsp;·&nbsp; <span class="history-tag">'+p.history+'</span> ('+p.games+'g)</div></div>';
+      html+='<div><div class="pick-badge '+cls+'">'+p.pick+(odds?'<span class="odds-pill">'+odds+'</span>':'')+'</div><div class="pick-note">'+p.pick_note+'</div></div></div>';
     }
-    html+='<div class="card"><div class="section-hdr">💣 Money Bombs — '+picks.length+' picks · '+data.games+' games</div>';
-    for(var game in byGame){
-      html+='<div class="game-hdr">🏈 '+game+'</div>';
-      for(var p of byGame[game]){
-        var hc=p.hit_pct>=80?'':p.hit_pct>=70?'med':'low';
-        var side_badge=p.side==='HOME'?'<span class="badge-home">HOME</span>':'<span class="badge-away">AWAY</span>';
-        var history=p.values.map(v=>Math.round(v)).join(', ');
-        html+='<div class="pick-card">';
-        html+='<div>';
-        html+='<div class="pick-name">'+p.name+' <span style="color:#6b7280;font-size:11px;font-weight:400">'+p.pos+'</span></div>';
-        html+='<div class="pick-detail">';
-        html+=p.label+' &nbsp;·&nbsp; '+side_badge+' vs '+p.opp;
-        html+=' &nbsp;·&nbsp; Line: <strong>'+p.line+'</strong><span class="line-pill">'+p.line_src+'</span>';
-        html+=' &nbsp;·&nbsp; Avg: <strong>'+p.avg+'</strong><span class="avg-pill">+'+(p.gap>0?'+':'')+p.gap+'</span>';
-        html+='<br><span class="hist-tag">'+history+'</span> ('+p.games+' H/A games vs '+p.opp+')';
-        html+='</div></div>';
-        html+='<div>';
-        html+='<div class="hit-rate '+hc+'">'+p.hit_pct+'%</div>';
-        html+='<div class="hit-sub">'+p.hits+'/'+p.games+' OVER</div>';
-        html+='</div>';
-        html+='</div>';
-      }
-    }
-    html+='</div>';
+    html+='</div></div>';
   }
-
-  el.innerHTML=html;
+  if(nopick.length){
+    html+='<div class="card"><div class="section-hdr">No Clear Signal ('+nopick.length+')</div><div style="display:flex;flex-wrap:wrap;gap:8px">';
+    for(var p of nopick){
+      html+='<div style="background:#0a0a0a;border:1px solid #222;border-radius:8px;padding:7px 11px;font-size:11px"><span style="font-weight:700">'+p.name+'</span><span style="color:#4b5563;margin-left:6px">'+p.label+' '+p.line+'</span><span style="color:#374151;margin-left:6px">'+p.pick_note+'</span></div>';
+    }
+    html+='</div></div>';
+  }
+  el.innerHTML=html; el.style.display='block';
 }
 </script>
 </body>
