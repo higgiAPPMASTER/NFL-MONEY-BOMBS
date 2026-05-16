@@ -405,15 +405,15 @@ footer{border-top:1px solid #1a1a1a;padding:24px;text-align:center;color:#374151
 <nav>
   <div class="logo">Money <span>Picks</span> Arena</div>
 </nav>
-<main style="padding-top:24px">
-  <div style="text-align:center;margin-bottom:32px">
-    <h1 style="font-family:'Playfair Display',serif;font-size:2.6rem;font-weight:900;color:#fff;margin-bottom:6px">NFL <span style="color:#f59e0b">Money Bombs</span></h1>
-    <p style="font-size:.85rem;color:#6b7280;letter-spacing:.15em;text-transform:uppercase">Player Props &middot; Daily Picks</p>
+<main>
+  <div class="hero">
+    <h1>NFL <span>Money Bombs</span></h1>
+    <p>NFL Daily Picks</p>
   </div>
-  <div class="card" style="text-align:center;max-width:600px;margin:0 auto 20px">
+  <div class="card" style="text-align:center">
     <h2 style="font-family:'Playfair Display',serif;font-size:1.5rem;font-weight:700;color:#fff;margin-bottom:20px">Run Today&#39;s Picks</h2>
     <div style="display:flex;align-items:center;justify-content:center;gap:12px;margin-bottom:20px">
-      <label style="color:#9ca3af;font-weight:600;font-size:.85rem;letter-spacing:.08em;text-transform:uppercase">Date</label>
+      <label style="color:#9ca3af;font-weight:600;font-size:.85rem;letter-spacing:.15em;text-transform:uppercase">Date</label>
       <input type="date" id="datePicker" class="date-input" style="max-width:200px" value="__TODAY__" max="__TODAY__">
     </div>
     <div style="text-align:center">
@@ -464,7 +464,7 @@ async function runPicks(){
   var btn=document.getElementById('runBtn');
   var status=document.getElementById('statusMsg');
   btn.disabled=true;
-  btn.textContent='Running...';
+  btn.innerHTML='<span class="spinner"></span>Running...';
   status.textContent='Fetching prop lines for '+date+'...';
   document.getElementById('results').style.display='none';
   try{
