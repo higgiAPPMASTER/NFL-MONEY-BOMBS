@@ -102,40 +102,76 @@ def _match(t1,t2):
 
 # ── Odds API ───────────────────────────────────────────────────────────
 async def get_nfl_events(date_str: str) -> List[Dict]:
-    """Fetch NFL events for a specific date — uses historical endpoint for past dates."""
-    if not ODDS_API_KEY: return []
+    """Get NFL games — ESPN for schedule (works any date), Odds API for event IDs."""
+    # Always use ESPN for schedule — reliable for historical AND live
+    espn_games = await _espn_schedule(date_str)
+    if not espn_games:
+        return []
+    # Try to enrich with Odds API event IDs for prop line fetching
+    if ODDS_API_KEY:
+        try:
+            odds_events = await _odds_events(date_str)
+            # Match ESPN games to Odds API events by team name
+            for g in espn_games:
+                for ev in odds_events:
+                    if (_match(g["home_team"], ev.get("home_team","")) and
+                            _match(g["away_team"], ev.get("away_team",""))):
+                        g["id"] = ev.get("id","")
+                        break
+        except Exception:
+            pass
+    return espn_games
+
+async def _espn_schedule(date_str: str) -> List[Dict]:
+    """ESPN NFL scoreboard — works for any historical or upcoming date."""
+    date_compact = date_str.replace("-","")
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.get(
+                "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard",
+                params={"dates": date_compact})
+            if not r.is_success: return []
+            games = []
+            for ev in r.json().get("events",[]):
+                comp = ev.get("competitions",[{}])[0]
+                teams = {t["homeAway"]: t["team"] for t in comp.get("competitors",[])}
+                home = teams.get("home",{})
+                away = teams.get("away",{})
+                games.append({
+                    "id":        "",   # filled in by Odds API match if available
+                    "home_team": home.get("displayName",""),
+                    "away_team": away.get("displayName",""),
+                    "home_abbr": home.get("abbreviation",""),
+                    "away_abbr": away.get("abbreviation",""),
+                    "game":      f"{away.get('displayName','')} @ {home.get('displayName','')}",
+                })
+            print(f"[ESPN] {len(games)} NFL games for {date_str}")
+            return games
+    except Exception as e:
+        print(f"[ESPN] Schedule error: {e}")
+        return []
+
+async def _odds_events(date_str: str) -> List[Dict]:
+    """Odds API events — current dates only, used for event IDs to fetch prop lines."""
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    is_past = date_str < today
     try:
         async with httpx.AsyncClient(timeout=15) as c:
-            if is_past:
-                # Historical endpoint — use noon UTC on the selected date
+            if date_str >= today:
+                tomorrow = (datetime.fromisoformat(date_str) + timedelta(days=1)).strftime("%Y-%m-%d")
+                day_start = f"{date_str}T00:00:00Z"
+                day_end   = f"{tomorrow}T06:00:00Z"
+                r = await c.get(f"{ODDS_BASE}/sports/americanfootball_nfl/events",
+                    params={"apiKey": ODDS_API_KEY, "dateFormat": "iso",
+                            "commenceTimeFrom": day_start, "commenceTimeTo": day_end})
+                return r.json() if r.is_success and isinstance(r.json(), list) else []
+            else:
                 hist_dt = f"{date_str}T12:00:00Z"
                 r = await c.get(
                     f"{ODDS_BASE}/historical/sports/americanfootball_nfl/events",
                     params={"apiKey": ODDS_API_KEY, "date": hist_dt, "dateFormat": "iso"})
                 data = r.json()
-                # Historical endpoint wraps data in {"data": [...], "timestamp": ...}
                 events = data.get("data", data) if isinstance(data, dict) else data
-                # Filter to events on the selected date
-                day_start = f"{date_str}T00:00:00"
-                day_end   = f"{date_str}T23:59:59"
-                events = [e for e in (events if isinstance(events, list) else [])
-                          if day_start <= e.get("commence_time","") <= day_end]
-                return events
-            else:
-                # Current/upcoming events with date filter
-                day_start = f"{date_str}T00:00:00Z"
-                day_end   = f"{date_str}T23:59:59Z"
-                r = await c.get(f"{ODDS_BASE}/sports/americanfootball_nfl/events",
-                    params={
-                        "apiKey":           ODDS_API_KEY,
-                        "dateFormat":       "iso",
-                        "commenceTimeFrom": day_start,
-                        "commenceTimeTo":   day_end,
-                    })
-                data = r.json()
-                return data if r.is_success and isinstance(data, list) else []
+                return events if isinstance(events, list) else []
     except Exception:
         return []
 
@@ -190,19 +226,30 @@ async def get_prop_lines(event_id: str, date_str: str = "") -> List[Dict]:
 
 # ── ESPN ───────────────────────────────────────────────────────────────
 async def find_espn_pid(name: str) -> Optional[str]:
+    info = await find_espn_player(name)
+    return info.get("pid") if info else None
+
+async def find_espn_player(name: str) -> Optional[Dict]:
+    """Returns {pid, team} for an NFL player."""
     try:
         async with httpx.AsyncClient(timeout=10) as c:
             r = await c.get("https://site.web.api.espn.com/apis/search/v2",
-                            params={"query":name,"limit":5,"sport":"nfl"})
+                            params={"query":name,"limit":8,"sport":"nfl"})
             for result in r.json().get("results",[]):
                 if result.get("type")!="player": continue
                 for item in result.get("contents",[]):
                     if _norm(item.get("displayName",""))==_norm(name):
                         uid=item.get("uid","")
                         m=re.search(r"a:(\d+)",uid)
-                        if m: return m.group(1)
-                        m2=re.search(r"/id/(\d+)",item.get("link",{}).get("web",""))
-                        if m2: return m2.group(1)
+                        pid = m.group(1) if m else None
+                        if not pid:
+                            m2=re.search(r"/id/(\d+)",item.get("link",{}).get("web",""))
+                            pid = m2.group(1) if m2 else None
+                        team = (item.get("teamDisplayName","") or
+                                item.get("teamName","") or
+                                item.get("team","") or "")
+                        if pid:
+                            return {"pid": pid, "team": team}
     except Exception: pass
     return None
 
@@ -250,25 +297,42 @@ async def run_pipeline(date_str: str) -> Dict:
         return {"picks":[],"all":[],"error":f"No NFL games found for {date_str} — NFL season runs Sept–Feb"}
     all_lines = []
     for ev in events:
-        lines = await get_prop_lines(ev["id"], date_str)
+        ev_id = ev.get("id","")
+        if ev_id:
+            lines = await get_prop_lines(ev_id, date_str)
+        else:
+            # No Odds API event ID — can still show game but no prop lines
+            lines = []
         for l in lines:
-            l["home_team"]=ev.get("home_team","")
-            l["away_team"]=ev.get("away_team","")
-            l["game"]     =f"{ev.get('away_team','')} @ {ev.get('home_team','')}"
+            l["home_team"] = ev.get("home_team","")
+            l["away_team"] = ev.get("away_team","")
+            l["game"]      = ev.get("game", f"{ev.get('away_team','')} @ {ev.get('home_team','')}")
         all_lines.extend(lines)
     if not all_lines:
-        return {"picks":[],"all":[],"error":"No prop lines posted yet — check back closer to game time"}
+        return {"picks":[],"all":[],"games":len(events),
+                "error":f"Games found ({len(events)}) but no prop lines available yet — check back closer to game time or upgrade Odds API plan for historical props"}
     all_results=[]
     async def analyze(pl):
         name=pl["name"]; line=pl["line"]; label=pl["label"]
-        side="AWAY"; opp=pl["home_team"]
-        pid = await find_espn_pid(name)
-        if not pid: return
+        # Look up player ESPN ID AND team
+        player_info = await find_espn_player(name)
+        if not player_info or not player_info.get("pid"):
+            return
+        pid = player_info["pid"]
+        player_team = player_info.get("team","")
+        # Determine if player is HOME or AWAY based on their team
+        if player_team and _match(player_team, pl.get("home_team","")):
+            side = "HOME"
+            opp  = pl.get("away_team","")
+        else:
+            side = "AWAY"
+            opp  = pl.get("home_team","")
         values = await get_logs_vs_opp(pid, opp, side, pl.get("stat_key",""))
         if not values:
             all_results.append({"name":name,"label":label,"line":line,"side":side,
                 "opp":opp,"game":pl.get("game",""),"avg":None,"games":0,"history":"—",
-                "pick":None,"pick_note":f"No H/A history vs {opp}",
+                "pick":None,"pick_note":f"No H/A history vs {opp} ({side})",
+                "side":side,
                 "over_odds":pl.get("over_odds"),"under_odds":pl.get("under_odds")})
             return
         avg=round(sum(values)/len(values),1)
