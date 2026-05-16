@@ -253,36 +253,63 @@ async def find_espn_player(name: str) -> Optional[Dict]:
     except Exception: pass
     return None
 
-async def get_logs_vs_opp(pid: str, opp: str, side: str, stat_key: str) -> List[float]:
-    is_home = (side=="HOME")
-    values  = []
-    async def fetch_s(season):
+async def get_logs_vs_opp(pid: str, opp: str, is_home: bool, stat_key: str) -> List[float]:
+    """
+    Uses ESPN gamelog for event metadata (opponent, H/A) then fetches
+    box score per matching game for actual stat values.
+    Works reliably for historical and current seasons.
+    """
+    ESPN_SUMMARY = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/summary"
+    values = []
+
+    async def fetch_season(season):
         try:
-            async with httpx.AsyncClient(timeout=15) as c:
-                r = await c.get(f"{ESPN_BASE}/athletes/{pid}/gamelog",params={"season":season})
-                if not r.is_success: return
-                data=r.json()
-                ev_map=data.get("events",{}).get("eventTypes",[{}])
-                labels=[]; stats_map={}
-                for et in ev_map:
-                    for cat in et.get("categories",[]):
-                        if not labels: labels=[e.get("text","") for e in cat.get("labels",[])]
-                        for ev in cat.get("events",[]):
-                            eid=ev.get("eventId","")
-                            if eid and ev.get("stats"): stats_map[eid]=ev["stats"]
-                for eid,ev_info in data.get("eventLog",{}).get("events",{}).items():
-                    if eid not in stats_map: continue
-                    if ev_info.get("home",False)!=is_home: continue
-                    o=ev_info.get("opponent",{}).get("displayName","")
-                    if not _match(o,opp): continue
-                    raw=stats_map[eid]
-                    if not labels or not raw: continue
+            async with httpx.AsyncClient(timeout=20) as c:
+                r = await c.get(f"{ESPN_BASE}/athletes/{pid}/gamelog",
+                                params={"season": season})
+                if not r.is_success:
+                    return
+                events = r.json().get("events", {})
+                # Find games matching H/A + opponent
+                matching_eids = []
+                for eid, ev in events.items():
+                    team_id    = str(ev.get("team", {}).get("id", ""))
+                    home_id    = str(ev.get("homeTeamId", ""))
+                    player_home = (team_id == home_id and team_id != "")
+                    if player_home != is_home:
+                        continue
+                    opp_name = ev.get("opponent", {}).get("displayName", "")
+                    if opp and not _match(opp_name, opp):
+                        continue
+                    matching_eids.append(eid)
+
+                # Fetch box scores for matching games
+                for eid in matching_eids:
                     try:
-                        idx=next((i for i,l in enumerate(labels) if _norm(l)==_norm(stat_key)),None)
-                        if idx is not None and idx<len(raw): values.append(float(raw[idx]))
-                    except Exception: pass
-        except Exception: pass
-    await asyncio.gather(*[fetch_s(s) for s in ESPN_SEASONS])
+                        r2 = await c.get(ESPN_SUMMARY, params={"event": eid}, timeout=10)
+                        if not r2.is_success:
+                            continue
+                        for box in r2.json().get("boxscore", {}).get("players", []):
+                            for sg in box.get("statistics", []):
+                                keys = [_norm(k) for k in sg.get("keys", [])]
+                                sk   = _norm(stat_key)
+                                if sk not in keys:
+                                    continue
+                                idx = keys.index(sk)
+                                for athlete in sg.get("athletes", []):
+                                    if str(athlete.get("athlete", {}).get("id", "")) == str(pid):
+                                        stats = athlete.get("stats", [])
+                                        if idx < len(stats):
+                                            try:
+                                                values.append(float(stats[idx]))
+                                            except (ValueError, TypeError):
+                                                pass
+                    except Exception:
+                        pass
+        except Exception as e:
+            print(f"[NFL ESPN] Season {season} pid {pid}: {e}")
+
+    await asyncio.gather(*[fetch_season(s) for s in ESPN_SEASONS])
     return values
 
 # ── Pipeline ───────────────────────────────────────────────────────────
@@ -327,7 +354,7 @@ async def run_pipeline(date_str: str) -> Dict:
         else:
             side = "AWAY"
             opp  = pl.get("home_team","")
-        values = await get_logs_vs_opp(pid, opp, side, pl.get("stat_key",""))
+        values = await get_logs_vs_opp(pid, opp, (side=="HOME"), pl.get("stat_key",""))
         if not values:
             all_results.append({"name":name,"label":label,"line":line,"side":side,
                 "opp":opp,"game":pl.get("game",""),"avg":None,"games":0,"history":"—",
