@@ -529,7 +529,7 @@ footer{text-align:center;padding:32px 24px;color:#4b5563;font-size:.78rem;border
     <h2>Run Today&#39;s Picks</h2>
     <div class="date-row">
       <label>Date</label>
-      <input type="date" id="datePicker" class="date-input" value="__TODAY__" max="__TODAY__">
+      <input type="date" id="datePicker" class="date-input" value="__TODAY__" >
     </div>
     <button class="btn" id="runBtn" onclick="runPicks()">Run Picks</button>
     <div class="status-msg" id="statusMsg"></div>
