@@ -542,19 +542,7 @@ footer{text-align:center;padding:32px 24px;color:#4b5563;font-size:.78rem;border
   <div style="margin-top:8px;font-size:.7rem">For entertainment only. Not a betting service. Must be 18+. Please gamble responsibly.</div>
 </footer>
 <script>
-// Hub JWT Token Gate
-(function(){
-  var HUB='https://www.moneypicksarena.com';
-  var KEY='__mpa_token';
-  var p=new URLSearchParams(window.location.search);
-  var t=p.get('token');
-  if(t){localStorage.setItem(KEY,t);window.history.replaceState({},'',window.location.pathname);}
-  var tok=localStorage.getItem(KEY);
-  if(!tok){window.location.href=HUB;return;}
-  fetch('/api/verify-token',{headers:{'Authorization':'Bearer '+tok}})
-    .then(function(r){if(!r.ok){localStorage.removeItem(KEY);window.location.href=HUB;}})
-    .catch(function(){localStorage.removeItem(KEY);window.location.href=HUB;});
-})();
+// No redirect gate
 
 var jobId=null, pollTimer=null;
 
