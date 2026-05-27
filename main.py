@@ -10,7 +10,6 @@ from typing import Dict, List, Optional
 from datetime import datetime, timedelta, timezone
 
 import httpx
-from replit_push import push_picks_to_replit  # pushes daily picks to Replit DB
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 from jose import jwt as jose_jwt
@@ -244,12 +243,12 @@ async def get_prop_lines(event_id: str, date_str: str) -> List[Dict]:
         async with httpx.AsyncClient(timeout=15) as c:
             if is_past:
                 base = f"{ODDS_BASE}/historical/sports/americanfootball_nfl/events/{event_id}/odds"
-                params = {"apiKey": ODDS_API_KEY, "regions": "us,us2",
+                params = {"apiKey": ODDS_API_KEY, "regions": "us",
                          "markets": ",".join(PROP_MARKETS), "oddsFormat": "american",
                          "date": f"{date_str}T12:00:00Z"}
             else:
                 base = f"{ODDS_BASE}/sports/americanfootball_nfl/events/{event_id}/odds"
-                params = {"apiKey": ODDS_API_KEY, "regions": "us,us2",
+                params = {"apiKey": ODDS_API_KEY, "regions": "us",
                          "markets": ",".join(PROP_MARKETS), "oddsFormat": "american"}
             r = await c.get(base, params=params)
             if not r.is_success: return []
@@ -415,7 +414,11 @@ async def run_pipeline(date_str: str) -> Dict:
                      key=lambda x: abs(x.get("gap") or 0), reverse=True)
     result  = {"picks":picks,"all":all_results,"date":date_str,"games":len(espn_games)}
     _cache_set(date_str, result)
-    push_picks_to_replit("nfl", result)  # push to Replit DB
+    try:
+        from replit_push import push_picks_to_replit
+        push_picks_to_replit("nfl", result)
+    except Exception as _e:
+        print(f"[replit_push] nfl push failed: {_e}")
     return result
 
 # ── Routes ─────────────────────────────────────────────────────────────────────
