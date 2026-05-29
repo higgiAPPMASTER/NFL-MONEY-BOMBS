@@ -449,9 +449,23 @@ async def clear_cache_route():
     global _nfl_df; _nfl_df = None
     return {"ok": True}
 
+def _verify_hub_token(token: str) -> bool:
+    if not token or len(token.split(".")) != 3:
+        return False
+    if not JWT_SECRET:
+        return False
+    try:
+        jose_jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+        return True
+    except Exception:
+        return False
+
 @app.post("/api/run")
 async def api_run(request: Request):
     body     = await request.json() if request.headers.get("content-type","").startswith("application/json") else {}
+    tok = body.get("token","") or request.headers.get("Authorization","").replace("Bearer ","").strip()
+    if not _verify_hub_token(tok):
+        raise HTTPException(status_code=401, detail="Subscription required — please log in via moneypicksarena.com")
     date_str = body.get("date", datetime.now(timezone.utc).strftime("%Y-%m-%d"))
     job_id   = str(uuid.uuid4())[:8]
     JOBS[job_id] = {"status":"running","result":None,"error":None}
@@ -549,6 +563,13 @@ footer{text-align:center;padding:32px 24px;color:#4b5563;font-size:.78rem;border
 <script>
 
 
+var _nflKey='__mpa_token';
+var _nflParams=new URLSearchParams(window.location.search);
+var _nflUrlTok=_nflParams.get('token');
+if(_nflUrlTok){localStorage.setItem(_nflKey,_nflUrlTok);window.history.replaceState({},'',window.location.pathname);}
+var _nflTok=localStorage.getItem(_nflKey)||'';
+if(!_nflTok){window.location.href='https://www.moneypicksarena.com';}
+
 var jobId=null, pollTimer=null;
 
 function fmtOdds(o){return o==null?'':(o>0?'+':'')+o;}
@@ -563,7 +584,7 @@ async function runPicks(){
   status.innerHTML='<span class="spinner"></span>Fetching prop lines and loading NFL stats...';
   document.getElementById('results').innerHTML='';
   try{
-    const r=await fetch('/api/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({date:date})});
+    const r=await fetch('/api/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({date:date,token:_nflTok})});
     const d=await r.json();
     jobId=d.job_id;
     pollTimer=setInterval(pollJob,2500);
