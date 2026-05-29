@@ -568,7 +568,7 @@ var _nflParams=new URLSearchParams(window.location.search);
 var _nflUrlTok=_nflParams.get('token');
 if(_nflUrlTok){localStorage.setItem(_nflKey,_nflUrlTok);window.history.replaceState({},'',window.location.pathname);}
 var _nflTok=localStorage.getItem(_nflKey)||'';
-if(!_nflTok){window.location.href='https://www.moneypicksarena.com';}
+if(!_nflTok){window.location.href='https://moneypicksarena.com';}
 
 var jobId=null, pollTimer=null;
 
