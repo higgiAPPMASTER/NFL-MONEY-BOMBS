@@ -460,6 +460,20 @@ def _verify_hub_token(token: str) -> bool:
     except Exception:
         return False
 
+_ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "higgi117711@gmail.com").strip().lower()
+
+def _token_email(token: str) -> str:
+    if not token or len(token.split(".")) != 3 or not JWT_SECRET:
+        return ""
+    try:
+        payload = jose_jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+        return str(payload.get("sub", "")).strip().lower()
+    except Exception:
+        return ""
+
+def _is_admin_token(token: str) -> bool:
+    return bool(_ADMIN_EMAIL) and _token_email(token) == _ADMIN_EMAIL
+
 @app.post("/api/run")
 async def api_run(request: Request):
     body     = await request.json() if request.headers.get("content-type","").startswith("application/json") else {}
@@ -484,10 +498,18 @@ async def api_poll(job_id: str):
     if not job: raise HTTPException(404, "Job not found")
     return job
 
+@app.get("/api/whoami")
+async def whoami(request: Request, token: str = ""):
+    tok = token or request.headers.get("Authorization", "").replace("Bearer ", "").strip()
+    return {"is_admin": _is_admin_token(tok)}
+
 @app.get("/", response_class=HTMLResponse)
-async def index():
+async def index(admin: str = "", token: str = ""):
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    return HTMLResponse(HTML.replace("__TODAY__", today))
+    is_admin = (bool(admin) and admin == os.environ.get("INTERNAL_API_TOKEN", "__none__")) or _is_admin_token(token)
+    js_flag = "true" if is_admin else "false"
+    html = HTML.replace("__TODAY__", today).replace("</head>", f"<script>window.IS_ADMIN = {js_flag};</script></head>", 1)
+    return HTMLResponse(html)
 
 # ── HTML ───────────────────────────────────────────────────────────────────────
 HTML = """<!DOCTYPE html>
@@ -535,6 +557,8 @@ tr:last-child td{border-bottom:none}
 .err-card{background:#161616;border:1px solid #262626;border-radius:14px;padding:40px;text-align:center;color:#6b7280}
 footer{text-align:center;padding:32px 24px;color:#4b5563;font-size:.78rem;border-top:1px solid #1c1c1c;margin-top:24px;font-family:'Source Sans Pro',sans-serif}
 .ft-logo{font-family:'Playfair Display',serif;color:#f59e0b;font-weight:700;font-size:.95rem;margin-bottom:6px}
+.admin-only{display:none !important}
+body.is-admin .admin-only{display:inline-block !important}
 </style>
 </head>
 <body>
@@ -550,7 +574,7 @@ footer{text-align:center;padding:32px 24px;color:#4b5563;font-size:.78rem;border
       <label>Date</label>
       <input type="date" id="datePicker" class="date-input" value="__TODAY__" >
     </div>
-    <button class="btn" id="runBtn" onclick="runPicks()">Run Picks</button>
+    <button class="btn admin-only" id="runBtn" onclick="runPicks()">Run Picks</button>
     <div class="status-msg" id="statusMsg"></div>
   </div>
   <div id="results"></div>
@@ -569,6 +593,8 @@ var _nflUrlTok=_nflParams.get('token');
 if(_nflUrlTok){localStorage.setItem(_nflKey,_nflUrlTok);window.history.replaceState({},'',window.location.pathname);}
 var _nflTok=localStorage.getItem(_nflKey)||'';
 if(!_nflTok){window.location.href='https://moneypicksarena.com';}
+function _applyAdmin(){if(window.IS_ADMIN){document.body&&document.body.classList.add('is-admin');}else{if(_nflTok){fetch('/api/whoami?token='+encodeURIComponent(_nflTok)).then(function(r){return r.json();}).then(function(d){if(d&&d.is_admin){window.IS_ADMIN=true;document.body&&document.body.classList.add('is-admin');}}).catch(function(){});}}}
+if(document.readyState==='loading'){document.addEventListener('DOMContentLoaded',_applyAdmin);}else{_applyAdmin();}
 
 var jobId=null, pollTimer=null;
 
