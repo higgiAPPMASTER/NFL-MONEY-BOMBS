@@ -474,6 +474,31 @@ def _token_email(token: str) -> str:
 def _is_admin_token(token: str) -> bool:
     return bool(_ADMIN_EMAIL) and _token_email(token) == _ADMIN_EMAIL
 
+_CRON_BUSY_NFL = False
+
+@app.api_route("/api/cron-run", methods=["GET", "POST"])
+async def cron_run_nfl(request: Request, date_str: str = ""):
+    # Cron-friendly trigger: authed by the static INTERNAL_API_TOKEN secret sent
+    # as a header (kept out of the URL so it isn't logged). No expiring hub login
+    # needed. Runs the pipeline (which caches it) so members can pull the picks,
+    # and wakes the free-tier app on Render. In-flight guard blocks overlapping runs.
+    global _CRON_BUSY_NFL
+    import hmac
+    secret = os.environ.get("INTERNAL_API_TOKEN", "")
+    tok = request.headers.get("X-Internal-Token", "") or request.headers.get("Authorization", "").replace("Bearer ", "").strip()
+    if not secret or not hmac.compare_digest(tok or "", secret):
+        raise HTTPException(status_code=401, detail="Invalid cron token")
+    ds = date_str or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if _CRON_BUSY_NFL:
+        return {"ran": False, "cached": bool(_cache_get(ds)), "date": ds, "reason": "already running"}
+    _CRON_BUSY_NFL = True
+    try:
+        await run_pipeline(ds)
+    finally:
+        _CRON_BUSY_NFL = False
+    return {"ran": True, "cached": bool(_cache_get(ds)), "date": ds}
+
+
 @app.post("/api/run")
 async def api_run(request: Request):
     body     = await request.json() if request.headers.get("content-type","").startswith("application/json") else {}
