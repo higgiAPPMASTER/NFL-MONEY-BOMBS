@@ -498,6 +498,19 @@ async def api_poll(job_id: str):
     if not job: raise HTTPException(404, "Job not found")
     return job
 
+@app.get("/api/cached")
+async def api_cached(request: Request, target_date: str = "", token: str = ""):
+    # Read-only: serve picks already saved on file. Never runs the pipeline, so any
+    # logged-in member can pull the latest saved picks without triggering a fresh run.
+    tok = token or request.headers.get("Authorization", "").replace("Bearer ", "").strip()
+    if not _verify_hub_token(tok):
+        raise HTTPException(status_code=401, detail="Subscription required — please log in via moneypicksarena.com")
+    date_str = target_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    cached = _cache_get(date_str)
+    if cached:
+        return cached
+    raise HTTPException(status_code=404, detail="No saved picks for this date.")
+
 @app.get("/api/whoami")
 async def whoami(request: Request, token: str = ""):
     tok = token or request.headers.get("Authorization", "").replace("Bearer ", "").strip()
@@ -574,7 +587,8 @@ body.is-admin .admin-only{display:inline-block !important}
       <label>Date</label>
       <input type="date" id="datePicker" class="date-input" value="__TODAY__" >
     </div>
-    <button class="btn admin-only" id="runBtn" onclick="runPicks()">Run Picks</button>
+    <button class="btn" id="getBtn" onclick="getPicks()">🎯 Get Picks</button>
+    <button class="btn admin-only" id="runBtn" onclick="runPicks()" style="margin-left:10px">Run Picks</button>
     <div class="status-msg" id="statusMsg"></div>
   </div>
   <div id="results"></div>
@@ -640,6 +654,31 @@ async function pollJob(){
       document.getElementById('statusMsg').innerHTML='<span class="spinner"></span>Analyzing player histories...';
     }
   }catch(e){}
+}
+
+// Get Picks: load saved picks for the chosen date (read-only, never runs the pipeline).
+async function getPicks(){
+  var date=document.getElementById('datePicker').value;
+  if(!date){alert('Please select a date');return;}
+  var btn=document.getElementById('getBtn');
+  var status=document.getElementById('statusMsg');
+  var orig=btn.textContent;
+  btn.disabled=true;
+  btn.innerHTML='<span class="spinner"></span>Loading...';
+  status.innerHTML='<span class="spinner"></span>Loading saved picks...';
+  document.getElementById('results').innerHTML='';
+  try{
+    var r=await fetch('/api/cached?target_date='+encodeURIComponent(date)+'&token='+encodeURIComponent(_nflTok));
+    if(r.status===404){ status.textContent=''; alert("Today's picks aren't ready yet -- check back a little later."); return; }
+    if(!r.ok) throw new Error('Server error '+r.status);
+    var d=await r.json();
+    renderResults(d);
+    status.textContent='';
+  }catch(e){
+    status.textContent='Error: '+e.message;
+  }finally{
+    btn.disabled=false; btn.textContent=orig;
+  }
 }
 
 function rateClass(r){
