@@ -515,9 +515,30 @@ def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str) -> Optional[Dict
             v = r[stat_col]
             if v is None or (isinstance(v, float) and v != v):
                 continue
-            glog.append({"d": f"{int(r['season'])} W{int(r['week'])}", "v": round(float(v), 1)})
+            ro = ""
+            try:
+                ro = str(r["opponent_team"]) if r.get("opponent_team") else ""
+            except Exception:
+                ro = ""
+            glog.append({"d": f"{int(r['season'])} W{int(r['week'])}", "v": round(float(v), 1), "o": ro})
         except Exception:
             continue
+
+    # Every career game vs THIS opponent (newest first) so the ladder modal can
+    # show the actual stat line from each past meeting even when it falls outside
+    # the recent-10 window (e.g. a single old game vs a rare opponent). Use the
+    # UNFILTERED vs_opp_all (both venues) — this section is "every meeting", not the
+    # H/A-filtered set that drives the vs-opp RATE stats.
+    vs_opp_log = []
+    if not vs_opp_all.empty:
+        for _, r in vs_opp_all.sort_values(["season", "week"], ascending=False).iterrows():
+            try:
+                v = r[stat_col]
+                if v is None or (isinstance(v, float) and v != v):
+                    continue
+                vs_opp_log.append({"d": f"{int(r['season'])} W{int(r['week'])}", "v": round(float(v), 1)})
+            except Exception:
+                continue
 
     return {
         # identity
@@ -541,7 +562,7 @@ def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str) -> Optional[Dict
         "underHits": under_hits, "underTotal": tot_b, "underRate": under_rate or 0, "underLine": line,
         # score / pick
         "score": score, "dispScore": score, "gap": gap, "pick": pick, "tag": tag,
-        "glog": glog,
+        "glog": glog, "vsOppLog": vs_opp_log,
         # ── legacy keys (kept for backward compatibility with cached payloads /
         #    any downstream consumer that predates the normalized contract) ──
         "opp": opp_abbr or "--",
@@ -844,6 +865,19 @@ tr:last-child td{border-bottom:none}
 .pick-card.acc-ptd{border-top:3px solid #38bdf8}
 .pick-card.acc-def{border-top:3px solid #fb7185}
 .pick-card.acc-kick{border-top:3px solid #2dd4bf}
+.nfl-toolbar{display:flex;justify-content:flex-end;margin:0 0 14px}
+#nflSearch{background:#111;color:#fff;border:1px solid #2a2a2a;border-radius:8px;padding:8px 14px;font-size:.9rem;outline:none;width:240px;max-width:60vw;font-family:'Source Sans Pro',sans-serif}
+.sec-hdr{cursor:pointer;display:flex;align-items:center;justify-content:space-between;user-select:none}
+.sec-caret{font-size:.85rem;color:#9ca3af;margin-left:10px}
+.gcard{cursor:pointer}
+.gc-hint{font-size:.62rem;color:#6b7280;margin-top:3px;text-transform:uppercase;letter-spacing:.08em}
+.big-modal{max-width:680px;width:92%;max-height:86vh;overflow:auto}
+.mk-hdr{font-size:.72rem;font-weight:800;color:#f59e0b;text-transform:uppercase;letter-spacing:.1em;margin:12px 0 6px}
+.pl-row{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:9px 12px;border:1px solid #1f1f1f;border-radius:9px;margin-bottom:6px;cursor:pointer;background:#0d0d0d}
+.pl-row:hover{border-color:rgba(245,158,11,.4)}
+.pl-row .nm{font-weight:700;color:#fff;font-size:.9rem}
+.pl-row .mt{font-size:.72rem;color:#8a8f98}
+.vsopp-row{display:flex;align-items:center;justify-content:space-between;font-size:.82rem;padding:5px 2px;border-bottom:1px solid #1a1a1a}
 .pc-rank{position:absolute;top:10px;right:14px;font-family:'Playfair Display',serif;font-weight:900;font-size:1.6rem;color:rgba(245,158,11,.35)}
 .pc-top{display:flex;align-items:center;gap:12px;margin-bottom:10px}
 .hs-wrap{position:relative;width:58px;height:58px;border-radius:50%;flex:0 0 auto;background:#222;border:2px solid #333;overflow:visible;display:flex;align-items:center;justify-content:center}
@@ -1199,9 +1233,52 @@ function _spRow(p){
   var best=Math.max(p.rateA||0,p.rateB||0);
   return `<div class="sp-row" onclick="openNflLadder('${key}')"><div><div class="nm">${p.name}</div><div class="mt">${p.team} vs ${p.opponent} · ${p.dispLine} ${p.pick||''}</div></div><div class="${rateClass(best)}" style="font-weight:800">${best}%</div></div>`;
 }
-function _spCol(title,picks){
-  var rows=(picks||[]).slice(0,8).map(_spRow).join('')||'<div class="mt" style="color:#6b7280;padding:6px">None</div>';
-  return `<div class="sp-col"><h4>${title}</h4>${rows}</div>`;
+function _edge(p){ var g=(p.gap==null?0:p.gap); return (p.pick==='UNDER')?(-g):g; }
+function _collapseSec(id,title,inner,open){
+  var disp=open?'block':'none'; var car=open?'▾':'▸';
+  return '<div class="sec sec-hdr" onclick="_secToggle(\''+id+'\')"><span>'+title+'</span>'+
+         '<span class="sec-caret" id="car_'+id+'">'+car+'</span></div>'+
+         '<div id="sec_'+id+'" style="display:'+disp+'">'+inner+'</div>';
+}
+function _secToggle(id){
+  var el=document.getElementById('sec_'+id); var c=document.getElementById('car_'+id);
+  if(!el) return; var hidden=el.style.display==='none';
+  el.style.display=hidden?'block':'none'; if(c) c.textContent=hidden?'▾':'▸';
+}
+function _playRow(p){
+  var key=_ladKey(p); window.__NFLLAD__[key]=p;
+  var best=Math.max(p.rateA||0,p.rateB||0);
+  var sub=p.team+' vs '+p.opponent+' · '+(p.mkt||p.label)+' · '+p.dispLine+' '+(p.pick||'');
+  return '<div class="pl-row" onclick="openNflLadder(\''+key+'\')">'+
+         '<div><div class="nm">'+p.name+'</div><div class="mt">'+sub+'</div></div>'+
+         '<div class="'+rateClass(best)+'" style="font-weight:800">'+best+'%</div></div>';
+}
+function _openModal(title,sub,body){
+  var html='<div class="lad-modal big-modal" onclick="event.stopPropagation()">'+
+    '<button class="lad-close" onclick="_closeModal()">✕</button>'+
+    '<h3>'+title+'</h3><div class="lad-sub">'+sub+'</div>'+body+'</div>';
+  var ov=document.createElement('div'); ov.className='lad-ov'; ov.id='nflModalOv';
+  ov.onclick=_closeModal; ov.innerHTML=html; document.body.appendChild(ov);
+}
+function _closeModal(){var o=document.getElementById('nflModalOv'); if(o)o.remove();}
+function _gameModal(gi){
+  var st=window._nflState||{}; var g=((st.d||{}).games||[])[gi]; if(!g) return;
+  var gk=g.game; var mu=(g.away_abbr||g.away_team||'?')+' @ '+(g.home_abbr||g.home_team||'?');
+  var plays=(st.all||[]).filter(function(p){return p.game===gk;});
+  var body='';
+  _MORDER.forEach(function(m){
+    var mp=plays.filter(function(p){return (p.mkt||p.label)===m;}).sort(function(a,b){return _edge(b)-_edge(a);});
+    if(!mp.length) return;
+    body+='<div class="mk-hdr">'+_mIcon(m)+' '+m+'</div>'+mp.map(_playRow).join('');
+  });
+  if(!body) body='<div class="mt" style="color:#6b7280;padding:10px">No plays for this game.</div>';
+  _openModal(mu, ((st.d||{}).date||'')+' · tap any play for its game log', body);
+}
+function _marketModal(m){
+  var st=window._nflState||{};
+  var plays=(st.all||[]).filter(function(p){return (p.mkt||p.label)===m;}).sort(function(a,b){return _edge(b)-_edge(a);});
+  var body=plays.length?plays.map(_playRow).join(''):'<div class="mt" style="color:#6b7280;padding:10px">No plays.</div>';
+  _openModal(_mIcon(m)+' '+m, plays.length+' plays · tap any play for its game log', body);
 }
 function _underBox(picks){
   var u=(picks||[]).filter(function(p){return p.underTotal>=2 && p.underRate>=60;})
@@ -1218,13 +1295,20 @@ function openNflLadder(key){
   var line=p.dispLine;
   var chips=(p.glog||[]).map(function(g){
     var hit=g.v>line; var cls=hit?'hit':'miss';
-    return `<div class="glchip ${cls}"><div class="d">${g.d}</div><div class="v">${g.v}</div></div>`;
+    var od=g.o?(' · '+g.o):'';
+    return `<div class="glchip ${cls}"><div class="d">${g.d}${od}</div><div class="v">${g.v}</div></div>`;
   }).join('');
   if(!chips) chips='<span class="gray">No game log available.</span>';
   var vslRow=(p.realLine!=null&&p.vsLineTotal)
     ? `<div class="lad-stat"><span class="k">Hits vs Book Line (${p.realLine}) L10</span><span class="v ${rateClass(p.vsLineRate)}">${p.vsLineHits}/${p.vsLineTotal} (${p.vsLineRate}%)</span></div>`
     : '';
   var hasHA=(p.homeRoad==='H'||p.homeRoad==='R');
+  var vol=(p.vsOppLog||[]);
+  var voHtml='';
+  if(vol.length){
+    voHtml='<div style="font-size:.7rem;color:#6b7280;text-transform:uppercase;letter-spacing:.08em;font-weight:700;margin:12px 0 4px">Every game vs '+p.opponent+' ('+vol.length+')</div>';
+    voHtml+=vol.map(function(g){var hit=g.v>line;return '<div class="vsopp-row"><span style="color:#9ca3af">'+g.d+'</span><span style="font-weight:700;color:'+(hit?'#4ade80':'#f87171')+'">'+g.v+'</span></div>';}).join('');
+  }
   var html=`
     <div class="lad-modal" onclick="event.stopPropagation()">
       <button class="lad-close" onclick="closeNflLadder()">✕</button>
@@ -1232,6 +1316,7 @@ function openNflLadder(key){
       <div class="lad-sub">${p.mkt} · ${p.team} vs ${p.opponent} · Line ${p.dispLine} · ${p.pick||''}</div>
       <div style="font-size:.7rem;color:#6b7280;text-transform:uppercase;letter-spacing:.08em;font-weight:700;margin-bottom:4px">Recent Games (green = over line)</div>
       <div class="lad-glog">${chips}</div>
+      ${voHtml}
       <div class="lad-stat"><span class="k">Career vs ${p.opponent}</span><span class="v">${_rateHtml(p.rateA,p.hitsA,p.totA)}</span></div>
       <div class="lad-stat"><span class="k">L10 ${hasHA?(p.homeRoad==='H'?'Home':'Away'):'H/A'}</span><span class="v">${_rateHtml(p.rateB,p.hitsB,p.totB)}</span></div>
       ${vslRow}
@@ -1283,86 +1368,75 @@ function renderResults(d){
     res.innerHTML='<div class="err-box">'+d.error+'<div style="font-size:13px;color:#9ca3af;margin-top:6px;font-weight:400">NFL season runs September through February</div></div>';
     return;
   }
-  var all=d.all||[]; window.__NFL_PLAYS__=all;
-  var picks=d.picks||[];
+  window._nflState={d:d, all:(d.all||[])};
+  window.__NFL_PLAYS__=d.all||[];
+  res.innerHTML='<div class="nfl-toolbar"><input id="nflSearch" type="text" placeholder="Search player…" oninput="_nflPaint(this.value)"/></div><div id="nflBody"></div>';
+  _nflPaint('');
+}
+
+// Paints chips/games/special/cards into #nflBody. Re-runs on every search
+// keystroke with a name filter; the search box itself lives outside #nflBody so
+// it keeps focus. Sections are collapsible (default closed) to cut scrolling;
+// a non-empty search auto-expands them so matches are visible.
+function _nflPaint(q){
+  var st=window._nflState||{}; var d=st.d; if(!d) return;
+  q=(q||'').toLowerCase().trim();
+  var expand=!!q;
+  var picks=(d.picks||[]);
+  if(q) picks=picks.filter(function(p){return (p.name||'').toLowerCase().indexOf(q)>=0;});
   var byM={}; _MORDER.forEach(function(m){byM[m]=[];});
   picks.forEach(function(p){ var m=p.mkt||p.label; if(!byM[m]) byM[m]=[]; byM[m].push(p); });
-  // backend ranks picks by gap; card grids display score-first within each market
-  Object.keys(byM).forEach(function(m){ byM[m].sort(function(a,b){return (b.dispScore||0)-(a.dispScore||0);}); });
+  // Rank within each market by cushion (avg vs line, in the pick's direction) so
+  // cheap 1.5 lines no longer automatically outrank tougher higher lines.
+  Object.keys(byM).forEach(function(m){ byM[m].sort(function(a,b){return _edge(b)-_edge(a);}); });
+  st.byM=byM;
+  var allF=(d.all||[]);
 
   var h='';
 
-  // Chips
+  // Chips (market chips are tappable -> all plays for that market)
   h+='<div class="chips">';
   h+='<div class="chip"><div class="val">'+((d.games||[]).length)+'</div><div class="lbl">Games</div></div>';
-  _MORDER.forEach(function(m){ if(byM[m]&&byM[m].length){ h+='<div class="chip"><div class="val">'+byM[m].length+'</div><div class="lbl">'+(_MLBL[m]||m)+'</div></div>'; }});
+  _MORDER.forEach(function(m){ if(byM[m]&&byM[m].length){ h+='<div class="chip" style="cursor:pointer" onclick="_marketModal(\''+m+'\')"><div class="val">'+byM[m].length+'</div><div class="lbl">'+(_MLBL[m]||m)+'</div></div>'; }});
   h+='</div>';
 
-  // Games
+  // Games (tappable -> all plays for that game)
   if((d.games||[]).length){
     h+='<div class="sec">- Games -- '+(d.date||'')+'</div><div class="games">';
-    d.games.forEach(function(g){
+    d.games.forEach(function(g,gi){
       var mu=(g.away_abbr||g.away_team||'?')+' @ '+(g.home_abbr||g.home_team||'?');
-      h+='<div class="gcard"><div class="mu">'+mu+'</div></div>';
+      h+='<div class="gcard" onclick="_gameModal('+gi+')"><div class="mu">'+mu+'</div><div class="gc-hint">tap for plays</div></div>';
     });
     h+='</div>';
   }
 
-  // Card grids per market
+  // Card grids per market (collapsible pop-downs, Top 12 each)
   var hasCards=false;
-  _MORDER.forEach(function(m){
+  _MORDER.forEach(function(m,i){
     var g=(byM[m]||[]).slice(0,12);
     if(!g.length) return;
     hasCards=true;
-    h+='<div class="sec">'+_mIcon(m)+' Top '+g.length+' '+m+'</div>';
-    h+=nflCardGrid(g);
+    h+=_collapseSec('mkt_'+i, _mIcon(m)+' Top '+g.length+' '+m, nflCardGrid(g), expand);
   });
   if(!hasCards){
-    h+='<div class="no-picks">No qualifying picks for '+(d.date||'today')+'.</div>';
+    h+='<div class="no-picks">No qualifying picks'+(q?' for "'+q+'"':' for '+(d.date||'today'))+'.</div>';
   }
 
-  // Under track
-  var ub=_underBox(all);
-  if(ub){ h+='<div class="sec">⬇ UNDER Track</div>'+ub; }
+  // Under track (collapsible)
+  var ub=_underBox(allF);
+  if(ub){ h+=_collapseSec('under_track','⬇ UNDER Track', ub, expand); }
 
-  // Special boxes
+  // Special - best plays (collapsible per category, 5 each)
   var present=_MORDER.filter(function(m){return byM[m]&&byM[m].length;});
   if(present.length){
     h+='<div class="sec">⭐ Special — Best Plays</div>';
-    for(var i=0;i<present.length;i+=2){
-      h+='<div class="special-wrap">'+_spCol(present[i],byM[present[i]]);
-      if(present[i+1]) h+=_spCol(present[i+1],byM[present[i+1]]);
-      h+='</div>';
-    }
-  }
-
-  // All plays by game (collapsible)
-  if(all.length){
-    h+='<div class="sec" style="margin-top:32px">All Plays by Game</div>';
-    var games={},order=[];
-    all.forEach(function(p){ var g=p.game||'Unknown'; if(!games[g]){games[g]=[];order.push(g);} games[g].push(p); });
-    order.forEach(function(game,gi){
-      var gp=games[game];
-      var gpicks=gp.filter(function(p){return p.pick;}).length;
-      h+='<div style="margin-bottom:10px">';
-      h+='<div onclick="nflToggle('+gi+')" style="background:#161616;border:1px solid #262626;border-radius:12px;padding:12px 18px;cursor:pointer;display:flex;align-items:center;justify-content:space-between">';
-      h+='<span style="font-weight:700;color:#fff;font-size:.92rem">'+game+'</span>';
-      h+='<div style="display:flex;align-items:center;gap:10px">';
-      h+='<span style="background:rgba(245,158,11,.1);color:#f59e0b;padding:3px 12px;border-radius:999px;font-size:.75rem;font-weight:700">'+gp.length+' props | '+gpicks+' picks</span>';
-      h+='<button id="nfltoggle_btn_'+gi+'" onclick="event.stopPropagation();nflToggle('+gi+')" style="background:none;border:1px solid #374151;color:#9ca3af;border-radius:6px;padding:3px 12px;font-size:.72rem;cursor:pointer">Expand</button>';
-      h+='</div></div>';
-      h+='<div id="nfltoggle_'+gi+'" style="display:none;margin-top:6px">';
-      _MORDER.forEach(function(m){
-        var mp=gp.filter(function(p){return (p.mkt||p.label)===m;});
-        if(!mp.length) return;
-        h+='<div style="font-size:.72rem;font-weight:700;color:#f59e0b;text-transform:uppercase;letter-spacing:.1em;padding:8px 12px 4px">'+m+'</div>';
-        h+=buildNormTable(mp,1);
-      });
-      h+='</div></div>';
+    present.forEach(function(m,i){
+      var rows=(byM[m]||[]).slice(0,5).map(_spRow).join('')||'<div class="mt" style="color:#6b7280;padding:6px">None</div>';
+      h+=_collapseSec('sp_'+i, _mIcon(m)+' '+m, rows, expand);
     });
   }
 
-  res.innerHTML=h;
+  document.getElementById('nflBody').innerHTML=h;
 }
 
 function nflToggle(n){
