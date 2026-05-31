@@ -1236,7 +1236,7 @@ function _spRow(p){
 function _edge(p){ var g=(p.gap==null?0:p.gap); return (p.pick==='UNDER')?(-g):g; }
 function _collapseSec(id,title,inner,open){
   var disp=open?'block':'none'; var car=open?'▾':'▸';
-  return '<div class="sec sec-hdr" onclick="_secToggle(\''+id+'\')"><span>'+title+'</span>'+
+  return '<div class="sec sec-hdr" onclick="_secToggle(&#39;'+id+'&#39;)"><span>'+title+'</span>'+
          '<span class="sec-caret" id="car_'+id+'">'+car+'</span></div>'+
          '<div id="sec_'+id+'" style="display:'+disp+'">'+inner+'</div>';
 }
@@ -1249,7 +1249,7 @@ function _playRow(p){
   var key=_ladKey(p); window.__NFLLAD__[key]=p;
   var best=Math.max(p.rateA||0,p.rateB||0);
   var sub=p.team+' vs '+p.opponent+' · '+(p.mkt||p.label)+' · '+p.dispLine+' '+(p.pick||'');
-  return '<div class="pl-row" onclick="openNflLadder(\''+key+'\')">'+
+  return '<div class="pl-row" onclick="openNflLadder(&#39;'+key+'&#39;)">'+
          '<div><div class="nm">'+p.name+'</div><div class="mt">'+sub+'</div></div>'+
          '<div class="'+rateClass(best)+'" style="font-weight:800">'+best+'%</div></div>';
 }
@@ -1397,7 +1397,7 @@ function _nflPaint(q){
   // Chips (market chips are tappable -> all plays for that market)
   h+='<div class="chips">';
   h+='<div class="chip"><div class="val">'+((d.games||[]).length)+'</div><div class="lbl">Games</div></div>';
-  _MORDER.forEach(function(m){ if(byM[m]&&byM[m].length){ h+='<div class="chip" style="cursor:pointer" onclick="_marketModal(\''+m+'\')"><div class="val">'+byM[m].length+'</div><div class="lbl">'+(_MLBL[m]||m)+'</div></div>'; }});
+  _MORDER.forEach(function(m){ if(byM[m]&&byM[m].length){ h+='<div class="chip" style="cursor:pointer" onclick="_marketModal(&#39;'+m+'&#39;)"><div class="val">'+byM[m].length+'</div><div class="lbl">'+(_MLBL[m]||m)+'</div></div>'; }});
   h+='</div>';
 
   // Games (tappable -> all plays for that game)
