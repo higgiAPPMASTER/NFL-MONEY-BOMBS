@@ -21,22 +21,47 @@ JWT_SECRET    = os.environ.get("JWT_SECRET", "")
 NFL_SEASONS   = [2024, 2023, 2022, 2021, 2020]
 
 PROP_MARKETS = [
-    "player_rush_yds", "player_reception_yds", "player_pass_yds",
-    "player_anytime_td", "player_receptions", "player_pass_tds",
+    # passing
+    "player_pass_yds", "player_pass_tds", "player_pass_completions",
+    "player_pass_attempts", "player_pass_interceptions",
+    # rushing
+    "player_rush_yds", "player_rush_attempts", "player_anytime_td",
+    # receiving
+    "player_reception_yds", "player_receptions",
+    # defense
+    "player_tackles_assists", "player_sacks", "player_defensive_interceptions",
+    # kicking
+    "player_kicking_points", "player_field_goals",
 ]
 PROP_LABELS = {
-    "player_rush_yds":"Rush Yds", "player_reception_yds":"Rec Yds",
-    "player_pass_yds":"Pass Yds", "player_anytime_td":"Anytime TD",
-    "player_receptions":"Receptions", "player_pass_tds":"Pass TDs",
+    "player_pass_yds":"Pass Yds", "player_pass_tds":"Pass TDs",
+    "player_pass_completions":"Completions", "player_pass_attempts":"Pass Att",
+    "player_pass_interceptions":"INT Thrown",
+    "player_rush_yds":"Rush Yds", "player_rush_attempts":"Rush Att",
+    "player_anytime_td":"Anytime TD",
+    "player_reception_yds":"Rec Yds", "player_receptions":"Receptions",
+    "player_tackles_assists":"Tackles+Ast", "player_sacks":"Sacks",
+    "player_defensive_interceptions":"Def INT",
+    "player_kicking_points":"Kick Pts", "player_field_goals":"FG Made",
 }
-# nfl-verse column names
+# nfl-verse column names (offense from player_stats, defense from player_stats_def,
+# kicking from player_stats_kicking; def/kicking columns are merged in at load time)
 PROP_TO_COL = {
-    "player_rush_yds":       "rushing_yards",
-    "player_reception_yds":  "receiving_yards",
-    "player_pass_yds":       "passing_yards",
-    "player_anytime_td":     "anytime_td",   # computed
-    "player_receptions":     "receptions",
-    "player_pass_tds":       "passing_tds",
+    "player_pass_yds":               "passing_yards",
+    "player_pass_tds":               "passing_tds",
+    "player_pass_completions":       "completions",
+    "player_pass_attempts":          "attempts",
+    "player_pass_interceptions":     "interceptions",
+    "player_rush_yds":               "rushing_yards",
+    "player_rush_attempts":          "carries",
+    "player_anytime_td":             "anytime_td",       # computed
+    "player_reception_yds":          "receiving_yards",
+    "player_receptions":             "receptions",
+    "player_tackles_assists":        "tackles_assists",  # def CSV: def_tackles
+    "player_sacks":                  "def_sacks",        # def CSV
+    "player_defensive_interceptions":"def_ints",         # def CSV: def_interceptions
+    "player_kicking_points":         "kicking_points",   # kicking CSV: computed
+    "player_field_goals":            "fg_made",          # kicking CSV
 }
 
 # Full team name ↔ abbreviation
@@ -149,44 +174,108 @@ async def _build_ha_lookup():
         print(f"[H/A] Built lookup: {len(_HA_LOOKUP)} entries")
 
 # Direct nfl-verse CSV URLs (no package needed)
-_NFL_CSV_URL = "https://github.com/nflverse/nflverse-data/releases/download/player_stats/player_stats_{year}.csv"
-_KEEP_COLS   = ["player_display_name","recent_team","opponent_team",
+_NFL_CSV_URL  = "https://github.com/nflverse/nflverse-data/releases/download/player_stats/player_stats_{year}.csv"
+_NFL_DEF_URL  = "https://github.com/nflverse/nflverse-data/releases/download/player_stats/player_stats_def_{year}.csv"
+_NFL_KICK_URL = "https://github.com/nflverse/nflverse-data/releases/download/player_stats/player_stats_kicking_{year}.csv"
+_KEEP_COLS   = ["player_display_name","player_id","headshot_url","recent_team","opponent_team",
                 "season","week","season_type","rushing_yards","receiving_yards","passing_yards",
-                "receptions","targets","passing_tds","rushing_tds","receiving_tds"]
+                "receptions","targets","passing_tds","rushing_tds","receiving_tds",
+                "completions","attempts","interceptions","carries"]
+
+def _dl_csv(url):
+    """Download one nfl-verse CSV (regular season only) as a DataFrame."""
+    import pandas as pd, io, urllib.request
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=45) as r:
+        d = pd.read_csv(io.BytesIO(r.read()), low_memory=False)
+    if "season_type" in d.columns:
+        d = d[d["season_type"] == "REG"]
+    return d
 
 def _load_nfl_stats_sync():
-    """Download CSV files from nfl-verse GitHub — no package needed, just pandas."""
+    """Download offense + defense + kicking CSVs from nfl-verse GitHub and merge
+    into one frame on the shared schema (player, season, week, recent_team,
+    opponent_team). The def/kicking files lack opponent_team, so it is derived
+    from the offense schedule. No package needed beyond pandas."""
     global _nfl_df
     if _nfl_df is not None:
         return _nfl_df
     print("[NFL Data] Downloading from nfl-verse GitHub...")
     try:
-        import pandas as pd, io, urllib.request
+        import pandas as pd
+        # ---- offense (skill-position) ----
         frames = []
         for year in NFL_SEASONS:
-            url = _NFL_CSV_URL.format(year=year)
             try:
-                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-                with urllib.request.urlopen(req, timeout=45) as r:
-                    df_yr = pd.read_csv(io.BytesIO(r.read()), low_memory=False)
-                    # Regular season only
-                    if "season_type" in df_yr.columns:
-                        df_yr = df_yr[df_yr["season_type"]=="REG"]
-                    keep = [c for c in _KEEP_COLS if c in df_yr.columns]
-                    frames.append(df_yr[keep])
-                    print(f"[NFL Data] {year}: {len(df_yr)} rows")
+                df_yr = _dl_csv(_NFL_CSV_URL.format(year=year))
+                keep  = [c for c in _KEEP_COLS if c in df_yr.columns]
+                frames.append(df_yr[keep])
+                print(f"[NFL Data] off {year}: {len(df_yr)} rows")
             except Exception as e:
-                print(f"[NFL Data] {year} failed: {e}")
+                print(f"[NFL Data] off {year} failed: {e}")
         if not frames:
             return None
-        import pandas as pd
-        df = pd.concat(frames, ignore_index=True)
-        # Compute anytime TD
-        td_cols = [c for c in ["rushing_tds","receiving_tds","passing_tds"] if c in df.columns]
+        off = pd.concat(frames, ignore_index=True)
+        # Compute anytime TD (offense only)
+        td_cols = [c for c in ["rushing_tds","receiving_tds","passing_tds"] if c in off.columns]
         if td_cols:
-            df["anytime_td"] = df[td_cols].sum(axis=1)
+            off["anytime_td"] = off[td_cols].sum(axis=1)
+
+        # (season, week, team) -> opponent_team map, from offense rows (carry both)
+        opp_map = {}
+        try:
+            sched = off[["season","week","recent_team","opponent_team"]].dropna()
+            sched = sched.drop_duplicates(subset=["season","week","recent_team"])
+            for t in sched.itertuples(index=False):
+                opp_map[(int(t.season), int(t.week), str(t.recent_team))] = str(t.opponent_team)
+        except Exception as e:
+            print(f"[NFL Data] opp map failed: {e}")
+
+        def _load_extra(tag, url_tpl, rename, computed):
+            """Download a def/kicking CSV family, normalize to the offense schema
+            (recent_team + derived opponent_team) and return the merged frame."""
+            parts = []
+            ident = ["player_display_name","player_id","headshot_url","season","week","season_type"]
+            for year in NFL_SEASONS:
+                try:
+                    d = _dl_csv(url_tpl.format(year=year))
+                    if "team" in d.columns:
+                        d = d.rename(columns={"team":"recent_team"})
+                    for src, dst in rename.items():
+                        if src in d.columns and src != dst:
+                            d[dst] = d[src]
+                    for dst, fn in computed.items():
+                        try: d[dst] = fn(d)
+                        except Exception: pass
+                    d["opponent_team"] = [
+                        opp_map.get((int(s), int(w), str(tm)), "")
+                        for s, w, tm in zip(d["season"], d["week"], d["recent_team"])
+                    ]
+                    want = ident + ["recent_team","opponent_team"] + list(rename.values()) + list(computed.keys())
+                    cols = [c for c in dict.fromkeys(want) if c in d.columns]
+                    parts.append(d[cols])
+                    print(f"[NFL Data] {tag} {year}: {len(d)} rows")
+                except Exception as e:
+                    print(f"[NFL Data] {tag} {year} failed: {e}")
+            return pd.concat(parts, ignore_index=True) if parts else None
+
+        # ---- defense ----
+        deff = _load_extra("def", _NFL_DEF_URL,
+            rename={"def_tackles":"tackles_assists", "def_sacks":"def_sacks",
+                    "def_interceptions":"def_ints"},
+            computed={})
+        # ---- kicking (kicking_points = 3*FG + PAT) ----
+        kick = _load_extra("kick", _NFL_KICK_URL,
+            rename={"fg_made":"fg_made"},
+            computed={"kicking_points": lambda d: d.get("fg_made", 0).fillna(0)*3
+                                                 + d.get("pat_made", 0).fillna(0)})
+
+        all_frames = [off] + [f for f in (deff, kick) if f is not None]
+        df = pd.concat(all_frames, ignore_index=True)
         _nfl_df = df
-        print(f"[NFL Data] Total: {len(_nfl_df):,} rows")
+        print(f"[NFL Data] Total: {len(_nfl_df):,} rows (off {len(off):,}"
+              + (f", def {len(deff):,}" if deff is not None else "")
+              + (f", kick {len(kick):,}" if kick is not None else "") + ")")
         # H/A will be added after ESPN lookup is built
     except Exception as e:
         print(f"[NFL Data] Error: {e}")
@@ -314,12 +403,36 @@ def _ha_side(row, is_home):
         return True
     return val == ("HOME" if is_home else "AWAY")
 
+def _book_tag_nfl(pick, score, gap, under_rate):
+    """SUGGESTED when the OVER side has a strong recent hit rate + edge over the
+    line; FADE when the UNDER side is strong + the line sits above the average."""
+    if pick == "OVER" and score is not None and score >= 65 and (gap or 0) > 0:
+        return "SUGGESTED"
+    if pick == "UNDER" and under_rate is not None and under_rate >= 65 and (gap or 0) < 0:
+        return "FADE"
+    return ""
+
+
+def _first_str(series):
+    """Return the first non-empty string value in a pandas series, else ''."""
+    try:
+        for v in series.tolist():
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+    except Exception:
+        pass
+    return ""
+
+
 def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str) -> Optional[Dict]:
-    """NHL-style: career vs opp + last 10 H/A + hit rates vs line."""
+    """Emit the shared NORMALIZED pick-field contract (same keys as the NHL app)
+    so the card grid, ladder modal, special boxes and parlay are market-agnostic.
+    Stats: career vs opponent (H/A filtered) + last-10 H/A + hits-vs-book-line L10."""
     name     = pl["name"]
     line     = pl["line"]
     label    = pl["label"]
     stat_col = pl.get("stat_col", "")
+    market   = pl.get("market", "")
 
     if not stat_col or stat_col not in df.columns:
         return None
@@ -335,16 +448,24 @@ def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str) -> Optional[Dict
 
     recent_team = pdf["recent_team"].mode().iloc[0] if not pdf.empty else ""
     if recent_team == home_abbr:
-        opp_abbr = away_abbr; is_home = True;  side = "HOME"
+        opp_abbr = away_abbr; is_home = True;  home_road = "H"; side = "HOME"
     elif recent_team == away_abbr:
-        opp_abbr = home_abbr; is_home = False; side = "AWAY"
+        opp_abbr = home_abbr; is_home = False; home_road = "R"; side = "AWAY"
     else:
-        opp_abbr = home_abbr; is_home = None;  side = "--"
+        opp_abbr = home_abbr; is_home = None;  home_road = "";  side = "--"
 
     if recent_team and recent_team == opp_abbr:
         return None
 
-    # Career vs opponent (H/A filtered)
+    pdf_sorted = pdf.sort_values(["season", "week"], ascending=False) if not pdf.empty else pdf
+
+    # Headshot URL + player id (most recent non-empty row)
+    head = _first_str(pdf_sorted["headshot_url"]) if "headshot_url" in pdf_sorted.columns else ""
+    pid  = _first_str(pdf_sorted["player_id"])    if "player_id"    in pdf_sorted.columns else ""
+    if not pid:
+        pid = _norm(name)
+
+    # Career vs opponent (H/A filtered, fallback to all-vs-opp)
     vs_opp_all = pdf[pdf["opponent_team"] == opp_abbr] if opp_abbr else pdf
     if is_home is not None and _HA_LOADED and not vs_opp_all.empty:
         vs_ha = vs_opp_all[vs_opp_all.apply(lambda r: _ha_side(r, is_home), axis=1)]
@@ -352,10 +473,11 @@ def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str) -> Optional[Dict
     else:
         vs_opp = vs_opp_all
 
-    vs_vals  = vs_opp[stat_col].dropna().tolist() if not vs_opp.empty else []
-    vs_avg   = round(sum(vs_vals)/len(vs_vals), 1) if vs_vals else None
-    vs_hits  = sum(1 for v in vs_vals if v > line)
-    vs_rate  = round(vs_hits/len(vs_vals)*100, 1) if len(vs_vals) >= 2 else None
+    vs_vals = vs_opp[stat_col].dropna().tolist() if not vs_opp.empty else []
+    avg_a   = round(sum(vs_vals)/len(vs_vals), 1) if vs_vals else None
+    hits_a  = sum(1 for v in vs_vals if v > line)
+    tot_a   = len(vs_vals)
+    rate_a  = round(hits_a/tot_a*100, 1) if tot_a >= 2 else None
 
     # Last 10 H/A games (any opponent)
     if is_home is not None and _HA_LOADED:
@@ -364,28 +486,70 @@ def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str) -> Optional[Dict
         l10_pool = pdf
     l10 = l10_pool.sort_values(["season","week"], ascending=False).head(10) if not l10_pool.empty else l10_pool
     l10_vals = l10[stat_col].dropna().tolist() if not l10.empty else []
-    l10_avg  = round(sum(l10_vals)/len(l10_vals), 1) if l10_vals else None
-    l10_hits = sum(1 for v in l10_vals if v > line)
-    l10_rate = round(l10_hits/len(l10_vals)*100, 1) if len(l10_vals) >= 3 else None
+    avg_b    = round(sum(l10_vals)/len(l10_vals), 1) if l10_vals else None
+    hits_b   = sum(1 for v in l10_vals if v > line)
+    tot_b    = len(l10_vals)
+    rate_b   = round(hits_b/tot_b*100, 1) if tot_b >= 3 else None
+    under_hits = sum(1 for v in l10_vals if v < line)
+    under_rate = round(under_hits/tot_b*100, 1) if tot_b >= 3 else None
 
-    rates = [r for r in [vs_rate, l10_rate] if r is not None]
+    # Hits vs the book line over last 10 games (any location)
+    last10_any = pdf_sorted.head(10)
+    la_vals    = last10_any[stat_col].dropna().tolist() if not last10_any.empty else []
+    vsl_hits   = sum(1 for v in la_vals if v > line)
+    vsl_tot    = len(la_vals)
+    vsl_rate   = round(vsl_hits/vsl_tot*100, 1) if vsl_tot >= 1 else None
+
+    rates = [r for r in [rate_a, rate_b] if r is not None]
     score = round(sum(rates)/len(rates), 1) if rates else 0
 
-    ref_avg = l10_avg if l10_avg is not None else vs_avg
+    ref_avg = avg_b if avg_b is not None else avg_a
     gap     = round(ref_avg - line, 1) if ref_avg is not None else None
     pick    = "OVER" if (ref_avg and ref_avg > line) else ("UNDER" if (ref_avg and ref_avg < line) else None)
+    tag     = _book_tag_nfl(pick, score, gap, under_rate)
+
+    # Recent game log (newest first) for the ladder modal
+    glog = []
+    for _, r in last10_any.iterrows():
+        try:
+            v = r[stat_col]
+            if v is None or (isinstance(v, float) and v != v):
+                continue
+            glog.append({"d": f"{int(r['season'])} W{int(r['week'])}", "v": round(float(v), 1)})
+        except Exception:
+            continue
 
     return {
-        "name": name, "label": label, "line": line,
-        "side": side, "opp": opp_abbr or "--", "game": pl.get("game",""),
-        "team": recent_team,
-        "vs_opp_avg": vs_avg, "vs_opp_games": len(vs_vals),
-        "vs_opp_hits": vs_hits, "vs_opp_rate": vs_rate,
-        "l10_avg": l10_avg, "l10_games": len(l10_vals),
-        "l10_hits": l10_hits, "l10_rate": l10_rate,
-        "score": score, "pick": pick, "gap": gap,
+        # identity
+        "name": name, "pid": pid, "team": recent_team, "opponent": opp_abbr or "--",
+        "homeRoad": home_road, "side": side, "head": head, "game": pl.get("game",""),
+        # market
+        "mkt": label, "label": label, "market": market,
+        "line": line, "dispLine": line, "realLine": line,
+        "realOdds": pl.get("over_odds"), "realUnderOdds": pl.get("under_odds"),
         "over_odds": pl.get("over_odds"), "under_odds": pl.get("under_odds"),
-        "avg": vs_avg or l10_avg, "games": len(vs_vals),
+        # averages
+        "avg": avg_b if avg_b is not None else (avg_a if avg_a is not None else 0),
+        "avgA": avg_a if avg_a is not None else 0,
+        # career vs opp
+        "rateA": rate_a or 0, "hitsA": hits_a, "totA": tot_a,
+        # L10 H/A
+        "rateB": rate_b or 0, "hitsB": hits_b, "totB": tot_b,
+        # hits vs book line L10
+        "vsLineHits": vsl_hits, "vsLineTotal": vsl_tot, "vsLineRate": vsl_rate or 0,
+        # under track
+        "underHits": under_hits, "underTotal": tot_b, "underRate": under_rate or 0, "underLine": line,
+        # score / pick
+        "score": score, "dispScore": score, "gap": gap, "pick": pick, "tag": tag,
+        "glog": glog,
+        # ── legacy keys (kept for backward compatibility with cached payloads /
+        #    any downstream consumer that predates the normalized contract) ──
+        "opp": opp_abbr or "--",
+        "vs_opp_avg": avg_a, "vs_opp_games": tot_a,
+        "vs_opp_hits": hits_a, "vs_opp_rate": rate_a,
+        "l10_avg": avg_b, "l10_games": tot_b,
+        "l10_hits": hits_b, "l10_rate": rate_b,
+        "games": tot_a,
         "history": ", ".join(str(int(v)) for v in vs_vals[:8]) or "--",
     }
 
@@ -445,7 +609,11 @@ async def run_pipeline(date_str: str) -> Dict:
 
     picks   = sorted([r for r in all_results if r.get("pick")],
                      key=lambda x: abs(x.get("gap") or 0), reverse=True)
-    result  = {"picks":picks,"all":all_results,"date":date_str,"games":len(espn_games)}
+    games_out = [{"home_team":g.get("home_team",""), "away_team":g.get("away_team",""),
+                  "home_abbr":g.get("home_abbr",""), "away_abbr":g.get("away_abbr",""),
+                  "game":g.get("game","")} for g in espn_games]
+    result  = {"picks":picks, "all":all_results, "date":date_str,
+               "games":games_out, "qualified":len(picks)}
     _cache_set(date_str, result)
     try:
         from replit_push import push_picks_to_replit
@@ -593,7 +761,6 @@ HTML = """<!DOCTYPE html>
 <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@400;700;900&family=Source+Sans+Pro:wght@300;400;600;700&display=swap" rel="stylesheet">
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-/* responsive: phones & tablets (mobile fit) */
 html,body{max-width:100%;overflow-x:hidden}
 img{max-width:100%;height:auto}
 @media (max-width:1200px){table{display:block;width:100%;overflow-x:auto;-webkit-overflow-scrolling:touch;white-space:nowrap}}
@@ -602,7 +769,7 @@ body{background:#0f0f0f;color:#fff;font-family:'Source Sans Pro',sans-serif;min-
 nav{position:fixed;top:0;width:100%;background:rgba(10,10,10,.95);backdrop-filter:blur(12px);border-bottom:1px solid #1c1c1c;z-index:100;padding:0 32px;height:80px;display:flex;align-items:center}
 .logo{font-family:'Playfair Display',serif;font-size:36px;font-weight:900;color:#f59e0b;letter-spacing:.02em;line-height:1}
 .logo span{color:#fff}
-main{max-width:900px;margin:0 auto;padding:100px 20px 60px}
+main{max-width:980px;margin:0 auto;padding:100px 20px 60px}
 .hero{text-align:center;margin-bottom:32px}
 .hero h1{font-family:'Playfair Display',serif;font-size:clamp(2rem,5vw,3rem);font-weight:900;margin-bottom:8px}
 .hero h1 span{color:#f59e0b}
@@ -621,22 +788,116 @@ input[type=date]::-webkit-calendar-picker-indicator{filter:invert(1);opacity:.7;
 .status-msg{margin-top:14px;color:#6b7280;font-size:13px;min-height:20px}
 .spinner{display:inline-block;width:13px;height:13px;border:2px solid rgba(245,158,11,.3);border-top-color:#f59e0b;border-radius:50%;animation:spin .7s linear infinite;margin-right:6px;vertical-align:middle}
 @keyframes spin{to{transform:rotate(360deg)}}
-.section-hdr{display:flex;align-items:center;gap:10px;font-size:.78rem;font-weight:700;color:#f59e0b;text-transform:uppercase;letter-spacing:.15em;margin-bottom:14px}
-.section-hdr::after{content:'';flex:1;height:1px;background:rgba(245,158,11,.15)}
-.tbl-wrap{overflow-x:auto;border-radius:14px;border:1px solid #262626}
-table{width:100%;border-collapse:collapse;font-size:.82rem;background:#161616}
-thead tr{border-bottom:1px solid rgba(245,158,11,.2)}
-th{padding:11px 12px;text-align:left;color:#f59e0b;font-size:.7rem;font-weight:700;text-transform:uppercase;letter-spacing:.1em;background:#1a1a1a;white-space:nowrap}
-td{padding:9px 12px;border-bottom:1px solid #1c1c1c;white-space:nowrap}
-tr:nth-child(even) td{background:#141414}
-tr:last-child td{border-bottom:none}
-.err-card{background:#161616;border:1px solid #262626;border-radius:14px;padding:40px;text-align:center;color:#6b7280}
 footer{text-align:center;padding:32px 24px;color:#4b5563;font-size:.78rem;border-top:1px solid #1c1c1c;margin-top:24px;font-family:'Source Sans Pro',sans-serif}
 .ft-logo{font-family:'Playfair Display',serif;color:#f59e0b;font-weight:700;font-size:.95rem;margin-bottom:6px}
 .admin-only{display:none !important}
 body.is-admin .admin-only{display:inline-block !important}
 #parlayCard{display:none}
 body.is-admin #parlayCard{display:block}
+/* chips + sections + games */
+.chips{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:12px;margin-bottom:28px}
+.chip{background:#161616;border:1px solid #262626;border-top:3px solid #f59e0b;border-radius:14px;padding:16px 10px;text-align:center}
+.chip .val{font-size:1.8rem;font-weight:900;color:#f59e0b;font-family:'Playfair Display',serif}
+.chip .lbl{font-size:.65rem;color:#6b7280;text-transform:uppercase;letter-spacing:.1em;margin-top:4px;font-weight:600}
+.sec{display:flex;align-items:center;gap:10px;font-size:.78rem;font-weight:700;color:#f59e0b;text-transform:uppercase;letter-spacing:.15em;margin:28px 0 12px}
+.sec::after{content:'';flex:1;height:1px;background:rgba(245,158,11,.15)}
+.games{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:10px;margin-bottom:24px}
+.gcard{background:#161616;border:1px solid #262626;border-radius:14px;padding:14px;text-align:center;transition:border-color .2s}
+.gcard:hover{border-color:#f59e0b}
+.gcard .mu{font-size:1rem;font-weight:700;color:#fff}
+.gcard .gt{font-size:.75rem;color:#6b7280;margin-top:5px}
+/* shared text helpers */
+.home{background:rgba(74,222,128,.08);color:#4ade80;padding:3px 8px;border-radius:4px;font-size:.74rem;font-weight:700;border:1px solid rgba(74,222,128,.2)}
+.away{background:rgba(239,68,68,.08);color:#f87171;padding:3px 8px;border-radius:4px;font-size:.74rem;font-weight:700;border:1px solid rgba(239,68,68,.2)}
+.gold{color:#f59e0b;font-weight:700}
+.green{color:#4ade80;font-weight:700}
+.red-txt{color:#f87171;font-weight:700}
+.gray{color:#6b7280;font-size:.8rem}
+.est{background:rgba(245,158,11,.08);color:#f59e0b;border:1px solid rgba(245,158,11,.2);padding:2px 8px;border-radius:4px;font-size:.78rem;font-weight:700}
+.real-line{color:#4ade80;font-weight:800}
+.odds-txt{color:#6b7280;font-size:.78rem}
+.pname{font-weight:700;color:#fff}
+.tbadge{background:#1f2937;color:#cbd5e1;padding:2px 7px;border-radius:5px;font-size:.72rem;font-weight:700}
+.score{color:#f59e0b;font-weight:800}
+.rk-num{color:#f59e0b;font-weight:900}
+.rk-rest{color:#6b7280;font-weight:700}
+.tag-sug{background:#065f46;color:#d1fae5;padding:2px 6px;border-radius:4px;font-size:.72rem;font-weight:700}
+.tag-fade{background:#7f1d1d;color:#fecaca;padding:2px 6px;border-radius:4px;font-size:.72rem;font-weight:700}
+.gap-pos{color:#10b981;font-weight:600}.gap-neg{color:#ef4444;font-weight:600}.gap-zero{color:#6b7280}
+.err-box{background:rgba(239,68,68,.08);border:1px solid rgba(239,68,68,.2);border-radius:12px;padding:20px;text-align:center;color:#f87171;font-weight:700}
+.no-picks{text-align:center;padding:50px;color:#4b5563}
+.tbl-wrap{overflow-x:auto;border-radius:14px;border:1px solid #262626;margin-bottom:8px}
+table{width:100%;border-collapse:collapse;font-size:.82rem;background:#161616}
+thead tr{border-bottom:1px solid rgba(245,158,11,.2)}
+th{padding:11px 12px;text-align:left;color:#f59e0b;font-size:.7rem;font-weight:700;text-transform:uppercase;letter-spacing:.1em;background:#1a1a1a;white-space:nowrap}
+td{padding:9px 12px;border-bottom:1px solid #1c1c1c;white-space:nowrap}
+tr:last-child td{border-bottom:none}
+/* NBA-style trading cards */
+.picks-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:16px;margin-bottom:10px}
+.pick-card{position:relative;background:linear-gradient(160deg,#1a1a1a,#121212);border:1px solid #2a2a2a;border-radius:18px;padding:18px 16px 14px;overflow:hidden;transition:border-color .2s,transform .2s}
+.pick-card:hover{border-color:#f59e0b;transform:translateY(-2px)}
+.pick-card.acc-rush{border-top:3px solid #34d399}
+.pick-card.acc-rec{border-top:3px solid #60a5fa}
+.pick-card.acc-pass{border-top:3px solid #f59e0b}
+.pick-card.acc-recpt{border-top:3px solid #a78bfa}
+.pick-card.acc-td{border-top:3px solid #f87171}
+.pick-card.acc-ptd{border-top:3px solid #38bdf8}
+.pick-card.acc-def{border-top:3px solid #fb7185}
+.pick-card.acc-kick{border-top:3px solid #2dd4bf}
+.pc-rank{position:absolute;top:10px;right:14px;font-family:'Playfair Display',serif;font-weight:900;font-size:1.6rem;color:rgba(245,158,11,.35)}
+.pc-top{display:flex;align-items:center;gap:12px;margin-bottom:10px}
+.hs-wrap{position:relative;width:58px;height:58px;border-radius:50%;flex:0 0 auto;background:#222;border:2px solid #333;overflow:visible;display:flex;align-items:center;justify-content:center}
+.hs-img{width:100%;height:100%;object-fit:cover;position:absolute;inset:0;z-index:2;border-radius:50%}
+.hs-ini{font-family:'Playfair Display',serif;font-weight:800;font-size:1.2rem;color:#9ca3af;z-index:1}
+.pc-logo{width:22px;height:22px;position:absolute;bottom:-3px;right:-3px;z-index:3;background:#0f0f0f;border-radius:50%;padding:1px}
+.pc-id{flex:1;min-width:0}
+.pc-name{font-weight:800;color:#fff;font-size:1.02rem;line-height:1.15;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.pc-meta{font-size:.74rem;color:#9ca3af;margin-top:4px;display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.pc-mkt{display:inline-block;font-size:.6rem;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:#6b7280;margin-top:4px}
+.pc-tagrow{min-height:1px;margin-bottom:8px}
+.pc-line-row{display:flex;align-items:center;justify-content:space-between;background:#0e0e0e;border:1px solid #242424;border-radius:10px;padding:8px 12px;margin-bottom:10px}
+.pc-line-row .ln{font-weight:900;color:#4ade80;font-size:1.05rem}
+.pc-line-row .od{color:#6b7280;font-size:.76rem}
+.pc-line-row .est{background:rgba(245,158,11,.08);color:#f59e0b;border:1px solid rgba(245,158,11,.2);padding:2px 8px;border-radius:5px;font-size:.82rem;font-weight:700}
+.pc-stats{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px}
+.pc-stat{background:#141414;border:1px solid #222;border-radius:9px;padding:8px;text-align:center}
+.pc-stat .k{font-size:.56rem;color:#6b7280;text-transform:uppercase;letter-spacing:.04em;font-weight:700}
+.pc-stat .v{font-weight:800;font-size:.92rem;margin-top:3px}
+.pc-foot{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.pc-score{font-family:'Playfair Display',serif;font-weight:900;color:#f59e0b;font-size:1.15rem}
+.pc-tap{background:none;border:1px solid #333;color:#9ca3af;border-radius:8px;padding:6px 10px;font-size:.7rem;font-weight:700;cursor:pointer;transition:all .2s}
+.pc-tap:hover{border-color:#f59e0b;color:#f59e0b}
+.uplays{background:#141414;border:1px solid #242424;border-radius:14px;padding:4px 4px;margin-bottom:10px}
+.uprow{display:flex;align-items:center;justify-content:space-between;padding:9px 12px;border-bottom:1px solid #1c1c1c;cursor:pointer}
+.uprow:last-child{border-bottom:none}
+.uprow:hover{background:#1a1a1a}
+.uprow .nm{font-weight:700;color:#fff;font-size:.82rem}
+.uprow .mt{color:#6b7280;font-size:.72rem;margin-top:2px}
+.special-wrap{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:10px}
+@media(max-width:680px){.special-wrap{grid-template-columns:1fr}}
+.sp-col{background:#141414;border:1px solid #242424;border-radius:14px;padding:14px}
+.sp-col h4{font-size:.72rem;font-weight:800;color:#f59e0b;text-transform:uppercase;letter-spacing:.1em;margin-bottom:8px}
+.sp-row{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 6px;border-bottom:1px solid #1c1c1c;cursor:pointer}
+.sp-row:last-child{border-bottom:none}
+.sp-row:hover{background:#1a1a1a}
+.sp-row .nm{font-weight:700;color:#fff;font-size:.82rem}
+.sp-row .mt{color:#6b7280;font-size:.72rem;margin-top:2px}
+.lad-ov{position:fixed;inset:0;background:rgba(0,0,0,.72);z-index:200;display:flex;align-items:center;justify-content:center;padding:18px}
+.lad-modal{background:#161616;border:1px solid #2a2a2a;border-radius:18px;max-width:460px;width:100%;max-height:86vh;overflow-y:auto;padding:22px}
+.lad-modal h3{font-family:'Playfair Display',serif;color:#fff;font-size:1.25rem;margin-bottom:2px}
+.lad-sub{color:#9ca3af;font-size:.8rem;margin-bottom:14px}
+.lad-close{float:right;background:none;border:1px solid #333;color:#9ca3af;border-radius:8px;padding:4px 10px;cursor:pointer;font-weight:700}
+.lad-glog{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0 14px}
+.glchip{background:#0e0e0e;border:1px solid #242424;border-radius:8px;padding:6px 8px;text-align:center;min-width:44px}
+.glchip .d{font-size:.56rem;color:#6b7280}
+.glchip .v{font-weight:800;font-size:.95rem;margin-top:2px;color:#e5e7eb}
+.glchip.hit{border-color:rgba(74,222,128,.35)}
+.glchip.hit .v{color:#4ade80}
+.glchip.miss .v{color:#f87171}
+.lad-stat{display:flex;justify-content:space-between;align-items:center;padding:8px 4px;border-bottom:1px solid #1c1c1c;font-size:.85rem}
+.lad-stat:last-child{border-bottom:none}
+.lad-stat .k{color:#9ca3af}
+.lad-stat .v{font-weight:700}
 </style>
 </head>
 <body>
@@ -697,8 +958,10 @@ function _floorOk(odds){if(odds==null||odds==='')return true;var a=parseFloat(od
 function _legScore(c){return (c.hasOdds?1:0)*1e9+(c.rate||0)*1e4+(c.dec?Math.min(c.dec,11)*100:0);}
 function _nflLeg(p){
   var dir=(p.pick==='O'||p.pick==='OVER')?'OVER':(p.pick==='U'||p.pick==='UNDER')?'UNDER':p.pick;
-  var odds=(dir==='OVER')?p.over_odds:(dir==='UNDER')?p.under_odds:null;var dec=_amToDec(odds);
-  return {player:p.name,team:p.team||'',opp:p.opp||'',market:p.label||'',dir:dir,line:p.line,rate:Math.round(p.score||0),odds:odds,dec:dec,hasOdds:!!dec};
+  var line=(p.realLine!=null?p.realLine:(p.dispLine!=null?p.dispLine:0));
+  var rate=(p.vsLineRate||p.rateB||p.rateA||p.dispScore||0);
+  var odds=(dir==='OVER')?p.realOdds:(dir==='UNDER')?p.realUnderOdds:null;var dec=_amToDec(odds);
+  return {player:p.name,team:p.team||'',opp:p.opponent||'',market:p.mkt||p.label||'',dir:dir,line:line,rate:Math.round(rate||0),odds:odds,dec:dec,hasOdds:!!dec};
 }
 function _parlayPool(){
   var plays=window.__NFL_PLAYS__||[];var byP={};
@@ -754,8 +1017,6 @@ function _renderParlay(randomize){
 }
 
 var jobId=null, pollTimer=null;
-
-function fmtOdds(o){return o==null?'':(o>0?'+':'')+o;}
 
 async function runPicks(){
   var date=document.getElementById('datePicker').value;
@@ -824,155 +1085,293 @@ async function getPicks(){
   }
 }
 
-function rateClass(r){
-  if(r==null) return '#4b5563';
-  return r>=75?'#4ade80':r>=55?'#f59e0b':'#f87171';
+// ===== NBA-style cards (NFL) =====
+window.__NFLLAD__ = window.__NFLLAD__ || {};
+var _MORDER=['Pass Yds','Pass TDs','Completions','Pass Att','INT Thrown','Rush Yds','Rush Att','Rec Yds','Receptions','Anytime TD','Tackles+Ast','Sacks','Def INT','Kick Pts','FG Made'];
+var _MLBL={'Pass Yds':'Pass','Pass TDs':'Pass TD','Completions':'Comp','Pass Att':'Att','INT Thrown':'INT','Rush Yds':'Rush','Rush Att':'Carries','Rec Yds':'Rec','Receptions':'Recept','Anytime TD':'TD','Tackles+Ast':'Tkl','Sacks':'Sacks','Def INT':'D INT','Kick Pts':'K Pts','FG Made':'FG'};
+
+function rateClass(r){ return r >= 70 ? 'green' : r >= 55 ? 'gold' : 'red-txt'; }
+function _initials(name){
+  var parts=String(name||'').trim().split(/\s+/);
+  if(!parts.length||!parts[0]) return '?';
+  if(parts.length===1) return parts[0].slice(0,2).toUpperCase();
+  return (parts[0][0]+parts[parts.length-1][0]).toUpperCase();
+}
+function _accFor(mkt){
+  if(mkt==='Rush Yds'||mkt==='Rush Att') return 'acc-rush';
+  if(mkt==='Rec Yds') return 'acc-rec';
+  if(mkt==='Pass Yds'||mkt==='Completions'||mkt==='Pass Att'||mkt==='INT Thrown') return 'acc-pass';
+  if(mkt==='Receptions') return 'acc-recpt';
+  if(mkt==='Anytime TD') return 'acc-td';
+  if(mkt==='Pass TDs') return 'acc-ptd';
+  if(mkt==='Tackles+Ast'||mkt==='Sacks'||mkt==='Def INT') return 'acc-def';
+  if(mkt==='Kick Pts'||mkt==='FG Made') return 'acc-kick';
+  return 'acc-pass';
+}
+function _mIcon(mkt){
+  if(mkt==='Rush Yds') return '🏈';
+  if(mkt==='Rush Att') return '🏃';
+  if(mkt==='Rec Yds') return '🙌';
+  if(mkt==='Pass Yds') return '🎯';
+  if(mkt==='Completions') return '✅';
+  if(mkt==='Pass Att') return '📨';
+  if(mkt==='INT Thrown') return '🛑';
+  if(mkt==='Receptions') return '🧤';
+  if(mkt==='Anytime TD') return '🏆';
+  if(mkt==='Pass TDs') return '💣';
+  if(mkt==='Tackles+Ast') return '🛡️';
+  if(mkt==='Sacks') return '💥';
+  if(mkt==='Def INT') return '🧲';
+  if(mkt==='Kick Pts') return '🦵';
+  if(mkt==='FG Made') return '🥅';
+  return '🏈';
+}
+function _logoAbbr(t){
+  var m={'LA':'lar','LAR':'lar','LAC':'lac','WAS':'wsh','WSH':'wsh','JAC':'jax','JAX':'jax','OAK':'lv','LV':'lv','SD':'lac','STL':'lar'};
+  var k=String(t||'').toUpperCase();
+  return (m[k]||k.toLowerCase());
+}
+function _ladKey(p){ return 'flad_'+p.pid+'_'+String(p.mkt||'').replace(/[^a-z]/gi,''); }
+function _rateHtml(rate,hits,tot){
+  if(!tot) return '<span class="gray">—</span>';
+  return '<span class="'+rateClass(rate)+'">'+hits+'/'+tot+' ('+rate+'%)</span>';
+}
+function fmtTag(t){
+  if(t==='SUGGESTED') return '<span class="tag-sug">⭐ PICK</span>';
+  if(t==='FADE')      return '<span class="tag-fade">⚠ FADE</span>';
+  return '';
+}
+function fmtGap(g){
+  if(g===null||g===undefined) return '<span class="gap-zero">—</span>';
+  var cls = g>0?'gap-pos':(g<0?'gap-neg':'gap-zero');
+  var sign = g>0?'+':'';
+  return '<span class="'+cls+'">'+sign+g+'</span>';
+}
+function fmtVsLine(p){
+  if(p.realLine==null||!p.vsLineTotal) return '<span class="gray">—</span>';
+  return '<span class="'+rateClass(p.vsLineRate)+'">'+p.vsLineHits+'/'+p.vsLineTotal+' ('+p.vsLineRate+'%)</span>';
+}
+function nflCard(p,i){
+  var key=_ladKey(p); window.__NFLLAD__[key]=p;
+  var ha=p.homeRoad==='H';
+  var hasHA=(p.homeRoad==='H'||p.homeRoad==='R');
+  var head=p.head||'';
+  var logo='https://a.espncdn.com/i/teamlogos/nfl/500/'+_logoAbbr(p.team)+'.png';
+  var lineHtml=(p.realLine!=null)
+    ? `<span class="ln">${p.dispLine}</span> <span class="od">${p.realOdds||''}</span>`
+    : `<span class="est">~${p.dispLine}</span>`;
+  var lastStat=(p.realLine!=null&&p.vsLineTotal)
+    ? `<div class="pc-stat"><div class="k">vs Book L10</div><div class="v ${rateClass(p.vsLineRate)}">${p.vsLineHits}/${p.vsLineTotal} (${p.vsLineRate}%)</div></div>`
+    : `<div class="pc-stat"><div class="k">Under L10</div><div class="v ${rateClass(p.underRate)}">${p.underHits}/${p.underTotal} (${p.underRate}%)</div></div>`;
+  var haBadge=hasHA?`<span class="${ha?'home':'away'}">${ha?'HOME':'AWAY'}</span>`:'';
+  return `
+   <div class="pick-card ${_accFor(p.mkt)}">
+     <div class="pc-rank">${i}</div>
+     <div class="pc-top">
+       <div class="hs-wrap"><span class="hs-ini">${_initials(p.name)}</span>
+         <img class="hs-img" src="${head}" onerror="this.style.display='none'"/>
+         <img class="pc-logo" src="${logo}" onerror="this.style.display='none'"/>
+       </div>
+       <div class="pc-id">
+         <div class="pc-name">${p.name}</div>
+         <div class="pc-meta">${p.team} vs ${p.opponent} ${haBadge}</div>
+         <div class="pc-mkt">${p.mkt||''} · ${p.pick||''}</div>
+       </div>
+     </div>
+     <div class="pc-tagrow">${fmtTag(p.tag)}</div>
+     <div class="pc-line-row"><span>${lineHtml}</span><span class="od">Line</span></div>
+     <div class="pc-stats">
+       <div class="pc-stat"><div class="k">Career vs ${p.opponent}</div><div class="v">${_rateHtml(p.rateA,p.hitsA,p.totA)}</div></div>
+       <div class="pc-stat"><div class="k">L10 ${hasHA?(ha?'Home':'Away'):'H/A'}</div><div class="v">${_rateHtml(p.rateB,p.hitsB,p.totB)}</div></div>
+       <div class="pc-stat"><div class="k">Avg</div><div class="v gold">${p.avg}</div></div>
+       ${lastStat}
+     </div>
+     <div class="pc-foot"><span class="pc-score">${p.dispScore}</span>
+       <button class="pc-tap" onclick="openNflLadder('${key}')">📊 Game Log</button></div>
+   </div>`;
+}
+function nflCardGrid(picks){
+  if(!picks||!picks.length) return '<div class="no-picks">No qualifying picks for this market.</div>';
+  return '<div class="picks-grid">'+picks.map(function(p,i){return nflCard(p,i+1);}).join('')+'</div>';
+}
+function _spRow(p){
+  var key=_ladKey(p); window.__NFLLAD__[key]=p;
+  var best=Math.max(p.rateA||0,p.rateB||0);
+  return `<div class="sp-row" onclick="openNflLadder('${key}')"><div><div class="nm">${p.name}</div><div class="mt">${p.team} vs ${p.opponent} · ${p.dispLine} ${p.pick||''}</div></div><div class="${rateClass(best)}" style="font-weight:800">${best}%</div></div>`;
+}
+function _spCol(title,picks){
+  var rows=(picks||[]).slice(0,8).map(_spRow).join('')||'<div class="mt" style="color:#6b7280;padding:6px">None</div>';
+  return `<div class="sp-col"><h4>${title}</h4>${rows}</div>`;
+}
+function _underBox(picks){
+  var u=(picks||[]).filter(function(p){return p.underTotal>=2 && p.underRate>=60;})
+      .sort(function(a,b){return b.underRate-a.underRate;}).slice(0,10);
+  if(!u.length) return '';
+  var rows=u.map(function(p){
+    var key=_ladKey(p); window.__NFLLAD__[key]=p;
+    return `<div class="uprow" onclick="openNflLadder('${key}')"><div><div class="nm">${p.name}</div><div class="mt">${p.team} vs ${p.opponent} · ${p.mkt} · under ${p.underLine}</div></div><div class="${rateClass(p.underRate)}" style="font-weight:800">${p.underHits}/${p.underTotal} (${p.underRate}%)</div></div>`;
+  }).join('');
+  return '<div class="uplays">'+rows+'</div>';
+}
+function openNflLadder(key){
+  var p=window.__NFLLAD__[key]; if(!p) return;
+  var line=p.dispLine;
+  var chips=(p.glog||[]).map(function(g){
+    var hit=g.v>line; var cls=hit?'hit':'miss';
+    return `<div class="glchip ${cls}"><div class="d">${g.d}</div><div class="v">${g.v}</div></div>`;
+  }).join('');
+  if(!chips) chips='<span class="gray">No game log available.</span>';
+  var vslRow=(p.realLine!=null&&p.vsLineTotal)
+    ? `<div class="lad-stat"><span class="k">Hits vs Book Line (${p.realLine}) L10</span><span class="v ${rateClass(p.vsLineRate)}">${p.vsLineHits}/${p.vsLineTotal} (${p.vsLineRate}%)</span></div>`
+    : '';
+  var hasHA=(p.homeRoad==='H'||p.homeRoad==='R');
+  var html=`
+    <div class="lad-modal" onclick="event.stopPropagation()">
+      <button class="lad-close" onclick="closeNflLadder()">✕</button>
+      <h3>${p.name}</h3>
+      <div class="lad-sub">${p.mkt} · ${p.team} vs ${p.opponent} · Line ${p.dispLine} · ${p.pick||''}</div>
+      <div style="font-size:.7rem;color:#6b7280;text-transform:uppercase;letter-spacing:.08em;font-weight:700;margin-bottom:4px">Recent Games (green = over line)</div>
+      <div class="lad-glog">${chips}</div>
+      <div class="lad-stat"><span class="k">Career vs ${p.opponent}</span><span class="v">${_rateHtml(p.rateA,p.hitsA,p.totA)}</span></div>
+      <div class="lad-stat"><span class="k">L10 ${hasHA?(p.homeRoad==='H'?'Home':'Away'):'H/A'}</span><span class="v">${_rateHtml(p.rateB,p.hitsB,p.totB)}</span></div>
+      ${vslRow}
+      <div class="lad-stat"><span class="k">Under Line L10</span><span class="v ${rateClass(p.underRate)}">${p.underHits}/${p.underTotal} (${p.underRate}%)</span></div>
+      <div class="lad-stat"><span class="k">Average</span><span class="v gold">${p.avg}</span></div>
+      <div class="lad-stat"><span class="k">Score</span><span class="v" style="color:#f59e0b">${p.dispScore}</span></div>
+    </div>`;
+  var ov=document.createElement('div');
+  ov.className='lad-ov'; ov.id='nflLadOv'; ov.onclick=closeNflLadder;
+  ov.innerHTML=html;
+  document.body.appendChild(ov);
+}
+function closeNflLadder(){var o=document.getElementById('nflLadOv');if(o)o.remove();}
+
+function buildNormTable(picks, startNum){
+  var thead = '<thead><tr><th>#</th><th>PLAYER</th><th>TEAM</th><th>OPP</th><th>H/A</th>' +
+    '<th>BOOK</th><th>AVG vs OPP</th><th>AVG L10 H/A</th><th>HITS BOOK L10</th>' +
+    '<th>GAP vs BOOK</th><th>Career vs OPP</th><th>L10 H/A</th><th>SCORE</th><th>PICK</th><th>TAG</th></tr></thead>';
+  var rows = '';
+  picks.forEach(function(p, i){
+    var hasHA=(p.homeRoad==='H'||p.homeRoad==='R');
+    var ha = p.homeRoad === 'H';
+    var num = startNum + i;
+    rows += '<tr>' +
+      '<td>' + (startNum === 1 ? '<span class="rk-num">' + num + '</span>' : '<span class="rk-rest">' + num + '</span>') + '</td>' +
+      '<td><span class="pname">' + p.name + '</span></td>' +
+      '<td><span class="tbadge">' + p.team + '</span></td>' +
+      '<td><span class="tbadge">' + p.opponent + '</span></td>' +
+      '<td>' + (hasHA ? '<span class="' + (ha ? 'home' : 'away') + '">' + (ha ? 'HOME' : 'AWAY') + '</span>' : '<span class="gray">—</span>') + '</td>' +
+      '<td>' + (p.realLine!=null ? '<span class="real-line">' + p.dispLine + '</span> <span class="odds-txt">' + (p.realOdds||'') + '</span>' : '<span class="est">~' + p.dispLine + '</span>') + '</td>' +
+      '<td><span class="gold">' + p.avgA + '</span></td>' +
+      '<td><span class="gold">' + p.avg + '</span></td>' +
+      '<td>' + fmtVsLine(p) + '</td>' +
+      '<td>' + fmtGap(p.gap) + '</td>' +
+      '<td>' + _rateHtml(p.rateA,p.hitsA,p.totA) + '</td>' +
+      '<td>' + _rateHtml(p.rateB,p.hitsB,p.totB) + '</td>' +
+      '<td><span class="score">' + p.dispScore + '</span></td>' +
+      '<td>' + (p.pick||'') + '</td>' +
+      '<td>' + fmtTag(p.tag) + '</td>' +
+      '</tr>';
+  });
+  return '<div class="tbl-wrap"><table>' + thead + '<tbody>' + rows + '</tbody></table></div>';
 }
 
-function fmtHits(hits, total, rate){
-  if(total<2) return '<span style="color:#4b5563">N/A</span>';
-  var clr=rateClass(rate);
-  return '<span style="color:'+clr+';font-weight:700">'+hits+'/'+total+' ('+rate+'%)</span>';
-}
-
-function buildTopRow(p, i){
-  var clr=rateClass(p.score);
-  var sBg=p.side==='HOME'?'rgba(245,158,11,.12)':'rgba(99,102,241,.12)';
-  var sClr=p.side==='HOME'?'#f59e0b':'#818cf8';
-  var rBg=i%2===0?'#161616':'#141414';
-  var pt=p.pick==='OVER'?'O':p.pick==='UNDER'?'U':(p.pick||'--');
-  var pClr=p.pick==='OVER'||p.pick==='O'?'#4ade80':p.pick==='UNDER'||p.pick==='U'?'#f87171':'#4b5563';
-  var l10Avg=p.l10_avg!=null?'<span style="color:#f59e0b;font-weight:700">'+p.l10_avg+'</span>':'<span style="color:#4b5563">--</span>';
-  var vOppAvg=p.vs_opp_avg!=null?'<span style="font-weight:700">'+p.vs_opp_avg+'</span>':'<span style="color:#4b5563">N/A</span>';
-  return '<tr style="background:'+rBg+'">'
-    +'<td style="color:#4b5563;font-size:.85rem">'+(i+1)+'</td>'
-    +'<td style="font-weight:700;color:#fff;white-space:nowrap">'+p.name+'</td>'
-    +'<td style="color:#9ca3af;font-size:.78rem">'+(p.team||'--')+'</td>'
-    +'<td style="color:#9ca3af;font-size:.78rem">'+(p.opp||'--')+'</td>'
-    +'<td><span style="background:'+sBg+';color:'+sClr+';padding:2px 8px;border-radius:4px;font-size:.72rem;font-weight:700">'+(p.side||'--')+'</span></td>'
-    +'<td style="font-family:monospace;font-weight:700">'+p.line+'</td>'
-    +'<td style="font-family:monospace">'+vOppAvg+'</td>'
-    +'<td style="font-family:monospace">'+l10Avg+'</td>'
-    +'<td>'+fmtHits(p.vs_opp_hits,p.vs_opp_games,p.vs_opp_rate)+'</td>'
-    +'<td>'+fmtHits(p.l10_hits,p.l10_games,p.l10_rate)+'</td>'
-    +'<td style="font-weight:900;color:'+clr+';font-size:1.05rem">'+p.score+'</td>'
-    +'<td><span style="color:'+pClr+';font-weight:900">'+pt+'</span></td>'
-    +'</tr>';
-}
-
-function buildRow(p, i){
-  var isO=p.pick==='OVER'||p.pick==='O';
-  var isU=p.pick==='UNDER'||p.pick==='U';
-  var clr=isO?'#4ade80':isU?'#f87171':'#4b5563';
-  var pt=p.pick==='OVER'?'O':p.pick==='UNDER'?'U':(p.pick||'--');
-  var gap=p.gap!=null?(p.gap>0?'+':'')+p.gap:'--';
-  var sBg=p.side==='HOME'?'rgba(245,158,11,.12)':'rgba(99,102,241,.12)';
-  var sClr=p.side==='HOME'?'#f59e0b':'#818cf8';
-  var rBg=i%2===0?'#161616':'#141414';
-  return '<tr style="background:'+rBg+'">'
-    +'<td style="color:#4b5563">'+(i+1)+'</td>'
-    +'<td style="font-weight:700;color:#fff">'+p.name+'</td>'
-    +'<td style="color:#9ca3af;font-size:.78rem">'+(p.team||'--')+'</td>'
-    +'<td style="color:#f59e0b;font-size:.78rem">'+p.label+'</td>'
-    +'<td><span style="background:'+sBg+';color:'+sClr+';padding:2px 8px;border-radius:4px;font-size:.72rem;font-weight:700">'+(p.side||'--')+'</span></td>'
-    +'<td style="color:#9ca3af;font-size:.78rem">'+(p.opp||'--')+'</td>'
-    +'<td style="font-family:monospace;font-weight:700">'+p.line+'</td>'
-    +'<td style="font-family:monospace;color:#f59e0b;font-weight:700">'+(p.vs_opp_avg!=null?p.vs_opp_avg:'--')+'</td>'
-    +'<td style="font-family:monospace;font-weight:700;color:#f59e0b">'+(p.l10_avg!=null?p.l10_avg:'--')+'</td>'
-    +'<td style="font-family:monospace;color:'+clr+';font-weight:700">'+(p.gap!=null?(p.gap>0?'+':'')+p.gap:'--')+'</td>'
-    +'<td><span style="color:'+clr+';font-weight:900">'+pt+'</span></td>'
-    +'</tr>';
-}
-
-function buildTopTable(rows){
-  var h='<div class="card" style="padding:0;overflow:hidden;margin-bottom:16px">';
-  h+='<div style="padding:14px 20px;border-bottom:1px solid #262626;display:flex;align-items:center;justify-content:space-between">';
-  h+='<span style="color:#f59e0b;font-size:.72rem;font-weight:900;letter-spacing:.18em;text-transform:uppercase">Top 10 Money Bombs</span>';
-  h+='<span style="background:rgba(245,158,11,.1);color:#f59e0b;padding:3px 12px;border-radius:999px;font-size:.75rem;font-weight:700">'+rows.length+' picks</span>';
-  h+='</div><div class="tbl-wrap"><table><thead><tr>';
-  var cols=['#','Player','Team','Opp','H/A','Line','Avg vs Opp','L10 H/A Avg','VS OPP HIT%','L10 H/A HIT%','Score','Pick'];
-  cols.forEach(function(c){h+='<th>'+c+'</th>';});
-  h+='</tr></thead><tbody>';
-  if(!rows.length){
-    h+='<tr><td colspan="12" style="text-align:center;padding:28px;color:#4b5563">No qualifying picks (need 3+ H/A games, 55%+ hit rate)</td></tr>';
-  }else{
-    rows.forEach(function(p,i){h+=buildTopRow(p,i);});
+function renderResults(d){
+  var res=document.getElementById('results');
+  if(!d){ res.innerHTML=''; return; }
+  if(d.error){
+    res.innerHTML='<div class="err-box">'+d.error+'<div style="font-size:13px;color:#9ca3af;margin-top:6px;font-weight:400">NFL season runs September through February</div></div>';
+    return;
   }
-  h+='</tbody></table></div>';
-  h+='<p style="padding:6px 16px 10px;font-size:.72rem;color:#4b5563">';
-  h+='<strong style="color:#f59e0b">VS OPP HIT%</strong> = career games vs opponent beating the line &nbsp;|&nbsp;';
-  h+='<strong style="color:#f59e0b">L10 H/A HIT%</strong> = last 10 H/A games (any opp) beating the line &nbsp;|&nbsp;';
-  h+='<strong style="color:#f59e0b">Score</strong> = avg of both hit rates';
-  h+='</p></div>';
-  return h;
+  var all=d.all||[]; window.__NFL_PLAYS__=all;
+  var picks=d.picks||[];
+  var byM={}; _MORDER.forEach(function(m){byM[m]=[];});
+  picks.forEach(function(p){ var m=p.mkt||p.label; if(!byM[m]) byM[m]=[]; byM[m].push(p); });
+  // backend ranks picks by gap; card grids display score-first within each market
+  Object.keys(byM).forEach(function(m){ byM[m].sort(function(a,b){return (b.dispScore||0)-(a.dispScore||0);}); });
+
+  var h='';
+
+  // Chips
+  h+='<div class="chips">';
+  h+='<div class="chip"><div class="val">'+((d.games||[]).length)+'</div><div class="lbl">Games</div></div>';
+  _MORDER.forEach(function(m){ if(byM[m]&&byM[m].length){ h+='<div class="chip"><div class="val">'+byM[m].length+'</div><div class="lbl">'+(_MLBL[m]||m)+'</div></div>'; }});
+  h+='</div>';
+
+  // Games
+  if((d.games||[]).length){
+    h+='<div class="sec">- Games -- '+(d.date||'')+'</div><div class="games">';
+    d.games.forEach(function(g){
+      var mu=(g.away_abbr||g.away_team||'?')+' @ '+(g.home_abbr||g.home_team||'?');
+      h+='<div class="gcard"><div class="mu">'+mu+'</div></div>';
+    });
+    h+='</div>';
+  }
+
+  // Card grids per market
+  var hasCards=false;
+  _MORDER.forEach(function(m){
+    var g=(byM[m]||[]).slice(0,12);
+    if(!g.length) return;
+    hasCards=true;
+    h+='<div class="sec">'+_mIcon(m)+' Top '+g.length+' '+m+'</div>';
+    h+=nflCardGrid(g);
+  });
+  if(!hasCards){
+    h+='<div class="no-picks">No qualifying picks for '+(d.date||'today')+'.</div>';
+  }
+
+  // Under track
+  var ub=_underBox(all);
+  if(ub){ h+='<div class="sec">⬇ UNDER Track</div>'+ub; }
+
+  // Special boxes
+  var present=_MORDER.filter(function(m){return byM[m]&&byM[m].length;});
+  if(present.length){
+    h+='<div class="sec">⭐ Special — Best Plays</div>';
+    for(var i=0;i<present.length;i+=2){
+      h+='<div class="special-wrap">'+_spCol(present[i],byM[present[i]]);
+      if(present[i+1]) h+=_spCol(present[i+1],byM[present[i+1]]);
+      h+='</div>';
+    }
+  }
+
+  // All plays by game (collapsible)
+  if(all.length){
+    h+='<div class="sec" style="margin-top:32px">All Plays by Game</div>';
+    var games={},order=[];
+    all.forEach(function(p){ var g=p.game||'Unknown'; if(!games[g]){games[g]=[];order.push(g);} games[g].push(p); });
+    order.forEach(function(game,gi){
+      var gp=games[game];
+      var gpicks=gp.filter(function(p){return p.pick;}).length;
+      h+='<div style="margin-bottom:10px">';
+      h+='<div onclick="nflToggle('+gi+')" style="background:#161616;border:1px solid #262626;border-radius:12px;padding:12px 18px;cursor:pointer;display:flex;align-items:center;justify-content:space-between">';
+      h+='<span style="font-weight:700;color:#fff;font-size:.92rem">'+game+'</span>';
+      h+='<div style="display:flex;align-items:center;gap:10px">';
+      h+='<span style="background:rgba(245,158,11,.1);color:#f59e0b;padding:3px 12px;border-radius:999px;font-size:.75rem;font-weight:700">'+gp.length+' props | '+gpicks+' picks</span>';
+      h+='<button id="nfltoggle_btn_'+gi+'" onclick="event.stopPropagation();nflToggle('+gi+')" style="background:none;border:1px solid #374151;color:#9ca3af;border-radius:6px;padding:3px 12px;font-size:.72rem;cursor:pointer">Expand</button>';
+      h+='</div></div>';
+      h+='<div id="nfltoggle_'+gi+'" style="display:none;margin-top:6px">';
+      _MORDER.forEach(function(m){
+        var mp=gp.filter(function(p){return (p.mkt||p.label)===m;});
+        if(!mp.length) return;
+        h+='<div style="font-size:.72rem;font-weight:700;color:#f59e0b;text-transform:uppercase;letter-spacing:.1em;padding:8px 12px 4px">'+m+'</div>';
+        h+=buildNormTable(mp,1);
+      });
+      h+='</div></div>';
+    });
+  }
+
+  res.innerHTML=h;
 }
 
-function buildGameTable(rows){
-  var cols=['#','Player','Team','Stat','H/A','Opp','Line','Avg vs Opp','L10 Avg','Gap','Pick'];
-  var h='<table style="width:100%;border-collapse:collapse;background:#161616"><thead><tr style="border-bottom:1px solid rgba(245,158,11,.2)">';
-  cols.forEach(function(c){h+='<th style="padding:10px 12px;text-align:left;color:#f59e0b;font-size:.7rem;font-weight:700;text-transform:uppercase;letter-spacing:.1em;background:#1a1a1a;white-space:nowrap">'+c+'</th>';});
-  h+='</tr></thead><tbody>';
-  rows.forEach(function(p,i){h+=buildRow(p,i);});
-  h+='</tbody></table>';
-  return h;
-}
-
-function toggleGame(n){
-  var el=document.getElementById('game_'+n);
-  var btn=document.getElementById('game_btn_'+n);
+function nflToggle(n){
+  var el=document.getElementById('nfltoggle_'+n);
+  var btn=document.getElementById('nfltoggle_btn_'+n);
   if(!el) return;
   var hidden=el.style.display==='none';
   el.style.display=hidden?'block':'none';
   if(btn) btn.textContent=hidden?'Collapse':'Expand';
-}
-
-function renderResults(data){
-  var el=document.getElementById('results');
-  if(!data){el.innerHTML='';return;}
-  if(data.error){
-    el.innerHTML='<div class="err-card"><h3 style="font-family:Playfair Display,serif;margin-bottom:8px">'+data.error+'</h3><p style="font-size:13px">NFL season runs September through February</p></div>';
-    return;
-  }
-  var all=data.all||[];
-  window.__NFL_PLAYS__=all;
-  if(!all.length){el.innerHTML='<div class="err-card">No prop lines found.</div>';return;}
-
-  // Top 10: l10 >= 3 games, l10_rate >= 55%, sorted by score
-  var qualified=all.filter(function(p){
-    return p.l10_games>=3 && p.l10_rate!=null && p.l10_rate>=55 && p.pick;
-  });
-  qualified.sort(function(a,b){return b.score-a.score;});
-  var top10=qualified.slice(0,10);
-
-  var html=buildTopTable(top10);
-
-  // All plays by game
-  html+='<div style="display:flex;align-items:center;gap:10px;font-size:.78rem;font-weight:700;color:#f59e0b;text-transform:uppercase;letter-spacing:.15em;margin:24px 0 12px">';
-  html+='All Plays by Game<span style="flex:1;height:1px;background:rgba(245,158,11,.15);display:inline-block;margin-left:8px"></span></div>';
-
-  var games={},order=[];
-  all.forEach(function(p){
-    var g=p.game||'Unknown';
-    if(!games[g]){games[g]=[];order.push(g);}
-    games[g].push(p);
-  });
-
-  order.forEach(function(game,gi){
-    var gPlays=games[game];
-    var gPicks=gPlays.filter(function(p){return p.pick;}).length;
-    html+='<div style="margin-bottom:10px">';
-    html+='<div onclick="toggleGame('+gi+')" style="background:#161616;border:1px solid #262626;border-radius:12px;padding:12px 18px;cursor:pointer;display:flex;align-items:center;justify-content:space-between">';
-    html+='<span style="font-weight:700;color:#fff;font-size:.92rem">'+game+'</span>';
-    html+='<div style="display:flex;align-items:center;gap:10px">';
-    html+='<span style="background:rgba(245,158,11,.1);color:#f59e0b;padding:3px 12px;border-radius:999px;font-size:.75rem;font-weight:700">'+gPlays.length+' props | '+gPicks+' picks</span>';
-    html+='<button id="game_btn_'+gi+'" onclick="event.stopPropagation();toggleGame('+gi+')" style="background:none;border:1px solid #374151;color:#9ca3af;border-radius:6px;padding:3px 12px;font-size:.72rem;cursor:pointer">Expand</button>';
-    html+='</div></div>';
-    html+='<div id="game_'+gi+'" style="display:none;margin-top:6px;border-radius:12px;overflow:hidden;border:1px solid #262626">';
-    html+=buildGameTable(gPlays);
-    html+='</div></div>';
-  });
-
-  el.innerHTML=html;
 }
 </script>
 </body>
