@@ -85,6 +85,31 @@ def _cache_set(date_key, result):
             json.dumps(result, ensure_ascii=False), encoding="utf-8")
     except: pass
 
+# Odds-layer cache: stores the raw Odds API prop lines per date so re-runs
+# (forced re-rank, runs after the result cache expires) reuse the odds already
+# pulled instead of hitting the Odds API again. Shorter TTL than the result
+# cache so lines still refresh over the day. Cleared by /api/clear-cache (which
+# globs nfl_*.json), so a true fresh run still re-pulls.
+_ODDS_TTL = 3 * 3600  # 3 hours
+
+def _odds_cache_get(date_key):
+    p = _CACHE_DIR / f"nfl_odds_{date_key}.json"
+    try:
+        if p.exists() and (time.time() - p.stat().st_mtime) < _ODDS_TTL:
+            print(f"[OddsCache] HIT nfl/{date_key}")
+            return json.loads(p.read_text(encoding="utf-8"))
+    except Exception as e:
+        print(f"[OddsCache] read error: {e}")
+    return None
+
+def _odds_cache_set(date_key, data):
+    try:
+        (_CACHE_DIR / f"nfl_odds_{date_key}.json").write_text(
+            json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        print(f"[OddsCache] SET nfl/{date_key}")
+    except Exception as e:
+        print(f"[OddsCache] write error: {e}")
+
 # ── nfl_data_py stats loader ───────────────────────────────────────────────────
 _nfl_df = None
 _nfl_df_lock = asyncio.Lock()
@@ -375,23 +400,31 @@ async def run_pipeline(date_str: str) -> Dict:
     if not espn_games:
         return {"picks":[],"all":[],"error":f"No NFL games found for {date_str} — NFL season runs Sept–Feb"}
 
-    # 2. Match Odds API event IDs
-    espn_games = await get_odds_events(date_str, espn_games)
+    # 2+3. Odds layer (event match + prop lines) — cached per date so re-runs
+    #      within _ODDS_TTL reuse pulled odds instead of re-hitting the Odds API.
+    #      The cached lines already carry team/abbr/game, so on a hit we skip the
+    #      event-match call too. ESPN game count (espn_games) is unaffected.
+    all_lines = _odds_cache_get(date_str)
+    if all_lines is None:
+        # 2. Match Odds API event IDs
+        espn_games = await get_odds_events(date_str, espn_games)
 
-    # 3. Get prop lines for each game
-    all_lines = []
-    for ev in espn_games:
-        ev_id = ev.get("id", "")
-        lines = await get_prop_lines(ev_id, date_str) if ev_id else []
-        home_abbr = ev.get("home_abbr", "") or _name_to_abbr(ev.get("home_team",""))
-        away_abbr = ev.get("away_abbr", "") or _name_to_abbr(ev.get("away_team",""))
-        for l in lines:
-            l["home_team"] = ev.get("home_team","")
-            l["away_team"] = ev.get("away_team","")
-            l["home_abbr"] = home_abbr
-            l["away_abbr"] = away_abbr
-            l["game"]      = ev.get("game","")
-        all_lines.extend(lines)
+        # 3. Get prop lines for each game
+        all_lines = []
+        for ev in espn_games:
+            ev_id = ev.get("id", "")
+            lines = await get_prop_lines(ev_id, date_str) if ev_id else []
+            home_abbr = ev.get("home_abbr", "") or _name_to_abbr(ev.get("home_team",""))
+            away_abbr = ev.get("away_abbr", "") or _name_to_abbr(ev.get("away_team",""))
+            for l in lines:
+                l["home_team"] = ev.get("home_team","")
+                l["away_team"] = ev.get("away_team","")
+                l["home_abbr"] = home_abbr
+                l["away_abbr"] = away_abbr
+                l["game"]      = ev.get("game","")
+            all_lines.extend(lines)
+        if all_lines:
+            _odds_cache_set(date_str, all_lines)
 
     if not all_lines:
         return {"picks":[],"all":[],"games":len(espn_games),
@@ -629,7 +662,7 @@ body.is-admin #parlayCard{display:block}
     <div style="display:flex;gap:10px;justify-content:center;align-items:center;flex-wrap:wrap">
       <label style="color:#9ca3af;font-size:.85rem;font-weight:600">Legs
         <select id="parlayLegs" style="background:#1a1a1a;color:#fff;border:1px solid #333;border-radius:8px;padding:8px 12px;font-size:.9rem;font-weight:700;margin-left:6px">
-          <option>2</option><option selected>3</option><option>4</option><option>5</option><option>6</option>
+          <option>2</option><option selected>3</option><option>4</option><option>5</option><option>6</option><option>7</option><option>8</option><option>9</option><option>10</option>
         </select>
       </label>
       <button class="btn" onclick="buildParlay()">Build Best Parlay</button>
