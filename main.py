@@ -866,9 +866,27 @@ def _nfl_market_from_groups(groups: dict, market: str):
     return None
 
 
+_NFL_BOX_CACHE: dict = {}
+_NFL_BOX_TTL = 120
+
 def _nfl_box_lookup(date_str: str) -> dict:
-    """Return {lowername: {'final': bool, market: value, ...}} for an NFL date,
-    sourced from ESPN scoreboard + summary box scores (same approach as NBA)."""
+    """Cached wrapper (see NBA): final dates cached permanently, in-progress dates
+    for _NFL_BOX_TTL seconds, to avoid repeat ESPN hits / HTTP 429 during settlement."""
+    import time as _t
+    ent = _NFL_BOX_CACHE.get(date_str)
+    now = _t.time()
+    if ent and (ent["final"] or now - ent["ts"] < _NFL_BOX_TTL):
+        return ent["data"]
+    res, complete = _nfl_box_lookup_raw(date_str)
+    allfinal = complete and bool(res)
+    _NFL_BOX_CACHE[date_str] = {"ts": now, "final": allfinal, "data": res}
+    return res
+
+def _nfl_box_lookup_raw(date_str: str):
+    """Return (results, complete). results = {lowername: {'final': bool, market: value}}.
+    complete is True only when EVERY event for the date is final AND its box score was
+    fetched successfully, so the wrapper marks the cache permanent only on fully-complete
+    data (a failed summary fetch keeps the date on the short TTL so it retries)."""
     d = date_str.replace("-", "")
     results: dict = {}
     try:
@@ -879,20 +897,26 @@ def _nfl_box_lookup(date_str: str) -> dict:
         events = sb.json().get("events", [])
     except Exception as e:
         print(f"[nfl_box] scoreboard failed {date_str}: {e}")
-        return results
+        return results, False
+    complete = True
     for ev in events:
         is_final = ev.get("status", {}).get("type", {}).get("completed", False)
+        if not is_final:
+            complete = False
         ev_id = ev.get("id")
         if not ev_id:
+            complete = False
             continue
         try:
             bs = httpx.get(
                 f"https://site.api.espn.com/apis/site/v2/sports/football/nfl/summary?event={ev_id}",
                 timeout=15, headers={"User-Agent": "Mozilla/5.0"})
             if bs.status_code != 200:
+                complete = False
                 continue
             boxscore = bs.json().get("boxscore", {})
         except Exception:
+            complete = False
             continue
         for team in boxscore.get("players", []):
             per_athlete: dict = {}
@@ -913,7 +937,7 @@ def _nfl_box_lookup(date_str: str) -> dict:
                     if v is not None:
                         ps[mk] = v
                 results[name] = ps
-    return results
+    return results, complete
 
 
 def _nfl_settle_cached(bet: dict, name_stats: dict) -> bool:
@@ -1035,12 +1059,24 @@ async def nfl_get_bets(request: Request, token: str = "", admin: str = "", settl
     with _NFL_BET_LOCK:
         data = _nfl_load_bets()
         key = _nfl_bet_user_key(tok, admin)
-        bets = data.get(key, [])
-        changed = _nfl_settle_batch(bets) if settle else False
-        if changed:
-            data[key] = bets
-            _nfl_save_bets(data)
-        snapshot = list(bets)
+        snapshot = list(data.get(key, []))
+    # Settle OFF-lock (see NBA): ESPN calls (now cached) must not hold _NFL_BET_LOCK.
+    # Merge settled fields by id so a concurrently-added bet is never clobbered.
+    if settle and _nfl_settle_batch(snapshot):
+        # Apply ONLY bets settled to a terminal result this pass, and only onto a
+        # still-pending on-disk bet — never write pending/None back and never flip an
+        # already-terminal value (so a concurrent settle pass can't be clobbered).
+        settled = {b.get("id"): b for b in snapshot
+                   if b.get("id") and b.get("result") in ("WIN", "LOSS", "PUSH")}
+        if settled:
+            with _NFL_BET_LOCK:
+                data = _nfl_load_bets()
+                for b in data.get(key, []):
+                    s = settled.get(b.get("id"))
+                    if s and b.get("result") not in ("WIN", "LOSS", "PUSH"):
+                        for f in ("result", "actual", "profit", "settled_at"):
+                            b[f] = s.get(f)
+                _nfl_save_bets(data)
     snapshot.sort(key=lambda b: (b.get("date", ""), b.get("placed_at", "")), reverse=True)
     return {"bets": snapshot, "summary": _nfl_summarize_bets(snapshot)}
 
