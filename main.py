@@ -682,7 +682,7 @@ def _verify_hub_token(token: str) -> bool:
     except Exception:
         return False
 
-_ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "higgi117711@gmail.com").strip().lower()
+_ADMIN_EMAILS = {e.strip().lower() for e in os.environ.get("ADMIN_EMAIL", "higgi117711@gmail.com").split(",") if e.strip()}
 
 def _token_email(token: str) -> str:
     if not token or len(token.split(".")) != 3 or not JWT_SECRET:
@@ -694,7 +694,7 @@ def _token_email(token: str) -> str:
         return ""
 
 def _is_admin_token(token: str) -> bool:
-    return bool(_ADMIN_EMAIL) and _token_email(token) == _ADMIN_EMAIL
+    return bool(_ADMIN_EMAILS) and _token_email(token) in _ADMIN_EMAILS
 
 _CRON_BUSY_NFL = False
 
@@ -762,6 +762,362 @@ async def api_cached(request: Request, target_date: str = "", token: str = ""):
 async def whoami(request: Request, token: str = ""):
     tok = token or request.headers.get("Authorization", "").replace("Bearer ", "").strip()
     return {"is_admin": _is_admin_token(tok)}
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  My Bets (bet tracking) — admin-only, mirrors NBA/NHL/MLB
+# ─────────────────────────────────────────────────────────────────────────────
+import threading as _bt_th, uuid as _bt_uuid
+from datetime import date as _bt_date
+
+_NFL_BET_LOG_PATH = str(_CACHE_DIR / "_nfl_bet_log.json")
+_NFL_BET_LOCK = _bt_th.Lock()
+_NFL_BET_STAT_KEYS = tuple(PROP_MARKETS)
+_NFL_STAT_LABEL = dict(PROP_LABELS)
+_NFL_CAT_ORDER = [PROP_LABELS[m] for m in PROP_MARKETS]
+
+
+def _nfl_load_bets() -> dict:
+    try:
+        with open(_NFL_BET_LOG_PATH) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _nfl_save_bets(data: dict):
+    try:
+        tmp = _NFL_BET_LOG_PATH + f".{os.getpid()}.tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp, _NFL_BET_LOG_PATH)
+    except Exception as e:
+        print(f"[nfl_bet_log] save failed: {e}")
+
+
+def _nfl_bet_admin_ok(tok: str, admin: str) -> bool:
+    return _is_admin_token(tok) or (
+        bool(admin) and admin == os.environ.get("INTERNAL_API_TOKEN", "__none__"))
+
+
+def _nfl_bet_user_key(tok: str, admin: str) -> str:
+    em = _token_email(tok) if tok else ""
+    return em.lower().strip() if em else "__admin__"
+
+
+def _nfl_american_profit(odds, stake, result) -> float:
+    try:
+        stake = float(stake)
+    except Exception:
+        return 0.0
+    if result == "WIN":
+        try:
+            o = float(odds)
+        except Exception:
+            return 0.0
+        return stake * (o / 100.0) if o > 0 else stake * (100.0 / abs(o))
+    if result == "LOSS":
+        return -stake
+    return 0.0
+
+
+def _nfl_num(s):
+    try:
+        if s is None:
+            return None
+        return float(str(s).strip())
+    except Exception:
+        return None
+
+
+def _nfl_made(s):
+    """ESPN 'made/att' style values e.g. '20/30' -> (20.0, 30.0)."""
+    try:
+        a, b = str(s).split("/")[:2]
+        return float(a.strip()), float(b.strip())
+    except Exception:
+        return None, None
+
+
+def _nfl_market_from_groups(groups: dict, market: str):
+    """Extract a single market value from a player's ESPN boxscore groups.
+    groups = {group_name_lower: {LABEL_UPPER: raw_str}}."""
+    def g(grp, lbl):
+        return (groups.get(grp) or {}).get(lbl)
+    if market == "player_pass_yds":            return _nfl_num(g("passing", "YDS"))
+    if market == "player_pass_tds":            return _nfl_num(g("passing", "TD"))
+    if market == "player_pass_completions":    return _nfl_made(g("passing", "C/ATT"))[0]
+    if market == "player_pass_attempts":       return _nfl_made(g("passing", "C/ATT"))[1]
+    if market == "player_pass_interceptions":  return _nfl_num(g("passing", "INT"))
+    if market == "player_rush_yds":            return _nfl_num(g("rushing", "YDS"))
+    if market == "player_rush_attempts":       return _nfl_num(g("rushing", "CAR"))
+    if market == "player_anytime_td":
+        rt = _nfl_num(g("rushing", "TD"))
+        ct = _nfl_num(g("receiving", "TD"))
+        if rt is None and ct is None:
+            return None
+        return (rt or 0) + (ct or 0)
+    if market == "player_reception_yds":       return _nfl_num(g("receiving", "YDS"))
+    if market == "player_receptions":          return _nfl_num(g("receiving", "REC"))
+    if market == "player_tackles_assists":     return _nfl_num(g("defensive", "TOT"))
+    if market == "player_sacks":               return _nfl_num(g("defensive", "SACKS"))
+    if market == "player_defensive_interceptions": return _nfl_num(g("interceptions", "INT"))
+    if market == "player_kicking_points":      return _nfl_num(g("kicking", "PTS"))
+    if market == "player_field_goals":         return _nfl_made(g("kicking", "FG"))[0]
+    return None
+
+
+def _nfl_box_lookup(date_str: str) -> dict:
+    """Return {lowername: {'final': bool, market: value, ...}} for an NFL date,
+    sourced from ESPN scoreboard + summary box scores (same approach as NBA)."""
+    d = date_str.replace("-", "")
+    results: dict = {}
+    try:
+        sb = httpx.get(
+            f"https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard?dates={d}",
+            timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+        sb.raise_for_status()
+        events = sb.json().get("events", [])
+    except Exception as e:
+        print(f"[nfl_box] scoreboard failed {date_str}: {e}")
+        return results
+    for ev in events:
+        is_final = ev.get("status", {}).get("type", {}).get("completed", False)
+        ev_id = ev.get("id")
+        if not ev_id:
+            continue
+        try:
+            bs = httpx.get(
+                f"https://site.api.espn.com/apis/site/v2/sports/football/nfl/summary?event={ev_id}",
+                timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+            if bs.status_code != 200:
+                continue
+            boxscore = bs.json().get("boxscore", {})
+        except Exception:
+            continue
+        for team in boxscore.get("players", []):
+            per_athlete: dict = {}
+            for grp in team.get("statistics", []):
+                gname = (grp.get("name") or "").lower()
+                labels = [str(l).upper() for l in grp.get("labels", [])]
+                for ath in grp.get("athletes", []):
+                    name = (ath.get("athlete", {}).get("displayName") or "").lower().strip()
+                    stats_arr = ath.get("stats", [])
+                    if not name or not stats_arr:
+                        continue
+                    bucket = per_athlete.setdefault(name, {})
+                    bucket[gname] = dict(zip(labels, stats_arr))
+            for name, groups in per_athlete.items():
+                ps: dict = {"final": is_final}
+                for mk in _NFL_BET_STAT_KEYS:
+                    v = _nfl_market_from_groups(groups, mk)
+                    if v is not None:
+                        ps[mk] = v
+                results[name] = ps
+    return results
+
+
+def _nfl_settle_cached(bet: dict, name_stats: dict) -> bool:
+    if bet.get("result") in ("WIN", "LOSS", "PUSH"):
+        return False
+    st = name_stats.get((bet.get("name") or "").lower().strip())
+    if not st or not st.get("final"):
+        return False
+    market = bet.get("market") or ""
+    actual = st.get(market)
+    # Anytime TD / any "did not record" market: a player who appears in the box
+    # but has no value for the stat recorded 0 (so an OVER 0.5 loses, UNDER wins).
+    if actual is None and market in ("player_anytime_td",):
+        actual = 0.0
+    if actual is None:
+        return False
+    try:
+        line = float(bet.get("line"))
+    except Exception:
+        return False
+    side = bet.get("side", "OVER")
+    if actual == line:
+        res = "PUSH"
+    elif side == "OVER":
+        res = "WIN" if actual > line else "LOSS"
+    else:
+        res = "WIN" if actual < line else "LOSS"
+    bet["result"] = res
+    bet["actual"] = actual
+    bet["profit"] = round(_nfl_american_profit(bet.get("odds"), bet.get("stake"), res), 2)
+    bet["settled_at"] = _bt_date.today().isoformat()
+    return True
+
+
+def _nfl_settle_bet(bet: dict) -> bool:
+    if bet.get("result") in ("WIN", "LOSS", "PUSH"):
+        return False
+    bdate = bet.get("date")
+    if not bdate or bdate >= _bt_date.today().isoformat():
+        return False
+    try:
+        ns = _nfl_box_lookup(bdate)
+    except Exception as e:
+        print(f"[nfl_bet_log] settle lookup failed {bdate}: {e}")
+        return False
+    return _nfl_settle_cached(bet, ns)
+
+
+def _nfl_settle_batch(bets: list) -> bool:
+    today = _bt_date.today().isoformat()
+    dates_needed: set = set()
+    for b in bets:
+        if b.get("result") in ("WIN", "LOSS", "PUSH"):
+            continue
+        if b.get("date") and b["date"] < today:
+            dates_needed.add(b["date"])
+    if not dates_needed:
+        return False
+    ns_cache: dict = {}
+    for d in sorted(dates_needed):
+        try:
+            ns_cache[d] = _nfl_box_lookup(d)
+        except Exception as e:
+            print(f"[nfl_bet_log] batch settle failed {d}: {e}")
+    changed = False
+    for b in bets:
+        bdate = b.get("date")
+        if bdate and bdate in ns_cache:
+            if _nfl_settle_cached(b, ns_cache[bdate]):
+                changed = True
+    return changed
+
+
+def _nfl_summarize_bets(bets: list) -> dict:
+    cats: dict = {}
+    tot_staked = tot_profit = 0.0
+    w = l = pu = pend = 0
+    for b in bets:
+        res = b.get("result", "pending")
+        try:
+            stake = float(b.get("stake") or 0)
+        except Exception:
+            stake = 0.0
+        c = cats.setdefault(b.get("category", "?"),
+                            {"wins": 0, "losses": 0, "push": 0, "pending": 0,
+                             "staked": 0.0, "profit": 0.0})
+        if res == "WIN": w += 1; c["wins"] += 1
+        elif res == "LOSS": l += 1; c["losses"] += 1
+        elif res == "PUSH": pu += 1; c["push"] += 1
+        else: pend += 1; c["pending"] += 1
+        if res in ("WIN", "LOSS", "PUSH"):
+            prof = float(b.get("profit") or 0)
+            tot_staked += stake; c["staked"] += stake
+            tot_profit += prof; c["profit"] += prof
+    roi = (tot_profit / tot_staked * 100.0) if tot_staked > 0 else None
+    ordered = _NFL_CAT_ORDER + [k for k in cats if k not in _NFL_CAT_ORDER]
+    by_cat = []
+    for cat in ordered:
+        c = cats.get(cat)
+        if not c:
+            continue
+        st = c["staked"]; pr = c["profit"]
+        by_cat.append({"category": cat, "wins": c["wins"], "losses": c["losses"],
+            "push": c["push"], "pending": c["pending"],
+            "staked": round(st, 2), "profit": round(pr, 2),
+            "roi": round(pr / st * 100, 1) if st > 0 else None})
+    return {"wins": w, "losses": l, "push": pu, "pending": pend,
+        "staked": round(tot_staked, 2), "profit": round(tot_profit, 2),
+        "returned": round(tot_staked + tot_profit, 2),
+        "roi": round(roi, 1) if roi is not None else None,
+        "by_category": by_cat}
+
+
+@app.get("/api/bets")
+async def nfl_get_bets(request: Request, token: str = "", admin: str = "", settle: bool = True):
+    tok = token or request.headers.get("Authorization", "").replace("Bearer ", "").strip()
+    if not _nfl_bet_admin_ok(tok, admin):
+        raise HTTPException(status_code=403, detail="Admin only")
+    with _NFL_BET_LOCK:
+        data = _nfl_load_bets()
+        key = _nfl_bet_user_key(tok, admin)
+        bets = data.get(key, [])
+        changed = _nfl_settle_batch(bets) if settle else False
+        if changed:
+            data[key] = bets
+            _nfl_save_bets(data)
+        snapshot = list(bets)
+    snapshot.sort(key=lambda b: (b.get("date", ""), b.get("placed_at", "")), reverse=True)
+    return {"bets": snapshot, "summary": _nfl_summarize_bets(snapshot)}
+
+
+@app.post("/api/bets")
+async def nfl_add_bet(request: Request, token: str = "", admin: str = ""):
+    tok = token or request.headers.get("Authorization", "").replace("Bearer ", "").strip()
+    if not _nfl_bet_admin_ok(tok, admin):
+        raise HTTPException(status_code=403, detail="Admin only")
+    body = await request.json()
+    try:
+        stake = round(float(body.get("stake")), 2)
+        odds = int(round(float(body.get("odds"))))
+        line = float(body.get("line"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="stake, odds and line must be numbers")
+    if stake <= 0:
+        raise HTTPException(status_code=400, detail="Bet size must be greater than 0")
+    name = (body.get("name") or "").strip()
+    market = (body.get("market") or "").strip()
+    side = (body.get("side") or "OVER").strip().upper()
+    if not name or market not in _NFL_BET_STAT_KEYS or side not in ("OVER", "UNDER"):
+        raise HTTPException(status_code=400, detail="Invalid bet")
+    bdate = (body.get("date") or _bt_date.today().isoformat()).strip()
+    bet = {"id": _bt_uuid.uuid4().hex[:12], "date": bdate,
+           "name": name, "pid": str(body.get("pid") or ""),
+           "team": (body.get("team") or "").strip(),
+           "opp": (body.get("opp") or "").strip(),
+           "category": (body.get("category") or _NFL_STAT_LABEL.get(market, "?")).strip(),
+           "side": side, "market": market,
+           "stat_label": (body.get("stat_label") or _NFL_STAT_LABEL.get(market, "")).strip(),
+           "line": line, "odds": odds, "stake": stake,
+           "placed_at": (body.get("placed_at") or _bt_date.today().isoformat()),
+           "result": "pending", "actual": None, "profit": None, "settled_at": None}
+    try:
+        _nfl_settle_bet(bet)
+    except Exception:
+        pass
+    with _NFL_BET_LOCK:
+        data = _nfl_load_bets()
+        key = _nfl_bet_user_key(tok, admin)
+        data.setdefault(key, []).append(bet)
+        _nfl_save_bets(data)
+    return {"ok": True, "bet": bet}
+
+
+@app.delete("/api/bets/{bet_id}")
+async def nfl_delete_bet(bet_id: str, request: Request, token: str = "", admin: str = ""):
+    tok = token or request.headers.get("Authorization", "").replace("Bearer ", "").strip()
+    if not _nfl_bet_admin_ok(tok, admin):
+        raise HTTPException(status_code=403, detail="Admin only")
+    with _NFL_BET_LOCK:
+        data = _nfl_load_bets()
+        key = _nfl_bet_user_key(tok, admin)
+        bets = data.get(key, [])
+        new_bets = [b for b in bets if b.get("id") != bet_id]
+        if len(new_bets) != len(bets):
+            data[key] = new_bets
+            _nfl_save_bets(data)
+    return {"ok": True}
+
+
+@app.get("/api/bets/summary")
+async def nfl_bets_summary(request: Request, token: str = "", admin: str = "", settle: bool = True):
+    tok = token or request.headers.get("Authorization", "").replace("Bearer ", "").strip()
+    if not _nfl_bet_admin_ok(tok, admin):
+        raise HTTPException(status_code=403, detail="Admin only")
+    with _NFL_BET_LOCK:
+        data = _nfl_load_bets()
+        key = _nfl_bet_user_key(tok, admin)
+        bets = data.get(key, [])
+        if settle and _nfl_settle_batch(bets):
+            data[key] = bets
+            _nfl_save_bets(data)
+        snapshot = list(bets)
+    return {"sport": "NFL", "summary": _nfl_summarize_bets(snapshot)}
+
 
 @app.get("/", response_class=HTMLResponse)
 async def index(admin: str = "", token: str = ""):
@@ -935,7 +1291,23 @@ tr:last-child td{border-bottom:none}
 </style>
 </head>
 <body>
-<nav><div class="logo">Money <span>Picks</span> Arena</div></nav>
+<nav style="display:flex;justify-content:space-between;align-items:center"><div class="logo">Money <span>Picks</span> Arena</div><div style="display:flex;gap:8px;align-items:center"><button class="admin-only" onclick="openNflMyBets()" style="background:#0e7490;color:#fff;border:none;border-radius:10px;padding:9px 16px;font-weight:800;font-size:.82rem;cursor:pointer;white-space:nowrap">&#128176; My Bets</button></div></nav>
+<style>
+.nfl-bets-tbl{width:100%;border-collapse:collapse;font-size:.82rem}
+.nfl-bets-tbl th{padding:7px 10px;text-align:left;font-size:.72rem;color:#9ca3af;font-weight:700;text-transform:uppercase;letter-spacing:.07em;border-bottom:1px solid #2a2a2a;white-space:nowrap}
+.nfl-bets-tbl td{padding:8px 10px;border-bottom:1px solid #161616;vertical-align:middle;color:#e5e7eb}
+.nfl-bets-tbl tr:last-child td{border-bottom:none}
+.nfl-bets-tbl tr:hover td{background:rgba(255,255,255,.02)}
+</style>
+<div id="nfl-mybets-card" style="display:none;max-width:960px;margin:18px auto 0;padding:0 16px">
+  <div class="card" style="padding:20px 22px">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+      <h2 style="font-family:'Playfair Display',serif;font-size:1.4rem;font-weight:700;color:#fff">&#128176; My Bets</h2>
+      <button onclick="document.getElementById(&#39;nfl-mybets-card&#39;).style.display=&#39;none&#39;" style="background:#1f2937;border:none;color:#9ca3af;border-radius:8px;padding:8px 11px;font-size:.9rem;cursor:pointer">&#215;</button>
+    </div>
+    <div id="nfl-mybets-body"><p style="color:#9ca3af;font-size:.85rem">Loading&#8230;</p></div>
+  </div>
+</div>
 <main>
   <div class="hero">
     <h1>NFL <span>Money Bombs</span></h1>
@@ -1221,7 +1593,7 @@ function nflCard(p,i){
        ${lastStat}
      </div>
      <div class="pc-foot"><span class="pc-score">${p.dispScore}</span>
-       <button class="pc-tap" onclick="openNflLadder('${key}')">📊 Game Log</button></div>
+       <span style="display:flex;gap:6px">${_nflBetBtn(p)}<button class="pc-tap" onclick="openNflLadder('${key}')">📊 Game Log</button></span></div>
    </div>`;
 }
 function nflCardGrid(picks){
@@ -1370,6 +1742,7 @@ function renderResults(d){
   }
   window._nflState={d:d, all:(d.all||[])};
   window.__NFL_PLAYS__=d.all||[];
+  window.__NFL_DATE__=d.date||'';
   res.innerHTML='<div class="nfl-toolbar"><input id="nflSearch" type="text" placeholder="Search player…" oninput="_nflPaint(this.value)"/></div><div id="nflBody"></div>';
   _nflPaint('');
 }
@@ -1446,6 +1819,187 @@ function nflToggle(n){
   var hidden=el.style.display==='none';
   el.style.display=hidden?'block':'none';
   if(btn) btn.textContent=hidden?'Collapse':'Expand';
+}
+// ── My Bets ──────────────────────────────────────────────────────────────────
+function _nflEsc(s){return(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+function _nflMoney(v){var n=Number(v)||0;return(n>=0?'$':'\u2212$')+Math.abs(n).toFixed(2);}
+function _nflBetAuthQS(){
+  var tok=localStorage.getItem('__mpa_token')||'';
+  var adm=new URLSearchParams(location.search).get('admin')||'';
+  return '?token='+encodeURIComponent(tok)+(adm?('&admin='+encodeURIComponent(adm)):'');
+}
+function _nflBetToast(msg){
+  var t=document.createElement('div');t.textContent=msg;
+  t.style.cssText='position:fixed;bottom:80px;left:50%;transform:translateX(-50%);background:#0e7490;color:#fff;padding:10px 20px;border-radius:10px;font-weight:700;font-size:.85rem;z-index:99999;white-space:nowrap;pointer-events:none;box-shadow:0 4px 20px rgba(0,0,0,.5)';
+  document.body.appendChild(t);
+  setTimeout(function(){t.style.opacity='0';t.style.transition='opacity .4s';setTimeout(function(){t.remove();},400);},2200);
+}
+var _nflBetN=0;
+window.__NFL_BET_SRC__=window.__NFL_BET_SRC__||{};
+function _nflBetBtn(p,forceSide){
+  if(p.realLine==null||!p.market) return '';
+  var side=forceSide||(p.pick==='UNDER'?'UNDER':'OVER');
+  var odds=side==='OVER'?(p.realOdds!=null?p.realOdds:p.realUnderOdds):(p.realUnderOdds!=null?p.realUnderOdds:p.realOdds);
+  var k='nf'+(++_nflBetN);
+  window.__NFL_BET_SRC__[k]={
+    name:p.name,pid:(p.pid!=null?String(p.pid):''),team:(p.team||''),opp:(p.opponent||''),
+    category:(p.mkt||p.label||''),side:side,market:p.market,stat_label:(p.mkt||p.label||''),
+    line:p.realLine,odds:(odds!=null?odds:null),date:(window.__NFL_DATE__||'')
+  };
+  return '<button data-betkey="'+k+'" class="admin-only" onclick="event.stopPropagation();_nflBetForm(this.dataset.betkey)" style="background:#0e7490;color:#fff;border:none;border-radius:8px;padding:6px 10px;font-size:.7rem;font-weight:800;cursor:pointer">Track Bet</button>';
+}
+function _nflBetForm(key){
+  var src=(window.__NFL_BET_SRC__||{})[key]; if(!src) return;
+  window.__NFL_BET_CUR__=src;
+  var ov=document.getElementById('nfl-bet-modal');
+  if(!ov){
+    ov=document.createElement('div'); ov.id='nfl-bet-modal';
+    ov.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.82);z-index:10000;display:flex;align-items:center;justify-content:center;padding:16px';
+    ov.onclick=function(e){if(e.target===ov)ov.style.display='none';};
+    document.body.appendChild(ov);
+  }
+  var pickTxt=src.side+' '+src.line+' '+(src.stat_label||'');
+  ov.innerHTML=`<div style="background:#161616;border:1px solid #0e7490;border-radius:16px;max-width:360px;width:100%;box-shadow:0 20px 60px rgba(0,0,0,.6)">
+    <div style="display:flex;justify-content:space-between;align-items:flex-start;padding:16px 18px;border-bottom:1px solid #2a2a2a">
+      <div>
+        <div style="font-weight:800;color:#fff;font-size:1.02rem">${_nflEsc(src.name)}</div>
+        <div style="color:#67e8f9;font-size:.82rem;font-weight:800;margin-top:2px">${_nflEsc(pickTxt)}</div>
+        <div style="color:#9ca3af;font-size:.72rem;margin-top:2px">${_nflEsc(src.category||'')}${src.opp?' &middot; vs '+_nflEsc(src.opp):''}${src.date?' &middot; '+src.date:''}</div>
+      </div>
+      <button onclick="document.getElementById('nfl-bet-modal').style.display='none'" style="background:#1f2937;border:none;color:#cbd5e1;width:30px;height:30px;border-radius:8px;cursor:pointer;font-size:1rem">&#215;</button>
+    </div>
+    <div style="padding:16px 18px;display:grid;gap:12px">
+      <label style="font-size:.72rem;color:#9ca3af;font-weight:600">Odds (American)<input id="nfl-bet-odds" type="number" value="${src.odds!=null?src.odds:''}" style="display:block;width:100%;margin-top:5px;background:#0b0b0b;border:1px solid #333;border-radius:8px;padding:9px 11px;color:#fbbf24;font-family:monospace;font-weight:700;font-size:.95rem"></label>
+      <label style="font-size:.72rem;color:#9ca3af;font-weight:600">Bet size ($)<input id="nfl-bet-stake" type="number" min="0" step="0.01" placeholder="e.g. 50" style="display:block;width:100%;margin-top:5px;background:#0b0b0b;border:1px solid #333;border-radius:8px;padding:9px 11px;color:#fff;font-weight:700;font-size:.95rem"></label>
+      <div id="nfl-bet-payout" style="font-size:.78rem;color:#6b7280;min-height:1em"></div>
+      <div id="nfl-bet-msg" style="font-size:.76rem;color:#f87171;min-height:1em"></div>
+      <button id="nfl-bet-save" onclick="_nflSaveBet()" style="background:#0e7490;color:#fff;border:none;border-radius:9px;padding:11px;font-weight:800;cursor:pointer;font-size:.92rem">Log Bet</button>
+    </div>
+  </div>`;
+  ov.style.display='flex';
+  var so=document.getElementById('nfl-bet-odds'),ss=document.getElementById('nfl-bet-stake');
+  function _calc(){
+    var o=parseFloat(so.value),s=parseFloat(ss.value);
+    var pay=document.getElementById('nfl-bet-payout');
+    if(!isFinite(o)||!isFinite(s)||s<=0){pay.textContent='';return;}
+    var win=o>0?s*(o/100):s*(100/Math.abs(o));
+    pay.innerHTML='To win <strong style="color:#4ade80">$'+win.toFixed(2)+'</strong> &middot; total payout <strong style="color:#cbd5e1">$'+(s+win).toFixed(2)+'</strong>';
+  }
+  so.oninput=_calc;ss.oninput=_calc;_calc();
+  setTimeout(function(){ss.focus();},50);
+}
+async function _nflSaveBet(){
+  var src=window.__NFL_BET_CUR__;if(!src) return;
+  var o=parseFloat(document.getElementById('nfl-bet-odds').value);
+  var s=parseFloat(document.getElementById('nfl-bet-stake').value);
+  var msg=document.getElementById('nfl-bet-msg');
+  if(!isFinite(o)){msg.textContent='Enter the odds.';return;}
+  if(!isFinite(s)||s<=0){msg.textContent='Enter a bet size greater than 0.';return;}
+  var btn=document.getElementById('nfl-bet-save');btn.disabled=true;btn.textContent='Saving\u2026';
+  try{
+    var body=Object.assign({},src,{odds:Math.round(o),stake:s,placed_at:new Date().toISOString()});
+    var res=await fetch('/api/bets'+_nflBetAuthQS(),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    if(!res.ok){throw new Error(await res.text());}
+    document.getElementById('nfl-bet-modal').style.display='none';
+    _nflBetToast('\u2705 Bet logged');
+    var mb=document.getElementById('nfl-mybets-card');
+    if(mb&&mb.style.display!=='none') openNflMyBets(false);
+  }catch(e){msg.textContent=(e.message||'Save failed');btn.disabled=false;btn.textContent='Log Bet';}
+}
+async function openNflMyBets(scroll){
+  var card=document.getElementById('nfl-mybets-card');if(!card) return;
+  card.style.display='block';
+  if(scroll!==false) card.scrollIntoView({behavior:'smooth',block:'start'});
+  document.getElementById('nfl-mybets-body').innerHTML='<p style="color:#9ca3af;font-size:.85rem">Loading\u2026</p>';
+  try{
+    var res=await fetch('/api/bets'+_nflBetAuthQS());
+    if(!res.ok){
+      var t=await res.text();
+      if(res.status===403) t='Session expired \u2014 reopen from hub';
+      throw new Error(t);
+    }
+    window.__NFL_MYBETS__=await res.json();
+    renderNflMyBets(window.__NFL_MYBETS__);
+  }catch(e){
+    document.getElementById('nfl-mybets-body').innerHTML='<p style="color:#f87171;padding:16px">'+(e.message||'Error loading bets')+'</p>';
+  }
+}
+function _nflBetOddsDisp(o){return o!=null?((o>0?'+':'')+o):'\u2014';}
+function _nflResColor(r){return r==='WIN'?'#4ade80':(r==='LOSS'?'#f87171':(r==='PUSH'?'#facc15':'#9ca3af'));}
+function _nflStatBox(lbl,val,clr){
+  return '<div style="background:#0e0e0e;border-radius:10px;padding:10px 14px;min-width:92px">'
+    +'<div style="font-size:.64rem;color:#6b7280;text-transform:uppercase;letter-spacing:.08em">'+lbl+'</div>'
+    +'<div style="font-size:1.12rem;font-weight:800;color:'+(clr||'#e5e7eb')+'">'+val+'</div></div>';
+}
+function renderNflMyBets(d){
+  var s=d.summary||{};var bets=d.bets||[];
+  var roiTxt=s.roi!=null?((s.roi>0?'+':'')+s.roi+'%'):'\u2014';
+  var roiClr=s.roi==null?'#9ca3af':(s.roi>0?'#4ade80':(s.roi<0?'#f87171':'#facc15'));
+  var netClr=(s.profit||0)>0?'#4ade80':((s.profit||0)<0?'#f87171':'#cbd5e1');
+  var recTxt=(s.wins||0)+'-'+(s.losses||0)+(s.push?('-'+s.push+'P'):'');
+  var head='<div style="display:flex;flex-wrap:wrap;gap:12px;align-items:center;margin-bottom:18px">'
+    +_nflStatBox('Record',recTxt,'#e5e7eb')
+    +_nflStatBox('Pending',(s.pending||0),'#9ca3af')
+    +_nflStatBox('Staked',_nflMoney(s.staked||0),'#cbd5e1')
+    +_nflStatBox('Net',_nflMoney(s.profit||0),netClr)
+    +_nflStatBox('Returned',_nflMoney(s.returned||0),'#cbd5e1')
+    +_nflStatBox('ROI',roiTxt,roiClr)
+    +'<div style="margin-left:auto"><button onclick="downloadNflMyBetsCSV()" style="background:#0e7490;color:#fff;border:none;border-radius:8px;padding:8px 12px;font-size:.78rem;font-weight:700;cursor:pointer">&#11015; CSV</button></div>'
+    +'</div>';
+  var bc=(s.by_category||[]).map(function(c){
+    var croi=c.roi!=null?((c.roi>0?'+':'')+c.roi+'%'):'\u2014';
+    var cclr=c.roi==null?'#9ca3af':(c.roi>0?'#4ade80':(c.roi<0?'#f87171':'#facc15'));
+    return '<tr><td style="font-weight:600">'+_nflEsc(c.category)+'</td>'
+      +'<td style="font-family:monospace">'+c.wins+'-'+c.losses+(c.push?('-'+c.push+'P'):'')+'</td>'
+      +'<td style="font-family:monospace;color:#9ca3af">'+(c.pending||0)+'</td>'
+      +'<td style="font-family:monospace">'+_nflMoney(c.staked)+'</td>'
+      +'<td style="font-family:monospace;color:'+((c.profit||0)>=0?'#4ade80':'#f87171')+'">'+_nflMoney(c.profit)+'</td>'
+      +'<td style="font-family:monospace;font-weight:700;color:'+cclr+'">'+croi+'</td></tr>';
+  }).join('');
+  var bcHtml=bc?'<div style="overflow-x:auto;margin-bottom:18px"><table class="nfl-bets-tbl"><thead><tr><th>Category</th><th>W-L</th><th>Pend</th><th>Staked</th><th>Net</th><th>ROI</th></tr></thead><tbody>'+bc+'</tbody></table></div>':'';
+  var rows=bets.map(function(b){
+    var res=b.result||'pending';
+    var delBtn='<button data-delid="'+b.id+'" onclick="_nflDeleteBet(this.dataset.delid)" title="Remove" style="background:none;border:none;color:#6b7280;cursor:pointer;font-size:1rem">&#10006;</button>';
+    var pk=b.side+' '+b.line+' '+(b.stat_label||'');
+    var actTxt=b.actual!=null?(' <span style="color:#6b7280;font-weight:400;font-size:.72rem">('+b.actual+')</span>'):'';
+    return '<tr>'
+      +'<td style="white-space:nowrap;color:#9ca3af;font-family:monospace;font-size:.76rem">'+(b.date||'')+'</td>'
+      +'<td style="font-weight:600">'+_nflEsc(b.name||'')+'<div style="font-size:.68rem;color:#6b7280">'+_nflEsc(b.category||'')+'</div></td>'
+      +'<td style="font-size:.82rem">'+_nflEsc(pk)+'</td>'
+      +'<td style="font-family:monospace">'+_nflBetOddsDisp(b.odds)+'</td>'
+      +'<td style="font-family:monospace">'+_nflMoney(b.stake)+'</td>'
+      +'<td style="font-weight:800;color:'+_nflResColor(res)+'">'+(res==='pending'?'pending':res)+actTxt+'</td>'
+      +'<td style="font-family:monospace;font-weight:700;color:'+((b.profit||0)>=0?'#4ade80':'#f87171')+'">'+(b.profit!=null?_nflMoney(b.profit):'\u2014')+'</td>'
+      +'<td>'+delBtn+'</td></tr>';
+  }).join('');
+  var rowsHtml=bets.length
+    ?'<div style="overflow-x:auto"><table class="nfl-bets-tbl"><thead><tr><th>Date</th><th>Player</th><th>Pick</th><th>Odds</th><th>Stake</th><th>Result</th><th>Profit</th><th></th></tr></thead><tbody>'+rows+'</tbody></table></div>'
+    :'<p style="color:#9ca3af;padding:16px">No bets logged yet. Click <strong style="color:#67e8f9">Track Bet</strong> on any pick card to start.</p>';
+  document.getElementById('nfl-mybets-body').innerHTML=head+bcHtml+rowsHtml;
+}
+async function _nflDeleteBet(id){
+  if(!confirm('Remove this bet from your log?')) return;
+  try{
+    var res=await fetch('/api/bets/'+encodeURIComponent(id)+_nflBetAuthQS(),{method:'DELETE'});
+    if(!res.ok) throw new Error(await res.text());
+    openNflMyBets(false);
+  }catch(e){alert(e.message||'Delete failed');}
+}
+function downloadNflMyBetsCSV(){
+  var d=window.__NFL_MYBETS__;if(!d){alert('Open My Bets first.');return;}
+  var rows=[['Date','Player','Team','Category','Side','Pick','Odds','Stake','Result','Actual','Profit']];
+  (d.bets||[]).forEach(function(b){
+    rows.push([b.date||'',b.name||'',b.team||'',b.category||'',b.side||'',
+      b.side+' '+b.line+' '+(b.stat_label||''),
+      b.odds!=null?b.odds:'',b.stake!=null?b.stake:'',
+      b.result||'',b.actual!=null?b.actual:'',b.profit!=null?b.profit:'']);
+  });
+  function _c(v){var sv=String(v==null?'':v);if(/[,"\\n]/.test(sv))sv='"'+sv.replace(/"/g,'""')+'"';return sv;}
+  var csv=rows.map(function(r){return r.map(_c).join(',');}).join('\\r\\n');
+  var blob=new Blob(['\ufeff'+csv],{type:'text/csv;charset=utf-8;'});
+  var url=URL.createObjectURL(blob);
+  var a=document.createElement('a');a.href=url;a.download='nfl-my-bets.csv';
+  document.body.appendChild(a);a.click();document.body.removeChild(a);URL.revokeObjectURL(url);
 }
 </script>
 </body>
