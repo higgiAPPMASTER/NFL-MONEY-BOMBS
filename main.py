@@ -21,16 +21,15 @@ JWT_SECRET    = os.environ.get("JWT_SECRET", "")
 NFL_SEASONS   = [2024, 2023, 2022, 2021, 2020]
 
 PROP_MARKETS = [
-    # passing
-    "player_pass_yds", "player_pass_tds", "player_pass_completions",
-    "player_pass_attempts", "player_pass_interceptions",
-    # rushing
-    "player_rush_yds", "player_rush_attempts", "player_anytime_td",
-    # receiving
+    # ALL prop markets get full Top 10 boards (user directive — see
+    # .agents/memory/nfl-boards-all-markets.md): offense, defense AND kicking.
+    # Never trim this list as part of a restyle without explicit user approval.
+    "player_pass_yds", "player_pass_tds",
+    "player_pass_completions", "player_pass_attempts", "player_pass_interceptions",
+    "player_rush_yds", "player_rush_attempts",
     "player_reception_yds", "player_receptions",
-    # defense
+    "player_anytime_td",
     "player_tackles_assists", "player_sacks", "player_defensive_interceptions",
-    # kicking
     "player_kicking_points", "player_field_goals",
 ]
 PROP_LABELS = {
@@ -84,9 +83,53 @@ def _name_to_abbr(full_name: str) -> str:
     return _TEAM_NAME_TO_ABBR.get(full_name.lower().strip(), "")
 
 def _norm(s): return re.sub(r"[^a-z0-9]", "", s.lower())
+
+def _team_nick(s: str) -> str:
+    """Canonical team nickname — the unique mascot word that identifies the
+    franchise. Shared-city clubs (New York Jets/Giants, Los Angeles
+    Rams/Chargers) must NEVER match on the city word; only the nickname is
+    decisive. 'Football Team' (old WSH) maps to 'team' — unique in the league."""
+    w = (s or "").lower().replace(".", "").split()
+    if not w:
+        return ""
+    return w[-1]
+
 def _match(t1, t2):
-    n1, n2 = _norm(t1), _norm(t2)
-    return n1 == n2 or n1 in n2 or n2 in n1
+    """Shared team-name matcher — nickname-based, never substring/last-word
+    overlap on city words (Jets/Giants, Rams/Chargers collide on 'new york' /
+    'los angeles')."""
+    a, b = (t1 or "").lower().strip(), (t2 or "").lower().strip()
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    na, nb = _team_nick(a), _team_nick(b)
+    return bool(na) and na == nb
+
+# ── Best-of-books odds selection (ported from the MLB app) ────────────────────
+# Show the BEST price across ALL sportsbooks; big US books win on ties.
+_PRIORITY_BOOKS = ("draftkings", "fanduel", "betmgm", "williamhill_us", "caesars",
+                   "betrivers", "ballybet", "bet365", "espnbet",
+                   "bet99", "thescore", "fliff", "mybookieag", "betonlineag", "bovada")
+_BOOK_PRIORITY = {b: i for i, b in enumerate(_PRIORITY_BOOKS)}
+_BOOK_LABEL = {"bet99":"Bet99","thescore":"theScore","bet365":"Bet365","draftkings":"DK",
+               "fanduel":"FanDuel","betmgm":"BetMGM","caesars":"Caesars",
+               "williamhill_us":"Caesars","betrivers":"BetRivers","ballybet":"Bally Bet",
+               "espnbet":"ESPN BET","fliff":"Fliff","mybookieag":"MyBookie",
+               "betonlineag":"BetOnline","bovada":"Bovada"}
+
+def _book_label(k):
+    return _BOOK_LABEL.get(k, (k or "").replace("_", " ").title())
+
+def _take_odds(entry, price_field, book_field, price, book_key):
+    """All books: keep the best American price; tie-break by book priority."""
+    if price is None:
+        return
+    cur = entry.get(price_field)
+    cur_book = entry.get(book_field)
+    if cur is None or price > cur or (price == cur and _BOOK_PRIORITY.get(book_key, 999) < _BOOK_PRIORITY.get(cur_book, 999)):
+        entry[price_field] = price
+        entry[book_field] = book_key
 
 app  = FastAPI(title="NFL Money Bombs", docs_url=None, redoc_url=None)
 JOBS: Dict[str, Dict] = {}
@@ -313,6 +356,9 @@ async def get_espn_games(date_str: str) -> List[Dict]:
                     "home_abbr": home.get("abbreviation", ""),
                     "away_abbr": away.get("abbreviation", ""),
                     "game":      f"{away.get('displayName','')} @ {home.get('displayName','')}",
+                    # ISO kickoff time (UTC) — every pick MUST carry game_start
+                    # so finished games drop off the board.
+                    "start":     ev.get("date", "") or comp.get("date", ""),
                 })
             print(f"[ESPN] {len(games)} NFL games for {date_str}")
             return games
@@ -357,12 +403,12 @@ async def get_prop_lines(event_id: str, date_str: str) -> List[Dict]:
         async with httpx.AsyncClient(timeout=15) as c:
             if is_past:
                 base = f"{ODDS_BASE}/historical/sports/americanfootball_nfl/events/{event_id}/odds"
-                params = {"apiKey": ODDS_API_KEY, "regions": "us",
+                params = {"apiKey": ODDS_API_KEY, "regions": "us,us2",
                          "markets": ",".join(PROP_MARKETS), "oddsFormat": "american",
                          "date": f"{date_str}T12:00:00Z"}
             else:
                 base = f"{ODDS_BASE}/sports/americanfootball_nfl/events/{event_id}/odds"
-                params = {"apiKey": ODDS_API_KEY, "regions": "us",
+                params = {"apiKey": ODDS_API_KEY, "regions": "us,us2",
                          "markets": ",".join(PROP_MARKETS), "oddsFormat": "american"}
             r = await c.get(base, params=params)
             if not r.is_success: return []
@@ -370,7 +416,9 @@ async def get_prop_lines(event_id: str, date_str: str) -> List[Dict]:
             data = raw.get("data", raw) if isinstance(raw, dict) and "data" in raw else raw
             if not isinstance(data, dict): return []
             lines = {}
+            # ALL bookmakers — best price per side with a book tag (_take_odds).
             for bm in data.get("bookmakers", []):
+                bkey = bm.get("key", "")
                 for mkt in bm.get("markets", []):
                     mk = mkt.get("key", "")
                     if mk not in PROP_MARKETS: continue
@@ -379,17 +427,39 @@ async def get_prop_lines(event_id: str, date_str: str) -> List[Dict]:
                         side  = oc.get("name", "")
                         point = oc.get("point")
                         price = oc.get("price")
+                        if mk == "player_anytime_td":
+                            # Anytime TD is a yes/no market with no point. The
+                            # player rides in description (name holds Yes/No) on
+                            # most books; some put the player in name directly.
+                            if side in ("Yes", "No", "Over", "Under"):
+                                if side != "Yes": continue
+                            else:
+                                name = oc.get("name", ""); side = "Yes"
+                                if (oc.get("description") or "") in ("No",): continue
+                            point = 0.5
+                            side  = "Over"      # yes == scores a TD == over 0.5
                         if not name or point is None: continue
                         key = f"{_norm(name)}_{mk}"
                         if key not in lines:
                             lines[key] = {"name": name, "market": mk,
                                 "label": PROP_LABELS.get(mk, mk),
                                 "stat_col": PROP_TO_COL.get(mk, ""),
-                                "line": float(point), "over_odds": None, "under_odds": None}
-                        if side == "Over":  lines[key]["over_odds"] = price
-                        elif side == "Under": lines[key]["under_odds"] = price
-                break  # first bookmaker only
-            return list(lines.values())
+                                "line": float(point), "over_odds": None, "under_odds": None,
+                                "over_book": None, "under_book": None}
+                        # Only merge prices posted at the SAME point as the
+                        # first-seen line — books at alternate lines must not
+                        # blend into one entry.
+                        if abs(float(point) - lines[key]["line"]) > 1e-9:
+                            continue
+                        if side == "Over":
+                            _take_odds(lines[key], "over_odds", "over_book", price, bkey)
+                        elif side == "Under":
+                            _take_odds(lines[key], "under_odds", "under_book", price, bkey)
+            out = list(lines.values())
+            for l in out:
+                l["over_book"]  = _book_label(l["over_book"])  if l.get("over_book")  else ""
+                l["under_book"] = _book_label(l["under_book"]) if l.get("under_book") else ""
+            return out
     except Exception as e:
         print(f"[OddsAPI props] {e}"); return []
 
@@ -503,10 +573,77 @@ def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str) -> Optional[Dict
     rates = [r for r in [rate_a, rate_b] if r is not None]
     score = round(sum(rates)/len(rates), 1) if rates else 0
 
+    # Season vs recent form (any venue): latest-season average + last-5 average.
+    season_avg = None
+    try:
+        latest_season = int(pdf_sorted["season"].max())
+        sv = pdf_sorted[pdf_sorted["season"] == latest_season][stat_col].dropna().tolist()
+        season_avg = round(sum(sv)/len(sv), 1) if sv else None
+    except Exception:
+        pass
+    l5_vals = la_vals[:5]
+    l5_avg  = round(sum(l5_vals)/len(l5_vals), 1) if l5_vals else None
+
+    is_td   = (market == "player_anytime_td")
     ref_avg = avg_b if avg_b is not None else avg_a
     gap     = round(ref_avg - line, 1) if ref_avg is not None else None
-    pick    = "OVER" if (ref_avg and ref_avg > line) else ("UNDER" if (ref_avg and ref_avg < line) else None)
+    if is_td:
+        # Yes-side top list: the board ranks who scores a TD, never an under.
+        pick = "OVER" if la_vals else None
+    else:
+        pick = "OVER" if (ref_avg and ref_avg > line) else ("UNDER" if (ref_avg and ref_avg < line) else None)
     tag     = _book_tag_nfl(pick, score, gap, under_rate)
+
+    # Model probability for the PICK side: blended over-rate across the three
+    # windows (L10 any venue 50%, L10 H/A 30%, career vs opp 20%), flipped for
+    # UNDER picks. Compared to the implied probability from the best-book price.
+    comps = []
+    if vsl_rate is not None: comps.append((vsl_rate, 0.5))
+    if rate_b   is not None: comps.append((rate_b,   0.3))
+    if rate_a   is not None: comps.append((rate_a,   0.2))
+    prob_over = (sum(r*w for r, w in comps) / sum(w for _, w in comps)) if comps else None
+    prob = None
+    if prob_over is not None and pick:
+        prob = round((prob_over if pick == "OVER" else 100.0 - prob_over) / 100.0, 3)
+    pick_odds = pl.get("over_odds") if pick == "OVER" else (pl.get("under_odds") if pick == "UNDER" else None)
+    book      = pl.get("over_book") if pick == "OVER" else (pl.get("under_book") if pick == "UNDER" else "")
+    impl_prob = None
+    if pick_odds is not None:
+        try:
+            o = float(pick_odds)
+            impl_prob = round((100.0/(o+100.0)) if o > 0 else (abs(o)/(abs(o)+100.0)), 3)
+        except Exception:
+            impl_prob = None
+    edge_prob = round(prob - impl_prob, 3) if (prob is not None and impl_prob is not None) else None
+
+    # Side score used for the Top-10 board ranking (edge/score in the pick's
+    # direction, not the raw over-rate).
+    side_score = None
+    if prob is not None:
+        side_score = round(prob * 100.0, 1)
+
+    # Plain-language write-up explaining the pick.
+    blurb = ""
+    if pick:
+        parts = []
+        word = "scored a TD" if is_td else (("cleared " + str(line) + " " + label) if pick == "OVER" else ("stayed under " + str(line) + " " + label))
+        if vsl_tot:
+            n_ok = vsl_hits if pick == "OVER" else (vsl_tot - vsl_hits)
+            parts.append(f"{word} in {n_ok} of his last {vsl_tot}")
+        if rate_a is not None and tot_a:
+            n_opp = hits_a if pick == "OVER" else (tot_a - hits_a)
+            parts.append(f"{n_opp} of {tot_a} career meetings with {opp_abbr}")
+        lead = " and ".join(parts) if parts else ""
+        form = ""
+        if not is_td and avg_b is not None:
+            hr_word = ("at home" if home_road == "H" else "on the road") if home_road else "recently"
+            form = f" Averaging {avg_b} {hr_word} vs the {line} line ({'+' if (gap or 0) >= 0 else ''}{gap})."
+        val = ""
+        if prob is not None and impl_prob is not None:
+            vs = "value" if (edge_prob or 0) > 0 else "no edge"
+            val = f" Model {round(prob*100)}% vs book {round(impl_prob*100)}% — {vs} on the {('YES' if is_td else pick)}."
+        blurb = ((lead[0].upper() + lead[1:] + ".") if lead else "") + form + val
+        blurb = blurb.strip()
 
     # Recent game log (newest first) for the ladder modal
     glog = []
@@ -520,7 +657,11 @@ def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str) -> Optional[Dict
                 ro = str(r["opponent_team"]) if r.get("opponent_team") else ""
             except Exception:
                 ro = ""
-            glog.append({"d": f"{int(r['season'])} W{int(r['week'])}", "v": round(float(v), 1), "o": ro})
+            ha = ""
+            if _HA_LOADED:
+                hv = _HA_LOOKUP.get((int(r["season"]), int(r["week"]), str(r["recent_team"])))
+                ha = "H" if hv == "HOME" else ("A" if hv == "AWAY" else "")
+            glog.append({"d": f"{int(r['season'])} W{int(r['week'])}", "v": round(float(v), 1), "o": ro, "ha": ha})
         except Exception:
             continue
 
@@ -563,6 +704,14 @@ def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str) -> Optional[Dict
         # score / pick
         "score": score, "dispScore": score, "gap": gap, "pick": pick, "tag": tag,
         "glog": glog, "vsOppLog": vs_opp_log,
+        # normalized MLB-parity fields
+        "over_book": pl.get("over_book") or "", "under_book": pl.get("under_book") or "",
+        "book": book or "", "odds": pick_odds,
+        "game_start": pl.get("game_start", ""),
+        "season_avg": season_avg, "l5_avg": l5_avg,
+        "prob": prob, "impl_prob": impl_prob, "edge_prob": edge_prob,
+        "side_score": side_score if side_score is not None else score,
+        "is_td": is_td, "blurb": blurb,
         # ── legacy keys (kept for backward compatibility with cached payloads /
         #    any downstream consumer that predates the normalized contract) ──
         "opp": opp_abbr or "--",
@@ -602,11 +751,12 @@ async def run_pipeline(date_str: str) -> Dict:
             home_abbr = ev.get("home_abbr", "") or _name_to_abbr(ev.get("home_team",""))
             away_abbr = ev.get("away_abbr", "") or _name_to_abbr(ev.get("away_team",""))
             for l in lines:
-                l["home_team"] = ev.get("home_team","")
-                l["away_team"] = ev.get("away_team","")
-                l["home_abbr"] = home_abbr
-                l["away_abbr"] = away_abbr
-                l["game"]      = ev.get("game","")
+                l["home_team"]  = ev.get("home_team","")
+                l["away_team"]  = ev.get("away_team","")
+                l["home_abbr"]  = home_abbr
+                l["away_abbr"]  = away_abbr
+                l["game"]       = ev.get("game","")
+                l["game_start"] = ev.get("start","")
             all_lines.extend(lines)
         if all_lines:
             _odds_cache_set(date_str, all_lines)
@@ -630,11 +780,30 @@ async def run_pipeline(date_str: str) -> Dict:
 
     picks   = sorted([r for r in all_results if r.get("pick")],
                      key=lambda x: abs(x.get("gap") or 0), reverse=True)
+
+    # Top 10 + Overflow boards, sliced PER SIDE (MLB overflow rules): for each
+    # category and side sort by model edge/score, ranks 1-10 = board, 11-20 =
+    # disjoint overflow (a side with <=10 picks has zero overflow). Anytime TD
+    # is a yes-side-only top list.
+    def _rank_key(p):
+        return ((p.get("side_score") or 0), abs(p.get("gap") or 0))
+    boards = {}
+    for mk in PROP_MARKETS:
+        lbl = PROP_LABELS.get(mk, mk)
+        mp  = [r for r in all_results if r.get("market") == mk and r.get("pick")]
+        if mk == "player_anytime_td":
+            yes = sorted(mp, key=_rank_key, reverse=True)[:20]
+            boards[lbl] = {"yes": yes}
+        else:
+            over  = sorted([r for r in mp if r["pick"] == "OVER"],  key=_rank_key, reverse=True)[:20]
+            under = sorted([r for r in mp if r["pick"] == "UNDER"], key=_rank_key, reverse=True)[:20]
+            boards[lbl] = {"over": over, "under": under}
+
     games_out = [{"home_team":g.get("home_team",""), "away_team":g.get("away_team",""),
                   "home_abbr":g.get("home_abbr",""), "away_abbr":g.get("away_abbr",""),
-                  "game":g.get("game","")} for g in espn_games]
+                  "game":g.get("game",""), "start":g.get("start","")} for g in espn_games]
     result  = {"picks":picks, "all":all_results, "date":date_str,
-               "games":games_out, "qualified":len(picks)}
+               "games":games_out, "boards":boards, "qualified":len(picks)}
     _cache_set(date_str, result)
     try:
         from replit_push import push_picks_to_replit
@@ -1338,6 +1507,25 @@ tr:last-child td{border-bottom:none}
 .lad-stat:last-child{border-bottom:none}
 .lad-stat .k{color:#9ca3af}
 .lad-stat .v{font-weight:700}
+/* MLB-style trading cards (ported from the MLB app) */
+.mlb-picks-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:16px;margin-bottom:10px}
+.mlb-pick-card{border-radius:14px;overflow:hidden;background:linear-gradient(180deg,#161616 0%,#0f0f0f 100%);border:1px solid #262626;display:flex;flex-direction:column}
+.mlb-pick-card:hover{border-color:rgba(245,158,11,.35)}
+.mlb-card-header{padding:6px 11px;display:flex;align-items:center;justify-content:space-between;gap:8px;border-bottom:2px solid #f59e0b}
+.mlb-card-header>div:first-child{min-width:0;flex:1 1 auto;flex-wrap:nowrap}
+.mlb-card-name{background:#f59e0b;color:#000;text-align:center;padding:4px 10px;font-weight:900;font-size:.9rem;letter-spacing:.01em}
+.mlb-card-body{padding:7px 11px 9px;flex:1;display:flex;flex-direction:column;gap:3px}
+.badge{display:inline-block;padding:2px 8px;border-radius:4px;font-size:.72rem;font-weight:700;letter-spacing:.3px}
+.badge-home{background:rgba(21,101,192,.35);color:#90caf9}
+.badge-away{background:rgba(103,58,183,.35);color:#ce93d8}
+.env-chip{display:inline-block;margin:3px 0 0;padding:2px 7px;border:1px solid #333;border-radius:6px;font-size:.6rem;font-weight:700;letter-spacing:.01em;line-height:1.25;background:#0d0d0d}
+.more-btn{width:100%;margin-top:14px;padding:11px 16px;background:#0f172a;border:1px solid #334155;border-radius:12px;font-size:.82rem;font-weight:700;cursor:pointer;letter-spacing:.06em;text-align:center;transition:background .15s,border-color .15s;color:#94a3b8}
+.more-btn:hover{background:#1e293b;border-color:#475569}
+.nb-face{position:relative;width:27px;height:27px;border-radius:50%;flex:0 0 auto;background:#111;display:flex;align-items:center;justify-content:center;overflow:hidden;border:1px solid rgba(0,0,0,.28)}
+.nb-ini{font-size:.6rem;font-weight:800;color:#9ca3af}
+.nb-face img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;object-position:center 18%}
+.mt-3{margin-top:12px}
+.side-hdr{font-size:.72rem;font-weight:800;letter-spacing:.1em;text-transform:uppercase;margin:14px 0 8px}
 </style>
 </head>
 <body>
@@ -1544,7 +1732,8 @@ async function getPicks(){
 // ===== NBA-style cards (NFL) =====
 window.__NFLLAD__ = window.__NFLLAD__ || {};
 var _MORDER=['Pass Yds','Pass TDs','Completions','Pass Att','INT Thrown','Rush Yds','Rush Att','Rec Yds','Receptions','Anytime TD','Tackles+Ast','Sacks','Def INT','Kick Pts','FG Made'];
-var _MLBL={'Pass Yds':'Pass','Pass TDs':'Pass TD','Completions':'Comp','Pass Att':'Att','INT Thrown':'INT','Rush Yds':'Rush','Rush Att':'Carries','Rec Yds':'Rec','Receptions':'Recept','Anytime TD':'TD','Tackles+Ast':'Tkl','Sacks':'Sacks','Def INT':'D INT','Kick Pts':'K Pts','FG Made':'FG'};
+var _MLBL={'Pass Yds':'Pass','Pass TDs':'Pass TD','Completions':'Comp','Pass Att':'Att','INT Thrown':'INT','Rush Yds':'Rush','Rush Att':'Carries','Rec Yds':'Rec','Receptions':'Recept','Anytime TD':'TD','Tackles+Ast':'Tkl','Sacks':'Sacks','Def INT':'Def INT','Kick Pts':'K Pts','FG Made':'FG'};
+var _NACC={'Pass Yds':'#f59e0b','Pass TDs':'#38bdf8','Completions':'#4ade80','Pass Att':'#fbbf24','INT Thrown':'#ef4444','Rush Yds':'#34d399','Rush Att':'#10b981','Rec Yds':'#60a5fa','Receptions':'#a78bfa','Anytime TD':'#f87171','Tackles+Ast':'#fb7185','Sacks':'#f97316','Def INT':'#e879f9','Kick Pts':'#2dd4bf','FG Made':'#22d3ee'};
 
 function rateClass(r){ return r >= 70 ? 'green' : r >= 55 ? 'gold' : 'red-txt'; }
 function _initials(name){
@@ -1607,48 +1796,128 @@ function fmtVsLine(p){
   if(p.realLine==null||!p.vsLineTotal) return '<span class="gray">—</span>';
   return '<span class="'+rateClass(p.vsLineRate)+'">'+p.vsLineHits+'/'+p.vsLineTotal+' ('+p.vsLineRate+'%)</span>';
 }
-function nflCard(p,i){
-  var key=_ladKey(p); window.__NFLLAD__[key]=p;
-  var ha=p.homeRoad==='H';
-  var hasHA=(p.homeRoad==='H'||p.homeRoad==='R');
-  var head=p.head||'';
-  var logo='https://a.espncdn.com/i/teamlogos/nfl/500/'+_logoAbbr(p.team)+'.png';
-  var lineHtml=(p.realLine!=null)
-    ? `<span class="ln">${p.dispLine}</span> <span class="od">${p.realOdds||''}</span>`
-    : `<span class="est">~${p.dispLine}</span>`;
-  var lastStat=(p.realLine!=null&&p.vsLineTotal)
-    ? `<div class="pc-stat"><div class="k">vs Book L10</div><div class="v ${rateClass(p.vsLineRate)}">${p.vsLineHits}/${p.vsLineTotal} (${p.vsLineRate}%)</div></div>`
-    : `<div class="pc-stat"><div class="k">Under L10</div><div class="v ${rateClass(p.underRate)}">${p.underHits}/${p.underTotal} (${p.underRate}%)</div></div>`;
-  var haBadge=hasHA?`<span class="${ha?'home':'away'}">${ha?'HOME':'AWAY'}</span>`:'';
-  return `
-   <div class="pick-card ${_accFor(p.mkt)}">
-     <div class="pc-rank">${i}</div>
-     <div class="pc-top">
-       <div class="hs-wrap"><span class="hs-ini">${_initials(p.name)}</span>
-         <img class="hs-img" src="${head}" onerror="this.style.display='none'"/>
-         <img class="pc-logo" src="${logo}" onerror="this.style.display='none'"/>
-       </div>
-       <div class="pc-id">
-         <div class="pc-name">${p.name}</div>
-         <div class="pc-meta">${p.team} vs ${p.opponent} ${haBadge}</div>
-         <div class="pc-mkt">${p.mkt||''} · ${p.pick||''}</div>
-       </div>
-     </div>
-     <div class="pc-tagrow">${fmtTag(p.tag)}</div>
-     <div class="pc-line-row"><span>${lineHtml}</span><span class="od">Line</span></div>
-     <div class="pc-stats">
-       <div class="pc-stat"><div class="k">Career vs ${p.opponent}</div><div class="v">${_rateHtml(p.rateA,p.hitsA,p.totA)}</div></div>
-       <div class="pc-stat"><div class="k">L10 ${hasHA?(ha?'Home':'Away'):'H/A'}</div><div class="v">${_rateHtml(p.rateB,p.hitsB,p.totB)}</div></div>
-       <div class="pc-stat"><div class="k">Avg</div><div class="v gold">${p.avg}</div></div>
-       ${lastStat}
-     </div>
-     <div class="pc-foot"><span class="pc-score">${p.dispScore}</span>
-       <span style="display:flex;gap:6px">${_nflBetBtn(p)}<button class="pc-tap" onclick="openNflLadder('${key}')">📊 Game Log</button></span></div>
-   </div>`;
+// ===== MLB-style trading cards (ported card renderer) =====
+function _nRankColors(rank,acc){return rank===1?['#f59e0b','#000']:rank===2?['#c0c0c0','#000']:rank===3?['#cd7f32','#fff']:['#1e1e1e',acc||'#f59e0b'];}
+function _nOddsFor(p){return p.pick==='UNDER'?(p.realUnderOdds!=null?p.realUnderOdds:p.under_odds):(p.realOdds!=null?p.realOdds:p.over_odds);}
+function _nOddsDisp(o){return o!=null?((o>0?'+':'')+o):'—';}
+function _nBookFor(p){return p.pick==='UNDER'?(p.under_book||p.book||''):(p.over_book||p.book||'');}
+function _nBookTag(p){var b=_nBookFor(p);return b?(' <span style="font-size:.62rem;color:#94a3b8;font-weight:600">'+b+'</span>'):'';}
+function _nflGameDone(p){
+  var s=p&&p.game_start; if(!s) return false;
+  var t=Date.parse(s); if(!t||isNaN(t)) return false;
+  return Date.now() > (t + 4*3600*1000);
 }
-function nflCardGrid(picks){
-  if(!picks||!picks.length) return '<div class="no-picks">No qualifying picks for this market.</div>';
-  return '<div class="picks-grid">'+picks.map(function(p,i){return nflCard(p,i+1);}).join('')+'</div>';
+// counts/rate flipped into the PICK direction (UNDER shows under counts)
+function _nSideCnt(p,hits,tot,rate){
+  if(!tot) return {h:0,t:0,r:0};
+  if(p.pick==='UNDER'){return {h:(tot-hits),t:tot,r:Math.round((100-(rate||0))*10)/10};}
+  return {h:hits,t:tot,r:(rate||0)};
+}
+function _nCatLbl(cat,acc){return '<span style="font-size:.7rem;letter-spacing:.08em;font-weight:800;white-space:nowrap"><span style="color:#64748b">NFL</span> <span style="color:'+acc+'">&#183; '+cat+'</span></span>';}
+function _nCardHdr(labelHtml,teamLogo,teamName,tagHtml){
+  var logo=teamLogo?('<img src="'+teamLogo+'" alt="'+(teamName||'')+'" style="height:22px;width:22px;object-fit:contain;flex:0 0 auto" onerror="this.remove()">'):'';
+  return '<div style="display:flex;align-items:center;gap:7px;min-width:0;flex:1 1 auto">'
+    + logo
+    + '<span style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:0 1 auto">'+labelHtml+'</span>'
+    + '</div>'
+    + '<div style="display:flex;align-items:center;gap:4px;flex:0 0 auto">'+(tagHtml||'')+'</div>';
+}
+// Gold name bar: rank badge + headshot (initials fallback) + name
+function _nNameBar(rank,rc,p){
+  var nc=(rc&&rc[0]==='#1e1e1e')?rc[1]:(rc?rc[0]:'#f59e0b');
+  var face='<span class="nb-face"><span class="nb-ini">'+_initials(p.name)+'</span>'
+    +(p.head?('<img src="'+p.head+'" alt="" onerror="this.remove()">'):'')
+    +'</span>';
+  return '<div class="mlb-card-name" style="display:flex;align-items:center;gap:8px;text-align:left">'
+    + '<div style="width:23px;height:23px;border-radius:50%;background:#111;color:'+nc+';display:flex;align-items:center;justify-content:center;font-weight:900;font-size:.86rem;flex:0 0 auto">'+rank+'</div>'
+    + face
+    + '<span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0">'+(p.name||'')+'</span>'
+    + '</div>';
+}
+function _nChip(txt,c,tip){return '<div class="env-chip" title="'+(tip||'')+'" style="border-color:'+c+'55;color:'+c+'">'+txt+'</div>';}
+function _nEvBadge(p){
+  if(p.prob==null||p.impl_prob==null) return '';
+  var edge=(p.edge_prob!=null)?p.edge_prob:(p.prob-p.impl_prob);
+  var pos=edge>0;
+  var bg=pos?'rgba(34,197,94,.14)':'rgba(148,163,184,.10)';
+  var bd=pos?'#22c55e':'#475569';
+  var fg=pos?'#4ade80':'#94a3b8';
+  var lbl=pos?('&#10003; +EV &#183; edge +'+Math.round(edge*100)+'%'):('&#8211; no edge '+(edge>0?'+':'')+Math.round(edge*100)+'%');
+  return '<div title="Our model win probability for this pick vs the book&#39;s implied probability from the best price." style="margin-top:6px;display:flex;align-items:center;justify-content:space-between;gap:6px;background:'+bg+';border:1px solid '+bd+';border-radius:8px;padding:3px 8px">'
+    +'<span style="font-size:.62rem;font-weight:800;letter-spacing:.03em;color:'+fg+'">'+lbl+'</span>'
+    +'<span style="font-size:.62rem;color:#cbd5e1;font-family:monospace">'+Math.round(p.prob*100)+'% vs '+Math.round(p.impl_prob*100)+'%</span>'
+    +'</div>';
+}
+function _nMlbCard(p,rank){
+  var key=_ladKey(p); window.__NFLLAD__[key]=p;
+  var cat=p.mkt||p.label||'';
+  var acc=_NACC[cat]||'#f59e0b';
+  var rc=_nRankColors(rank,acc);
+  var isU=p.pick==='UNDER';
+  var logo='https://a.espncdn.com/i/teamlogos/nfl/500/'+_logoAbbr(p.team)+'.png';
+  var hasHA=(p.homeRoad==='H'||p.homeRoad==='R');
+  var ha=p.homeRoad==='H';
+  var sideCls=ha?'badge-home':'badge-away';
+  var line=(p.realLine!=null?p.realLine:p.dispLine);
+  var pickLbl=p.is_td?'TD YES':((isU?'U ':'O ')+line);
+  var pickClr=p.is_td?'#f87171':(isU?'#ff8a65':'#63cab7');
+  var hdrGrad=isU?'linear-gradient(135deg,#2a1414 0%,#180808 100%)':'linear-gradient(135deg,#1a2a1a 0%,#0a1a0a 100%)';
+  var sideChip='<span style="font-size:.62rem;font-weight:800;color:'+pickClr+';white-space:nowrap">'+pickLbl+'</span>';
+  // chips: matchup / splits / form — flipped into the pick direction
+  var chips='';
+  var cA=_nSideCnt(p,p.hitsA,p.totA,p.rateA);
+  if(cA.t>=2) chips+=_nChip('vs '+p.opponent+' career '+cA.h+'/'+cA.t+' ('+cA.r+'%)','#93c5fd','Career meetings with '+p.opponent+' (home/away matched) '+(isU?'staying under':'clearing')+' the line');
+  var cB=_nSideCnt(p,p.hitsB,p.totB,p.rateB);
+  if(cB.t>=3) chips+=_nChip('L10 '+(hasHA?(ha?'home':'away'):'H/A')+' '+cB.h+'/'+cB.t+' ('+cB.r+'%)','#c4b5fd','Last 10 '+(ha?'home':'away')+' games (any opponent) '+(isU?'under':'over')+' the line');
+  if(p.season_avg!=null&&p.l5_avg!=null&&!p.is_td) chips+=_nChip('Season '+p.season_avg+' &#183; L5 '+p.l5_avg,'#9ca3af','Season average vs last-5 form');
+  // last-10 hit-rate line (true last 10, any venue, vs the posted line)
+  var cL=_nSideCnt(p,p.vsLineHits,p.vsLineTotal,p.vsLineRate);
+  var l10Row=p.vsLineTotal?('<div style="display:flex;align-items:center;justify-content:space-between;margin-top:4px">'
+    +'<span style="font-size:.72rem;color:#64748b">'+(p.is_td?'TD in L10':'L10 vs line')+'</span>'
+    +'<span style="font-family:monospace;font-weight:700;font-size:.82rem" class="'+rateClass(cL.r)+'">'+cL.h+'/'+cL.t+' ('+cL.r+'%)</span></div>'):'';
+  var avgRow=(!p.is_td&&p.avg!=null)?('<div style="display:flex;align-items:center;justify-content:space-between;margin-top:2px">'
+    +'<span style="font-size:.72rem;color:#64748b">Avg L10 '+(hasHA?(ha?'home':'away'):'')+'</span>'
+    +'<span style="font-family:monospace;font-weight:700;color:#7dd3fc;font-size:.82rem">'+p.avg+'</span></div>'):'';
+  var odds=_nOddsFor(p);
+  var blurb=p.blurb?('<div style="margin-top:5px;font-size:.72rem;color:#94a3b8;line-height:1.5;font-style:italic;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden">'+p.blurb+'</div>'):'';
+  return '<div class="mlb-pick-card" onclick="openNflLadder(&#39;'+key+'&#39;)" title="Click for the full breakdown" style="cursor:pointer">'
+    +'<div class="mlb-card-header" style="background:'+hdrGrad+';border-bottom-color:'+acc+'">'+_nCardHdr(_nCatLbl(cat,acc),logo,p.team,sideChip)+'</div>'
+    +_nNameBar(rank,rc,p)
+    +'<div class="mlb-card-body">'
+    +'<div style="display:flex;align-items:center;justify-content:space-between">'
+    +'<span style="font-size:.82rem;color:#94a3b8">'+p.team+' vs <strong style="color:#fff">'+(p.opponent||'—')+'</strong></span>'
+    +(hasHA?('<span class="badge '+sideCls+'">'+(ha?'HOME':'AWAY')+'</span>'):'')
+    +'</div>'
+    +chips
+    +l10Row
+    +avgRow
+    +blurb
+    +'<div style="display:flex;align-items:center;justify-content:space-between;margin-top:6px;padding-top:6px;border-top:1px solid #1f1f1f">'
+    +'<span style="font-size:.72rem;color:'+pickClr+';font-weight:800;text-transform:uppercase;letter-spacing:.06em">'+(p.is_td?'Anytime TD':pickLbl+' '+cat)+'</span>'
+    +'<span style="font-family:monospace;color:#fbbf24;font-weight:700;font-size:.95rem">'+_nOddsDisp(odds)+_nBookTag(p)+'</span>'
+    +'</div>'
+    +_nEvBadge(p)
+    +'<div style="margin-top:6px;display:flex;justify-content:flex-end">'+_nflBetBtn(p)+'</div>'
+    +'</div>'
+    +'</div>';
+}
+// "Show N more" overflow toggle (ranks 11-20, disjoint from the Top 10)
+function _moreWrapN(items,renderFn,startRank,label,color){
+  if(!items||!items.length) return '';
+  var clr=color||'#94a3b8';
+  var cards=items.map(function(p,i){return renderFn(p,startRank+i);}).join('');
+  return '<details style="margin-top:14px">'
+    +'<summary class="more-btn" style="color:'+clr+';border-color:'+clr+'33">&#9655; '+items.length+' more &mdash; '+label+'</summary>'
+    +'<div class="mlb-picks-grid mt-3">'+cards+'</div>'
+    +'</details>';
+}
+function _nSideBoard(arr,lbl,clr){
+  if(!arr||!arr.length) return '';
+  var top=arr.slice(0,10), extra=arr.slice(10,20);
+  var h='<div class="side-hdr" style="color:'+clr+'">'+lbl+' &mdash; Top '+top.length+'</div>';
+  h+='<div class="mlb-picks-grid">'+top.map(function(p,i){return _nMlbCard(p,i+1);}).join('')+'</div>';
+  h+=_moreWrapN(extra,_nMlbCard,11,'Overflow (ranks 11&ndash;20)',clr);
+  return h;
 }
 function _spRow(p){
   var key=_ladKey(p); window.__NFLLAD__[key]=p;
@@ -1712,40 +1981,88 @@ function _underBox(picks){
   }).join('');
   return '<div class="uplays">'+rows+'</div>';
 }
+// MLB-style breakdown popup: last-10 ladder colored vs the line, career vs
+// today's opponent, home/away splits, season vs recent form, the posted line +
+// best-book odds + model probability/edge, and the plain-language write-up.
 function openNflLadder(key){
   var p=window.__NFLLAD__[key]; if(!p) return;
-  var line=p.dispLine;
-  var chips=(p.glog||[]).map(function(g){
-    var hit=g.v>line; var cls=hit?'hit':'miss';
-    var od=g.o?(' · '+g.o):'';
-    return `<div class="glchip ${cls}"><div class="d">${g.d}${od}</div><div class="v">${g.v}</div></div>`;
-  }).join('');
-  if(!chips) chips='<span class="gray">No game log available.</span>';
-  var vslRow=(p.realLine!=null&&p.vsLineTotal)
-    ? `<div class="lad-stat"><span class="k">Hits vs Book Line (${p.realLine}) L10</span><span class="v ${rateClass(p.vsLineRate)}">${p.vsLineHits}/${p.vsLineTotal} (${p.vsLineRate}%)</span></div>`
-    : '';
+  var isU=p.pick==='UNDER';
+  var cat=p.mkt||p.label||'';
+  var acc=_NACC[cat]||'#f59e0b';
+  var line=(p.realLine!=null?p.realLine:p.dispLine);
+  var goal=p.is_td?'To score a touchdown':((isU?'Under ':'Over ')+line+' '+cat);
+  var pickClr=p.is_td?'#f87171':(isU?'#ff8a65':'#63cab7');
   var hasHA=(p.homeRoad==='H'||p.homeRoad==='R');
+  var ha=p.homeRoad==='H';
+  // last-10 ladder
+  var rows=(p.glog||[]).map(function(g){
+    var over=g.v>line;
+    var good=isU?!over:over;
+    var clr=good?'#63cab7':'#ff8a65';
+    var oppTxt=g.o?((g.ha==='H'?'vs ':(g.ha==='A'?'@ ':''))+g.o):'';
+    return '<tr>'
+      +'<td style="padding:6px 10px;color:#94a3b8;font-family:monospace;font-size:.78rem">'+g.d+'</td>'
+      +'<td style="padding:6px 10px;color:#cbd5e1;font-size:.8rem">'+oppTxt+'</td>'
+      +'<td style="padding:6px 10px;text-align:right;font-family:monospace;font-weight:800;color:'+clr+'">'+g.v+'</td>'
+      +'</tr>';
+  }).join('')||'<tr><td colspan="3" style="padding:14px;color:#64748b;text-align:center">No recent games on record</td></tr>';
+  // every meeting vs today's opponent
   var vol=(p.vsOppLog||[]);
-  var voHtml='';
-  if(vol.length){
-    voHtml='<div style="font-size:.7rem;color:#6b7280;text-transform:uppercase;letter-spacing:.08em;font-weight:700;margin:12px 0 4px">Every game vs '+p.opponent+' ('+vol.length+')</div>';
-    voHtml+=vol.map(function(g){var hit=g.v>line;return '<div class="vsopp-row"><span style="color:#9ca3af">'+g.d+'</span><span style="font-weight:700;color:'+(hit?'#4ade80':'#f87171')+'">'+g.v+'</span></div>';}).join('');
+  var voRows=vol.map(function(g){
+    var over=g.v>line; var good=isU?!over:over;
+    return '<tr>'
+      +'<td style="padding:5px 10px;color:#94a3b8;font-family:monospace;font-size:.78rem">'+g.d+'</td>'
+      +'<td style="padding:5px 10px;text-align:right;font-family:monospace;font-weight:800;color:'+(good?'#63cab7':'#ff8a65')+'">'+g.v+'</td>'
+      +'</tr>';
+  }).join('');
+  var voBlock=vol.length?('<div style="margin-top:14px">'
+    +'<div style="font-size:.62rem;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:#93c5fd;margin-bottom:6px">Every meeting vs '+p.opponent+' ('+vol.length+')</div>'
+    +'<div style="background:#0b1220;border:1px solid #1e293b;border-radius:10px;overflow:hidden;max-height:180px;overflow-y:auto"><table style="width:100%;border-collapse:collapse">'+voRows+'</table></div>'
+    +'</div>'):'';
+  // splits + form
+  function _statRow(k,vHtml){return '<div class="lad-stat"><span class="k">'+k+'</span><span class="v">'+vHtml+'</span></div>';}
+  var cA=_nSideCnt(p,p.hitsA,p.totA,p.rateA);
+  var cB=_nSideCnt(p,p.hitsB,p.totB,p.rateB);
+  var cL=_nSideCnt(p,p.vsLineHits,p.vsLineTotal,p.vsLineRate);
+  var dirWord=p.is_td?'TD':(isU?'under':'over');
+  var splits='';
+  splits+=_statRow('Career vs '+p.opponent+' ('+dirWord+')', cA.t?('<span class="'+rateClass(cA.r)+'">'+cA.h+'/'+cA.t+' ('+cA.r+'%)</span>'+(p.avgA?(' <span style="color:#7dd3fc;font-family:monospace">avg '+p.avgA+'</span>'):'')):'<span class="gray">no history</span>');
+  splits+=_statRow('L10 '+(hasHA?(ha?'home':'away'):'H/A')+' ('+dirWord+')', cB.t?('<span class="'+rateClass(cB.r)+'">'+cB.h+'/'+cB.t+' ('+cB.r+'%)</span>'+(p.avg?(' <span style="color:#7dd3fc;font-family:monospace">avg '+p.avg+'</span>'):'')):'<span class="gray">—</span>');
+  splits+=_statRow('L10 any venue ('+dirWord+')', cL.t?('<span class="'+rateClass(cL.r)+'">'+cL.h+'/'+cL.t+' ('+cL.r+'%)</span>'):'<span class="gray">—</span>');
+  if(!p.is_td&&(p.season_avg!=null||p.l5_avg!=null)){
+    splits+=_statRow('Season vs recent form','<span style="font-family:monospace;color:#cbd5e1">'+(p.season_avg!=null?('szn '+p.season_avg):'')+(p.l5_avg!=null?(' &#183; L5 '+p.l5_avg):'')+'</span>');
   }
-  var html=`
-    <div class="lad-modal" onclick="event.stopPropagation()">
-      <button class="lad-close" onclick="closeNflLadder()">✕</button>
-      <h3>${p.name}</h3>
-      <div class="lad-sub">${p.mkt} · ${p.team} vs ${p.opponent} · Line ${p.dispLine} · ${p.pick||''}</div>
-      <div style="font-size:.7rem;color:#6b7280;text-transform:uppercase;letter-spacing:.08em;font-weight:700;margin-bottom:4px">Recent Games (green = over line)</div>
-      <div class="lad-glog">${chips}</div>
-      ${voHtml}
-      <div class="lad-stat"><span class="k">Career vs ${p.opponent}</span><span class="v">${_rateHtml(p.rateA,p.hitsA,p.totA)}</span></div>
-      <div class="lad-stat"><span class="k">L10 ${hasHA?(p.homeRoad==='H'?'Home':'Away'):'H/A'}</span><span class="v">${_rateHtml(p.rateB,p.hitsB,p.totB)}</span></div>
-      ${vslRow}
-      <div class="lad-stat"><span class="k">Under Line L10</span><span class="v ${rateClass(p.underRate)}">${p.underHits}/${p.underTotal} (${p.underRate}%)</span></div>
-      <div class="lad-stat"><span class="k">Average</span><span class="v gold">${p.avg}</span></div>
-      <div class="lad-stat"><span class="k">Score</span><span class="v" style="color:#f59e0b">${p.dispScore}</span></div>
-    </div>`;
+  // value box: posted line + best-book odds + model prob/edge
+  var odds=_nOddsFor(p);
+  var book=_nBookFor(p);
+  var edge=(p.edge_prob!=null)?p.edge_prob:((p.prob!=null&&p.impl_prob!=null)?(p.prob-p.impl_prob):null);
+  var edgeClr=(edge==null)?'#94a3b8':(edge>0?'#4ade80':'#f87171');
+  var valBox='<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:8px;margin-top:12px">'
+    +'<div style="background:#0b1220;border:1px solid #1e293b;border-radius:10px;padding:9px 12px"><div style="font-size:.58rem;color:#64748b;text-transform:uppercase;letter-spacing:.07em;font-weight:700">Line</div><div style="font-weight:900;font-size:1rem;color:#fff;margin-top:2px">'+(p.is_td?'0.5 TD':line)+'</div></div>'
+    +'<div style="background:#0b1220;border:1px solid #1e293b;border-radius:10px;padding:9px 12px"><div style="font-size:.58rem;color:#64748b;text-transform:uppercase;letter-spacing:.07em;font-weight:700">Best odds</div><div style="font-weight:900;font-size:1rem;color:#fbbf24;font-family:monospace;margin-top:2px">'+_nOddsDisp(odds)+(book?(' <span style="font-size:.62rem;color:#94a3b8;font-weight:600">'+book+'</span>'):'')+'</div></div>'
+    +(p.prob!=null?('<div style="background:#0b1220;border:1px solid #1e293b;border-radius:10px;padding:9px 12px"><div style="font-size:.58rem;color:#64748b;text-transform:uppercase;letter-spacing:.07em;font-weight:700">Model prob</div><div style="font-weight:900;font-size:1rem;color:#cbd5e1;font-family:monospace;margin-top:2px">'+Math.round(p.prob*100)+'%'+(p.impl_prob!=null?(' <span style="font-size:.68rem;color:#64748b">vs '+Math.round(p.impl_prob*100)+'%</span>'):'')+'</div></div>'):'')
+    +(edge!=null?('<div style="background:#0b1220;border:1px solid #1e293b;border-radius:10px;padding:9px 12px"><div style="font-size:.58rem;color:#64748b;text-transform:uppercase;letter-spacing:.07em;font-weight:700">Edge</div><div style="font-weight:900;font-size:1rem;color:'+edgeClr+';font-family:monospace;margin-top:2px">'+(edge>0?'+':'')+Math.round(edge*100)+'%</div></div>'):'')
+    +'</div>';
+  var wu=p.blurb?('<div style="margin-top:14px;background:rgba(245,158,11,.05);border:1px solid rgba(245,158,11,.22);border-radius:10px;padding:11px 13px">'
+    +'<div style="font-size:.6rem;font-weight:800;letter-spacing:.07em;text-transform:uppercase;color:'+acc+';margin-bottom:6px">Why this pick</div>'
+    +'<div style="font-size:.82rem;line-height:1.55;color:#cbd5e1">'+p.blurb+'</div></div>'):'';
+  var haBadge=hasHA?('<span class="badge '+(ha?'badge-home':'badge-away')+'" style="margin-left:8px">'+(ha?'HOME':'AWAY')+'</span>'):'';
+  var html='<div style="background:#0f172a;border:1px solid #1e293b;border-radius:16px;max-width:640px;width:100%;max-height:88vh;overflow:auto;box-shadow:0 20px 60px rgba(0,0,0,.5)" onclick="event.stopPropagation()">'
+    +'<div style="display:flex;justify-content:space-between;align-items:center;padding:16px 18px;border-bottom:1px solid #1e293b">'
+    +'<div><div style="font-weight:800;font-size:1.05rem;color:#fff">'+p.name+haBadge+'</div>'
+    +'<div style="color:#94a3b8;font-size:.78rem;margin-top:2px">'+p.team+' vs '+p.opponent+' &#183; <span style="color:'+pickClr+';font-weight:800">'+goal+'</span></div></div>'
+    +'<button onclick="closeNflLadder()" style="background:#1e293b;border:none;color:#cbd5e1;width:30px;height:30px;border-radius:8px;cursor:pointer;font-size:1rem">&#x2715;</button>'
+    +'</div>'
+    +'<div style="padding:14px 18px">'
+    +valBox
+    +'<div style="margin-top:14px;font-size:.62rem;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:'+acc+';margin-bottom:6px">Last '+(p.glog||[]).length+' games <span style="color:#64748b;font-weight:600;text-transform:none;letter-spacing:0">(green = '+(isU?'stayed under':'cleared')+' '+(p.is_td?'0.5 TD':line)+')</span></div>'
+    +'<div style="background:#0b1220;border:1px solid #1e293b;border-radius:10px;overflow:hidden"><table style="width:100%;border-collapse:collapse">'+rows+'</table></div>'
+    +voBlock
+    +'<div style="margin-top:14px">'+splits+'</div>'
+    +wu
+    +'<div style="margin-top:12px;border-top:1px solid #1e293b;padding-top:10px;color:'+pickClr+';font-weight:800;font-size:.85rem">Pick: '+goal+'</div>'
+    +'</div>'
+    +'</div>';
   var ov=document.createElement('div');
   ov.className='lad-ov'; ov.id='nflLadOv'; ov.onclick=closeNflLadder;
   ov.innerHTML=html;
@@ -1833,13 +2150,39 @@ function _nflPaint(q){
     h+='</div>';
   }
 
-  // Card grids per market (collapsible pop-downs, Top 12 each)
+  // MLB-style Top 10 boards per category — Over/Under sub-sections (Anytime TD
+  // is yes-side only) + a disjoint Overflow list (ranks 11-20) per side.
+  // Finished games (kickoff + 4h passed) drop off the board.
   var hasCards=false;
+  var boards=d.boards||null;
+  var _bf=function(arr){
+    arr=(arr||[]).filter(function(p){return !_nflGameDone(p);});
+    if(q) arr=arr.filter(function(p){return (p.name||'').toLowerCase().indexOf(q)>=0;});
+    return arr;
+  };
   _MORDER.forEach(function(m,i){
-    var g=(byM[m]||[]).slice(0,12);
-    if(!g.length) return;
+    var over=[],under=[],yes=[];
+    var b=boards?boards[m]:null;
+    if(b){ over=b.over||[]; under=b.under||[]; yes=b.yes||[]; }
+    else{
+      // legacy cached payloads without boards: derive per side from picks
+      var mp=(byM[m]||[]);
+      if(m==='Anytime TD'){ yes=mp; }
+      else{
+        over=mp.filter(function(p){return p.pick==='OVER';});
+        under=mp.filter(function(p){return p.pick==='UNDER';});
+      }
+    }
+    over=_bf(over); under=_bf(under); yes=_bf(yes);
+    var inner='';
+    if(m==='Anytime TD'){ inner+=_nSideBoard(yes,'YES &mdash; scores a TD','#f87171'); }
+    else{
+      inner+=_nSideBoard(over,'Over','#63cab7');
+      inner+=_nSideBoard(under,'Under','#ff8a65');
+    }
+    if(!inner) return;
     hasCards=true;
-    h+=_collapseSec('mkt_'+i, _mIcon(m)+' Top '+g.length+' '+m, nflCardGrid(g), expand);
+    h+=_collapseSec('mkt_'+i, _mIcon(m)+' '+m+' — Top 10', inner, expand);
   });
   if(!hasCards){
     h+='<div class="no-picks">No qualifying picks'+(q?' for "'+q+'"':' for '+(d.date||'today'))+'.</div>';
