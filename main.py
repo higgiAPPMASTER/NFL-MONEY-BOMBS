@@ -2025,6 +2025,10 @@ var _MLBL={'Pass Yds':'Pass','Pass TDs':'Pass TD','Completions':'Comp','Pass Att
 function _nflGameDone(p){
   var s=p&&p.game_start; if(!s) return false;
   var t=new Date(s).getTime(); if(!t||isNaN(t)) return false;
+  // Only auto-hide finished games on TODAY'S live slate. When browsing a
+  // past date every game is long over — show ALL picks (historical review).
+  var d=new Date(t), now=new Date();
+  if(d.toDateString()!==now.toDateString()) return false;
   return Date.now() > (t + 4*3600*1000);
 }
 function rateClass(r){ return r >= 70 ? 'green' : r >= 55 ? 'gold' : 'red-txt'; }
