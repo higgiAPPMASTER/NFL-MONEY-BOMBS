@@ -75,13 +75,13 @@ _TEAM_NAME_TO_ABBR = {
     "cincinnati bengals":"CIN","cleveland browns":"CLE","dallas cowboys":"DAL",
     "denver broncos":"DEN","detroit lions":"DET","green bay packers":"GB",
     "houston texans":"HOU","indianapolis colts":"IND","jacksonville jaguars":"JAX",
-    "kansas city chiefs":"KC","los angeles chargers":"LAC","los angeles rams":"LA",
+    "kansas city chiefs":"KC","los angeles chargers":"LAC","los angeles rams":"LAR",
     "las vegas raiders":"LV","miami dolphins":"MIA","minnesota vikings":"MIN",
     "new england patriots":"NE","new orleans saints":"NO","new york giants":"NYG",
     "new york jets":"NYJ","philadelphia eagles":"PHI","pittsburgh steelers":"PIT",
     "seattle seahawks":"SEA","san francisco 49ers":"SF","tampa bay buccaneers":"TB",
     "tennessee titans":"TEN","washington commanders":"WSH","washington football team":"WSH",
-    "raiders":"LV","rams":"LA","chargers":"LAC","49ers":"SF",
+    "raiders":"LV","rams":"LAR","chargers":"LAC","49ers":"SF",
 }
 
 def _name_to_abbr(full_name: str) -> str:
@@ -143,10 +143,20 @@ _CACHE_DIR = pathlib.Path("/tmp/mpa_cache")
 _CACHE_DIR.mkdir(parents=True, exist_ok=True)
 _CACHE_TTL = 6 * 3600
 
+def _is_past_date(date_key) -> bool:
+    """Past dates are FINAL — historical odds/results never change, so their
+    caches never expire. (Historical Odds API calls cost 10x live ones, so
+    re-buying the same finished lines burns credits for nothing.)"""
+    try:
+        return str(date_key) < datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    except Exception:
+        return False
+
 def _cache_get(date_key):
     p = _CACHE_DIR / f"nfl_{date_key}.json"
     try:
-        if p.exists() and (time.time() - p.stat().st_mtime) < _CACHE_TTL:
+        if p.exists() and (_is_past_date(date_key)
+                           or (time.time() - p.stat().st_mtime) < _CACHE_TTL):
             return json.loads(p.read_text(encoding="utf-8"))
     except: pass
     return None
@@ -169,7 +179,8 @@ def _odds_cache_get(date_key):
     Handles the old list-only format for backward compat."""
     p = _CACHE_DIR / f"nfl_odds_{date_key}.json"
     try:
-        if p.exists() and (time.time() - p.stat().st_mtime) < _ODDS_TTL:
+        if p.exists() and (_is_past_date(date_key)
+                           or (time.time() - p.stat().st_mtime) < _ODDS_TTL):
             print(f"[OddsCache] HIT nfl/{date_key}")
             raw = json.loads(p.read_text(encoding="utf-8"))
             if isinstance(raw, dict) and "props" in raw:
@@ -191,7 +202,14 @@ def _odds_cache_set(date_key, props, game_lines):
 # ── nfl_data_py stats loader ───────────────────────────────────────────────────
 _nfl_df = None
 _nfl_df_lock = asyncio.Lock()
-_NFL_PKL      = _CACHE_DIR / "nfl_df_cache.pkl"
+_NFL_PKL      = _CACHE_DIR / "nfl_df_cache_v3.pkl"  # v3: ESPN team codes + scorer-only anytime_td
+
+# nfl-verse team codes that differ from ESPN's (ESPN is what the schedule,
+# H/A lookup and card display all use). Normalized ONCE at data load so every
+# comparison in the app speaks the same language. Without this, LAR/WSH
+# players look "traded" (wrong team + wrong home/away on cards, starters
+# evicted by mislabeled players) and their vs-opponent history comes up empty.
+_NFLVERSE_TO_ESPN = {"LA": "LAR", "WAS": "WSH"}
 _NFL_PKL_TTL  = 20 * 3600  # 20h — refresh once a day
 
 # ── ESPN H/A Lookup — (season, week, team_abbr) → 'HOME' or 'AWAY' ───────────
@@ -326,7 +344,7 @@ def _load_nfl_stats_sync():
                                   "passing_interceptions": "interceptions"})
             def col(name):
                 return d[name].fillna(0) if name in d.columns else 0
-            d["anytime_td"]      = col("rushing_tds") + col("receiving_tds") + col("passing_tds")
+            d["anytime_td"]      = col("rushing_tds") + col("receiving_tds")  # scorer only — no passing TDs
             d["tackles_assists"] = col("def_tackles_solo") + col("def_tackle_assists")
             d["def_ints"]        = col("def_interceptions")
             d["kicking_points"]  = col("fg_made") * 3 + col("pat_made")
@@ -354,8 +372,10 @@ def _load_nfl_stats_sync():
             return None
         off = pd.concat(off_frames, ignore_index=True)
 
-        # Compute anytime TD (offense only)
-        td_cols = [c for c in ["rushing_tds","receiving_tds","passing_tds"] if c in off.columns]
+        # Compute anytime TD (offense only). Anytime-TD props pay when the player
+        # SCORES — rushing or receiving TDs only. Passing TDs don't count (and
+        # would double-count the receiver's score in team aggregates).
+        td_cols = [c for c in ["rushing_tds","receiving_tds"] if c in off.columns]
         if td_cols:
             off["anytime_td"] = off[td_cols].sum(axis=1)
 
@@ -407,6 +427,11 @@ def _load_nfl_stats_sync():
 
         all_frames = [off] + [f for f in (deff, kick) if f is not None]
         _nfl_df = pd.concat(all_frames, ignore_index=True)
+        # Normalize team codes to ESPN style (LA→LAR, WAS→WSH) so schedule,
+        # H/A lookup, starter filter and cards all agree on team identity.
+        for _c in ("recent_team", "opponent_team"):
+            if _c in _nfl_df.columns:
+                _nfl_df[_c] = _nfl_df[_c].replace(_NFLVERSE_TO_ESPN)
         print(f"[NFL Data] Total: {len(_nfl_df):,} rows "
               f"(off {len(off):,}"
               + (f", def {len(deff):,}" if deff is not None else "")
@@ -541,12 +566,12 @@ async def get_prop_lines(event_id: str, date_str: str) -> List[Dict]:
         async with httpx.AsyncClient(timeout=20) as c:
             if is_past:
                 base = f"{ODDS_BASE}/historical/sports/americanfootball_nfl/events/{event_id}/odds"
-                params = {"apiKey": ODDS_API_KEY, "regions": "us,us2",
+                params = {"apiKey": ODDS_API_KEY, "regions": "us",
                          "markets": ",".join(PROP_MARKETS), "oddsFormat": "american",
                          "date": f"{date_str}T12:00:00Z"}
             else:
                 base = f"{ODDS_BASE}/sports/americanfootball_nfl/events/{event_id}/odds"
-                params = {"apiKey": ODDS_API_KEY, "regions": "us,us2",
+                params = {"apiKey": ODDS_API_KEY, "regions": "us",
                          "markets": ",".join(PROP_MARKETS), "oddsFormat": "american"}
             r = await c.get(base, params=params)
             if not r.is_success:
@@ -606,12 +631,12 @@ async def get_nfl_game_lines(event_id: str, date_str: str) -> dict:
         async with httpx.AsyncClient(timeout=15) as c:
             if is_past:
                 base   = f"{ODDS_BASE}/historical/sports/americanfootball_nfl/events/{event_id}/odds"
-                params = {"apiKey": ODDS_API_KEY, "regions": "us,us2",
+                params = {"apiKey": ODDS_API_KEY, "regions": "us",
                           "markets": "h2h,totals", "oddsFormat": "american",
                           "date": f"{date_str}T12:00:00Z"}
             else:
                 base   = f"{ODDS_BASE}/sports/americanfootball_nfl/events/{event_id}/odds"
-                params = {"apiKey": ODDS_API_KEY, "regions": "us,us2",
+                params = {"apiKey": ODDS_API_KEY, "regions": "us",
                           "markets": "h2h,totals", "oddsFormat": "american"}
             r = await c.get(base, params=params)
             if not r.is_success: return {}
@@ -678,6 +703,53 @@ def _first_str(series):
         pass
     return ""
 
+
+# ── Opponent defensive strength factor ─────────────────────────────────────────
+# For each offensive stat, measure how much of it every defense ALLOWS per game
+# recently vs the league average. A leaky defense (>1) nudges the projection up
+# (helps OVERS); a stingy one (<1) nudges it down. Clamped to ±10% — a modest
+# reorder nudge, never a takeover. Computed from data already in memory: zero
+# extra API calls or credits.
+_OPP_ADJ_COLS = {
+    "passing_yards": "pass D", "passing_tds": "pass D", "completions": "pass D",
+    "attempts": "pass D", "interceptions": "INT D",
+    "rushing_yards": "rush D", "carries": "rush D",
+    "receiving_yards": "pass D", "receptions": "pass D",
+    "anytime_td": "TD D",
+}
+_DEFF_CACHE: dict = {"df_ref": None, "maps": {}}
+
+def _def_factor_map(df, stat_col: str, n_games: int = 8) -> dict:
+    """{team_abbr: (factor, rank)} — factor clamped 0.90-1.10, rank 1 = stingiest
+    (allows the LEAST of this stat per game over its last n_games)."""
+    if _DEFF_CACHE["df_ref"] is not df:   # hold the object itself, not id() (reusable after gc)
+        _DEFF_CACHE["df_ref"] = df
+        _DEFF_CACHE["maps"] = {}
+    if stat_col in _DEFF_CACHE["maps"]:
+        return _DEFF_CACHE["maps"][stat_col]
+    out: dict = {}
+    try:
+        d = df[["season", "week", "opponent_team", stat_col]].dropna(
+            subset=["opponent_team", stat_col])
+        d = d[d["opponent_team"].astype(str) != ""]
+        g = (d.groupby(["opponent_team", "season", "week"])[stat_col].sum()
+               .reset_index().sort_values(["season", "week"], ascending=False))
+        per_team = {}
+        for team, grp in g.groupby("opponent_team"):
+            vals = grp[stat_col].head(n_games).tolist()
+            if len(vals) >= 3:
+                per_team[str(team)] = sum(vals) / len(vals)
+        if per_team:
+            lg = sum(per_team.values()) / len(per_team)
+            if lg > 0:
+                ranked = sorted(per_team.items(), key=lambda kv: kv[1])
+                for i, (tm, allowed) in enumerate(ranked):
+                    f = max(0.90, min(1.10, allowed / lg))
+                    out[tm] = (round(f, 3), i + 1)
+    except Exception as e:
+        print(f"[DefFactor] {stat_col} failed: {e}")
+    _DEFF_CACHE["maps"][stat_col] = out
+    return out
 
 def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str) -> Optional[Dict]:
     """Emit the shared NORMALIZED pick-field contract (same keys as the NHL app)
@@ -764,8 +836,22 @@ def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str) -> Optional[Dict
     score = round(sum(rates)/len(rates), 1) if rates else 0
 
     ref_avg = avg_b if avg_b is not None else avg_a
-    gap     = round(ref_avg - line, 1) if ref_avg is not None else None
-    pick    = "OVER" if (ref_avg and ref_avg > line) else ("UNDER" if (ref_avg and ref_avg < line) else None)
+
+    # Opponent-defense adjustment: project vs THIS defense, not a neutral one.
+    def_factor = 1.0; def_rank = None; def_lbl = _OPP_ADJ_COLS.get(stat_col, "")
+    if opp_abbr and stat_col in _OPP_ADJ_COLS:
+        _fr = _def_factor_map(df, stat_col).get(opp_abbr)
+        if _fr:
+            def_factor, def_rank = _fr
+    adj_avg = round(ref_avg * def_factor, 1) if ref_avg is not None else None
+    def_adj = round((def_factor - 1) * 100)
+
+    gap     = round(adj_avg - line, 1) if adj_avg is not None else None
+    # EVERY player with any history gets a pick — a 0.0 average is a real
+    # signal (obvious UNDER), not "no data". Ties lean UNDER (book gets the push).
+    pick    = None
+    if adj_avg is not None:
+        pick = "OVER" if adj_avg > line else "UNDER"
     tag     = _book_tag_nfl(pick, score, gap, under_rate)
 
     # Recent game log (newest first) for the ladder modal
@@ -821,6 +907,9 @@ def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str) -> Optional[Dict
         "vsLineHits": vsl_hits, "vsLineTotal": vsl_tot, "vsLineRate": vsl_rate or 0,
         # under track
         "underHits": under_hits, "underTotal": tot_b, "underRate": under_rate or 0, "underLine": line,
+        # opponent-defense adjustment
+        "defAdj": def_adj, "defRank": def_rank, "defLbl": def_lbl,
+        "projAvg": adj_avg,
         # score / pick
         "score": score, "dispScore": score, "gap": gap, "pick": pick, "tag": tag,
         "glog": glog, "vsOppLog": vs_opp_log,
@@ -913,14 +1002,26 @@ def _nfl_starter_name(team_abbr: str, df, col: str = "passing_yards") -> str:
     except Exception:
         return "TBD"
 
-async def _build_nfl_game_predictions(espn_games: list, df, date_str: str) -> list:
+async def _build_nfl_game_predictions(espn_games: list, df, date_str: str,
+                                      gl_cache: dict = None) -> tuple:
     """Build Game Predictor payload for every game on today's slate.
-    Fetches h2h + totals for all games concurrently via get_nfl_game_lines."""
+    Fetches h2h + totals for all games concurrently via get_nfl_game_lines.
+    Uses cached game lines when available (past-date lines are final) and
+    returns (predictions, newly_fetched_lines_by_event_id) so the caller can
+    persist them — every skipped historical call saves 10x-priced credits."""
     HOME_ADJ = 1.05
     predictions = []
-    # Fetch game-level odds concurrently
-    line_tasks = [get_nfl_game_lines(g.get("id", ""), date_str) for g in espn_games]
-    all_gl = await asyncio.gather(*line_tasks)
+    gl_cache = dict(gl_cache or {})
+    fetched: dict = {}
+    async def _one_gl(g):
+        eid = g.get("id", "")
+        if eid and eid in gl_cache:
+            return gl_cache[eid]
+        gl = await get_nfl_game_lines(eid, date_str)
+        if eid and gl:
+            fetched[eid] = gl
+        return gl
+    all_gl = await asyncio.gather(*[_one_gl(g) for g in espn_games])
     for g, gl in zip(espn_games, all_gl):
         ha = g.get("home_abbr", ""); aa = g.get("away_abbr", "")
         if not ha or not aa:
@@ -984,7 +1085,7 @@ async def _build_nfl_game_predictions(espn_games: list, df, date_str: str) -> li
             "mkt_edge": mkt_edge, "value_flag": value_flag,
             "drivers": drivers, "game_start": g.get("start", ""),
         })
-    return predictions
+    return predictions, fetched
 
 # ── Pipeline ───────────────────────────────────────────────────────────────────
 async def run_pipeline(date_str: str, progress=None) -> Dict:
@@ -1085,7 +1186,12 @@ async def run_pipeline(date_str: str, progress=None) -> Dict:
     # 7. Game Predictor — fetches h2h + totals concurrently (separate calls from props
     #    so player-prop market quota is never shared with game-level markets)
     _p("Building game predictions…")
-    game_predictions = await _build_nfl_game_predictions(espn_games, df, date_str)
+    game_predictions, new_gl = await _build_nfl_game_predictions(
+        espn_games, df, date_str, game_lines_by_id)
+    if new_gl:
+        # Persist freshly-bought game lines so re-runs never re-buy them
+        merged_gl = {**(game_lines_by_id or {}), **new_gl}
+        _odds_cache_set(date_str, all_lines, merged_gl)
     _p("Finishing up…")
     result  = {"picks":picks, "all":all_results, "date":date_str,
                "games":games_out, "qualified":len(picks),
@@ -2106,6 +2212,11 @@ function nflCard(p,i){
     ? `<div class="pc-stat"><div class="k">vs Book L10</div><div class="v ${rateClass(p.vsLineRate)}">${p.vsLineHits}/${p.vsLineTotal} (${p.vsLineRate}%)</div></div>`
     : `<div class="pc-stat"><div class="k">Under L10</div><div class="v ${rateClass(p.underRate)}">${p.underHits}/${p.underTotal} (${p.underRate}%)</div></div>`;
   var haBadge=hasHA?`<span class="${ha?'home':'away'}">${ha?'HOME':'AWAY'}</span>`:'';
+  var defChip='';
+  if(p.defRank&&p.defAdj){
+    var dcol=p.defAdj>0?'#4ade80':'#f87171';
+    defChip='<div style="font-size:.62rem;font-weight:800;color:'+dcol+';margin-top:2px">vs #'+p.defRank+' '+(p.defLbl||'D')+' · '+(p.defAdj>0?'+':'')+p.defAdj+'% proj</div>';
+  }
   return `
    <div class="pick-card ${_accFor(p.mkt)}">
      <div class="pc-rank">${i}</div>
@@ -2118,6 +2229,7 @@ function nflCard(p,i){
          <div class="pc-name">${p.name}</div>
          <div class="pc-meta">${p.team} vs ${p.opponent} ${haBadge}</div>
          <div class="pc-mkt">${p.mkt||''} · ${p.pick||''}</div>
+         ${defChip}
        </div>
      </div>
      <div class="pc-tagrow">${fmtTag(p.tag)}</div>
