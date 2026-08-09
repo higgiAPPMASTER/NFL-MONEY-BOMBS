@@ -1017,11 +1017,24 @@ def _devig_nfl(odds_home, odds_away):
     return round(ph / tot * 100), round(pa / tot * 100)
 
 def _nfl_starter_name(team_abbr: str, df, col: str = "passing_yards") -> str:
-    """Name of the player with most career volume in col for this team (= starter)."""
+    """Name of the CURRENT starter for this team: latest season only, and only
+    players whose most recent game was with this team (excludes traded players
+    like Geno Smith whose old-team rows would otherwise win on career volume)."""
     try:
         if col not in df.columns:
             return "TBD"
-        team_df = df[df["recent_team"] == team_abbr]
+        latest = int(df["season"].max())
+        cur = df[df["season"] == latest]
+        team_df = cur[cur["recent_team"] == team_abbr]
+        if not team_df.empty:
+            # Keep only players still on this team (their latest row is here)
+            last_rows = (cur.sort_values(["season", "week"])
+                            .groupby("player_display_name").tail(1))
+            on_team = set(last_rows[last_rows["recent_team"] == team_abbr]
+                          ["player_display_name"])
+            team_df = team_df[team_df["player_display_name"].isin(on_team)]
+        if team_df.empty:
+            team_df = df[df["recent_team"] == team_abbr]
         if team_df.empty:
             return "TBD"
         grp = (team_df.groupby("player_display_name")[col].sum()
