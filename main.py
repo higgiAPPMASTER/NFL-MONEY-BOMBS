@@ -18,7 +18,7 @@ from jose import jwt as jose_jwt
 ODDS_API_KEY  = os.environ.get("ODDS_API_KEY", "")
 ODDS_BASE     = "https://api.the-odds-api.com/v4"
 JWT_SECRET    = os.environ.get("JWT_SECRET", "")
-NFL_SEASONS   = [2024, 2023, 2022, 2021, 2020]
+NFL_SEASONS   = [2024, 2023]
 
 PROP_MARKETS = [
     # passing
@@ -257,21 +257,22 @@ _KEEP_COLS   = ["player_display_name","player_id","headshot_url","recent_team","
                 "completions","attempts","interceptions","carries"]
 
 def _dl_csv(url):
-    """Download one nfl-verse CSV (regular season only) as a DataFrame."""
-    import pandas as pd, io, urllib.request
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=45) as r:
-        d = pd.read_csv(io.BytesIO(r.read()), low_memory=False)
+    """Download one nfl-verse CSV (regular season only) as a DataFrame.
+    Uses httpx with a hard 60-second total timeout so a stalled download
+    fails fast instead of hanging forever."""
+    import pandas as pd, io
+    r = httpx.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=60, follow_redirects=True)
+    r.raise_for_status()
+    d = pd.read_csv(io.BytesIO(r.content), low_memory=False)
     if "season_type" in d.columns:
         d = d[d["season_type"] == "REG"]
     return d
 
 def _load_nfl_stats_sync():
-    """Download offense + defense + kicking CSVs from nfl-verse GitHub and merge
-    into one frame on the shared schema (player, season, week, recent_team,
-    opponent_team). The def/kicking files lack opponent_team, so it is derived
-    from the offense schedule. No package needed beyond pandas.
-    Result is pickled to disk so spin-down restarts skip the 60-120s download."""
+    """Download offense + defense + kicking CSVs from nfl-verse GitHub.
+    ALL files are fetched in parallel (ThreadPoolExecutor) so total download
+    time = slowest single file, not sum of all files.
+    Result is pickled to disk so spin-down restarts load in ~1 second."""
     global _nfl_df
     if _nfl_df is not None:
         return _nfl_df
@@ -284,28 +285,46 @@ def _load_nfl_stats_sync():
             return _nfl_df
     except Exception as e:
         print(f"[NFL Data] Disk cache load failed: {e}")
-    print("[NFL Data] Downloading from nfl-verse GitHub...")
+    print(f"[NFL Data] Downloading {len(NFL_SEASONS)*3} CSVs in parallel from nfl-verse…")
     try:
         import pandas as pd
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        # Build the full list of (tag, url) pairs for parallel download
+        off_urls  = [(f"off_{y}",  _NFL_CSV_URL.format(year=y))  for y in NFL_SEASONS]
+        def_urls  = [(f"def_{y}",  _NFL_DEF_URL.format(year=y))  for y in NFL_SEASONS]
+        kick_urls = [(f"kick_{y}", _NFL_KICK_URL.format(year=y)) for y in NFL_SEASONS]
+        all_tasks = off_urls + def_urls + kick_urls
+
+        results: dict = {}
+        with ThreadPoolExecutor(max_workers=len(all_tasks)) as ex:
+            fut_map = {ex.submit(_dl_csv, url): tag for tag, url in all_tasks}
+            for fut in as_completed(fut_map):
+                tag = fut_map[fut]
+                try:
+                    results[tag] = fut.result()
+                    print(f"[NFL Data] {tag}: {len(results[tag])} rows")
+                except Exception as e:
+                    print(f"[NFL Data] {tag} failed: {e}")
+
         # ---- offense (skill-position) ----
-        frames = []
-        for year in NFL_SEASONS:
-            try:
-                df_yr = _dl_csv(_NFL_CSV_URL.format(year=year))
-                keep  = [c for c in _KEEP_COLS if c in df_yr.columns]
-                frames.append(df_yr[keep])
-                print(f"[NFL Data] off {year}: {len(df_yr)} rows")
-            except Exception as e:
-                print(f"[NFL Data] off {year} failed: {e}")
-        if not frames:
+        off_frames = []
+        for y in NFL_SEASONS:
+            df_yr = results.get(f"off_{y}")
+            if df_yr is not None:
+                keep = [c for c in _KEEP_COLS if c in df_yr.columns]
+                off_frames.append(df_yr[keep])
+        if not off_frames:
+            print("[NFL Data] No offense data downloaded — aborting")
             return None
-        off = pd.concat(frames, ignore_index=True)
+        off = pd.concat(off_frames, ignore_index=True)
+
         # Compute anytime TD (offense only)
         td_cols = [c for c in ["rushing_tds","receiving_tds","passing_tds"] if c in off.columns]
         if td_cols:
             off["anytime_td"] = off[td_cols].sum(axis=1)
 
-        # (season, week, team) -> opponent_team map, from offense rows (carry both)
+        # (season, week, team) -> opponent_team map from offense rows
         opp_map = {}
         try:
             sched = off[["season","week","recent_team","opponent_team"]].dropna()
@@ -315,16 +334,16 @@ def _load_nfl_stats_sync():
         except Exception as e:
             print(f"[NFL Data] opp map failed: {e}")
 
-        def _load_extra(tag, url_tpl, rename, computed):
-            """Download a def/kicking CSV family, normalize to the offense schema
-            (recent_team + derived opponent_team) and return the merged frame."""
+        def _merge_extra(tag_prefix, url_tpl, rename, computed):
             parts = []
             ident = ["player_display_name","player_id","headshot_url","season","week","season_type"]
-            for year in NFL_SEASONS:
+            for y in NFL_SEASONS:
+                d = results.get(f"{tag_prefix}_{y}")
+                if d is None:
+                    continue
                 try:
-                    d = _dl_csv(url_tpl.format(year=year))
                     if "team" in d.columns:
-                        d = d.rename(columns={"team":"recent_team"})
+                        d = d.rename(columns={"team": "recent_team"})
                     for src, dst in rename.items():
                         if src in d.columns and src != dst:
                             d[dst] = d[src]
@@ -338,29 +357,26 @@ def _load_nfl_stats_sync():
                     want = ident + ["recent_team","opponent_team"] + list(rename.values()) + list(computed.keys())
                     cols = [c for c in dict.fromkeys(want) if c in d.columns]
                     parts.append(d[cols])
-                    print(f"[NFL Data] {tag} {year}: {len(d)} rows")
                 except Exception as e:
-                    print(f"[NFL Data] {tag} {year} failed: {e}")
+                    print(f"[NFL Data] merge {tag_prefix}_{y} failed: {e}")
             return pd.concat(parts, ignore_index=True) if parts else None
 
-        # ---- defense ----
-        deff = _load_extra("def", _NFL_DEF_URL,
-            rename={"def_tackles":"tackles_assists", "def_sacks":"def_sacks",
+        deff = _merge_extra("def", _NFL_DEF_URL,
+            rename={"def_tackles":"tackles_assists","def_sacks":"def_sacks",
                     "def_interceptions":"def_ints"},
             computed={})
-        # ---- kicking (kicking_points = 3*FG + PAT) ----
-        kick = _load_extra("kick", _NFL_KICK_URL,
+        kick = _merge_extra("kick", _NFL_KICK_URL,
             rename={"fg_made":"fg_made"},
-            computed={"kicking_points": lambda d: d.get("fg_made", 0).fillna(0)*3
-                                                 + d.get("pat_made", 0).fillna(0)})
+            computed={"kicking_points": lambda d: d.get("fg_made", pd.Series(dtype=float)).fillna(0)*3
+                                                 + d.get("pat_made", pd.Series(dtype=float)).fillna(0)})
 
         all_frames = [off] + [f for f in (deff, kick) if f is not None]
-        df = pd.concat(all_frames, ignore_index=True)
-        _nfl_df = df
-        print(f"[NFL Data] Total: {len(_nfl_df):,} rows (off {len(off):,}"
+        _nfl_df = pd.concat(all_frames, ignore_index=True)
+        print(f"[NFL Data] Total: {len(_nfl_df):,} rows "
+              f"(off {len(off):,}"
               + (f", def {len(deff):,}" if deff is not None else "")
               + (f", kick {len(kick):,}" if kick is not None else "") + ")")
-        # Persist to disk so spin-down restarts skip the 60-120s download
+        # Persist to disk so spin-down restarts skip the download entirely
         try:
             import pickle
             _NFL_PKL.write_bytes(pickle.dumps(_nfl_df))
@@ -369,6 +385,7 @@ def _load_nfl_stats_sync():
             print(f"[NFL Data] Disk cache save failed: {pe}")
     except Exception as e:
         print(f"[NFL Data] Error: {e}")
+        import traceback; traceback.print_exc()
         _nfl_df = None
     return _nfl_df
 
@@ -385,16 +402,14 @@ async def get_nfl_stats():
 @app.on_event("startup")
 async def _startup_preload():
     """Kick off stat downloads and H/A lookup immediately on server start.
-    Both run in the background so they don't block the server from accepting
-    requests. By the time the first user clicks Run, the data is usually ready
-    (or at least well underway so the wait is short)."""
+    Runs entirely in the background — the server accepts requests immediately.
+    By the time the first user clicks Run the data is usually ready."""
     async def _bg():
-        # H/A lookup first (fast: disk cache → instant; ESPN → ~30s)
-        asyncio.create_task(_build_ha_lookup())
-        # Stats download (disk cache → ~1s; GitHub → 60-120s first deploy)
-        loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, _load_nfl_stats_sync)
-        print("[Startup] Preload complete — stats ready")
+        try:
+            await get_nfl_stats()   # handles lock, disk cache, parallel download
+            print("[Startup] Preload complete — stats ready")
+        except Exception as e:
+            print(f"[Startup] Preload error (non-fatal): {e}")
     asyncio.create_task(_bg())
 
 # ── ESPN Schedule ──────────────────────────────────────────────────────────────
