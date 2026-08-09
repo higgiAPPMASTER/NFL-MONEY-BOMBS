@@ -287,8 +287,18 @@ def _dl_csv(url):
     Uses httpx with a hard 60-second total timeout so a stalled download
     fails fast instead of hanging forever."""
     import pandas as pd, io
-    r = httpx.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=60, follow_redirects=True)
-    r.raise_for_status()
+    last_err = None
+    for attempt in range(3):   # retry — a single flaky download must not silently
+        try:                   # drop a whole season of stats from every pick
+            r = httpx.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=60, follow_redirects=True)
+            r.raise_for_status()
+            break
+        except Exception as e:
+            last_err = e
+            print(f"[NFL Data] download attempt {attempt+1}/3 failed for {url}: {e}")
+            time.sleep(2 * (attempt + 1))
+    else:
+        raise last_err
     d = pd.read_csv(io.BytesIO(r.content), low_memory=False)
     if "season_type" in d.columns:
         d = d[d["season_type"] == "REG"]
@@ -436,11 +446,18 @@ def _load_nfl_stats_sync():
               f"(off {len(off):,}"
               + (f", def {len(deff):,}" if deff is not None else "")
               + (f", kick {len(kick):,}" if kick is not None else "") + ")")
-        # Persist to disk so spin-down restarts skip the download entirely
+        # Persist to disk so spin-down restarts skip the download entirely.
+        # ONLY cache a COMPLETE dataset — pickling a partial one (a season's
+        # download failed) would serve season-less picks for hours.
         try:
-            import pickle
-            _NFL_PKL.write_bytes(pickle.dumps(_nfl_df))
-            print(f"[NFL Data] Saved to disk cache ({_NFL_PKL})")
+            got_seasons = {int(s) for s in _nfl_df["season"].dropna().unique()}
+            if all(y in got_seasons for y in NFL_SEASONS):
+                import pickle
+                _NFL_PKL.write_bytes(pickle.dumps(_nfl_df))
+                print(f"[NFL Data] Saved to disk cache ({_NFL_PKL})")
+            else:
+                print(f"[NFL Data] NOT caching — missing seasons "
+                      f"{sorted(set(NFL_SEASONS) - got_seasons)}; next run retries")
         except Exception as pe:
             print(f"[NFL Data] Disk cache save failed: {pe}")
     except Exception as e:
@@ -688,8 +705,8 @@ def _book_tag_nfl(pick, score, gap, under_rate):
     line; FADE when the UNDER side is strong + the line sits above the average."""
     if pick == "OVER" and score is not None and score >= 65 and (gap or 0) > 0:
         return "SUGGESTED"
-    if pick == "UNDER" and under_rate is not None and under_rate >= 65 and (gap or 0) < 0:
-        return "FADE"
+    if pick == "UNDER" and score is not None and score >= 65 and (gap or 0) < 0:
+        return "FADE"   # score is side-aware — for UNDER picks it already measures under-hits
     return ""
 
 
@@ -832,9 +849,6 @@ def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str) -> Optional[Dict
     vsl_tot    = len(la_vals)
     vsl_rate   = round(vsl_hits/vsl_tot*100, 1) if vsl_tot >= 1 else None
 
-    rates = [r for r in [rate_a, rate_b] if r is not None]
-    score = round(sum(rates)/len(rates), 1) if rates else 0
-
     ref_avg = avg_b if avg_b is not None else avg_a
 
     # Opponent-defense adjustment: project vs THIS defense, not a neutral one.
@@ -852,6 +866,20 @@ def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str) -> Optional[Dict
     pick    = None
     if adj_avg is not None:
         pick = "OVER" if adj_avg > line else "UNDER"
+
+    # Side-aware stats: on an UNDER card every rate + the score describe the
+    # UNDER side (times the player stayed BELOW the line). A green 100% must
+    # always SUPPORT the printed pick — never contradict it.
+    if pick == "UNDER":
+        hits_a = sum(1 for v in vs_vals if v < line)
+        rate_a = round(hits_a/tot_a*100, 1) if tot_a >= 1 else None
+        hits_b = under_hits
+        rate_b = under_rate
+        vsl_hits = sum(1 for v in la_vals if v < line)
+        vsl_rate = round(vsl_hits/vsl_tot*100, 1) if vsl_tot >= 1 else None
+
+    rates = [r for r in [rate_a, rate_b] if r is not None]
+    score = round(sum(rates)/len(rates), 1) if rates else 0
     tag     = _book_tag_nfl(pick, score, gap, under_rate)
 
     # Recent game log (newest first) for the ladder modal
@@ -1193,8 +1221,23 @@ async def run_pipeline(date_str: str, progress=None) -> Dict:
         merged_gl = {**(game_lines_by_id or {}), **new_gl}
         _odds_cache_set(date_str, all_lines, merged_gl)
     _p("Finishing up…")
+    # Data health: if a whole season failed to download, SAY so on screen —
+    # picks silently built from old seasons look like nonsense stats.
+    data_warning = ""
+    try:
+        loaded_seasons = sorted({int(s) for s in df["season"].dropna().unique()})
+        missing = [y for y in NFL_SEASONS if y not in loaded_seasons]
+        if missing:
+            data_warning = ("⚠️ " + ", ".join(map(str, missing)) +
+                            " season stats failed to download — picks below use only " +
+                            ", ".join(map(str, loaded_seasons)) +
+                            " data. Tap Force Refresh to retry.")
+    except Exception:
+        pass
+
     result  = {"picks":picks, "all":all_results, "date":date_str,
                "games":games_out, "qualified":len(picks),
+               "data_warning": data_warning,
                "game_predictions": game_predictions}
     _cache_set(date_str, result)
     try:
@@ -2346,6 +2389,7 @@ function openNflLadder(key){
       ${vslRow}
       <div class="lad-stat"><span class="k">Under Line L10</span><span class="v ${rateClass(p.underRate)}">${p.underHits}/${p.underTotal} (${p.underRate}%)</span></div>
       <div class="lad-stat"><span class="k">Average</span><span class="v gold">${p.avg}</span></div>
+      ${(p.defRank!=null&&p.defAdj!=null)?`<div class="lad-stat"><span class="k">Opp Def Adj (#${p.defRank} ${p.defLbl||'D'})</span><span class="v" style="color:${p.defAdj>0?'#4ade80':(p.defAdj<0?'#f87171':'#9ca3af')}">${p.defAdj>0?'+':''}${p.defAdj}% → ${p.projAvg!=null?p.projAvg:p.avg}</span></div>`:''}
       <div class="lad-stat"><span class="k">Score</span><span class="v" style="color:#f59e0b">${p.dispScore}</span></div>
     </div>`;
   var ov=document.createElement('div');
@@ -2578,7 +2622,8 @@ function renderResults(d){
   window._nflState={d:d, all:(d.all||[])};
   window.__NFL_PLAYS__=d.all||[];
   window.__NFL_DATE__=d.date||'';
-  res.innerHTML='<div class="nfl-toolbar"><input id="nflSearch" type="text" placeholder="Search player…" oninput="_nflPaint(this.value)"/></div><div id="nflBody"></div>';
+  var warn=d.data_warning?('<div class="err-box" style="margin-bottom:10px">'+d.data_warning+'</div>'):'';
+  res.innerHTML=warn+'<div class="nfl-toolbar"><input id="nflSearch" type="text" placeholder="Search player…" oninput="_nflPaint(this.value)"/></div><div id="nflBody"></div>';
   _renderNflGamePredictor(d);
   _nflPaint('');
 }
