@@ -18,7 +18,11 @@ from jose import jwt as jose_jwt
 ODDS_API_KEY  = os.environ.get("ODDS_API_KEY", "")
 ODDS_BASE     = "https://api.the-odds-api.com/v4"
 JWT_SECRET    = os.environ.get("JWT_SECRET", "")
-NFL_SEASONS   = [2024, 2023]
+# Current NFL season + previous one, computed automatically (season year rolls
+# over in September — so in Jan 2026 the "current" season is 2025).
+_now_utc      = datetime.now(timezone.utc)
+_cur_season   = _now_utc.year if _now_utc.month >= 9 else _now_utc.year - 1
+NFL_SEASONS   = [_cur_season, _cur_season - 1]
 
 PROP_MARKETS = [
     # passing
@@ -251,6 +255,10 @@ async def _build_ha_lookup():
 _NFL_CSV_URL  = "https://github.com/nflverse/nflverse-data/releases/download/player_stats/player_stats_{year}.csv"
 _NFL_DEF_URL  = "https://github.com/nflverse/nflverse-data/releases/download/player_stats/player_stats_def_{year}.csv"
 _NFL_KICK_URL = "https://github.com/nflverse/nflverse-data/releases/download/player_stats/player_stats_kicking_{year}.csv"
+# nfl-verse retired the per-type player_stats files after 2024. Seasons 2025+
+# live in ONE combined weekly file (offense + defense + kicking per player-week).
+_NFL_NEW_URL       = "https://github.com/nflverse/nflverse-data/releases/download/stats_player/stats_player_week_{year}.csv"
+_NFL_NEW_FMT_START = 2025
 _KEEP_COLS   = ["player_display_name","player_id","headshot_url","recent_team","opponent_team",
                 "season","week","season_type","rushing_yards","receiving_yards","passing_yards",
                 "receptions","targets","passing_tds","rushing_tds","receiving_tds",
@@ -285,16 +293,21 @@ def _load_nfl_stats_sync():
             return _nfl_df
     except Exception as e:
         print(f"[NFL Data] Disk cache load failed: {e}")
-    print(f"[NFL Data] Downloading {len(NFL_SEASONS)*3} CSVs in parallel from nfl-verse…")
+    print(f"[NFL Data] Downloading stats for seasons {NFL_SEASONS} in parallel from nfl-verse…")
     try:
         import pandas as pd
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        # Build the full list of (tag, url) pairs for parallel download
-        off_urls  = [(f"off_{y}",  _NFL_CSV_URL.format(year=y))  for y in NFL_SEASONS]
-        def_urls  = [(f"def_{y}",  _NFL_DEF_URL.format(year=y))  for y in NFL_SEASONS]
-        kick_urls = [(f"kick_{y}", _NFL_KICK_URL.format(year=y)) for y in NFL_SEASONS]
-        all_tasks = off_urls + def_urls + kick_urls
+        # Build the full list of (tag, url) pairs for parallel download.
+        # Seasons < 2025 use the old 3-file layout; 2025+ use the single
+        # combined weekly file (nfl-verse retired the old files).
+        old_years = [y for y in NFL_SEASONS if y < _NFL_NEW_FMT_START]
+        new_years = [y for y in NFL_SEASONS if y >= _NFL_NEW_FMT_START]
+        off_urls  = [(f"off_{y}",  _NFL_CSV_URL.format(year=y))  for y in old_years]
+        def_urls  = [(f"def_{y}",  _NFL_DEF_URL.format(year=y))  for y in old_years]
+        kick_urls = [(f"kick_{y}", _NFL_KICK_URL.format(year=y)) for y in old_years]
+        new_urls  = [(f"new_{y}",  _NFL_NEW_URL.format(year=y))  for y in new_years]
+        all_tasks = off_urls + def_urls + kick_urls + new_urls
 
         results: dict = {}
         with ThreadPoolExecutor(max_workers=len(all_tasks)) as ex:
@@ -307,13 +320,35 @@ def _load_nfl_stats_sync():
                 except Exception as e:
                     print(f"[NFL Data] {tag} failed: {e}")
 
+        # ---- new combined format (2025+): one file has off + def + kicking ----
+        def _new_fmt_transform(d):
+            d = d.rename(columns={"team": "recent_team",
+                                  "passing_interceptions": "interceptions"})
+            def col(name):
+                return d[name].fillna(0) if name in d.columns else 0
+            d["anytime_td"]      = col("rushing_tds") + col("receiving_tds") + col("passing_tds")
+            d["tackles_assists"] = col("def_tackles_solo") + col("def_tackle_assists")
+            d["def_ints"]        = col("def_interceptions")
+            d["kicking_points"]  = col("fg_made") * 3 + col("pat_made")
+            extra = ["anytime_td","tackles_assists","def_sacks","def_ints",
+                     "fg_made","kicking_points"]
+            keep  = [c for c in _KEEP_COLS + extra if c in d.columns]
+            return d[keep]
+
         # ---- offense (skill-position) ----
         off_frames = []
-        for y in NFL_SEASONS:
+        for y in old_years:
             df_yr = results.get(f"off_{y}")
             if df_yr is not None:
                 keep = [c for c in _KEEP_COLS if c in df_yr.columns]
                 off_frames.append(df_yr[keep])
+        for y in new_years:
+            df_yr = results.get(f"new_{y}")
+            if df_yr is not None:
+                try:
+                    off_frames.append(_new_fmt_transform(df_yr))
+                except Exception as e:
+                    print(f"[NFL Data] new-format {y} transform failed: {e}")
         if not off_frames:
             print("[NFL Data] No offense data downloaded — aborting")
             return None
@@ -397,7 +432,15 @@ async def get_nfl_stats():
         if _nfl_df is not None:
             return _nfl_df
         loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, _load_nfl_stats_sync)
+        try:
+            # Hard wall-clock deadline: even a pathological slow-drip download
+            # can't hold the job in "running" forever — after 150s we give up
+            # and the pipeline returns a clean error the user can retry.
+            return await asyncio.wait_for(
+                loop.run_in_executor(None, _load_nfl_stats_sync), timeout=150)
+        except asyncio.TimeoutError:
+            print("[NFL Data] Stats load exceeded 150s deadline — giving up this run")
+            return None
 
 @app.on_event("startup")
 async def _startup_preload():
@@ -1144,9 +1187,16 @@ async def api_run(request: Request):
     JOBS[job_id] = {"status":"running","result":None,"error":None,"progress":"Starting…"}
     async def _run():
         try:
-            result = await run_pipeline(date_str,
-                progress=lambda m: JOBS.get(job_id, {}).update({"progress": m}))
+            # Job-level watchdog: no matter what hangs inside, the job always
+            # resolves to done/error within 5 minutes so the UI never spins forever.
+            result = await asyncio.wait_for(
+                run_pipeline(date_str,
+                    progress=lambda m: JOBS.get(job_id, {}).update({"progress": m})),
+                timeout=300)
             JOBS[job_id].update({"status":"done","result":result})
+        except asyncio.TimeoutError:
+            JOBS[job_id].update({"status":"error",
+                "error":"Run timed out after 5 minutes — the data sources may be slow right now. Please try again."})
         except Exception as e:
             JOBS[job_id].update({"status":"error","error":str(e)})
     asyncio.create_task(_run())
