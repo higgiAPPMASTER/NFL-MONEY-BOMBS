@@ -193,13 +193,29 @@ _HA_LOOKUP: dict = {}
 _HA_LOADED = False
 _HA_LOCK   = asyncio.Lock()
 
+_HA_CACHE_FILE = _CACHE_DIR / "nfl_ha_lookup.json"
+
 async def _build_ha_lookup():
-    """Build home/away lookup from ESPN historical schedules (18 weeks x 5 seasons)."""
+    """Build home/away lookup from ESPN historical schedules (18 weeks x 5 seasons).
+    Result is persisted to disk so subsequent requests within the same dyno instance
+    skip the 90-request ESPN fetch entirely."""
     global _HA_LOOKUP, _HA_LOADED
     async with _HA_LOCK:
         if _HA_LOADED:
             return
-        print("[H/A] Building home/away lookup from ESPN schedules...")
+        # Try disk cache first — survives spin-down within the same deploy
+        try:
+            if _HA_CACHE_FILE.exists():
+                raw = json.loads(_HA_CACHE_FILE.read_text(encoding="utf-8"))
+                _HA_LOOKUP = {tuple(int(x) if x.isdigit() else x for x in k.split("|")): v
+                              for k, v in raw.items()}
+                _HA_LOADED = True
+                print(f"[H/A] Loaded from disk cache: {len(_HA_LOOKUP)} entries")
+                return
+        except Exception as e:
+            print(f"[H/A] Disk cache load failed: {e}")
+
+        print("[H/A] Building home/away lookup from ESPN schedules (90 requests)…")
         sem = asyncio.Semaphore(15)
         async def fetch_week(season, week):
             async with sem:
@@ -221,6 +237,13 @@ async def _build_ha_lookup():
         await asyncio.gather(*[fetch_week(s, w) for s, w in pairs])
         _HA_LOADED = True
         print(f"[H/A] Built lookup: {len(_HA_LOOKUP)} entries")
+        # Persist to disk so the next request skips this step
+        try:
+            serializable = {f"{s}|{w}|{a}": v for (s, w, a), v in _HA_LOOKUP.items()}
+            _HA_CACHE_FILE.write_text(json.dumps(serializable), encoding="utf-8")
+            print(f"[H/A] Saved to disk cache")
+        except Exception as e:
+            print(f"[H/A] Disk cache save failed: {e}")
 
 # Direct nfl-verse CSV URLs (no package needed)
 _NFL_CSV_URL  = "https://github.com/nflverse/nflverse-data/releases/download/player_stats/player_stats_{year}.csv"
