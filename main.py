@@ -1792,11 +1792,23 @@ async function runPicks(){
   }
 }
 
+var _pollFails=0;
 async function pollJob(){
   if(!jobId)return;
   try{
     const r=await fetch('/api/run/'+jobId);
+    if(!r.ok){
+      // 404 = job gone (server restarted mid-run); stop and tell user
+      if(r.status===404){
+        clearInterval(pollTimer);
+        document.getElementById('statusMsg').textContent='Server restarted mid-run — please try again.';
+        document.getElementById('runBtn').disabled=false;
+        document.getElementById('runBtn').textContent='Run Picks';
+      }
+      return;
+    }
     const d=await r.json();
+    _pollFails=0;
     if(d.status==='done'){
       clearInterval(pollTimer);
       renderResults(d.result);
@@ -1811,7 +1823,16 @@ async function pollJob(){
     }else{
       document.getElementById('statusMsg').innerHTML='<span class="spinner"></span>Analyzing player histories...';
     }
-  }catch(e){}
+  }catch(e){
+    // Network error — retry up to 5 times before giving up
+    _pollFails++;
+    if(_pollFails>=5){
+      clearInterval(pollTimer);
+      document.getElementById('statusMsg').textContent='Connection lost — please refresh and try again.';
+      document.getElementById('runBtn').disabled=false;
+      document.getElementById('runBtn').textContent='Run Picks';
+    }
+  }
 }
 
 // Get Picks: load saved picks for the chosen date (read-only, never runs the pipeline).
