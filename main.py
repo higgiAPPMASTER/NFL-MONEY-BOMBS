@@ -187,6 +187,8 @@ def _odds_cache_set(date_key, props, game_lines):
 # ── nfl_data_py stats loader ───────────────────────────────────────────────────
 _nfl_df = None
 _nfl_df_lock = asyncio.Lock()
+_NFL_PKL      = _CACHE_DIR / "nfl_df_cache.pkl"
+_NFL_PKL_TTL  = 20 * 3600  # 20h — refresh once a day
 
 # ── ESPN H/A Lookup — (season, week, team_abbr) → 'HOME' or 'AWAY' ───────────
 _HA_LOOKUP: dict = {}
@@ -268,10 +270,20 @@ def _load_nfl_stats_sync():
     """Download offense + defense + kicking CSVs from nfl-verse GitHub and merge
     into one frame on the shared schema (player, season, week, recent_team,
     opponent_team). The def/kicking files lack opponent_team, so it is derived
-    from the offense schedule. No package needed beyond pandas."""
+    from the offense schedule. No package needed beyond pandas.
+    Result is pickled to disk so spin-down restarts skip the 60-120s download."""
     global _nfl_df
     if _nfl_df is not None:
         return _nfl_df
+    # ── Disk cache (pickle) ───────────────────────────────────────────────────
+    try:
+        if _NFL_PKL.exists() and (time.time() - _NFL_PKL.stat().st_mtime) < _NFL_PKL_TTL:
+            import pickle
+            _nfl_df = pickle.loads(_NFL_PKL.read_bytes())
+            print(f"[NFL Data] Loaded from disk cache: {len(_nfl_df):,} rows")
+            return _nfl_df
+    except Exception as e:
+        print(f"[NFL Data] Disk cache load failed: {e}")
     print("[NFL Data] Downloading from nfl-verse GitHub...")
     try:
         import pandas as pd
@@ -348,20 +360,42 @@ def _load_nfl_stats_sync():
         print(f"[NFL Data] Total: {len(_nfl_df):,} rows (off {len(off):,}"
               + (f", def {len(deff):,}" if deff is not None else "")
               + (f", kick {len(kick):,}" if kick is not None else "") + ")")
-        # H/A will be added after ESPN lookup is built
+        # Persist to disk so spin-down restarts skip the 60-120s download
+        try:
+            import pickle
+            _NFL_PKL.write_bytes(pickle.dumps(_nfl_df))
+            print(f"[NFL Data] Saved to disk cache ({_NFL_PKL})")
+        except Exception as pe:
+            print(f"[NFL Data] Disk cache save failed: {pe}")
     except Exception as e:
         print(f"[NFL Data] Error: {e}")
         _nfl_df = None
     return _nfl_df
 
 async def get_nfl_stats():
-    # Ensure H/A lookup is built (runs concurrently with stat download)
-    await _build_ha_lookup()
+    # Fire H/A lookup in background — analysis falls back gracefully when not ready
+    if not _HA_LOADED:
+        asyncio.create_task(_build_ha_lookup())
     async with _nfl_df_lock:
         if _nfl_df is not None:
             return _nfl_df
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, _load_nfl_stats_sync)
+
+@app.on_event("startup")
+async def _startup_preload():
+    """Kick off stat downloads and H/A lookup immediately on server start.
+    Both run in the background so they don't block the server from accepting
+    requests. By the time the first user clicks Run, the data is usually ready
+    (or at least well underway so the wait is short)."""
+    async def _bg():
+        # H/A lookup first (fast: disk cache → instant; ESPN → ~30s)
+        asyncio.create_task(_build_ha_lookup())
+        # Stats download (disk cache → ~1s; GitHub → 60-120s first deploy)
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, _load_nfl_stats_sync)
+        print("[Startup] Preload complete — stats ready")
+    asyncio.create_task(_bg())
 
 # ── ESPN Schedule ──────────────────────────────────────────────────────────────
 async def get_espn_games(date_str: str) -> List[Dict]:
@@ -913,24 +947,21 @@ async def run_pipeline(date_str: str) -> Dict:
         # 2. Match Odds API event IDs
         espn_games = await get_odds_events(date_str, espn_games)
 
-        # 3. Fetch prop lines for ALL games concurrently (parallel asyncio.gather)
-        async def _fetch_ev(ev):
-            ev_id = ev.get("id", "")
-            if not ev_id:
-                return []
-            props = await get_prop_lines(ev_id, date_str)
-            ha = ev.get("home_abbr","") or _name_to_abbr(ev.get("home_team",""))
-            aa = ev.get("away_abbr","") or _name_to_abbr(ev.get("away_team",""))
-            for l in props:
-                l["home_team"] = ev.get("home_team",""); l["away_team"] = ev.get("away_team","")
-                l["home_abbr"] = ha; l["away_abbr"] = aa
-                l["game"] = ev.get("game",""); l["game_start"] = ev.get("start","")
-            return props
-
-        fetched = await asyncio.gather(*[_fetch_ev(ev) for ev in espn_games])
+        # 3. Fetch prop lines per game
         all_lines = []
-        for props in fetched:
-            all_lines.extend(props)
+        for ev in espn_games:
+            ev_id = ev.get("id", "")
+            lines = await get_prop_lines(ev_id, date_str) if ev_id else []
+            home_abbr = ev.get("home_abbr", "") or _name_to_abbr(ev.get("home_team",""))
+            away_abbr = ev.get("away_abbr", "") or _name_to_abbr(ev.get("away_team",""))
+            for l in lines:
+                l["home_team"] = ev.get("home_team","")
+                l["away_team"] = ev.get("away_team","")
+                l["home_abbr"] = home_abbr
+                l["away_abbr"] = away_abbr
+                l["game"]      = ev.get("game","")
+                l["game_start"]= ev.get("start","")
+            all_lines.extend(lines)
         if all_lines:
             _odds_cache_set(date_str, all_lines, {})
 
