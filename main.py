@@ -131,7 +131,23 @@ def _take_odds(entry, price_field, book_field, price, book_key):
         entry[price_field] = price
         entry[book_field] = book_key
 
-app  = FastAPI(title="NFL Money Bombs", docs_url=None, redoc_url=None)
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def _lifespan(app):
+    """Pre-warm the nfl-verse stat cache in the background at startup so the
+    first user request doesn't have to wait 30-60s for the CSV downloads."""
+    async def _warm():
+        try:
+            print("[Startup] Pre-loading nfl-verse stats in background…")
+            await get_nfl_stats()
+            print("[Startup] nfl-verse stats ready.")
+        except Exception as e:
+            print(f"[Startup] pre-warm failed (non-fatal): {e}")
+    asyncio.create_task(_warm())
+    yield
+
+app  = FastAPI(title="NFL Money Bombs", docs_url=None, redoc_url=None, lifespan=_lifespan)
 JOBS: Dict[str, Dict] = {}
 
 # ── File cache ─────────────────────────────────────────────────────────────────
