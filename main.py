@@ -2554,6 +2554,7 @@ function nflToggle(n){
 }
 // ── My Bets ──────────────────────────────────────────────────────────────────
 function _nflEsc(s){return(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+function _esc(s){return _nflEsc(s==null?'':String(s));}
 function _nflMoney(v){var n=Number(v)||0;return(n>=0?'$':'\u2212$')+Math.abs(n).toFixed(2);}
 function _nflBetAuthQS(){
   var tok=localStorage.getItem('__mpa_token')||'';
