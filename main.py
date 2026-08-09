@@ -84,9 +84,52 @@ def _name_to_abbr(full_name: str) -> str:
     return _TEAM_NAME_TO_ABBR.get(full_name.lower().strip(), "")
 
 def _norm(s): return re.sub(r"[^a-z0-9]", "", s.lower())
+
+def _team_nick(s: str) -> str:
+    """Canonical team nickname — the unique mascot word that identifies the
+    franchise. Shared-city clubs (New York Jets/Giants, Los Angeles
+    Rams/Chargers) must NEVER match on the city word; only the nickname is
+    decisive. 'Football Team' (old WSH) maps to 'team' — unique in the league."""
+    w = (s or "").lower().replace(".", "").split()
+    if not w:
+        return ""
+    return w[-1]
+
 def _match(t1, t2):
-    n1, n2 = _norm(t1), _norm(t2)
-    return n1 == n2 or n1 in n2 or n2 in n1
+    """Shared team-name matcher — nickname-based, never substring/last-word
+    overlap on city words (Jets/Giants, Rams/Chargers collide on 'new york' /
+    'los angeles')."""
+    a, b = (t1 or "").lower().strip(), (t2 or "").lower().strip()
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    na, nb = _team_nick(a), _team_nick(b)
+    return bool(na) and na == nb
+
+# ── Best-of-books odds selection ───────────────────────────────────────────────
+_PRIORITY_BOOKS = ("draftkings", "fanduel", "betmgm", "williamhill_us", "caesars",
+                   "betrivers", "ballybet", "bet365", "espnbet",
+                   "bet99", "thescore", "fliff", "mybookieag", "betonlineag", "bovada")
+_BOOK_PRIORITY = {b: i for i, b in enumerate(_PRIORITY_BOOKS)}
+_BOOK_LABEL = {"bet99":"Bet99","thescore":"theScore","bet365":"Bet365","draftkings":"DK",
+               "fanduel":"FanDuel","betmgm":"BetMGM","caesars":"Caesars",
+               "williamhill_us":"Caesars","betrivers":"BetRivers","ballybet":"Bally Bet",
+               "espnbet":"ESPN BET","fliff":"Fliff","mybookieag":"MyBookie",
+               "betonlineag":"BetOnline","bovada":"Bovada"}
+
+def _book_label(k):
+    return _BOOK_LABEL.get(k, (k or "").replace("_", " ").title())
+
+def _take_odds(entry, price_field, book_field, price, book_key):
+    """All books: keep the best American price; tie-break by book priority."""
+    if price is None:
+        return
+    cur = entry.get(price_field)
+    cur_book = entry.get(book_field)
+    if cur is None or price > cur or (price == cur and _BOOK_PRIORITY.get(book_key, 999) < _BOOK_PRIORITY.get(cur_book, 999)):
+        entry[price_field] = price
+        entry[book_field] = book_key
 
 app  = FastAPI(title="NFL Money Bombs", docs_url=None, redoc_url=None)
 JOBS: Dict[str, Dict] = {}
@@ -313,6 +356,8 @@ async def get_espn_games(date_str: str) -> List[Dict]:
                     "home_abbr": home.get("abbreviation", ""),
                     "away_abbr": away.get("abbreviation", ""),
                     "game":      f"{away.get('displayName','')} @ {home.get('displayName','')}",
+                    # ISO kickoff time — picks carry this so finished games drop off board
+                    "start":     ev.get("date", "") or comp.get("date", ""),
                 })
             print(f"[ESPN] {len(games)} NFL games for {date_str}")
             return games
@@ -357,12 +402,12 @@ async def get_prop_lines(event_id: str, date_str: str) -> List[Dict]:
         async with httpx.AsyncClient(timeout=15) as c:
             if is_past:
                 base = f"{ODDS_BASE}/historical/sports/americanfootball_nfl/events/{event_id}/odds"
-                params = {"apiKey": ODDS_API_KEY, "regions": "us",
+                params = {"apiKey": ODDS_API_KEY, "regions": "us,us2",
                          "markets": ",".join(PROP_MARKETS), "oddsFormat": "american",
                          "date": f"{date_str}T12:00:00Z"}
             else:
                 base = f"{ODDS_BASE}/sports/americanfootball_nfl/events/{event_id}/odds"
-                params = {"apiKey": ODDS_API_KEY, "regions": "us",
+                params = {"apiKey": ODDS_API_KEY, "regions": "us,us2",
                          "markets": ",".join(PROP_MARKETS), "oddsFormat": "american"}
             r = await c.get(base, params=params)
             if not r.is_success: return []
@@ -370,7 +415,9 @@ async def get_prop_lines(event_id: str, date_str: str) -> List[Dict]:
             data = raw.get("data", raw) if isinstance(raw, dict) and "data" in raw else raw
             if not isinstance(data, dict): return []
             lines = {}
+            # ALL bookmakers — best price per side with a book tag (_take_odds)
             for bm in data.get("bookmakers", []):
+                bkey = bm.get("key", "")
                 for mkt in bm.get("markets", []):
                     mk = mkt.get("key", "")
                     if mk not in PROP_MARKETS: continue
@@ -379,17 +426,34 @@ async def get_prop_lines(event_id: str, date_str: str) -> List[Dict]:
                         side  = oc.get("name", "")
                         point = oc.get("point")
                         price = oc.get("price")
+                        if mk == "player_anytime_td":
+                            # yes/no market — no point field; treat as 0.5 OVER
+                            if side in ("Yes", "No", "Over", "Under"):
+                                if side != "Yes": continue
+                            else:
+                                name = oc.get("name", ""); side = "Yes"
+                                if (oc.get("description") or "") in ("No",): continue
+                            point = 0.5
+                            side  = "Over"
                         if not name or point is None: continue
                         key = f"{_norm(name)}_{mk}"
                         if key not in lines:
                             lines[key] = {"name": name, "market": mk,
                                 "label": PROP_LABELS.get(mk, mk),
                                 "stat_col": PROP_TO_COL.get(mk, ""),
-                                "line": float(point), "over_odds": None, "under_odds": None}
-                        if side == "Over":  lines[key]["over_odds"] = price
-                        elif side == "Under": lines[key]["under_odds"] = price
-                break  # first bookmaker only
-            return list(lines.values())
+                                "line": float(point), "over_odds": None, "under_odds": None,
+                                "over_book": None, "under_book": None}
+                        if abs(float(point) - lines[key]["line"]) > 1e-9:
+                            continue
+                        if side == "Over":
+                            _take_odds(lines[key], "over_odds", "over_book", price, bkey)
+                        elif side == "Under":
+                            _take_odds(lines[key], "under_odds", "under_book", price, bkey)
+            out = list(lines.values())
+            for l in out:
+                l["over_book"]  = _book_label(l["over_book"])  if l.get("over_book")  else ""
+                l["under_book"] = _book_label(l["under_book"]) if l.get("under_book") else ""
+            return out
     except Exception as e:
         print(f"[OddsAPI props] {e}"); return []
 
@@ -544,6 +608,7 @@ def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str) -> Optional[Dict
         # identity
         "name": name, "pid": pid, "team": recent_team, "opponent": opp_abbr or "--",
         "homeRoad": home_road, "side": side, "head": head, "game": pl.get("game",""),
+        "game_start": pl.get("game_start",""),
         # market
         "mkt": label, "label": label, "market": market,
         "line": line, "dispLine": line, "realLine": line,
@@ -607,6 +672,7 @@ async def run_pipeline(date_str: str) -> Dict:
                 l["home_abbr"] = home_abbr
                 l["away_abbr"] = away_abbr
                 l["game"]      = ev.get("game","")
+                l["game_start"]= ev.get("start","")
             all_lines.extend(lines)
         if all_lines:
             _odds_cache_set(date_str, all_lines)
@@ -1062,15 +1128,12 @@ async def nfl_get_bets(request: Request, token: str = "", admin: str = "", settl
         snapshot = list(data.get(key, []))
     # Settle OFF-lock (see NBA): ESPN calls (now cached) must not hold _NFL_BET_LOCK.
     # Merge settled fields by id so a concurrently-added bet is never clobbered.
-    if settle:
-        loop = asyncio.get_running_loop()
-        changed = await loop.run_in_executor(None, _nfl_settle_batch, snapshot)
+    if settle and _nfl_settle_batch(snapshot):
         # Apply ONLY bets settled to a terminal result this pass, and only onto a
         # still-pending on-disk bet — never write pending/None back and never flip an
         # already-terminal value (so a concurrent settle pass can't be clobbered).
-        settled = ({b.get("id"): b for b in snapshot
-                    if b.get("id") and b.get("result") in ("WIN", "LOSS", "PUSH")}
-                   if changed else {})
+        settled = {b.get("id"): b for b in snapshot
+                   if b.get("id") and b.get("result") in ("WIN", "LOSS", "PUSH")}
         if settled:
             with _NFL_BET_LOCK:
                 data = _nfl_load_bets()
@@ -1147,26 +1210,15 @@ async def nfl_bets_summary(request: Request, token: str = "", admin: str = "", s
     tok = token or request.headers.get("Authorization", "").replace("Bearer ", "").strip()
     if not _nfl_bet_admin_ok(tok, admin):
         raise HTTPException(status_code=403, detail="Admin only")
-    key = _nfl_bet_user_key(tok, admin)
     with _NFL_BET_LOCK:
         data = _nfl_load_bets()
-        bets = list(data.get(key, []))
-    if settle:
-        loop = asyncio.get_running_loop()
-        changed = await loop.run_in_executor(None, _nfl_settle_batch, bets)
-        if changed:
-            with _NFL_BET_LOCK:
-                data2 = _nfl_load_bets()
-                disk = {b["id"]: b for b in data2.get(key, [])}
-                for b in bets:
-                    if b.get("result") in ("WIN", "LOSS", "PUSH"):
-                        d = disk.get(b["id"])
-                        if d and d.get("result") not in ("WIN", "LOSS", "PUSH"):
-                            d.update({"result": b["result"], "actual": b.get("actual"),
-                                      "profit": b.get("profit"), "settled_at": b.get("settled_at")})
-                data2[key] = list(disk.values())
-                _nfl_save_bets(data2)
-    return {"sport": "NFL", "summary": _nfl_summarize_bets(bets)}
+        key = _nfl_bet_user_key(tok, admin)
+        bets = data.get(key, [])
+        if settle and _nfl_settle_batch(bets):
+            data[key] = bets
+            _nfl_save_bets(data)
+        snapshot = list(bets)
+    return {"sport": "NFL", "summary": _nfl_summarize_bets(snapshot)}
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -1546,6 +1598,11 @@ window.__NFLLAD__ = window.__NFLLAD__ || {};
 var _MORDER=['Pass Yds','Pass TDs','Completions','Pass Att','INT Thrown','Rush Yds','Rush Att','Rec Yds','Receptions','Anytime TD','Tackles+Ast','Sacks','Def INT','Kick Pts','FG Made'];
 var _MLBL={'Pass Yds':'Pass','Pass TDs':'Pass TD','Completions':'Comp','Pass Att':'Att','INT Thrown':'INT','Rush Yds':'Rush','Rush Att':'Carries','Rec Yds':'Rec','Receptions':'Recept','Anytime TD':'TD','Tackles+Ast':'Tkl','Sacks':'Sacks','Def INT':'D INT','Kick Pts':'K Pts','FG Made':'FG'};
 
+function _nflGameDone(p){
+  var s=p&&p.game_start; if(!s) return false;
+  var t=new Date(s).getTime(); if(!t||isNaN(t)) return false;
+  return Date.now() > (t + 4*3600*1000);
+}
 function rateClass(r){ return r >= 70 ? 'green' : r >= 55 ? 'gold' : 'red-txt'; }
 function _initials(name){
   var parts=String(name||'').trim().split(/\s+/);
@@ -1834,9 +1891,10 @@ function _nflPaint(q){
   }
 
   // Card grids per market (collapsible pop-downs, Top 12 each)
+  // Finished games (kickoff + 4h elapsed) drop off the board.
   var hasCards=false;
   _MORDER.forEach(function(m,i){
-    var g=(byM[m]||[]).slice(0,12);
+    var g=(byM[m]||[]).filter(function(p){return !_nflGameDone(p);}).slice(0,12);
     if(!g.length) return;
     hasCards=true;
     h+=_collapseSec('mkt_'+i, _mIcon(m)+' Top '+g.length+' '+m, nflCardGrid(g), expand);
