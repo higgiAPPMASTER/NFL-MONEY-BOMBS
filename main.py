@@ -391,6 +391,19 @@ async def get_odds_events(date_str: str, espn_games: List[Dict]) -> List[Dict]:
     if not ODDS_API_KEY: return []
     today    = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     tomorrow = (datetime.fromisoformat(date_str) + timedelta(days=1)).strftime("%Y-%m-%d")
+    def _match_events(odds_evs):
+        matched = 0
+        for g in espn_games:
+            if g.get("id"):
+                matched += 1
+                continue
+            for ev in odds_evs:
+                if (_match(g["home_team"], ev.get("home_team", "")) and
+                        _match(g["away_team"], ev.get("away_team", ""))):
+                    g["id"] = ev.get("id", "")
+                    matched += 1
+                    break
+        return matched
     try:
         async with httpx.AsyncClient(timeout=15) as c:
             if date_str >= today:
@@ -399,82 +412,55 @@ async def get_odds_events(date_str: str, espn_games: List[Dict]) -> List[Dict]:
                             "commenceTimeFrom": f"{date_str}T00:00:00Z",
                             "commenceTimeTo":   f"{tomorrow}T06:00:00Z"})
                 odds_evs = r.json() if r.is_success and isinstance(r.json(), list) else []
+                _match_events(odds_evs)
             else:
-                r = await c.get(f"{ODDS_BASE}/historical/sports/americanfootball_nfl/events",
-                    params={"apiKey": ODDS_API_KEY, "date": f"{date_str}T12:00:00Z", "dateFormat": "iso"})
-                data = r.json()
-                odds_evs = data.get("data", data) if isinstance(data, dict) else []
-                odds_evs = odds_evs if isinstance(odds_evs, list) else []
-            # Match to ESPN games
-            for g in espn_games:
-                for ev in odds_evs:
-                    if (_match(g["home_team"], ev.get("home_team", "")) and
-                            _match(g["away_team"], ev.get("away_team", ""))):
-                        g["id"] = ev.get("id", "")
-                        break
+                # Try two snapshots: pre-game (T18:00:00Z = 1pm ET) then post-game (next day T04:00:00Z).
+                # T18:00:00Z catches lines before any kickoff; the next-day fallback grabs games
+                # that didn't have odds until later (e.g. night playoff games).
+                for snap in [f"{date_str}T18:00:00Z", f"{tomorrow}T04:00:00Z"]:
+                    r = await c.get(f"{ODDS_BASE}/historical/sports/americanfootball_nfl/events",
+                        params={"apiKey": ODDS_API_KEY, "date": snap, "dateFormat": "iso"})
+                    data = r.json()
+                    odds_evs = data.get("data", data) if isinstance(data, dict) else []
+                    odds_evs = odds_evs if isinstance(odds_evs, list) else []
+                    matched = _match_events(odds_evs)
+                    print(f"[OddsAPI events] snap={snap} found={len(odds_evs)} matched={matched}/{len(espn_games)}")
+                    if matched >= len(espn_games):
+                        break   # all matched, no need for second snapshot
             return espn_games
     except Exception as e:
         print(f"[OddsAPI events] {e}"); return espn_games
 
-async def get_prop_lines(event_id: str, date_str: str) -> tuple:
-    """ONE Odds API call per game: fetches all prop markets + h2h + totals together.
-    Returns (prop_lines: List[Dict], game_lines: dict) so the Game Predictor
-    never needs a separate API call — eliminating the duplicate credit spend."""
-    _empty = ([], {})
-    if not event_id or not ODDS_API_KEY: return _empty
+async def get_prop_lines(event_id: str, date_str: str) -> List[Dict]:
+    """Fetch player prop lines for one NFL game. Returns a list of prop dicts.
+    Kept as a props-only call (PROP_MARKETS only) so it stays within Odds API
+    plan market limits. Game-level lines (h2h/totals) are fetched separately."""
+    if not event_id or not ODDS_API_KEY: return []
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     is_past = date_str < today
-    # Combine prop markets with h2h + totals in one request
-    all_markets = ",".join(PROP_MARKETS) + ",h2h,totals"
     try:
         async with httpx.AsyncClient(timeout=20) as c:
             if is_past:
                 base = f"{ODDS_BASE}/historical/sports/americanfootball_nfl/events/{event_id}/odds"
                 params = {"apiKey": ODDS_API_KEY, "regions": "us,us2",
-                         "markets": all_markets, "oddsFormat": "american",
-                         "date": f"{date_str}T12:00:00Z"}
+                         "markets": ",".join(PROP_MARKETS), "oddsFormat": "american",
+                         "date": f"{date_str}T18:00:00Z"}
             else:
                 base = f"{ODDS_BASE}/sports/americanfootball_nfl/events/{event_id}/odds"
                 params = {"apiKey": ODDS_API_KEY, "regions": "us,us2",
-                         "markets": all_markets, "oddsFormat": "american"}
+                         "markets": ",".join(PROP_MARKETS), "oddsFormat": "american"}
             r = await c.get(base, params=params)
-            if not r.is_success: return _empty
+            if not r.is_success:
+                print(f"[OddsAPI props] {event_id} HTTP {r.status_code}")
+                return []
             raw  = r.json()
             data = raw.get("data", raw) if isinstance(raw, dict) and "data" in raw else raw
-            if not isinstance(data, dict): return _empty
-            home_team = data.get("home_team", "")
-            away_team = data.get("away_team", "")
+            if not isinstance(data, dict): return []
             lines = {}
-            game_lines = {"away_ml": None, "home_ml": None,
-                          "away_ml_book": None, "home_ml_book": None,
-                          "total_line": None, "total_over_odds": None,
-                          "total_under_odds": None,
-                          "_tot_over_book": None, "_tot_under_book": None}
             for bm in data.get("bookmakers", []):
                 bkey = bm.get("key", "")
                 for mkt in bm.get("markets", []):
                     mk = mkt.get("key", "")
-                    # ── game-level markets ──────────────────────────────────
-                    if mk == "h2h":
-                        for oc in mkt.get("outcomes", []):
-                            nm = oc.get("name", ""); price = oc.get("price")
-                            if _match(nm, home_team):
-                                _take_odds(game_lines, "home_ml", "home_ml_book", price, bkey)
-                            elif _match(nm, away_team):
-                                _take_odds(game_lines, "away_ml", "away_ml_book", price, bkey)
-                        continue
-                    if mk == "totals":
-                        for oc in mkt.get("outcomes", []):
-                            side = oc.get("name",""); point = oc.get("point"); price = oc.get("price")
-                            if point is not None:
-                                if game_lines["total_line"] is None:
-                                    game_lines["total_line"] = float(point)
-                                if side == "Over":
-                                    _take_odds(game_lines, "total_over_odds", "_tot_over_book", price, bkey)
-                                elif side == "Under":
-                                    _take_odds(game_lines, "total_under_odds", "_tot_under_book", price, bkey)
-                        continue
-                    # ── prop markets ────────────────────────────────────────
                     if mk not in PROP_MARKETS: continue
                     for oc in mkt.get("outcomes", []):
                         name  = oc.get("description") or oc.get("name", "")
@@ -482,12 +468,13 @@ async def get_prop_lines(event_id: str, date_str: str) -> tuple:
                         point = oc.get("point")
                         price = oc.get("price")
                         if mk == "player_anytime_td":
-                            if side in ("Yes","No","Over","Under"):
+                            if side in ("Yes", "No", "Over", "Under"):
                                 if side != "Yes": continue
                             else:
-                                name = oc.get("name",""); side = "Yes"
+                                name = oc.get("name", ""); side = "Yes"
                                 if (oc.get("description") or "") in ("No",): continue
-                            point = 0.5; side = "Over"
+                            point = 0.5
+                            side  = "Over"
                         if not name or point is None: continue
                         key = f"{_norm(name)}_{mk}"
                         if key not in lines:
@@ -496,7 +483,8 @@ async def get_prop_lines(event_id: str, date_str: str) -> tuple:
                                 "stat_col": PROP_TO_COL.get(mk, ""),
                                 "line": float(point), "over_odds": None, "under_odds": None,
                                 "over_book": None, "under_book": None}
-                        if abs(float(point) - lines[key]["line"]) > 1e-9: continue
+                        if abs(float(point) - lines[key]["line"]) > 1e-9:
+                            continue
                         if side == "Over":
                             _take_odds(lines[key], "over_odds", "over_book", price, bkey)
                         elif side == "Under":
@@ -505,9 +493,61 @@ async def get_prop_lines(event_id: str, date_str: str) -> tuple:
             for l in out:
                 l["over_book"]  = _book_label(l["over_book"])  if l.get("over_book")  else ""
                 l["under_book"] = _book_label(l["under_book"]) if l.get("under_book") else ""
-            return out, game_lines
+            return out
     except Exception as e:
-        print(f"[OddsAPI props] {e}"); return _empty
+        print(f"[OddsAPI props] {e}"); return []
+
+async def get_nfl_game_lines(event_id: str, date_str: str) -> dict:
+    """Fetch moneyline (h2h) + totals for one NFL game — separate call so it
+    never competes with the player-prop market quota."""
+    if not event_id or not ODDS_API_KEY: return {}
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    is_past = date_str < today
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            if is_past:
+                base   = f"{ODDS_BASE}/historical/sports/americanfootball_nfl/events/{event_id}/odds"
+                params = {"apiKey": ODDS_API_KEY, "regions": "us,us2",
+                          "markets": "h2h,totals", "oddsFormat": "american",
+                          "date": f"{date_str}T18:00:00Z"}
+            else:
+                base   = f"{ODDS_BASE}/sports/americanfootball_nfl/events/{event_id}/odds"
+                params = {"apiKey": ODDS_API_KEY, "regions": "us,us2",
+                          "markets": "h2h,totals", "oddsFormat": "american"}
+            r = await c.get(base, params=params)
+            if not r.is_success: return {}
+            raw  = r.json()
+            data = raw.get("data", raw) if isinstance(raw, dict) and "data" in raw else raw
+            if not isinstance(data, dict): return {}
+            res = {"away_ml": None, "home_ml": None, "away_ml_book": None, "home_ml_book": None,
+                   "total_line": None, "total_over_odds": None, "total_under_odds": None,
+                   "_tot_over_book": None, "_tot_under_book": None}
+            home_team = data.get("home_team", "")
+            away_team = data.get("away_team", "")
+            for bm in data.get("bookmakers", []):
+                bkey = bm.get("key", "")
+                for mkt in bm.get("markets", []):
+                    mk = mkt.get("key", "")
+                    if mk == "h2h":
+                        for oc in mkt.get("outcomes", []):
+                            nm = oc.get("name", ""); price = oc.get("price")
+                            if _match(nm, home_team):
+                                _take_odds(res, "home_ml", "home_ml_book", price, bkey)
+                            elif _match(nm, away_team):
+                                _take_odds(res, "away_ml", "away_ml_book", price, bkey)
+                    elif mk == "totals":
+                        for oc in mkt.get("outcomes", []):
+                            side = oc.get("name",""); point = oc.get("point"); price = oc.get("price")
+                            if point is not None:
+                                if res["total_line"] is None:
+                                    res["total_line"] = float(point)
+                                if side == "Over":
+                                    _take_odds(res, "total_over_odds", "_tot_over_book", price, bkey)
+                                elif side == "Under":
+                                    _take_odds(res, "total_under_odds", "_tot_under_book", price, bkey)
+            return res
+    except Exception as e:
+        print(f"[GP GameLines] {e}"); return {}
 
 # ── Analysis using nfl_data_py ─────────────────────────────────────────────────
 def _ha_side(row, is_home):
@@ -774,16 +814,15 @@ def _nfl_starter_name(team_abbr: str, df, col: str = "passing_yards") -> str:
     except Exception:
         return "TBD"
 
-async def _build_nfl_game_predictions(espn_games: list, df, date_str: str,
-                                       game_lines_by_id: dict = None) -> list:
+async def _build_nfl_game_predictions(espn_games: list, df, date_str: str) -> list:
     """Build Game Predictor payload for every game on today's slate.
-    game_lines_by_id — pre-fetched {event_id: game_lines_dict} from get_prop_lines,
-    so zero additional Odds API calls are needed here."""
+    Fetches h2h + totals for all games concurrently via get_nfl_game_lines."""
     HOME_ADJ = 1.05
     predictions = []
-    gl_map = game_lines_by_id or {}
-    for g in espn_games:
-        gl = gl_map.get(g.get("id", ""), {})
+    # Fetch game-level odds concurrently
+    line_tasks = [get_nfl_game_lines(g.get("id", ""), date_str) for g in espn_games]
+    all_gl = await asyncio.gather(*line_tasks)
+    for g, gl in zip(espn_games, all_gl):
         ha = g.get("home_abbr", ""); aa = g.get("away_abbr", "")
         if not ha or not aa:
             continue
@@ -867,33 +906,34 @@ async def run_pipeline(date_str: str) -> Dict:
         # 2. Match Odds API event IDs
         espn_games = await get_odds_events(date_str, espn_games)
 
-        # 3. Fetch props + game lines for ALL games concurrently
+        # 3. Fetch prop lines for ALL games concurrently (parallel asyncio.gather)
         async def _fetch_ev(ev):
             ev_id = ev.get("id", "")
             if not ev_id:
-                return [], {}
-            props, gl = await get_prop_lines(ev_id, date_str)
+                return []
+            props = await get_prop_lines(ev_id, date_str)
             ha = ev.get("home_abbr","") or _name_to_abbr(ev.get("home_team",""))
             aa = ev.get("away_abbr","") or _name_to_abbr(ev.get("away_team",""))
             for l in props:
                 l["home_team"] = ev.get("home_team",""); l["away_team"] = ev.get("away_team","")
                 l["home_abbr"] = ha; l["away_abbr"] = aa
                 l["game"] = ev.get("game",""); l["game_start"] = ev.get("start","")
-            return props, gl
+            return props
 
         fetched = await asyncio.gather(*[_fetch_ev(ev) for ev in espn_games])
-        all_lines = []; game_lines_by_id = {}
-        for ev, (props, gl) in zip(espn_games, fetched):
+        all_lines = []
+        for props in fetched:
             all_lines.extend(props)
-            if ev.get("id"):
-                game_lines_by_id[ev["id"]] = gl
         if all_lines:
-            _odds_cache_set(date_str, all_lines, game_lines_by_id)
+            _odds_cache_set(date_str, all_lines, {})
 
-    game_lines_by_id = game_lines_by_id or {}
     if not all_lines:
-        return {"picks":[],"all":[],"games":len(espn_games),
-                "error":"No prop lines available yet — check back closer to game time"}
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if date_str < today:
+            msg = f"No prop data found for {date_str} — the Odds API may not have archived lines for these games."
+        else:
+            msg = "No prop lines available yet — check back closer to game time"
+        return {"picks":[],"all":[],"games":len(espn_games),"error":msg}
 
     # 4. Load NFL stats (nfl_data_py — downloads once, cached in memory)
     print(f"[Pipeline] Loading NFL stats for {len(all_lines)} props...")
@@ -936,9 +976,9 @@ async def run_pipeline(date_str: str) -> Dict:
     games_out = [{"home_team":g.get("home_team",""), "away_team":g.get("away_team",""),
                   "home_abbr":g.get("home_abbr",""), "away_abbr":g.get("away_abbr",""),
                   "game":g.get("game","")} for g in espn_games]
-    # 7. Game Predictor — uses pre-fetched game lines, zero extra API calls
-    game_predictions = await _build_nfl_game_predictions(
-        espn_games, df, date_str, game_lines_by_id=game_lines_by_id)
+    # 7. Game Predictor — fetches h2h + totals concurrently (separate calls from props
+    #    so player-prop market quota is never shared with game-level markets)
+    game_predictions = await _build_nfl_game_predictions(espn_games, df, date_str)
     result  = {"picks":picks, "all":all_results, "date":date_str,
                "games":games_out, "qualified":len(picks),
                "game_predictions": game_predictions}
