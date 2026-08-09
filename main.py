@@ -131,23 +131,7 @@ def _take_odds(entry, price_field, book_field, price, book_key):
         entry[price_field] = price
         entry[book_field] = book_key
 
-from contextlib import asynccontextmanager
-
-@asynccontextmanager
-async def _lifespan(app):
-    """Pre-warm the nfl-verse stat cache in the background at startup so the
-    first user request doesn't have to wait 30-60s for the CSV downloads."""
-    async def _warm():
-        try:
-            print("[Startup] Pre-loading nfl-verse stats in background…")
-            await get_nfl_stats()
-            print("[Startup] nfl-verse stats ready.")
-        except Exception as e:
-            print(f"[Startup] pre-warm failed (non-fatal): {e}")
-    asyncio.create_task(_warm())
-    yield
-
-app  = FastAPI(title="NFL Money Bombs", docs_url=None, redoc_url=None, lifespan=_lifespan)
+app  = FastAPI(title="NFL Money Bombs", docs_url=None, redoc_url=None)
 JOBS: Dict[str, Dict] = {}
 
 # ── File cache ─────────────────────────────────────────────────────────────────
@@ -417,7 +401,7 @@ async def get_odds_events(date_str: str, espn_games: List[Dict]) -> List[Dict]:
                 # Try two snapshots: pre-game (T18:00:00Z = 1pm ET) then post-game (next day T04:00:00Z).
                 # T18:00:00Z catches lines before any kickoff; the next-day fallback grabs games
                 # that didn't have odds until later (e.g. night playoff games).
-                for snap in [f"{date_str}T18:00:00Z", f"{tomorrow}T04:00:00Z"]:
+                for snap in [f"{date_str}T12:00:00Z", f"{date_str}T20:00:00Z"]:
                     r = await c.get(f"{ODDS_BASE}/historical/sports/americanfootball_nfl/events",
                         params={"apiKey": ODDS_API_KEY, "date": snap, "dateFormat": "iso"})
                     data = r.json()
@@ -444,7 +428,7 @@ async def get_prop_lines(event_id: str, date_str: str) -> List[Dict]:
                 base = f"{ODDS_BASE}/historical/sports/americanfootball_nfl/events/{event_id}/odds"
                 params = {"apiKey": ODDS_API_KEY, "regions": "us,us2",
                          "markets": ",".join(PROP_MARKETS), "oddsFormat": "american",
-                         "date": f"{date_str}T18:00:00Z"}
+                         "date": f"{date_str}T12:00:00Z"}
             else:
                 base = f"{ODDS_BASE}/sports/americanfootball_nfl/events/{event_id}/odds"
                 params = {"apiKey": ODDS_API_KEY, "regions": "us,us2",
@@ -509,7 +493,7 @@ async def get_nfl_game_lines(event_id: str, date_str: str) -> dict:
                 base   = f"{ODDS_BASE}/historical/sports/americanfootball_nfl/events/{event_id}/odds"
                 params = {"apiKey": ODDS_API_KEY, "regions": "us,us2",
                           "markets": "h2h,totals", "oddsFormat": "american",
-                          "date": f"{date_str}T18:00:00Z"}
+                          "date": f"{date_str}T12:00:00Z"}
             else:
                 base   = f"{ODDS_BASE}/sports/americanfootball_nfl/events/{event_id}/odds"
                 params = {"apiKey": ODDS_API_KEY, "regions": "us,us2",
