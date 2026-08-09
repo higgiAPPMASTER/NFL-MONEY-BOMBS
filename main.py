@@ -944,15 +944,22 @@ async def _build_nfl_game_predictions(espn_games: list, df, date_str: str) -> li
     return predictions
 
 # ── Pipeline ───────────────────────────────────────────────────────────────────
-async def run_pipeline(date_str: str) -> Dict:
+async def run_pipeline(date_str: str, progress=None) -> Dict:
+    def _p(msg):
+        print(f"[Pipeline] {msg}")
+        if progress:
+            try: progress(msg)
+            except Exception: pass
+
     cached = _cache_get(date_str)
     if cached:
         return cached
 
     # 1. Get game schedule from ESPN
+    _p("Fetching NFL schedule from ESPN…")
     espn_games = await get_espn_games(date_str)
     if not espn_games:
-        return {"picks":[],"all":[],"error":f"No NFL games found for {date_str} — NFL season runs Sept–Feb"}
+        return {"picks":[],"all":[],"error":f"No NFL games found for {date_str} — NFL season runs Sept–Feb. (Note: check the exact date — e.g. Championship Sunday was Jan 26, not Jan 25.)"}
 
     # 2+3. Odds layer — ONE call per game fetches props + h2h + totals together.
     #      All games are fetched concurrently (asyncio.gather) then cached for 6h.
@@ -960,12 +967,14 @@ async def run_pipeline(date_str: str) -> Dict:
     all_lines, game_lines_by_id = _odds_cache_get(date_str)
     if all_lines is None:
         # 2. Match Odds API event IDs
+        _p(f"Matching {len(espn_games)} games with sportsbook events…")
         espn_games = await get_odds_events(date_str, espn_games)
 
         # 3. Fetch prop lines per game
         all_lines = []
-        for ev in espn_games:
+        for gi, ev in enumerate(espn_games):
             ev_id = ev.get("id", "")
+            _p(f"Fetching prop lines — game {gi+1}/{len(espn_games)}: {ev.get('game','')}…")
             lines = await get_prop_lines(ev_id, date_str) if ev_id else []
             home_abbr = ev.get("home_abbr", "") or _name_to_abbr(ev.get("home_team",""))
             away_abbr = ev.get("away_abbr", "") or _name_to_abbr(ev.get("away_team",""))
@@ -989,12 +998,13 @@ async def run_pipeline(date_str: str) -> Dict:
         return {"picks":[],"all":[],"games":len(espn_games),"error":msg}
 
     # 4. Load NFL stats (nfl_data_py — downloads once, cached in memory)
-    print(f"[Pipeline] Loading NFL stats for {len(all_lines)} props...")
+    _p(f"Loading player stats ({len(all_lines)} props to analyze) — first run after deploy downloads ~20s…")
     df = await get_nfl_stats()
     if df is None:
         return {"picks":[],"all":[],"error":"Could not load NFL stats data — try again in a moment"}
 
     # 5. Analyze props synchronously (pandas is fast, no I/O)
+    _p(f"Analyzing {len(all_lines)} player prop histories…")
     all_results = []
     for pl in all_lines:
         result = _analyze_prop(pl, df, pl.get("home_abbr",""), pl.get("away_abbr",""))
@@ -1031,7 +1041,9 @@ async def run_pipeline(date_str: str) -> Dict:
                   "game":g.get("game","")} for g in espn_games]
     # 7. Game Predictor — fetches h2h + totals concurrently (separate calls from props
     #    so player-prop market quota is never shared with game-level markets)
+    _p("Building game predictions…")
     game_predictions = await _build_nfl_game_predictions(espn_games, df, date_str)
+    _p("Finishing up…")
     result  = {"picks":picks, "all":all_results, "date":date_str,
                "games":games_out, "qualified":len(picks),
                "game_predictions": game_predictions}
@@ -1129,10 +1141,11 @@ async def api_run(request: Request):
         raise HTTPException(status_code=401, detail="Subscription required — please log in via moneypicksarena.com")
     date_str = body.get("date", datetime.now(timezone.utc).strftime("%Y-%m-%d"))
     job_id   = str(uuid.uuid4())[:8]
-    JOBS[job_id] = {"status":"running","result":None,"error":None}
+    JOBS[job_id] = {"status":"running","result":None,"error":None,"progress":"Starting…"}
     async def _run():
         try:
-            result = await run_pipeline(date_str)
+            result = await run_pipeline(date_str,
+                progress=lambda m: JOBS.get(job_id, {}).update({"progress": m}))
             JOBS[job_id].update({"status":"done","result":result})
         except Exception as e:
             JOBS[job_id].update({"status":"error","error":str(e)})
@@ -1914,7 +1927,8 @@ async function pollJob(){
       document.getElementById('runBtn').disabled=false;
       document.getElementById('runBtn').textContent='Run Picks';
     }else{
-      document.getElementById('statusMsg').innerHTML='<span class="spinner"></span>Analyzing player histories...';
+      var prog=(d.progress||'Analyzing player histories...').replace(/</g,'&lt;');
+      document.getElementById('statusMsg').innerHTML='<span class="spinner"></span>'+prog;
     }
   }catch(e){
     // Network error — retry up to 5 times before giving up
