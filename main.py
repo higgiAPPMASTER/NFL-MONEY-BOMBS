@@ -1739,7 +1739,7 @@ def _nfl_grade_date(date_str: str, snap: list) -> dict:
     for key in by_group:
         by_group[key].sort(key=lambda x: float(x.get("score") or 0), reverse=True)
 
-    main_rows, ovf_rows = [], []
+    main_rows, ovf_rows, lock_rows = [], [], []
     for (mk, direction), ps in by_group.items():
         label = PROP_LABELS[mk]
         dir_word = "Over" if direction == "OVER" else "Under"
@@ -1777,13 +1777,16 @@ def _nfl_grade_date(date_str: str, snap: list) -> dict:
                 main_rows.append(row)
             else:
                 ovf_rows.append({**row, "category": "NFL Overflow"})
+            # Cross-market 80-100% Locks category
+            if float(p.get("score") or p.get("dispScore") or 0) >= 80:
+                lock_rows.append({**row, "category": "80-100% Locks"})
 
     return {"any_game": any_game, "all_final": all_final,
-            "main": main_rows, "overflow": ovf_rows}
+            "main": main_rows, "overflow": ovf_rows, "locks": lock_rows}
 
 def _nfl_aggregate_graded(graded: dict) -> dict:
     agg: dict = {}
-    for row in graded.get("main", []) + graded.get("overflow", []):
+    for row in graded.get("main", []) + graded.get("overflow", []) + graded.get("locks", []):
         if row.get("result") not in ("WIN", "LOSS"):
             continue
         if row.get("odds") is None:
@@ -1799,7 +1802,7 @@ def _nfl_aggregate_graded(graded: dict) -> dict:
 
 def _nfl_detail_graded(graded: dict) -> list:
     out = []
-    for row in graded.get("main", []) + graded.get("overflow", []):
+    for row in graded.get("main", []) + graded.get("overflow", []) + graded.get("locks", []):
         if row.get("result") not in ("WIN", "LOSS"):
             continue
         if row.get("odds") is None:
@@ -2969,27 +2972,29 @@ function _nflPaint(q){
   _MORDER.forEach(function(m){ if(byM[m]&&byM[m].length){ h+='<div class="chip" style="cursor:pointer" onclick="_marketModal(&#39;'+m+'&#39;)"><div class="val">'+byM[m].length+'</div><div class="lbl">'+(_MLBL[m]||m)+'</div></div>'; }});
   h+='</div>';
 
-  // ── 💯 100% Lock Board — every tracked sample hit at 100% ─────────────────
+  // ── 🔒 80–100% Locks — every tracked sample hit at 80%+ ─────────────────
   var lockPicks=(d.all||[]).filter(function(p){
-    return !_nflGameDone(p) && Number(p.score||p.dispScore)>=100 && p.pick;
+    return !_nflGameDone(p) && Number(p.score||p.dispScore)>=80 && p.pick;
   });
   if(q) lockPicks=lockPicks.filter(function(p){return (p.name||'').toLowerCase().indexOf(q)>=0;});
   lockPicks.sort(function(a,b){
+    var sa=Number(b.score||b.dispScore||0),sb=Number(a.score||a.dispScore||0);
+    if(sa!==sb) return sa-sb;
     var ai=_MORDER.indexOf(a.mkt||a.label),bi=_MORDER.indexOf(b.mkt||b.label);
     return ai-bi||(a.name||'').localeCompare(b.name||'');
   });
   if(lockPicks.length){
     h+='<div style="background:linear-gradient(135deg,rgba(245,158,11,.1),rgba(74,222,128,.05));border:1px solid rgba(245,158,11,.4);border-radius:14px;margin-bottom:14px;overflow:hidden">'
-      +'<div style="display:flex;align-items:center;gap:10px;padding:12px 16px;cursor:pointer;user-select:none" onclick="_secToggle(&#39;lock100&#39;)">'
-      +'<span style="font-size:1.4rem;flex-shrink:0">&#128175;</span>'
+      +'<div style="display:flex;align-items:center;gap:10px;padding:12px 16px;cursor:pointer;user-select:none" onclick="_secToggle(&#39;lock8100&#39;)">'
+      +'<span style="font-size:1.4rem;flex-shrink:0">&#128274;</span>'
       +'<div style="flex:1;min-width:0">'
-      +'<div style="font-weight:900;font-size:1rem;color:#f59e0b;letter-spacing:.03em">100% Lock Board</div>'
-      +'<div style="font-size:.72rem;color:#9ca3af;margin-top:2px">Every tracked sample hit — career vs opp <span style="color:#4ade80;font-weight:700">&amp;</span> L10 H/A both at 100%</div>'
+      +'<div style="font-weight:900;font-size:1rem;color:#f59e0b;letter-spacing:.03em">80–100% Locks</div>'
+      +'<div style="font-size:.72rem;color:#9ca3af;margin-top:2px">All tracked samples hit at 80%+ across all markets — sorted highest % first</div>'
       +'</div>'
       +'<div style="background:rgba(245,158,11,.2);border:1px solid rgba(245,158,11,.5);border-radius:20px;padding:3px 12px;font-size:.73rem;font-weight:900;color:#f59e0b;flex-shrink:0">'+lockPicks.length+' lock'+(lockPicks.length!==1?'s':'')+'</div>'
-      +'<span id="car_lock100" style="color:#f59e0b;font-size:1rem;flex-shrink:0">&#9660;</span>'
+      +'<span id="car_lock8100" style="color:#f59e0b;font-size:1rem;flex-shrink:0">&#9660;</span>'
       +'</div>'
-      +'<div id="sec_lock100">'+nflCardGrid(lockPicks)+'</div>'
+      +'<div id="sec_lock8100">'+nflCardGrid(lockPicks)+'</div>'
       +'</div>';
   }
 
