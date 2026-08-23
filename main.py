@@ -2246,23 +2246,6 @@ tr:last-child td{border-bottom:none}
 .nfl-trk-bar-wrap{width:80px;background:#1f2937;border-radius:4px;height:8px;overflow:hidden;display:inline-block;vertical-align:middle}
 .nfl-trk-bar{height:100%;border-radius:4px}
 </style>
-<div id="nfl-track-section" style="max-width:960px;margin:18px auto 0;padding:0 16px 40px">
-  <div class="card" style="padding:20px 22px">
-    <div style="margin-bottom:14px">
-      <h2 style="font-family:'Playfair Display',serif;font-size:1.4rem;font-weight:700;color:#fff">&#128202; NFL Track Record</h2>
-    </div>
-    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:14px">
-      <label style="color:#9ca3af;font-size:.78rem;font-weight:700;text-transform:uppercase;letter-spacing:.1em">Date</label>
-      <input type="date" id="nflTrkDate" class="date-input" style="width:auto" onchange="_nflTrkDayName();renderNflTrackDay()">
-      <span id="nflTrkDayName" style="color:#34d399;font-weight:700;font-size:.9rem"></span>
-      <button onclick="loadNflTrackRecord()" style="background:#065f46;color:#fff;border:none;border-radius:8px;padding:8px 14px;font-weight:700;cursor:pointer;font-size:.82rem">&#8635; Get Results</button>
-      <button id="nflTrkBtnCat" onclick="nflTrkSetTab('cat')" style="background:#065f46;color:#fff;border:none;border-radius:8px;padding:8px 14px;font-weight:700;cursor:pointer;font-size:.82rem">By Category</button>
-      <button id="nflTrkBtnList" onclick="nflTrkSetTab('list')" style="background:#1f2937;color:#fff;border:none;border-radius:8px;padding:8px 14px;font-weight:700;cursor:pointer;font-size:.82rem">Full List</button>
-    </div>
-    <div id="nflTrkSummary"></div>
-    <div id="nflTrkBody"></div>
-  </div>
-</div>
 <div id="nfl-mybets-card" style="display:none;max-width:960px;margin:18px auto 0;padding:0 16px">
   <div class="card" style="padding:20px 22px">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
@@ -2313,6 +2296,23 @@ tr:last-child td{border-bottom:none}
   <div>NFL Money Bombs &middot; Player Props &middot; Daily Picks</div>
   <div style="margin-top:8px;font-size:.7rem">For entertainment only. Not a betting service. Must be 18+. Please gamble responsibly.</div>
 </footer>
+<div id="nfl-track-section" style="max-width:960px;margin:18px auto 0;padding:0 16px 40px">
+  <div class="card" style="padding:20px 22px">
+    <div style="margin-bottom:14px">
+      <h2 style="font-family:'Playfair Display',serif;font-size:1.4rem;font-weight:700;color:#fff">&#128202; NFL Track Record</h2>
+    </div>
+    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:14px">
+      <label style="color:#9ca3af;font-size:.78rem;font-weight:700;text-transform:uppercase;letter-spacing:.1em">Date</label>
+      <input type="date" id="nflTrkDate" class="date-input" style="width:auto" onchange="_nflTrkDayName();renderNflTrackDay()">
+      <span id="nflTrkDayName" style="color:#34d399;font-weight:700;font-size:.9rem"></span>
+      <button onclick="loadNflTrackRecord()" style="background:#065f46;color:#fff;border:none;border-radius:8px;padding:8px 14px;font-weight:700;cursor:pointer;font-size:.82rem">&#8635; Get Results</button>
+      <button id="nflTrkBtnCat" onclick="nflTrkSetTab('cat')" style="background:#065f46;color:#fff;border:none;border-radius:8px;padding:8px 14px;font-weight:700;cursor:pointer;font-size:.82rem">By Category</button>
+      <button id="nflTrkBtnList" onclick="nflTrkSetTab('list')" style="background:#1f2937;color:#fff;border:none;border-radius:8px;padding:8px 14px;font-weight:700;cursor:pointer;font-size:.82rem">Full List</button>
+    </div>
+    <div id="nflTrkSummary"></div>
+    <div id="nflTrkBody"></div>
+  </div>
+</div>
 <script>
 
 
