@@ -1253,6 +1253,7 @@ async def run_pipeline(date_str: str, progress=None) -> Dict:
                "data_warning": data_warning,
                "game_predictions": game_predictions}
     _cache_set(date_str, result)
+    _nfl_save_picks_snapshot(date_str, result)
     try:
         from replit_push import push_picks_to_replit
         push_picks_to_replit("nfl", result)
@@ -1636,6 +1637,236 @@ def _nfl_settle_batch(bets: list) -> bool:
     return changed
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  NFL Track Record — automated daily grading with Supabase storage
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Supabase helpers (httpx — already a dependency) ───────────────────────────
+_SB_URL_RAW = os.environ.get("SUPABASE_URL", "").strip().rstrip("/")
+_SB_URL = (f"https://{_SB_URL_RAW}.supabase.co"
+           if _SB_URL_RAW and not _SB_URL_RAW.startswith("http")
+           else _SB_URL_RAW)
+_SB_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
+
+def _nfl_sb_get(table, params=None):
+    if not _SB_URL or not _SB_KEY:
+        return []
+    try:
+        r = httpx.get(
+            f"{_SB_URL}/rest/v1/{table}",
+            headers={"apikey": _SB_KEY, "Authorization": f"Bearer {_SB_KEY}"},
+            params=params or {}, timeout=15)
+        if r.status_code == 200:
+            return r.json()
+    except Exception as e:
+        print(f"[nfl_sb_get] {e}")
+    return []
+
+def _nfl_sb_upsert(table, rows, on_conflict=None):
+    if not _SB_URL or not _SB_KEY or not rows:
+        return False
+    try:
+        h = {
+            "apikey": _SB_KEY, "Authorization": f"Bearer {_SB_KEY}",
+            "Content-Type": "application/json",
+            "Prefer": "resolution=merge-duplicates,return=minimal",
+        }
+        url = f"{_SB_URL}/rest/v1/{table}"
+        if on_conflict:
+            url += f"?on_conflict={on_conflict}"
+        r = httpx.post(url, headers=h, json=rows, timeout=20)
+        return r.status_code in (200, 201, 204)
+    except Exception as e:
+        print(f"[nfl_sb_upsert] {e}")
+    return False
+
+# ── Pick snapshot ─────────────────────────────────────────────────────────────
+_NFL_TRK_APP   = "nfl"
+_NFL_PICKS_CAT = "__picks__"
+_NFL_TRK_STAKE = 20.0
+_NFL_TRK_TOP   = 10   # picks per market+direction that count in main record
+
+def _nfl_save_picks_snapshot(date_str: str, result: dict):
+    """Persist today's qualified picks to Supabase so they survive redeploys
+    and can be graded once game box scores are final."""
+    picks = result.get("picks") or []
+    if not picks:
+        return
+    row = {
+        "app": _NFL_TRK_APP, "date": date_str,
+        "category": _NFL_PICKS_CAT, "side": "ALL",
+        "wins": 0, "losses": 0, "locked": False,
+        "detail": picks,
+    }
+    ok = _nfl_sb_upsert("mpa_track_ledger", [row], on_conflict="app,date,category,side")
+    print(f"[nfl_track] snapshot {'saved' if ok else 'FAILED'}: {len(picks)} picks -> {date_str}")
+
+def _nfl_load_picks_snapshot(date_str: str) -> list:
+    rows = _nfl_sb_get("mpa_track_ledger", {
+        "app": f"eq.{_NFL_TRK_APP}", "category": f"eq.{_NFL_PICKS_CAT}",
+        "side": "eq.ALL", "date": f"eq.{date_str}",
+        "select": "detail", "limit": "1",
+    })
+    if rows:
+        d = rows[0].get("detail") or []
+        return d if isinstance(d, list) else []
+    return []
+
+def _nfl_list_snap_dates() -> list:
+    rows = _nfl_sb_get("mpa_track_ledger", {
+        "app": f"eq.{_NFL_TRK_APP}", "category": f"eq.{_NFL_PICKS_CAT}",
+        "side": "eq.ALL", "select": "date", "limit": "365",
+    })
+    return sorted({r["date"] for r in rows if r.get("date")})
+
+# ── Grading ───────────────────────────────────────────────────────────────────
+def _nfl_grade_date(date_str: str, snap: list) -> dict:
+    """Grade every pick in snap against ESPN box scores.
+    Groups by market+direction, ranks by score desc.
+    Top _NFL_TRK_TOP per group -> main record; extras -> NFL Overflow."""
+    from collections import defaultdict
+    box = _nfl_box_lookup(date_str)
+    any_game = bool(box)
+    all_final = any_game and all(v.get("final", False) for v in box.values())
+
+    by_group: dict = defaultdict(list)
+    for p in (snap or []):
+        mk = p.get("market") or p.get("mkt") or ""
+        if mk not in PROP_LABELS:
+            continue
+        direction = (p.get("pick") or "OVER").upper()
+        by_group[(mk, direction)].append(p)
+    for key in by_group:
+        by_group[key].sort(key=lambda x: float(x.get("score") or 0), reverse=True)
+
+    main_rows, ovf_rows = [], []
+    for (mk, direction), ps in by_group.items():
+        label = PROP_LABELS[mk]
+        dir_word = "Over" if direction == "OVER" else "Under"
+        cat = f"{label} ({dir_word})"
+        for rank, p in enumerate(ps, 1):
+            nk = (p.get("name") or "").lower().strip()
+            st = (box or {}).get(nk, {})
+            odds = p.get("over_odds") if direction == "OVER" else p.get("under_odds")
+            line_raw = p.get("line") or p.get("realLine")
+            result_val = actual = profit = None
+            if st.get("final") and line_raw is not None:
+                actual = st.get(mk)
+                if actual is None and mk == "player_anytime_td":
+                    actual = 0.0
+                if actual is not None:
+                    try:
+                        fl = float(line_raw)
+                        if actual == fl:
+                            result_val = "PUSH"
+                        elif direction == "OVER":
+                            result_val = "WIN" if actual > fl else "LOSS"
+                        else:
+                            result_val = "WIN" if actual < fl else "LOSS"
+                        if result_val and odds is not None:
+                            profit = round(_nfl_american_profit(odds, _NFL_TRK_STAKE, result_val), 2)
+                    except Exception:
+                        pass
+            row = {
+                "name": p.get("name", ""), "team": p.get("team", ""),
+                "category": cat, "side": direction, "market": mk,
+                "line": line_raw, "odds": odds, "rank": rank,
+                "result": result_val, "actual": actual, "profit": profit,
+            }
+            if rank <= _NFL_TRK_TOP:
+                main_rows.append(row)
+            else:
+                ovf_rows.append({**row, "category": "NFL Overflow"})
+
+    return {"any_game": any_game, "all_final": all_final,
+            "main": main_rows, "overflow": ovf_rows}
+
+def _nfl_aggregate_graded(graded: dict) -> dict:
+    agg: dict = {}
+    for row in graded.get("main", []) + graded.get("overflow", []):
+        if row.get("result") not in ("WIN", "LOSS"):
+            continue
+        if row.get("odds") is None:
+            continue
+        cat  = row["category"]
+        side = row.get("side", "OVER")
+        rec  = agg.setdefault(cat, {}).setdefault(side, [0, 0])
+        if row["result"] == "WIN":
+            rec[0] += 1
+        else:
+            rec[1] += 1
+    return agg
+
+def _nfl_detail_graded(graded: dict) -> list:
+    out = []
+    for row in graded.get("main", []) + graded.get("overflow", []):
+        if row.get("result") not in ("WIN", "LOSS"):
+            continue
+        if row.get("odds") is None:
+            continue
+        out.append({k: row.get(k) for k in (
+            "name", "team", "category", "side", "market",
+            "line", "odds", "rank", "result", "actual", "profit",
+        )})
+    return out
+
+# ── Track ledger update ───────────────────────────────────────────────────────
+_NFL_TRK_LOCK = _bt_th.Lock()
+
+def _nfl_update_track_ledger():
+    """Grade all saved pick snapshots for past dates not yet locked.
+    Safe to call repeatedly — locked dates are skipped."""
+    from datetime import date as _d
+    today = _d.today().isoformat()
+    with _NFL_TRK_LOCK:
+        locked_rows = _nfl_sb_get("mpa_track_ledger", {
+            "app": f"eq.{_NFL_TRK_APP}", "category": "eq.__ledger__",
+            "locked": "eq.true", "select": "date", "limit": "500",
+        })
+        locked = {r["date"] for r in (locked_rows or [])}
+        upserts = []
+        for d in _nfl_list_snap_dates():
+            if d >= today or d in locked:
+                continue
+            snap = _nfl_load_picks_snapshot(d)
+            if not snap:
+                continue
+            try:
+                graded = _nfl_grade_date(d, snap)
+            except Exception as e:
+                print(f"[nfl_track] grade failed {d}: {e}")
+                continue
+            if not graded.get("any_game"):
+                continue
+            try:
+                from datetime import date as _dd
+                old_enough = (_dd.today() - _dd.fromisoformat(d)).days >= 2
+            except Exception:
+                old_enough = False
+            if not graded.get("all_final") and not old_enough:
+                continue   # wait for all scores to be final
+            agg = _nfl_aggregate_graded(graded)
+            det = _nfl_detail_graded(graded)
+            upserts += [
+                {"app": _NFL_TRK_APP, "date": d, "category": "__ledger__", "side": "ALL",
+                 "wins": 0, "losses": 0, "locked": True, "detail": agg},
+                {"app": _NFL_TRK_APP, "date": d, "category": "__detail__", "side": "ALL",
+                 "wins": 0, "losses": 0, "locked": True, "detail": det},
+            ]
+        if upserts:
+            for i in range(0, len(upserts), 10):
+                _nfl_sb_upsert("mpa_track_ledger", upserts[i:i+10], "app,date,category,side")
+            print(f"[nfl_track] locked {len(upserts)//2} dates into ledger")
+
+def _nfl_trk_bg():
+    try:
+        _nfl_update_track_ledger()
+    except Exception as e:
+        print(f"[nfl_track] bg update error: {e}")
+
+_bt_th.Thread(target=_nfl_trk_bg, daemon=True).start()
+
+
 def _nfl_summarize_bets(bets: list) -> dict:
     cats: dict = {}
     tot_staked = tot_profit = 0.0
@@ -1778,6 +2009,51 @@ async def nfl_bets_summary(request: Request, token: str = "", admin: str = "", s
             _nfl_save_bets(data)
         snapshot = list(bets)
     return {"sport": "NFL", "summary": _nfl_summarize_bets(snapshot)}
+
+
+@app.get("/api/track-record")
+async def nfl_track_record():
+    """NFL Track Record — all graded picks by date with W/L, ROI at $20/play."""
+    _bt_th.Thread(target=_nfl_trk_bg, daemon=True).start()
+    led_rows = _nfl_sb_get("mpa_track_ledger", {
+        "app": f"eq.{_NFL_TRK_APP}", "category": "eq.__detail__",
+        "locked": "eq.true", "select": "date,detail", "limit": "365",
+    })
+    detail_by_date = {r["date"]: (r.get("detail") or []) for r in (led_rows or [])}
+    dates = sorted(detail_by_date.keys(), reverse=True)
+    result = []
+    for d in dates:
+        det = detail_by_date[d]
+        decided = [r for r in det if r.get("result") in ("WIN","LOSS") and r.get("odds") is not None]
+        wins   = sum(1 for r in decided if r["result"] == "WIN")
+        losses = len(decided) - wins
+        net_pl = round(sum(r.get("profit") or 0 for r in decided), 2)
+        staked = len(decided) * _NFL_TRK_STAKE
+        roi    = round(net_pl / staked * 100, 1) if staked else None
+        cats: dict = {}
+        for r in decided:
+            cat = r.get("category","?")
+            e = cats.setdefault(cat, {"wins":0,"losses":0,"pl":0.0,"staked":0.0})
+            if r["result"] == "WIN": e["wins"] += 1
+            else: e["losses"] += 1
+            e["pl"] = round(e["pl"] + (r.get("profit") or 0), 2)
+            e["staked"] += _NFL_TRK_STAKE
+        by_cat = []
+        for cat, e in cats.items():
+            total = e["wins"] + e["losses"]
+            by_cat.append({
+                "category": cat, "wins": e["wins"], "losses": e["losses"],
+                "net_pl": e["pl"],
+                "roi": round(e["pl"]/e["staked"]*100,1) if e["staked"] else None,
+                "rate": round(e["wins"]/total*100,1) if total else None,
+            })
+        by_cat.sort(key=lambda x: (x.get("roi") or -999), reverse=True)
+        result.append({
+            "date": d, "wins": wins, "losses": losses,
+            "net_pl": net_pl, "roi": roi,
+            "by_cat": by_cat, "detail": det,
+        })
+    return JSONResponse({"dates": result, "stake": _NFL_TRK_STAKE})
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -1952,14 +2228,42 @@ tr:last-child td{border-bottom:none}
 </style>
 </head>
 <body>
-<nav style="display:flex;justify-content:space-between;align-items:center"><div class="logo">Money <span>Picks</span> Arena</div><div style="display:flex;gap:8px;align-items:center"><button class="admin-only" onclick="openNflMyBets()" style="background:#0e7490;color:#fff;border:none;border-radius:10px;padding:9px 16px;font-weight:800;font-size:.82rem;cursor:pointer;white-space:nowrap">&#128176; My Bets</button></div></nav>
+<nav style="display:flex;justify-content:space-between;align-items:center"><div class="logo">Money <span>Picks</span> Arena</div><div style="display:flex;gap:8px;align-items:center"><button onclick="openNflTrackRecord()" style="background:#065f46;color:#fff;border:none;border-radius:10px;padding:9px 16px;font-weight:800;font-size:.82rem;cursor:pointer;white-space:nowrap">&#128202; Track Record</button><button class="admin-only" onclick="openNflMyBets()" style="background:#0e7490;color:#fff;border:none;border-radius:10px;padding:9px 16px;font-weight:800;font-size:.82rem;cursor:pointer;white-space:nowrap">&#128176; My Bets</button></div></nav>
 <style>
 .nfl-bets-tbl{width:100%;border-collapse:collapse;font-size:.82rem}
 .nfl-bets-tbl th{padding:7px 10px;text-align:left;font-size:.72rem;color:#9ca3af;font-weight:700;text-transform:uppercase;letter-spacing:.07em;border-bottom:1px solid #2a2a2a;white-space:nowrap}
 .nfl-bets-tbl td{padding:8px 10px;border-bottom:1px solid #161616;vertical-align:middle;color:#e5e7eb}
 .nfl-bets-tbl tr:last-child td{border-bottom:none}
 .nfl-bets-tbl tr:hover td{background:rgba(255,255,255,.02)}
+/* NFL Track Record */
+.nfl-trk-sum{background:#1a1a1a;border-radius:12px;padding:14px 18px;display:flex;flex-wrap:wrap;gap:18px;align-items:center;margin-bottom:14px}
+.nfl-trk-tbl{width:100%;border-collapse:collapse;font-size:.82rem;background:#161616}
+.nfl-trk-tbl thead tr{border-bottom:1px solid rgba(52,211,153,.2)}
+.nfl-trk-tbl th{padding:10px 12px;text-align:left;color:#34d399;font-size:.7rem;font-weight:700;text-transform:uppercase;letter-spacing:.1em;background:#1a1a1a;white-space:nowrap}
+.nfl-trk-tbl td{padding:9px 12px;border-bottom:1px solid #1c1c1c;white-space:nowrap}
+.nfl-trk-tbl tr:last-child td{border-bottom:none}
+.nfl-trk-tbl tr:hover td{background:rgba(255,255,255,.02)}
+.nfl-trk-bar-wrap{width:80px;background:#1f2937;border-radius:4px;height:8px;overflow:hidden;display:inline-block;vertical-align:middle}
+.nfl-trk-bar{height:100%;border-radius:4px}
 </style>
+<div id="nfl-track-card" style="display:none;max-width:960px;margin:18px auto 0;padding:0 16px">
+  <div class="card" style="padding:20px 22px">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
+      <h2 style="font-family:'Playfair Display',serif;font-size:1.4rem;font-weight:700;color:#fff">&#128202; NFL Track Record</h2>
+      <button onclick="document.getElementById('nfl-track-card').style.display='none'" style="background:#1f2937;border:none;color:#9ca3af;border-radius:8px;padding:8px 11px;font-size:.9rem;cursor:pointer">&#215;</button>
+    </div>
+    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:14px">
+      <label style="color:#9ca3af;font-size:.78rem;font-weight:700;text-transform:uppercase;letter-spacing:.1em">Date</label>
+      <input type="date" id="nflTrkDate" class="date-input" style="width:auto" onchange="_nflTrkDayName();renderNflTrackDay()">
+      <span id="nflTrkDayName" style="color:#34d399;font-weight:700;font-size:.9rem"></span>
+      <button onclick="loadNflTrackRecord()" style="background:#065f46;color:#fff;border:none;border-radius:8px;padding:8px 14px;font-weight:700;cursor:pointer;font-size:.82rem">&#8635; Get Results</button>
+      <button id="nflTrkBtnCat" onclick="nflTrkSetTab('cat')" style="background:#065f46;color:#fff;border:none;border-radius:8px;padding:8px 14px;font-weight:700;cursor:pointer;font-size:.82rem">By Category</button>
+      <button id="nflTrkBtnList" onclick="nflTrkSetTab('list')" style="background:#1f2937;color:#fff;border:none;border-radius:8px;padding:8px 14px;font-weight:700;cursor:pointer;font-size:.82rem">Full List</button>
+    </div>
+    <div id="nflTrkSummary"></div>
+    <div id="nflTrkBody"></div>
+  </div>
+</div>
 <div id="nfl-mybets-card" style="display:none;max-width:960px;margin:18px auto 0;padding:0 16px">
   <div class="card" style="padding:20px 22px">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
@@ -2916,6 +3220,136 @@ async function _nflDeleteBet(id){
     openNflMyBets(false);
   }catch(e){alert(e.message||'Delete failed');}
 }
+// ── NFL Track Record ──────────────────────────────────────────────────────────
+var _nflTrkData=null,_nflTrkTabMode='cat';
+function openNflTrackRecord(){
+  var card=document.getElementById('nfl-track-card');
+  if(!card) return;
+  var mb=document.getElementById('nfl-mybets-card');
+  if(mb) mb.style.display='none';
+  if(card.style.display!=='none'){card.style.display='none';return;}
+  card.style.display='block';
+  card.scrollIntoView({behavior:'smooth',block:'start'});
+  var dp=document.getElementById('nflTrkDate');
+  if(dp&&!dp.value){var pd=document.getElementById('datePicker');if(pd) dp.value=pd.value;}
+  _nflTrkDayName();
+  if(!_nflTrkData) loadNflTrackRecord(); else renderNflTrackDay();
+}
+function _nflTrkDayName(){
+  var dp=document.getElementById('nflTrkDate'),dn=document.getElementById('nflTrkDayName');
+  if(!dp||!dn) return;
+  try{var days=['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
+    dn.textContent=days[new Date(dp.value+'T12:00:00').getDay()];}catch(e){dn.textContent='';}
+}
+async function loadNflTrackRecord(){
+  var body=document.getElementById('nflTrkBody');
+  if(body) body.innerHTML='<p style="color:#9ca3af;padding:24px">Loading\u2026</p>';
+  try{
+    var r=await fetch('/api/track-record');
+    if(!r.ok) throw new Error(await r.text());
+    _nflTrkData=await r.json();
+    renderNflTrackDay();
+  }catch(e){
+    if(body) body.innerHTML='<p style="color:#f87171;padding:16px">'+(e.message||'Error loading track record')+'</p>';
+  }
+}
+function nflTrkSetTab(tab){
+  _nflTrkTabMode=tab;
+  var bc=document.getElementById('nflTrkBtnCat'),bl=document.getElementById('nflTrkBtnList');
+  if(bc) bc.style.background=tab==='cat'?'#065f46':'#1f2937';
+  if(bl) bl.style.background=tab==='list'?'#065f46':'#1f2937';
+  renderNflTrackDay();
+}
+function renderNflTrackDay(){
+  if(!_nflTrkData) return;
+  var dp=document.getElementById('nflTrkDate');
+  var selDate=dp?dp.value:'';
+  var dates=_nflTrkData.dates||[];
+  var dayData=selDate?dates.find(function(d){return d.date===selDate;}):null;
+  var sumEl=document.getElementById('nflTrkSummary'),bodyEl=document.getElementById('nflTrkBody');
+  if(!sumEl||!bodyEl) return;
+  // Flatten rows from selected date (or all dates if none selected)
+  var rows=[];
+  if(dayData) rows=dayData.detail||[];
+  else dates.forEach(function(d){(d.detail||[]).forEach(function(r){rows.push(r);});});
+  var decided=rows.filter(function(r){return(r.result==='WIN'||r.result==='LOSS')&&r.odds!=null;});
+  if(!decided.length&&selDate){
+    sumEl.innerHTML='<p style="color:#9ca3af;padding:12px;text-align:center">No graded picks for '+selDate+'. Games may not be final yet.</p>';
+    bodyEl.innerHTML='';return;
+  }
+  var stake=_nflTrkData.stake||20;
+  var wins=decided.filter(function(r){return r.result==='WIN';}).length;
+  var losses=decided.length-wins;
+  var netPL=decided.reduce(function(a,r){return a+(r.profit||0);},0);
+  var totalStaked=decided.length*stake;
+  var roi=totalStaked?(netPL/totalStaked*100):null;
+  var rate=decided.length?(wins/decided.length*100):null;
+  var plColor=netPL>=0?'#4ade80':'#f87171';
+  var plSign=netPL>=0?'+$':'-$';
+  sumEl.innerHTML='<div class="nfl-trk-sum">'
+    +'<span style="font-size:1.05rem;font-weight:900;color:#fff"><span style="color:#4ade80">'+wins+'</span>/<span style="color:#f87171">'+(wins+losses)+'</span>'
+    +(rate!=null?' <span style="color:#9ca3af;font-size:.85rem;font-weight:600">('+rate.toFixed(1)+'%)</span>':'')+'</span>'
+    +'<span style="font-family:monospace;font-weight:800;color:'+plColor+'">Net '+plSign+Math.abs(netPL).toFixed(0)+'</span>'
+    +(roi!=null?'<span style="font-family:monospace;font-weight:700;color:'+plColor+'">ROI '+(roi>=0?'+':'')+roi.toFixed(1)+'%</span>':'')
+    +'<span style="color:#6b7280;font-size:.8rem">$'+stake+'/play \u00b7 $20 flat</span>'
+    +'</div>';
+  bodyEl.innerHTML=_nflTrkTabMode==='cat'?_nflTrkCatHtml(decided):_nflTrkListHtml(decided);
+}
+function _nflTrkCatHtml(decided){
+  if(!decided.length) return '<p style="color:#6b7280;padding:20px;text-align:center">No graded picks yet.</p>';
+  var cats={};
+  decided.forEach(function(r){
+    var c=cats[r.category]=cats[r.category]||{w:0,l:0,pl:0,staked:0};
+    if(r.result==='WIN') c.w++; else c.l++;
+    c.pl+=(r.profit||0); c.staked+=20;
+  });
+  var entries=Object.entries(cats).sort(function(a,b){
+    return ((b[1].pl/b[1].staked)||0)-((a[1].pl/a[1].staked)||0);
+  });
+  var rows=entries.map(function(e){
+    var cat=e[0],c=e[1],total=c.w+c.l;
+    var rate=total?(c.w/total*100):0;
+    var roi=c.staked?(c.pl/c.staked*100):null;
+    var plColor=c.pl>=0?'#4ade80':'#f87171';
+    var barColor=rate>=70?'#4ade80':rate>=55?'#facc15':'#f87171';
+    var barW=Math.min(100,Math.round(rate));
+    return '<tr>'
+      +'<td style="color:#fff;font-weight:700">'+cat+'</td>'
+      +'<td style="font-family:monospace;color:#fff">'+c.w+'-'+c.l+'</td>'
+      +'<td><div style="display:flex;align-items:center;gap:8px">'
+      +'<div class="nfl-trk-bar-wrap"><div class="nfl-trk-bar" style="width:'+barW+'%;background:'+barColor+'"></div></div>'
+      +'<span style="color:'+barColor+';font-weight:700;font-size:.82rem">'+rate.toFixed(0)+'%</span></div></td>'
+      +'<td style="font-family:monospace;font-weight:800;color:'+plColor+'">'+(c.pl>=0?'+$':'-$')+Math.abs(c.pl).toFixed(0)+'</td>'
+      +'<td style="font-family:monospace;font-weight:700;color:'+plColor+'">'+(roi!=null?(roi>=0?'+':'')+roi.toFixed(1)+'%':'—')+'</td>'
+      +'</tr>';
+  }).join('');
+  return '<div class="tbl-wrap"><table class="nfl-trk-tbl">'
+    +'<thead><tr><th>Category</th><th>Record</th><th>Hit Rate</th><th>Net P/L</th><th>ROI</th></tr></thead>'
+    +'<tbody>'+rows+'</tbody></table></div>';
+}
+function _nflTrkListHtml(decided){
+  if(!decided.length) return '<p style="color:#6b7280;padding:20px;text-align:center">No graded picks yet.</p>';
+  var sorted=[].concat(decided).sort(function(a,b){return(b.profit||0)-(a.profit||0);});
+  var rows=sorted.map(function(r){
+    var plColor=r.result==='WIN'?'#4ade80':'#f87171';
+    var pl=r.profit!=null?((r.profit>=0?'+$':'-$')+Math.abs(r.profit).toFixed(0)):'—';
+    var odds=r.odds!=null?(r.odds>0?'+':'')+r.odds:'—';
+    return '<tr>'
+      +'<td style="color:#9ca3af;font-size:.78rem">'+r.category+'</td>'
+      +'<td style="color:#fff;font-weight:700">'+r.name+'</td>'
+      +'<td style="color:#6b7280">'+r.team+'</td>'
+      +'<td style="color:#d1d5db">'+(r.side||'')+(r.line!=null?' '+r.line:'')+'</td>'
+      +'<td style="font-family:monospace;color:#9ca3af">'+odds+'</td>'
+      +'<td style="color:#6b7280">'+((r.actual!=null)?r.actual:'—')+'</td>'
+      +'<td style="font-weight:800;color:'+plColor+'">'+r.result+'</td>'
+      +'<td style="font-family:monospace;font-weight:700;color:'+plColor+'">'+pl+'</td>'
+      +'</tr>';
+  }).join('');
+  return '<div class="tbl-wrap"><table class="nfl-trk-tbl">'
+    +'<thead><tr><th>Category</th><th>Player</th><th>Team</th><th>Pick</th><th>Odds</th><th>Actual</th><th>Result</th><th>P/L</th></tr></thead>'
+    +'<tbody>'+rows+'</tbody></table></div>';
+}
+
 function downloadNflMyBetsCSV(){
   var d=window.__NFL_MYBETS__;if(!d){alert('Open My Bets first.');return;}
   var rows=[['Date','Player','Team','Category','Side','Pick','Odds','Stake','Result','Actual','Profit']];
