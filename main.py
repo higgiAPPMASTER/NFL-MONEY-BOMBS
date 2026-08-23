@@ -2228,7 +2228,7 @@ tr:last-child td{border-bottom:none}
 </style>
 </head>
 <body>
-<nav style="display:flex;justify-content:space-between;align-items:center"><div class="logo">Money <span>Picks</span> Arena</div><div style="display:flex;gap:8px;align-items:center"><button onclick="openNflTrackRecord()" style="background:#065f46;color:#fff;border:none;border-radius:10px;padding:9px 16px;font-weight:800;font-size:.82rem;cursor:pointer;white-space:nowrap">&#128202; Track Record</button><button class="admin-only" onclick="openNflMyBets()" style="background:#0e7490;color:#fff;border:none;border-radius:10px;padding:9px 16px;font-weight:800;font-size:.82rem;cursor:pointer;white-space:nowrap">&#128176; My Bets</button></div></nav>
+<nav style="display:flex;justify-content:space-between;align-items:center"><div class="logo">Money <span>Picks</span> Arena</div><div style="display:flex;gap:8px;align-items:center"><button onclick="document.getElementById('nfl-track-section').scrollIntoView({behavior:'smooth'})" style="background:#065f46;color:#fff;border:none;border-radius:10px;padding:9px 16px;font-weight:800;font-size:.82rem;cursor:pointer;white-space:nowrap">&#128202; Track Record</button><button class="admin-only" onclick="openNflMyBets()" style="background:#0e7490;color:#fff;border:none;border-radius:10px;padding:9px 16px;font-weight:800;font-size:.82rem;cursor:pointer;white-space:nowrap">&#128176; My Bets</button></div></nav>
 <style>
 .nfl-bets-tbl{width:100%;border-collapse:collapse;font-size:.82rem}
 .nfl-bets-tbl th{padding:7px 10px;text-align:left;font-size:.72rem;color:#9ca3af;font-weight:700;text-transform:uppercase;letter-spacing:.07em;border-bottom:1px solid #2a2a2a;white-space:nowrap}
@@ -2246,11 +2246,10 @@ tr:last-child td{border-bottom:none}
 .nfl-trk-bar-wrap{width:80px;background:#1f2937;border-radius:4px;height:8px;overflow:hidden;display:inline-block;vertical-align:middle}
 .nfl-trk-bar{height:100%;border-radius:4px}
 </style>
-<div id="nfl-track-card" style="display:none;max-width:960px;margin:18px auto 0;padding:0 16px">
+<div id="nfl-track-section" style="max-width:960px;margin:18px auto 0;padding:0 16px 40px">
   <div class="card" style="padding:20px 22px">
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
+    <div style="margin-bottom:14px">
       <h2 style="font-family:'Playfair Display',serif;font-size:1.4rem;font-weight:700;color:#fff">&#128202; NFL Track Record</h2>
-      <button onclick="document.getElementById('nfl-track-card').style.display='none'" style="background:#1f2937;border:none;color:#9ca3af;border-radius:8px;padding:8px 11px;font-size:.9rem;cursor:pointer">&#215;</button>
     </div>
     <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:14px">
       <label style="color:#9ca3af;font-size:.78rem;font-weight:700;text-transform:uppercase;letter-spacing:.1em">Date</label>
@@ -3223,17 +3222,8 @@ async function _nflDeleteBet(id){
 // ── NFL Track Record ──────────────────────────────────────────────────────────
 var _nflTrkData=null,_nflTrkTabMode='cat';
 function openNflTrackRecord(){
-  var card=document.getElementById('nfl-track-card');
-  if(!card) return;
-  var mb=document.getElementById('nfl-mybets-card');
-  if(mb) mb.style.display='none';
-  if(card.style.display!=='none'){card.style.display='none';return;}
-  card.style.display='block';
-  card.scrollIntoView({behavior:'smooth',block:'start'});
-  var dp=document.getElementById('nflTrkDate');
-  if(dp&&!dp.value){var pd=document.getElementById('datePicker');if(pd) dp.value=pd.value;}
-  _nflTrkDayName();
-  if(!_nflTrkData) loadNflTrackRecord(); else renderNflTrackDay();
+  var sec=document.getElementById('nfl-track-section');
+  if(sec) sec.scrollIntoView({behavior:'smooth',block:'start'});
 }
 function _nflTrkDayName(){
   var dp=document.getElementById('nflTrkDate'),dn=document.getElementById('nflTrkDayName');
@@ -3366,6 +3356,22 @@ function downloadNflMyBetsCSV(){
   var a=document.createElement('a');a.href=url;a.download='nfl-my-bets.csv';
   document.body.appendChild(a);a.click();document.body.removeChild(a);URL.revokeObjectURL(url);
 }
+document.addEventListener('DOMContentLoaded',function(){
+  var dp=document.getElementById('nflTrkDate');
+  if(dp){dp.value=new Date().toISOString().slice(0,10);
+    dp.addEventListener('change',function(){_nflTrkDayName();renderNflTrackDay();});}
+  _nflTrkDayName();
+  loadNflTrackRecord();
+  var top=document.getElementById('nfl-btn-top'),bot=document.getElementById('nfl-btn-bot');
+  function _sc(){var y=window.pageYOffset||document.documentElement.scrollTop;
+    var atBot=(y+window.innerHeight)>=document.body.scrollHeight-50;
+    if(top) top.style.display=y>400?'block':'none';
+    if(bot) bot.style.display=!atBot?'block':'none';}
+  window.addEventListener('scroll',_sc,{passive:true});_sc();
+});
 </script>
+<!-- Scroll buttons -->
+<button id="nfl-btn-top" onclick="window.scrollTo({top:0,behavior:'smooth'})" title="Back to top" style="position:fixed;bottom:76px;right:22px;z-index:9999;display:none;width:48px;height:48px;border-radius:50%;border:none;cursor:pointer;background:#f59e0b;color:#0a0a0a;font-size:1.4rem;font-weight:900;box-shadow:0 4px 14px rgba(0,0,0,.45);line-height:1">&#8593;</button>
+<button id="nfl-btn-bot" onclick="window.scrollTo({top:document.body.scrollHeight,behavior:'smooth'})" title="Scroll to bottom" style="position:fixed;bottom:22px;right:22px;z-index:9999;display:none;width:48px;height:48px;border-radius:50%;border:none;cursor:pointer;background:#0ea5e9;color:#0a0a0a;font-size:1.4rem;font-weight:900;box-shadow:0 4px 14px rgba(0,0,0,.45);line-height:1">&#8595;</button>
 </body>
 </html>"""
