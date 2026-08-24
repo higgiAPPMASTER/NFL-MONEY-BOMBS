@@ -116,6 +116,10 @@ _PRIORITY_BOOKS = ("draftkings", "fanduel", "betmgm", "williamhill_us", "caesars
                    "betrivers", "ballybet", "bet365", "espnbet",
                    "bet99", "thescore", "fliff", "mybookieag", "betonlineag", "bovada")
 _BOOK_PRIORITY = {b: i for i, b in enumerate(_PRIORITY_BOOKS)}
+# Keep every prop market, but do not pull the same lines from every regional
+# bookmaker. These books cover the user's main US/Canadian options while
+# reducing the response size and Odds API point usage substantially.
+ODDS_BOOKMAKERS = "draftkings,fanduel,betmgm,caesars,bet365,bet99,thescore"
 _BOOK_LABEL = {"bet99":"Bet99","thescore":"theScore","bet365":"Bet365","draftkings":"DK",
                "fanduel":"FanDuel","betmgm":"BetMGM","caesars":"Caesars",
                "williamhill_us":"Caesars","betrivers":"BetRivers","ballybet":"Bally Bet",
@@ -583,12 +587,12 @@ async def get_prop_lines(event_id: str, date_str: str) -> List[Dict]:
         async with httpx.AsyncClient(timeout=20) as c:
             if is_past:
                 base = f"{ODDS_BASE}/historical/sports/americanfootball_nfl/events/{event_id}/odds"
-                params = {"apiKey": ODDS_API_KEY, "regions": "us,us2,eu,ca",
+                params = {"apiKey": ODDS_API_KEY, "bookmakers": ODDS_BOOKMAKERS,
                          "markets": ",".join(PROP_MARKETS), "oddsFormat": "american",
                          "date": f"{date_str}T12:00:00Z"}
             else:
                 base = f"{ODDS_BASE}/sports/americanfootball_nfl/events/{event_id}/odds"
-                params = {"apiKey": ODDS_API_KEY, "regions": "us,us2,eu,ca",
+                params = {"apiKey": ODDS_API_KEY, "bookmakers": ODDS_BOOKMAKERS,
                          "markets": ",".join(PROP_MARKETS), "oddsFormat": "american"}
             r = await c.get(base, params=params)
             if not r.is_success:
@@ -648,12 +652,12 @@ async def get_nfl_game_lines(event_id: str, date_str: str) -> dict:
         async with httpx.AsyncClient(timeout=15) as c:
             if is_past:
                 base   = f"{ODDS_BASE}/historical/sports/americanfootball_nfl/events/{event_id}/odds"
-                params = {"apiKey": ODDS_API_KEY, "regions": "us,us2,eu,ca",
+                params = {"apiKey": ODDS_API_KEY, "bookmakers": ODDS_BOOKMAKERS,
                           "markets": "h2h,totals", "oddsFormat": "american",
                           "date": f"{date_str}T12:00:00Z"}
             else:
                 base   = f"{ODDS_BASE}/sports/americanfootball_nfl/events/{event_id}/odds"
-                params = {"apiKey": ODDS_API_KEY, "regions": "us,us2,eu,ca",
+                params = {"apiKey": ODDS_API_KEY, "bookmakers": ODDS_BOOKMAKERS,
                           "markets": "h2h,totals", "oddsFormat": "american"}
             r = await c.get(base, params=params)
             if not r.is_success: return {}
@@ -689,6 +693,68 @@ async def get_nfl_game_lines(event_id: str, date_str: str) -> dict:
             return res
     except Exception as e:
         print(f"[GP GameLines] {e}"); return {}
+
+# Keep a small candidate pool for each team/market before running the expensive
+# history analysis. The final starter filter below still chooses one player, but
+# there is no value in analyzing every backup and deep-roster prop first.
+_MAX_PROP_CANDIDATES_PER_TEAM_MARKET = 3
+
+def _trim_prop_lines(lines: list, df) -> list:
+    if not lines or df is None or len(lines) <= _MAX_PROP_CANDIDATES_PER_TEAM_MARKET:
+        return lines
+    try:
+        cols = {"player_display_name", "recent_team", "season", "week"}
+        if not cols.issubset(df.columns):
+            return lines
+
+        # Latest team prevents a traded player's old team from taking the
+        # candidate slot for the current matchup.
+        latest_team = {}
+        for row in df[["player_display_name", "recent_team", "season", "week"]].itertuples(index=False):
+            name = str(row.player_display_name or "").strip().lower()
+            if not name:
+                continue
+            try:
+                stamp = (int(row.season), int(row.week))
+            except Exception:
+                stamp = (0, 0)
+            if name not in latest_team or stamp >= latest_team[name][0]:
+                latest_team[name] = (stamp, str(row.recent_team or "").strip())
+
+        # Career volume is the same signal used by the final starter filter.
+        # Precomputing these maps keeps the reduction cheap even with thousands
+        # of raw Odds API props.
+        volume_maps = {}
+        name_series = df["player_display_name"].astype(str).str.strip().str.lower()
+        for stat_col in set(PROP_TO_COL.values()):
+            if stat_col not in df.columns:
+                continue
+            totals = df.assign(_n=name_series).groupby("_n")[stat_col].sum()
+            volume_maps[stat_col] = totals.to_dict()
+
+        groups = {}
+        for idx, line in enumerate(lines):
+            name = str(line.get("name") or "").strip().lower()
+            market = line.get("market") or ""
+            home = line.get("home_abbr") or ""
+            away = line.get("away_abbr") or ""
+            team = (latest_team.get(name) or ((0, ""), ""))[1]
+            if team not in (home, away):
+                # Match the analyzer's conservative traded-player fallback.
+                team = home or away or ""
+            stat_col = line.get("stat_col") or ""
+            score = volume_maps.get(stat_col, {}).get(name, 0) or 0
+            group_key = (home, away, market, team)
+            groups.setdefault(group_key, []).append((float(score), idx))
+
+        keep = set()
+        for candidates in groups.values():
+            candidates.sort(key=lambda item: (-item[0], item[1]))
+            keep.update(idx for _, idx in candidates[:_MAX_PROP_CANDIDATES_PER_TEAM_MARKET])
+        return [line for idx, line in enumerate(lines) if idx in keep]
+    except Exception as e:
+        print(f"[PropTrim] skipped: {e}")
+        return lines
 
 # ── Analysis using nfl_data_py ─────────────────────────────────────────────────
 def _ha_side(row, is_home):
@@ -1189,7 +1255,11 @@ async def run_pipeline(date_str: str, progress=None) -> Dict:
         return {"picks":[],"all":[],"error":"Could not load NFL stats data — try again in a moment"}
 
     # 5. Analyze props synchronously (pandas is fast, no I/O)
-    _p(f"Analyzing {len(all_lines)} player prop histories…")
+    raw_line_count = len(all_lines)
+    all_lines = _trim_prop_lines(all_lines, df)
+    _p(f"Analyzing {len(all_lines)} player prop histories"
+       + (f" (reduced from {raw_line_count})" if len(all_lines) < raw_line_count else "")
+       + "…")
     all_results = []
     for pl in all_lines:
         result = _analyze_prop(pl, df, pl.get("home_abbr",""), pl.get("away_abbr",""))
