@@ -583,12 +583,12 @@ async def get_prop_lines(event_id: str, date_str: str) -> List[Dict]:
         async with httpx.AsyncClient(timeout=20) as c:
             if is_past:
                 base = f"{ODDS_BASE}/historical/sports/americanfootball_nfl/events/{event_id}/odds"
-                params = {"apiKey": ODDS_API_KEY, "regions": "us",
+                params = {"apiKey": ODDS_API_KEY, "regions": "us,us2,eu,ca",
                          "markets": ",".join(PROP_MARKETS), "oddsFormat": "american",
                          "date": f"{date_str}T12:00:00Z"}
             else:
                 base = f"{ODDS_BASE}/sports/americanfootball_nfl/events/{event_id}/odds"
-                params = {"apiKey": ODDS_API_KEY, "regions": "us",
+                params = {"apiKey": ODDS_API_KEY, "regions": "us,us2,eu,ca",
                          "markets": ",".join(PROP_MARKETS), "oddsFormat": "american"}
             r = await c.get(base, params=params)
             if not r.is_success:
@@ -648,12 +648,12 @@ async def get_nfl_game_lines(event_id: str, date_str: str) -> dict:
         async with httpx.AsyncClient(timeout=15) as c:
             if is_past:
                 base   = f"{ODDS_BASE}/historical/sports/americanfootball_nfl/events/{event_id}/odds"
-                params = {"apiKey": ODDS_API_KEY, "regions": "us",
+                params = {"apiKey": ODDS_API_KEY, "regions": "us,us2,eu,ca",
                           "markets": "h2h,totals", "oddsFormat": "american",
                           "date": f"{date_str}T12:00:00Z"}
             else:
                 base   = f"{ODDS_BASE}/sports/americanfootball_nfl/events/{event_id}/odds"
-                params = {"apiKey": ODDS_API_KEY, "regions": "us",
+                params = {"apiKey": ODDS_API_KEY, "regions": "us,us2,eu,ca",
                           "markets": "h2h,totals", "oddsFormat": "american"}
             r = await c.get(base, params=params)
             if not r.is_success: return {}
