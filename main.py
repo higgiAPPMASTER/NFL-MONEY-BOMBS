@@ -3134,6 +3134,7 @@ async function getPicks(){
     if(d.error) throw new Error(d.error);
     renderResults(d);
     if(isHistorical&&d.historicalTrackRecord){
+      _nflTrkReplayDate=date;
       _nflTrkData=d.historicalTrackRecord;
       var trkDate=document.getElementById('nflTrkDate');
       if(trkDate)trkDate.value=date;
@@ -3957,7 +3958,7 @@ async function _nflDeleteBet(id){
   }catch(e){alert(e.message||'Delete failed');}
 }
 // ── NFL Track Record ──────────────────────────────────────────────────────────
-var _nflTrkData=null,_nflTrkTabMode='cat';
+var _nflTrkData=null,_nflTrkTabMode='cat',_nflTrkReplayDate='',_nflTrkLoadSeq=0;
 function openNflTrackRecord(){
   var sec=document.getElementById('nfl-track-section');
   if(sec) sec.scrollIntoView({behavior:'smooth',block:'start'});
@@ -3968,13 +3969,20 @@ function _nflTrkDayName(){
   try{var days=['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
     dn.textContent=days[new Date(dp.value+'T12:00:00').getDay()];}catch(e){dn.textContent='';}
 }
-async function loadNflTrackRecord(){
+async function loadNflTrackRecord(forceOfficial){
+  forceOfficial=forceOfficial!==false;
+  var loadSeq=++_nflTrkLoadSeq;
   var body=document.getElementById('nflTrkBody');
   if(body) body.innerHTML='<p style="color:#9ca3af;padding:24px">Loading\u2026</p>';
   try{
     var r=await fetch('/api/track-record');
     if(!r.ok) throw new Error(await r.text());
-    _nflTrkData=await r.json();
+    var officialData=await r.json();
+    // The initial official-record request runs in the background. It must not
+    // overwrite a replay that finished while that request was in flight.
+    if(loadSeq!==_nflTrkLoadSeq || (!forceOfficial&&_nflTrkReplayDate)) return;
+    _nflTrkReplayDate='';
+    _nflTrkData=officialData;
     renderNflTrackDay();
   }catch(e){
     if(body) body.innerHTML='<p style="color:#f87171;padding:16px">'+(e.message||'Error loading track record')+'</p>';
@@ -4102,7 +4110,7 @@ document.addEventListener('DOMContentLoaded',function(){
   if(dp){dp.value=new Date().toISOString().slice(0,10);
     dp.addEventListener('change',function(){_nflTrkDayName();renderNflTrackDay();});}
   _nflTrkDayName();
-  loadNflTrackRecord();
+  loadNflTrackRecord(false);
   var top=document.getElementById('nfl-btn-top'),bot=document.getElementById('nfl-btn-bot');
   function _sc(){var y=window.pageYOffset||document.documentElement.scrollTop;
     var atBot=(y+window.innerHeight)>=document.body.scrollHeight-50;
