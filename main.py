@@ -18,11 +18,12 @@ from jose import jwt as jose_jwt
 ODDS_API_KEY  = os.environ.get("ODDS_API_KEY", "")
 ODDS_BASE     = "https://api.the-odds-api.com/v4"
 JWT_SECRET    = os.environ.get("JWT_SECRET", "")
-# Current NFL season + previous one, computed automatically (season year rolls
-# over in September — so in Jan 2026 the "current" season is 2025).
+# Use five completed seasons of nfl-verse player-stat history. The current file
+# is optional before Week 1; completed seasons provide the baseline until the
+# new season has real games. Recent-form calculations still explicitly use L10.
 _now_utc      = datetime.now(timezone.utc)
 _cur_season   = _now_utc.year if _now_utc.month >= 9 else _now_utc.year - 1
-NFL_SEASONS   = [_cur_season, _cur_season - 1]
+NFL_SEASONS   = list(range(_cur_season - 5, _cur_season + 1))
 
 PROP_MARKETS = [
     # passing
@@ -206,7 +207,7 @@ def _odds_cache_set(date_key, props, game_lines):
 # ── nfl_data_py stats loader ───────────────────────────────────────────────────
 _nfl_df = None
 _nfl_df_lock = asyncio.Lock()
-_NFL_PKL      = _CACHE_DIR / "nfl_df_cache_v3.pkl"  # v3: ESPN team codes + scorer-only anytime_td
+_NFL_PKL      = _CACHE_DIR / "nfl_df_cache_v6.pkl"  # v6: five completed seasons + REG/POST
 
 # nfl-verse team codes that differ from ESPN's (ESPN is what the schedule,
 # H/A lookup and card display all use). Normalized ONCE at data load so every
@@ -221,10 +222,10 @@ _HA_LOOKUP: dict = {}
 _HA_LOADED = False
 _HA_LOCK   = asyncio.Lock()
 
-_HA_CACHE_FILE = _CACHE_DIR / "nfl_ha_lookup.json"
+_HA_CACHE_FILE = _CACHE_DIR / "nfl_ha_lookup_v3.json"  # v3: five-season window + postseason
 
 async def _build_ha_lookup():
-    """Build home/away lookup from ESPN historical schedules (18 weeks x 5 seasons).
+    """Build home/away lookup from ESPN historical schedules (REG + POST).
     Result is persisted to disk so subsequent requests within the same dyno instance
     skip the 90-request ESPN fetch entirely."""
     global _HA_LOOKUP, _HA_LOADED
@@ -245,29 +246,33 @@ async def _build_ha_lookup():
 
         print("[H/A] Building home/away lookup from ESPN schedules (90 requests)…")
         sem = asyncio.Semaphore(15)
-        async def fetch_week(season, week):
+        async def fetch_week(season, season_type, week):
             async with sem:
                 try:
                     async with httpx.AsyncClient(timeout=8) as c:
                         r = await c.get(
                             "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard",
-                            params={"seasontype":2,"week":week,"season":season})
+                            params={"seasontype":season_type,"week":week,"season":season})
                         for ev in r.json().get("events",[]):
                             comp = ev.get("competitions",[{}])[0]
                             for t in comp.get("competitors",[]):
                                 abbr = t["team"].get("abbreviation","")
                                 ha   = "HOME" if t["homeAway"]=="home" else "AWAY"
                                 if abbr:
-                                    _HA_LOOKUP[(season, week, abbr)] = ha
+                                    _HA_LOOKUP[(season, "POST" if season_type == 3 else "REG",
+                                                 week, abbr)] = ha
                 except Exception:
                     pass
-        pairs = [(s, w) for s in NFL_SEASONS for w in range(1, 19)]
-        await asyncio.gather(*[fetch_week(s, w) for s, w in pairs])
+        pairs = ([(s, 2, w) for s in NFL_SEASONS for w in range(1, 19)] +
+                 [(s, 3, w) for s in NFL_SEASONS for w in range(1, 6)])
+        await asyncio.gather(*[fetch_week(s, season_type, w)
+                               for s, season_type, w in pairs])
         _HA_LOADED = True
         print(f"[H/A] Built lookup: {len(_HA_LOOKUP)} entries")
         # Persist to disk so the next request skips this step
         try:
-            serializable = {f"{s}|{w}|{a}": v for (s, w, a), v in _HA_LOOKUP.items()}
+            serializable = {f"{s}|{st}|{w}|{a}": v
+                            for (s, st, w, a), v in _HA_LOOKUP.items()}
             _HA_CACHE_FILE.write_text(json.dumps(serializable), encoding="utf-8")
             print(f"[H/A] Saved to disk cache")
         except Exception as e:
@@ -287,7 +292,7 @@ _KEEP_COLS   = ["player_display_name","player_id","headshot_url","recent_team","
                 "completions","attempts","interceptions","carries"]
 
 def _dl_csv(url):
-    """Download one nfl-verse CSV (regular season only) as a DataFrame.
+    """Download one nfl-verse CSV (regular season + playoffs) as a DataFrame.
     Uses httpx with a hard 60-second total timeout so a stalled download
     fails fast instead of hanging forever."""
     import pandas as pd, io
@@ -305,7 +310,7 @@ def _dl_csv(url):
         raise last_err
     d = pd.read_csv(io.BytesIO(r.content), low_memory=False)
     if "season_type" in d.columns:
-        d = d[d["season_type"] == "REG"]
+        d = d[d["season_type"].isin(["REG", "POST"])]
     return d
 
 def _load_nfl_stats_sync():
@@ -325,7 +330,7 @@ def _load_nfl_stats_sync():
             return _nfl_df
     except Exception as e:
         print(f"[NFL Data] Disk cache load failed: {e}")
-    print(f"[NFL Data] Downloading stats for seasons {NFL_SEASONS} in parallel from nfl-verse…")
+    print(f"[NFL Data] Downloading REG+POST stats for seasons {NFL_SEASONS} in parallel from nfl-verse…")
     try:
         import pandas as pd
         from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -342,7 +347,9 @@ def _load_nfl_stats_sync():
         all_tasks = off_urls + def_urls + kick_urls + new_urls
 
         results: dict = {}
-        with ThreadPoolExecutor(max_workers=len(all_tasks)) as ex:
+        # Keep the full-history download parallel without opening one socket per
+        # file; the old layout can produce dozens of requests.
+        with ThreadPoolExecutor(max_workers=min(24, max(1, len(all_tasks)))) as ex:
             fut_map = {ex.submit(_dl_csv, url): tag for tag, url in all_tasks}
             for fut in as_completed(fut_map):
                 tag = fut_map[fut]
@@ -455,13 +462,14 @@ def _load_nfl_stats_sync():
         # download failed) would serve season-less picks for hours.
         try:
             got_seasons = {int(s) for s in _nfl_df["season"].dropna().unique()}
-            if all(y in got_seasons for y in NFL_SEASONS):
+            required_seasons = [y for y in NFL_SEASONS if y != _cur_season]
+            if all(y in got_seasons for y in required_seasons):
                 import pickle
                 _NFL_PKL.write_bytes(pickle.dumps(_nfl_df))
                 print(f"[NFL Data] Saved to disk cache ({_NFL_PKL})")
             else:
-                print(f"[NFL Data] NOT caching — missing seasons "
-                      f"{sorted(set(NFL_SEASONS) - got_seasons)}; next run retries")
+                print(f"[NFL Data] NOT caching — missing completed seasons "
+                      f"{sorted(set(required_seasons) - got_seasons)}; next run retries")
         except Exception as pe:
             print(f"[NFL Data] Disk cache save failed: {pe}")
     except Exception as e:
@@ -530,6 +538,68 @@ async def get_espn_games(date_str: str) -> List[Dict]:
             return games
     except Exception as e:
         print(f"[ESPN] {e}"); return []
+
+# ── Current post-preseason roster ─────────────────────────────────────────────
+# Week 1 cannot rely on nfl-verse's latest team column: the new season has no
+# regular-season rows yet, so traded/free-agent players still carry last year's
+# team. ESPN's roster is current after final preseason cuts. Sportsbook props
+# remain the expected-game lineup; this map assigns those players to the right
+# team and excludes explicit inactive/practice-squad listings.
+_NFL_ROSTER_CACHE: dict = {}
+_NFL_ROSTER_TTL = 6 * 3600
+
+async def get_espn_roster_map(espn_games: List[Dict], date_str: str) -> dict:
+    """Return normalized player name -> current roster metadata for slate teams.
+    Used only for current/future games in the active season; historical runs keep
+    their date-appropriate nfl-verse team history."""
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    try:
+        if date_str < today or int(date_str[:4]) != _cur_season:
+            return {}
+    except Exception:
+        return {}
+    teams = sorted({a for g in espn_games for a in
+                    (g.get("home_abbr", ""), g.get("away_abbr", "")) if a})
+    now = time.time()
+
+    async def _one(team):
+        cached = _NFL_ROSTER_CACHE.get(team)
+        if cached and now - cached.get("ts", 0) < _NFL_ROSTER_TTL:
+            return cached.get("players", {})
+        players = {}
+        try:
+            async with httpx.AsyncClient(timeout=12) as c:
+                r = await c.get(
+                    f"https://site.api.espn.com/apis/site/v2/sports/football/nfl/teams/{team}/roster")
+            if r.is_success:
+                for group in r.json().get("athletes", []):
+                    bucket = str(group.get("position") or "")
+                    for athlete in group.get("items", []):
+                        name = str(athlete.get("fullName") or "").strip()
+                        if not name:
+                            continue
+                        status = athlete.get("status") or {}
+                        pos = athlete.get("position") or {}
+                        status_type = str(status.get("type") or "").lower()
+                        eligible = (bucket in ("offense", "defense", "specialTeam")
+                                    and status_type not in
+                                    ("injuredreserve", "out", "suspended", "practicesquad"))
+                        players[_norm(name)] = {
+                            "team": team, "eligible": eligible,
+                            "bucket": bucket,
+                            "position": str(pos.get("abbreviation") or ""),
+                        }
+        except Exception as e:
+            print(f"[Roster] {team} failed: {e}")
+        if players:
+            _NFL_ROSTER_CACHE[team] = {"ts": now, "players": players}
+        return players
+
+    out = {}
+    for team_players in await asyncio.gather(*[_one(t) for t in teams]):
+        out.update(team_players)
+    print(f"[Roster] {len(out)} current players across {len(teams)} slate teams")
+    return out
 
 # ── Odds API ───────────────────────────────────────────────────────────────────
 async def get_odds_events(date_str: str, espn_games: List[Dict]) -> List[Dict]:
@@ -738,7 +808,7 @@ def _trim_prop_lines(lines: list, df) -> list:
             market = line.get("market") or ""
             home = line.get("home_abbr") or ""
             away = line.get("away_abbr") or ""
-            team = (latest_team.get(name) or ((0, ""), ""))[1]
+            team = line.get("roster_team") or (latest_team.get(name) or ((0, ""), ""))[1]
             if team not in (home, away):
                 # Match the analyzer's conservative traded-player fallback.
                 team = home or away or ""
@@ -760,7 +830,8 @@ def _trim_prop_lines(lines: list, df) -> list:
 def _ha_side(row, is_home):
     if not _HA_LOADED:
         return True
-    key = (int(row["season"]), int(row["week"]), str(row["recent_team"]))
+    season_type = str(row.get("season_type", "REG") or "REG").upper()
+    key = (int(row["season"]), season_type, int(row["week"]), str(row["recent_team"]))
     val = _HA_LOOKUP.get(key)
     if val is None:
         return True
@@ -859,11 +930,12 @@ def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str) -> Optional[Dict
     # Use MOST RECENT team (not historical mode) so traded players show correct team
     pdf_sorted = pdf.sort_values(["season", "week"], ascending=False) if not pdf.empty else pdf
     recent_team = pdf_sorted["recent_team"].iloc[0] if not pdf_sorted.empty else ""
+    current_team = pl.get("roster_team") or recent_team
 
     # Determine home/away using current game teams first, fall back to historical
-    if home_abbr and recent_team == home_abbr:
+    if home_abbr and current_team == home_abbr:
         opp_abbr = away_abbr; is_home = True;  home_road = "H"; side = "HOME"; game_team = home_abbr
-    elif away_abbr and recent_team == away_abbr:
+    elif away_abbr and current_team == away_abbr:
         opp_abbr = home_abbr; is_home = False; home_road = "R"; side = "AWAY"; game_team = away_abbr
     elif home_abbr and away_abbr:
         # Player traded — nfl-verse team is stale; assume home until ESPN confirms
@@ -1082,7 +1154,8 @@ def _devig_nfl(odds_home, odds_away):
     tot = ph + pa
     return round(ph / tot * 100), round(pa / tot * 100)
 
-def _nfl_starter_name(team_abbr: str, df, col: str = "passing_yards") -> str:
+def _nfl_starter_name(team_abbr: str, df, col: str = "passing_yards",
+                      roster_map: dict = None) -> str:
     """Name of the CURRENT starter for this team: latest season only, and only
     players whose most recent game was with this team (excludes traded players
     like Geno Smith whose old-team rows would otherwise win on career volume)."""
@@ -1092,7 +1165,17 @@ def _nfl_starter_name(team_abbr: str, df, col: str = "passing_yards") -> str:
         latest = int(df["season"].max())
         cur = df[df["season"] == latest]
         team_df = cur[cur["recent_team"] == team_abbr]
-        if not team_df.empty:
+        roster_override = False
+        if roster_map:
+            active_names = {k for k, v in roster_map.items()
+                            if v.get("team") == team_abbr and v.get("eligible")
+                            and (not v.get("position") or v.get("position") == "QB")}
+            if active_names:
+                all_df = df[df["player_display_name"].astype(str).map(_norm).isin(active_names)]
+                if not all_df.empty:
+                    team_df = all_df
+                    roster_override = True
+        if not team_df.empty and not roster_override:
             # Keep only players still on this team (their latest row is here)
             last_rows = (cur.sort_values(["season", "week"])
                             .groupby("player_display_name").tail(1))
@@ -1110,7 +1193,8 @@ def _nfl_starter_name(team_abbr: str, df, col: str = "passing_yards") -> str:
         return "TBD"
 
 async def _build_nfl_game_predictions(espn_games: list, df, date_str: str,
-                                      gl_cache: dict = None) -> tuple:
+                                      gl_cache: dict = None,
+                                      roster_map: dict = None) -> tuple:
     """Build Game Predictor payload for every game on today's slate.
     Fetches h2h + totals for all games concurrently via get_nfl_game_lines.
     Uses cached game lines when available (past-date lines are final) and
@@ -1163,8 +1247,8 @@ async def _build_nfl_game_predictions(espn_games: list, df, date_str: str,
             total_pick = "OVER" if proj_total > total_line else "UNDER"
             total_edge = round(proj_total - total_line, 1)
         # Starter names (QB = highest career passing_yards)
-        away_sp = _nfl_starter_name(aa, df, "passing_yards")
-        home_sp = _nfl_starter_name(ha, df, "passing_yards")
+        away_sp = _nfl_starter_name(aa, df, "passing_yards", roster_map)
+        home_sp = _nfl_starter_name(ha, df, "passing_yards", roster_map)
         # Driver phrases
         drivers = []
         if pick_home:
@@ -1211,6 +1295,8 @@ async def run_pipeline(date_str: str, progress=None) -> Dict:
     espn_games = await get_espn_games(date_str)
     if not espn_games:
         return {"picks":[],"all":[],"error":f"No NFL games found for {date_str} — NFL season runs Sept–Feb. (Note: check the exact date — e.g. Championship Sunday was Jan 26, not Jan 25.)"}
+    _p("Loading current post-preseason rosters…")
+    roster_map = await get_espn_roster_map(espn_games, date_str)
 
     # 2+3. Odds layer — ONE call per game fetches props + h2h + totals together.
     #      All games are fetched concurrently (asyncio.gather) then cached for 6h.
@@ -1247,6 +1333,21 @@ async def run_pipeline(date_str: str, progress=None) -> Dict:
         else:
             msg = "No prop lines available yet — check back closer to game time"
         return {"picks":[],"all":[],"games":len(espn_games),"error":msg}
+
+    # Sportsbook-listed players are the expected game lineup. Stamp each one
+    # with ESPN's current post-cut team so Week 1 trades/free-agent moves do not
+    # inherit last season's team; remove only players explicitly off the active
+    # roster. Names absent from ESPN are retained rather than silently dropped.
+    roster_filtered = []
+    for line in all_lines:
+        ri = roster_map.get(_norm(line.get("name", ""))) if roster_map else None
+        if ri:
+            line["roster_team"] = ri.get("team", "")
+            line["roster_position"] = ri.get("position", "")
+            if not ri.get("eligible", True):
+                continue
+        roster_filtered.append(line)
+    all_lines = roster_filtered
 
     # 4. Load NFL stats (nfl_data_py — downloads once, cached in memory)
     _p(f"Loading player stats ({len(all_lines)} props to analyze) — first run after deploy downloads ~20s…")
@@ -1298,29 +1399,42 @@ async def run_pipeline(date_str: str, progress=None) -> Dict:
     #    so player-prop market quota is never shared with game-level markets)
     _p("Building game predictions…")
     game_predictions, new_gl = await _build_nfl_game_predictions(
-        espn_games, df, date_str, game_lines_by_id)
+        espn_games, df, date_str, game_lines_by_id, roster_map)
     if new_gl:
         # Persist freshly-bought game lines so re-runs never re-buy them
         merged_gl = {**(game_lines_by_id or {}), **new_gl}
         _odds_cache_set(date_str, all_lines, merged_gl)
     _p("Finishing up…")
-    # Data health: if a whole season failed to download, SAY so on screen —
-    # picks silently built from old seasons look like nonsense stats.
+    # Data health: the current season is normally absent before its first games.
+    # That is expected for Week 1, so show it as an informational note; only
+    # missing completed baseline seasons are treated as a warning.
     data_warning = ""
+    data_note = ""
     try:
         loaded_seasons = sorted({int(s) for s in df["season"].dropna().unique()})
-        missing = [y for y in NFL_SEASONS if y not in loaded_seasons]
-        if missing:
-            data_warning = ("⚠️ " + ", ".join(map(str, missing)) +
-                            " season stats failed to download — picks below use only " +
+        completed = [y for y in NFL_SEASONS if y != _cur_season]
+        missing_completed = [y for y in completed if y not in loaded_seasons]
+        if missing_completed:
+            data_warning = ("⚠️ " + ", ".join(map(str, missing_completed)) +
+                            " completed-season stats failed to download — picks below use only " +
                             ", ".join(map(str, loaded_seasons)) +
                             " data. Tap Force Refresh to retry.")
+        if _cur_season not in loaded_seasons:
+            usable = [y for y in loaded_seasons if y != _cur_season]
+            if usable and usable == list(range(min(usable), max(usable) + 1)):
+                usable_label = f"{min(usable)}–{max(usable)}"
+            else:
+                usable_label = ", ".join(map(str, usable))
+            data_note = (f"ℹ️ {_cur_season} stats are not published yet — using "
+                         + (usable_label if usable else "completed-season")
+                         + " regular-season and playoff data.")
     except Exception:
         pass
 
     result  = {"picks":picks, "all":all_results, "date":date_str,
                "games":games_out, "qualified":len(picks),
                "data_warning": data_warning,
+               "data_note": data_note,
                "game_predictions": game_predictions}
     _cache_set(date_str, result)
     _nfl_save_picks_snapshot(date_str, result)
@@ -3011,8 +3125,9 @@ function renderResults(d){
   window._nflState={d:d, all:(d.all||[])};
   window.__NFL_PLAYS__=d.all||[];
   window.__NFL_DATE__=d.date||'';
+  var note=d.data_note?('<div style="margin-bottom:10px;padding:11px 14px;border:1px solid #24506b;background:#0b2230;border-radius:10px;color:#9bd5f5;font-size:.82rem">'+d.data_note+'</div>'):'';
   var warn=d.data_warning?('<div class="err-box" style="margin-bottom:10px">'+d.data_warning+'</div>'):'';
-  res.innerHTML=warn+'<div class="nfl-toolbar"><input id="nflSearch" type="text" placeholder="Search player…" oninput="_nflPaint(this.value)"/></div><div id="nflBody"></div>';
+  res.innerHTML=note+warn+'<div class="nfl-toolbar"><input id="nflSearch" type="text" placeholder="Search player…" oninput="_nflPaint(this.value)"/></div><div id="nflBody"></div>';
   _renderNflGamePredictor(d);
   _nflPaint('');
 }
