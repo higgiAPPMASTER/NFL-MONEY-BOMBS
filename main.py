@@ -1576,6 +1576,15 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False) -> 
             try: progress(msg)
             except Exception: pass
 
+    # Every past-date request is a historical replay, regardless of which
+    # caller initiated it. This prevents the Run Picks endpoint from analyzing
+    # a completed date with stats from that date or later.
+    if not simulate:
+        try:
+            if date_str < datetime.now(timezone.utc).strftime("%Y-%m-%d"):
+                simulate = True
+        except Exception:
+            pass
     cached = None if simulate else _cache_get(date_str)
     if cached:
         return cached
@@ -1780,8 +1789,14 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False) -> 
         )
         return result
     _cache_set(date_str, result)
-    _nfl_save_picks_snapshot(date_str, result)
-    _nfl_save_gp_snapshot(date_str, result)
+    official_capture = _nfl_official_capture_allowed(date_str, result)
+    result["official_tracking"] = official_capture
+    if official_capture:
+        _nfl_save_picks_snapshot(date_str, result)
+        _nfl_save_gp_snapshot(date_str, result)
+    else:
+        print(f"[nfl_track] official snapshot skipped for {date_str}: "
+              "capture was not before every kickoff")
     try:
         from replit_push import push_picks_to_replit
         push_picks_to_replit("nfl", result)
@@ -2229,16 +2244,53 @@ def _nfl_sb_upsert(table, rows, on_conflict=None):
 
 # ── Pick snapshot ─────────────────────────────────────────────────────────────
 _NFL_TRK_APP   = "nfl"
-_NFL_PICKS_CAT = "__picks__"
-_NFL_GP_CAT    = "__gp__"
+_NFL_PICKS_CAT = "__official_picks__"
+_NFL_GP_CAT    = "__official_gp__"
+_NFL_LEDGER_CAT = "__official_ledger__"
+_NFL_DETAIL_CAT = "__official_detail__"
 _NFL_TRK_STAKE = 20.0
 _NFL_TRK_TOP   = 10   # picks per market+direction that count in main record
+
+def _nfl_official_capture_allowed(date_str: str, result: dict) -> bool:
+    """Official records require a slate captured before every kickoff.
+    Historical/manual after-the-fact runs remain view-only simulations."""
+    today = datetime.now(timezone.utc).date()
+    try:
+        slate_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return False
+    if slate_date < today:
+        return False
+    now = datetime.now(timezone.utc)
+    predictions = result.get("game_predictions") or []
+    if not predictions:
+        return False
+    for prediction in predictions:
+        start = prediction.get("game_start") or ""
+        try:
+            kickoff = datetime.fromisoformat(str(start).replace("Z", "+00:00"))
+            if kickoff.tzinfo is None:
+                kickoff = kickoff.replace(tzinfo=timezone.utc)
+            else:
+                kickoff = kickoff.astimezone(timezone.utc)
+        except (TypeError, ValueError):
+            return False
+        if now >= kickoff:
+            return False
+    return True
 
 def _nfl_save_picks_snapshot(date_str: str, result: dict):
     """Persist today's qualified picks to Supabase so they survive redeploys
     and can be graded once game box scores are final."""
     picks = result.get("picks") or []
     if not picks:
+        return
+    existing = _nfl_sb_get("mpa_track_ledger", {
+        "app": f"eq.{_NFL_TRK_APP}", "category": f"eq.{_NFL_PICKS_CAT}",
+        "side": "eq.ALL", "date": f"eq.{date_str}",
+        "select": "detail", "limit": "1",
+    })
+    if existing and isinstance(existing[0].get("detail"), list) and existing[0]["detail"]:
         return
     row = {
         "app": _NFL_TRK_APP, "date": date_str,
@@ -2690,7 +2742,7 @@ def _nfl_update_track_ledger(include_date: str = ""):
     today = _d.today().isoformat()
     with _NFL_TRK_LOCK:
         locked_rows = _nfl_sb_get("mpa_track_ledger", {
-            "app": f"eq.{_NFL_TRK_APP}", "category": "eq.__ledger__",
+            "app": f"eq.{_NFL_TRK_APP}", "category": f"eq.{_NFL_LEDGER_CAT}",
             "locked": "eq.true", "select": "date", "limit": "500",
         })
         locked = {r["date"] for r in (locked_rows or [])}
@@ -2718,9 +2770,9 @@ def _nfl_update_track_ledger(include_date: str = ""):
             agg = _nfl_aggregate_graded(graded)
             det = _nfl_detail_graded(graded)
             upserts += [
-                {"app": _NFL_TRK_APP, "date": d, "category": "__ledger__", "side": "ALL",
+                {"app": _NFL_TRK_APP, "date": d, "category": _NFL_LEDGER_CAT, "side": "ALL",
                  "wins": 0, "losses": 0, "locked": True, "detail": agg},
-                {"app": _NFL_TRK_APP, "date": d, "category": "__detail__", "side": "ALL",
+                {"app": _NFL_TRK_APP, "date": d, "category": _NFL_DETAIL_CAT, "side": "ALL",
                  "wins": 0, "losses": 0, "locked": True, "detail": det},
             ]
         if upserts:
@@ -2905,7 +2957,7 @@ async def nfl_track_record(grade: bool = False, date_str: str = ""):
     else:
         _bt_th.Thread(target=_nfl_trk_bg, daemon=True).start()
     led_rows = _nfl_sb_get("mpa_track_ledger", {
-        "app": f"eq.{_NFL_TRK_APP}", "category": "eq.__detail__",
+        "app": f"eq.{_NFL_TRK_APP}", "category": f"eq.{_NFL_DETAIL_CAT}",
         "locked": "eq.true", "select": "date,detail", "limit": "365",
     })
     detail_by_date = {r["date"]: (r.get("detail") or []) for r in (led_rows or [])}
@@ -3338,9 +3390,23 @@ async function pollJob(){
     if(d.status==='done'){
       clearInterval(pollTimer);
       renderResults(d.result);
+      if(d.result&&d.result.historicalTrackRecord){
+        _nflTrkReplayDate=d.result.date||'';
+        _nflTrkData=d.result.historicalTrackRecord;
+        var replayDate=document.getElementById('nflTrkDate');
+        if(replayDate) replayDate.value=d.result.date||'';
+        _nflTrkDayName();
+        renderNflTrackDay();
+        renderNflGpRecord();
+      }
       document.getElementById('runBtn').disabled=false;
       document.getElementById('runBtn').textContent='Run Picks';
-      document.getElementById('statusMsg').textContent='';
+      document.getElementById('statusMsg').textContent=
+        d.result&&d.result.historicalTrackRecord
+          ?'HISTORICAL REPLAY — this run excludes the selected date from model inputs and is excluded from the official Track Record.'
+          :d.result&&d.result.official_tracking===false
+          ?'VIEW ONLY — this run was not captured before every kickoff and is excluded from the official Track Record.'
+          :'Official pre-game snapshot saved for Track Record grading.';
     }else if(d.status==='error'){
       clearInterval(pollTimer);
       document.getElementById('statusMsg').textContent='Error: '+(d.error||'Unknown error');
@@ -4299,7 +4365,9 @@ function renderNflGpRecord(){
     +statCard('Game Winners',wr,'#a78bfa')+statCard('Point Totals',tr,'#38bdf8')+'</div>';
   var dp=document.getElementById('nflTrkDate'),sel=dp?dp.value:'';
   var day=daily.find(function(d){return d.date===sel;});
-  var shown=day?(day.games||[]).map(function(g){return Object.assign({record_date:day.date},g);}):allGames;
+  var shown=sel
+    ?(day?(day.games||[]).map(function(g){return Object.assign({record_date:day.date},g);}):[])
+    :allGames;
   shown=[].concat(shown).sort(function(a,b){return String(b.record_date||'').localeCompare(String(a.record_date||''));}).slice(0,80);
   function badge(result){
     if(!result)return '<span style="color:#64748b;font-weight:800">PENDING</span>';
@@ -4318,7 +4386,7 @@ function renderNflGpRecord(){
       +'<td style="color:#cbd5e1">'+(g.actual_total!=null?g.actual_total:'—')+'</td>'
       +'<td>'+badge(g.total_result)+'</td></tr>';
   }).join('');
-  var label=day?'Results for '+sel:'All recorded games';
+  var label=sel?'Results for '+sel:'All recorded games';
   bodyEl.innerHTML='<div style="color:#94a3b8;font-size:.72rem;font-weight:900;text-transform:uppercase;letter-spacing:.08em;margin:2px 0 8px">'+label+'</div>'
     +'<div class="tbl-wrap"><table class="nfl-trk-tbl"><thead><tr><th>Date</th><th>Matchup</th><th>Winner Pick</th><th>Final</th><th>Result</th><th>Total Pick</th><th>Actual Total</th><th>Result</th></tr></thead><tbody>'+rows+'</tbody></table></div>';
 }
@@ -4332,7 +4400,7 @@ function renderNflTrackDay(){
   if(!sumEl||!bodyEl) return;
   // Flatten rows from selected date (or all dates if none selected)
   var rows=[];
-  if(dayData) rows=dayData.detail||[];
+  if(selDate) rows=dayData?(dayData.detail||[]):[];
   else dates.forEach(function(d){(d.detail||[]).forEach(function(r){rows.push(r);});});
   var decided=rows.filter(function(r){return r.result==='WIN'||r.result==='LOSS';});
   if(!decided.length&&selDate){
