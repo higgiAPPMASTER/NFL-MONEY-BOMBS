@@ -2061,9 +2061,11 @@ def _nfl_box_lookup_raw(date_str: str):
     d = date_str.replace("-", "")
     results: dict = {}
     try:
+        # ESPN currently rejects the generic browser User-Agent with HTTP 403
+        # on these settlement endpoints. httpx's normal client headers work.
         sb = httpx.get(
             f"https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard?dates={d}",
-            timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+            timeout=15)
         sb.raise_for_status()
         events = sb.json().get("events", [])
     except Exception as e:
@@ -2081,7 +2083,7 @@ def _nfl_box_lookup_raw(date_str: str):
         try:
             bs = httpx.get(
                 f"https://site.api.espn.com/apis/site/v2/sports/football/nfl/summary?event={ev_id}",
-                timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+                timeout=15)
             if bs.status_code != 200:
                 complete = False
                 continue
