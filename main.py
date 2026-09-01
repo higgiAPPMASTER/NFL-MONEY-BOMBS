@@ -2528,8 +2528,6 @@ def _nfl_aggregate_graded(graded: dict) -> dict:
     for row in graded.get("main", []) + graded.get("overflow", []) + graded.get("locks", []):
         if row.get("result") not in ("WIN", "LOSS"):
             continue
-        if row.get("odds") is None:
-            continue
         cat  = row["category"]
         side = row.get("side", "OVER")
         rec  = agg.setdefault(cat, {}).setdefault(side, [0, 0])
@@ -2543,8 +2541,6 @@ def _nfl_detail_graded(graded: dict) -> list:
     out = []
     for row in graded.get("main", []) + graded.get("overflow", []) + graded.get("locks", []):
         if row.get("result") not in ("WIN", "LOSS"):
-            continue
-        if row.get("odds") is None:
             continue
         out.append({k: row.get(k) for k in (
             "name", "team", "category", "side", "market",
@@ -2915,11 +2911,12 @@ async def nfl_track_record(grade: bool = False, date_str: str = ""):
     result = []
     for d in dates:
         det = detail_by_date[d]
-        decided = [r for r in det if r.get("result") in ("WIN","LOSS") and r.get("odds") is not None]
+        decided = [r for r in det if r.get("result") in ("WIN","LOSS")]
         wins   = sum(1 for r in decided if r["result"] == "WIN")
         losses = len(decided) - wins
-        net_pl = round(sum(r.get("profit") or 0 for r in decided), 2)
-        staked = len(decided) * _NFL_TRK_STAKE
+        priced = [r for r in decided if r.get("odds") is not None]
+        net_pl = round(sum(r.get("profit") or 0 for r in priced), 2)
+        staked = len(priced) * _NFL_TRK_STAKE
         roi    = round(net_pl / staked * 100, 1) if staked else None
         cats: dict = {}
         for r in decided:
@@ -2927,8 +2924,9 @@ async def nfl_track_record(grade: bool = False, date_str: str = ""):
             e = cats.setdefault(cat, {"wins":0,"losses":0,"pl":0.0,"staked":0.0})
             if r["result"] == "WIN": e["wins"] += 1
             else: e["losses"] += 1
-            e["pl"] = round(e["pl"] + (r.get("profit") or 0), 2)
-            e["staked"] += _NFL_TRK_STAKE
+            if r.get("odds") is not None:
+                e["pl"] = round(e["pl"] + (r.get("profit") or 0), 2)
+                e["staked"] += _NFL_TRK_STAKE
         by_cat = []
         for cat, e in cats.items():
             total = e["wins"] + e["losses"]
@@ -4233,11 +4231,17 @@ function _nflTrkDayName(){
 }
 async function loadNflTrackRecord(forceOfficial){
   forceOfficial=forceOfficial!==false;
+  var dp=document.getElementById('nflTrkDate');
+  // A historical run already contains its freshly graded replay. Pressing
+  // Get Results must keep that view instead of replacing it with the separate
+  // official ledger, which intentionally has no replay-only dates.
+  if(forceOfficial&&_nflTrkReplayDate&&dp&&dp.value===_nflTrkReplayDate){
+    renderNflTrackDay();renderNflGpRecord();return;
+  }
   var loadSeq=++_nflTrkLoadSeq;
   var body=document.getElementById('nflTrkBody');
   if(body) body.innerHTML='<p style="color:#9ca3af;padding:24px">Loading\u2026</p>';
   try{
-    var dp=document.getElementById('nflTrkDate');
     var qs=forceOfficial?'?grade=true&date_str='+encodeURIComponent(dp?dp.value:''):'';
     var r=await fetch('/api/track-record'+qs);
     if(!r.ok) throw new Error(await r.text());
@@ -4328,7 +4332,7 @@ function renderNflTrackDay(){
   var rows=[];
   if(dayData) rows=dayData.detail||[];
   else dates.forEach(function(d){(d.detail||[]).forEach(function(r){rows.push(r);});});
-  var decided=rows.filter(function(r){return(r.result==='WIN'||r.result==='LOSS')&&r.odds!=null;});
+  var decided=rows.filter(function(r){return r.result==='WIN'||r.result==='LOSS';});
   if(!decided.length&&selDate){
     sumEl.innerHTML='<p style="color:#9ca3af;padding:12px;text-align:center">No graded picks for '+selDate+'. Games may not be final yet.</p>';
     bodyEl.innerHTML='';return;
@@ -4336,8 +4340,9 @@ function renderNflTrackDay(){
   var stake=_nflTrkData.stake||20;
   var wins=decided.filter(function(r){return r.result==='WIN';}).length;
   var losses=decided.length-wins;
-  var netPL=decided.reduce(function(a,r){return a+(r.profit||0);},0);
-  var totalStaked=decided.length*stake;
+  var priced=decided.filter(function(r){return r.odds!=null;});
+  var netPL=priced.reduce(function(a,r){return a+(r.profit||0);},0);
+  var totalStaked=priced.length*stake;
   var roi=totalStaked?(netPL/totalStaked*100):null;
   var rate=decided.length?(wins/decided.length*100):null;
   var plColor=netPL>=0?'#4ade80':'#f87171';
@@ -4351,7 +4356,7 @@ function renderNflTrackDay(){
     +(rate!=null?' <span style="color:#9ca3af;font-size:.85rem;font-weight:600">('+rate.toFixed(1)+'%)</span>':'')+'</span>'
     +'<span style="font-family:monospace;font-weight:800;color:'+plColor+'">Net '+plSign+Math.abs(netPL).toFixed(0)+'</span>'
     +(roi!=null?'<span style="font-family:monospace;font-weight:700;color:'+plColor+'">ROI '+(roi>=0?'+':'')+roi.toFixed(1)+'%</span>':'')
-    +'<span style="color:#6b7280;font-size:.8rem">$'+stake+'/play \u00b7 $20 flat</span>'
+    +'<span style="color:#6b7280;font-size:.8rem">$'+stake+'/play \u00b7 ROI uses priced plays only</span>'
     +'</div>';
   bodyEl.innerHTML=_nflTrkTabMode==='cat'?_nflTrkCatHtml(decided):_nflTrkListHtml(decided);
 }
@@ -4361,7 +4366,7 @@ function _nflTrkCatHtml(decided){
   decided.forEach(function(r){
     var c=cats[r.category]=cats[r.category]||{w:0,l:0,pl:0,staked:0};
     if(r.result==='WIN') c.w++; else c.l++;
-    c.pl+=(r.profit||0); c.staked+=20;
+    if(r.odds!=null){c.pl+=(r.profit||0);c.staked+=20;}
   });
   var entries=Object.entries(cats).sort(function(a,b){
     return ((b[1].pl/b[1].staked)||0)-((a[1].pl/a[1].staked)||0);
