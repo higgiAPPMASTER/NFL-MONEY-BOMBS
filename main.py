@@ -5,7 +5,7 @@ Historical stats:  nfl_data_py (nfl-verse GitHub data — no rate limits)
 Schedule:          ESPN scoreboard API
 """
 
-import os, re, asyncio, uuid, time, json, pathlib
+import os, re, asyncio, uuid, time, json, pathlib, csv, io
 from typing import Dict, List, Optional
 from datetime import datetime, timedelta, timezone
 
@@ -158,7 +158,9 @@ def _is_past_date(date_key) -> bool:
         return False
 
 def _cache_get(date_key):
-    p = _CACHE_DIR / f"nfl_{date_key}.json"
+    # v2 invalidates pre-blend Game Predictor results without invalidating the
+    # separate raw-odds cache (so recalculation does not re-buy sportsbook data).
+    p = _CACHE_DIR / f"nfl_v2_{date_key}.json"
     try:
         if p.exists() and (_is_past_date(date_key)
                            or (time.time() - p.stat().st_mtime) < _CACHE_TTL):
@@ -168,7 +170,7 @@ def _cache_get(date_key):
 
 def _cache_set(date_key, result):
     try:
-        (_CACHE_DIR / f"nfl_{date_key}.json").write_text(
+        (_CACHE_DIR / f"nfl_v2_{date_key}.json").write_text(
             json.dumps(result, ensure_ascii=False), encoding="utf-8")
     except: pass
 
@@ -524,6 +526,9 @@ async def get_espn_games(date_str: str) -> List[Dict]:
                 teams = {t["homeAway"]: t["team"] for t in comp.get("competitors", [])}
                 home  = teams.get("home", {})
                 away  = teams.get("away", {})
+                season_obj = ev.get("season") or {}
+                season_type_num = season_obj.get("type")
+                week_obj = ev.get("week") or {}
                 games.append({
                     "id":        "",
                     "home_team": home.get("displayName", ""),
@@ -533,11 +538,125 @@ async def get_espn_games(date_str: str) -> List[Dict]:
                     "game":      f"{away.get('displayName','')} @ {home.get('displayName','')}",
                     # ISO kickoff time — picks carry this so finished games drop off board
                     "start":     ev.get("date", "") or comp.get("date", ""),
+                    "season":    season_obj.get("year"),
+                    "season_type": "POST" if str(season_type_num) == "3" else "REG",
+                    "week":      week_obj.get("number"),
                 })
             print(f"[ESPN] {len(games)} NFL games for {date_str}")
             return games
     except Exception as e:
         print(f"[ESPN] {e}"); return []
+
+# ── NFL Game Predictor matchup history ─────────────────────────────────────────
+# This is free nfl-verse schedule data only — it does not touch the Odds API.
+# The history loads only after the user opens a predictor card and is cached.
+_NFL_H2H_CACHE: dict = {}
+_NFL_H2H_TTL = 24 * 3600
+_NFL_GAMES_HISTORY: list = []
+_NFL_GAMES_HISTORY_TS = 0.0
+_NFL_GAMES_HISTORY_LOCK = asyncio.Lock()
+_NFL_GAMES_HISTORY_URL = (
+    "https://github.com/nflverse/nflverse-data/releases/download/schedules/games.csv"
+)
+_NFL_HISTORY_TEAM_ALIASES = {
+    "LA": "LAR", "STL": "LAR", "SD": "LAC", "OAK": "LV", "WAS": "WSH",
+}
+
+def _nfl_history_team(abbr: str) -> str:
+    code = str(abbr or "").upper().strip()
+    return _NFL_HISTORY_TEAM_ALIASES.get(code, code)
+
+def _nfl_score_value(value):
+    try:
+        if isinstance(value, dict):
+            value = value.get("value", value.get("displayValue"))
+        return int(float(str(value).replace(",", "").strip()))
+    except Exception:
+        return None
+
+def _nfl_history_date_label(iso_date: str) -> str:
+    try:
+        return datetime.fromisoformat(iso_date.replace("Z", "+00:00")).strftime("%b %-d, %Y")
+    except Exception:
+        return str(iso_date or "")[:10]
+
+async def _load_nfl_games_history() -> list:
+    """Load nfl-verse's single all-games schedule file once per day."""
+    global _NFL_GAMES_HISTORY, _NFL_GAMES_HISTORY_TS
+    now = time.time()
+    if _NFL_GAMES_HISTORY and now - _NFL_GAMES_HISTORY_TS < _NFL_H2H_TTL:
+        return _NFL_GAMES_HISTORY
+    async with _NFL_GAMES_HISTORY_LOCK:
+        now = time.time()
+        if _NFL_GAMES_HISTORY and now - _NFL_GAMES_HISTORY_TS < _NFL_H2H_TTL:
+            return _NFL_GAMES_HISTORY
+        try:
+            async with httpx.AsyncClient(timeout=30, follow_redirects=True) as c:
+                r = await c.get(_NFL_GAMES_HISTORY_URL)
+            if not r.is_success:
+                return []
+            rows = list(csv.DictReader(io.StringIO(r.content.decode("utf-8-sig"))))
+            if rows:
+                _NFL_GAMES_HISTORY = rows
+                _NFL_GAMES_HISTORY_TS = now
+            return rows
+        except Exception as e:
+            print(f"[NFL H2H] Schedule history failed: {e}")
+            return []
+
+async def get_nfl_game_history(home_abbr: str, away_abbr: str,
+                               before_date: str = "") -> dict:
+    """Return the five most recent completed meetings before the selected game.
+    ESPN team schedules give us venue, home/away, final scores, and winner
+    without making any additional sportsbook request."""
+    home = str(home_abbr or "").upper().strip()
+    away = str(away_abbr or "").upper().strip()
+    if not home or not away or home == away:
+        return {"games": [], "error": "Invalid matchup"}
+    key = f"{away}@{home}:{before_date or _cur_season}"
+    now = time.time()
+    cached = _NFL_H2H_CACHE.get(key)
+    if cached and now - cached.get("ts", 0) < _NFL_H2H_TTL:
+        return cached.get("payload", {"games": []})
+
+    schedule_rows = await _load_nfl_games_history()
+    meetings = []
+    for row in schedule_rows:
+        raw_home = str(row.get("home_team") or "").upper()
+        raw_away = str(row.get("away_team") or "").upper()
+        h_team = _nfl_history_team(raw_home)
+        a_team = _nfl_history_team(raw_away)
+        if {h_team, a_team} != {home, away}:
+            continue
+        iso_date = str(row.get("gameday") or "")
+        if before_date and iso_date >= before_date:
+            continue
+        hs = _nfl_score_value(row.get("home_score"))
+        a_s = _nfl_score_value(row.get("away_score"))
+        if hs is None or a_s is None:
+            continue
+        winner = h_team if hs > a_s else (a_team if a_s > hs else "TIE")
+        meetings.append({
+            "event_id": str(row.get("game_id") or ""),
+            "date": iso_date,
+            "date_label": _nfl_history_date_label(iso_date),
+            "season": _nfl_score_value(row.get("season")),
+            "season_type": str(row.get("game_type") or "REG").upper(),
+            "week": _nfl_score_value(row.get("week")),
+            "home_abbr": h_team, "away_abbr": a_team,
+            "home_score": hs, "away_score": a_s,
+            "winner": winner,
+            "venue": str(row.get("stadium") or "Stadium unavailable"),
+            "city_state": "",
+        })
+    meetings.sort(key=lambda x: x.get("date", ""), reverse=True)
+    payload = {"games": meetings[:5], "home_abbr": home, "away_abbr": away}
+    _NFL_H2H_CACHE[key] = {"ts": now, "payload": payload}
+    return payload
+
+@app.get("/api/nfl/game-history")
+async def nfl_game_history(home: str = "", away: str = "", before: str = ""):
+    return await get_nfl_game_history(home, away, before)
 
 # ── Current post-preseason roster ─────────────────────────────────────────────
 # Week 1 cannot rely on nfl-verse's latest team column: the new season has no
@@ -1092,10 +1211,39 @@ def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str) -> Optional[Dict
 
 # ── NFL Game Predictor helpers ─────────────────────────────────────────────────
 
-def _nfl_team_pts_projection(team_abbr: str, df, n_games: int = 5) -> float:
+def _nfl_stats_before_game(df, target_season=None, target_week=None,
+                           target_type: str = "REG"):
+    """Exclude every stats row at or after the selected game's week."""
+    try:
+        if target_season is None or "season" not in df.columns:
+            return df
+        seasons = df["season"].fillna(0).astype(int)
+        older = seasons < int(target_season)
+        same_season = seasons == int(target_season)
+        weeks = df["week"].fillna(0).astype(int)
+        target_week = int(target_week or 1)
+        if "season_type" in df.columns:
+            types = df["season_type"].fillna("REG").astype(str).str.upper()
+            if str(target_type or "REG").upper() == "POST":
+                prior_same = (types == "REG") | ((types == "POST") & (weeks < target_week))
+            else:
+                prior_same = (types == "REG") & (weeks < target_week)
+        else:
+            prior_same = weeks < target_week
+        return df[older | (same_season & prior_same)]
+    except Exception:
+        try:
+            return df.iloc[0:0]
+        except Exception:
+            return df
+
+def _nfl_team_pts_projection(team_abbr: str, df, n_games: int = 5,
+                             target_season=None, target_week=None,
+                             target_type: str = "REG") -> float:
     """Project a team's offensive point output from their L5 total yards (nfl-verse).
     ~350 total yards per game ≈ league avg 23 pts; clamped 10-45."""
     try:
+        df = _nfl_stats_before_game(df, target_season, target_week, target_type)
         off_cols = [c for c in ["passing_yards", "rushing_yards"] if c in df.columns]
         if not off_cols:
             return 23.0
@@ -1113,10 +1261,13 @@ def _nfl_team_pts_projection(team_abbr: str, df, n_games: int = 5) -> float:
     except Exception:
         return 23.0
 
-def _nfl_team_def_strength(opp_abbr: str, df, n_games: int = 5) -> float:
+def _nfl_team_def_strength(opp_abbr: str, df, n_games: int = 5,
+                           target_season=None, target_week=None,
+                           target_type: str = "REG") -> float:
     """Defensive strength multiplier (1.0 = league avg, <1 = strong, >1 = weak).
     Measures how many offensive yards opponents piled up against this team."""
     try:
+        df = _nfl_stats_before_game(df, target_season, target_week, target_type)
         off_cols = [c for c in ["passing_yards", "rushing_yards"] if c in df.columns]
         if not off_cols or "opponent_team" not in df.columns:
             return 1.0
@@ -1130,6 +1281,48 @@ def _nfl_team_def_strength(opp_abbr: str, df, n_games: int = 5) -> float:
         return round(avg_vs / 350.0, 3)
     except Exception:
         return 1.0
+
+def _nfl_season_team_profiles(df, season: int) -> dict:
+    """Build full-season offensive and defensive yardage profiles by team.
+    Player rows are aggregated to team/game first so player volume is not
+    mistaken for games played."""
+    profiles = {}
+    try:
+        if "season" not in df.columns:
+            return profiles
+        sdf = df[df["season"] == season].copy()
+        if "season_type" in sdf.columns:
+            sdf = sdf[sdf["season_type"].fillna("REG").astype(str).str.upper() == "REG"]
+        if sdf.empty:
+            return profiles
+        off_cols = [c for c in ["passing_yards", "rushing_yards"] if c in sdf.columns]
+        if not off_cols:
+            return profiles
+        sdf["_yards"] = sdf[off_cols].fillna(0).sum(axis=1)
+        if "recent_team" in sdf.columns:
+            og = (sdf[sdf["recent_team"].notna()]
+                  .groupby(["recent_team", "week"])["_yards"].sum()
+                  .groupby(level=0).mean())
+        else:
+            og = {}
+        if "opponent_team" in sdf.columns:
+            dg = (sdf[sdf["opponent_team"].notna()]
+                  .groupby(["opponent_team", "week"])["_yards"].sum()
+                  .groupby(level=0).mean())
+        else:
+            dg = {}
+        teams = set(getattr(og, "index", [])) | set(getattr(dg, "index", []))
+        for team in teams:
+            off_yards = float(og.get(team, 350.0))
+            allowed_yards = float(dg.get(team, 350.0))
+            profiles[str(team)] = {
+                "off_yards": off_yards,
+                "off_pts": max(10.0, min(45.0, off_yards * 23.0 / 350.0)),
+                "def_factor": round(allowed_yards / 350.0, 3),
+            }
+    except Exception:
+        return {}
+    return profiles
 
 def _nfl_pythagorean(proj_home: float, proj_away: float, exp: float = 2.37):
     """NFL Pythagorean win probability (exponent 2.37)."""
@@ -1204,6 +1397,7 @@ async def _build_nfl_game_predictions(espn_games: list, df, date_str: str,
     predictions = []
     gl_cache = dict(gl_cache or {})
     fetched: dict = {}
+    season_profile_cache = {}
     async def _one_gl(g):
         eid = g.get("id", "")
         if eid and eid in gl_cache:
@@ -1213,19 +1407,90 @@ async def _build_nfl_game_predictions(espn_games: list, df, date_str: str,
             fetched[eid] = gl
         return gl
     all_gl = await asyncio.gather(*[_one_gl(g) for g in espn_games])
-    for g, gl in zip(espn_games, all_gl):
+    h2h_payloads = await asyncio.gather(*[
+        get_nfl_game_history(g.get("home_abbr", ""), g.get("away_abbr", ""), date_str)
+        for g in espn_games
+    ])
+    for game_index, (g, gl) in enumerate(zip(espn_games, all_gl)):
         ha = g.get("home_abbr", ""); aa = g.get("away_abbr", "")
         if not ha or not aa:
             continue
+        try:
+            target_season = int(g.get("season") or str(date_str)[:4])
+        except Exception:
+            target_season = _cur_season
+        try:
+            target_week = int(g.get("week") or 1)
+        except Exception:
+            target_week = 1
+        target_type = str(g.get("season_type") or "REG").upper()
+        reference_season = target_season if target_type == "POST" else target_season - 1
+        if reference_season not in season_profile_cache:
+            season_profile_cache[reference_season] = _nfl_season_team_profiles(
+                df, reference_season)
+        season_profiles = season_profile_cache[reference_season]
         # Offensive projections (L5 team yards → pts)
-        home_off = _nfl_team_pts_projection(ha, df)
-        away_off = _nfl_team_pts_projection(aa, df)
-        # Defensive strength of each team's OPPONENT
-        home_def_str = _nfl_team_def_strength(ha, df)   # how tough home D is (for away offense)
-        away_def_str = _nfl_team_def_strength(aa, df)   # how tough away D is (for home offense)
-        # Projected score: own offense × opp's defensive resistance × home adj
-        proj_home = round(home_off * home_def_str * HOME_ADJ, 1)
-        proj_away = round(away_off * away_def_str, 1)
+        home_off = _nfl_team_pts_projection(
+            ha, df, target_season=target_season, target_week=target_week,
+            target_type=target_type)
+        away_off = _nfl_team_pts_projection(
+            aa, df, target_season=target_season, target_week=target_week,
+            target_type=target_type)
+        # Defensive strength belongs to the opponent being faced:
+        # away defense suppresses home scoring and home defense suppresses away.
+        home_def_str = _nfl_team_def_strength(
+            ha, df, target_season=target_season, target_week=target_week,
+            target_type=target_type)
+        away_def_str = _nfl_team_def_strength(
+            aa, df, target_season=target_season, target_week=target_week,
+            target_type=target_type)
+        recent_home = home_off * away_def_str * HOME_ADJ
+        recent_away = away_off * home_def_str
+        hp = season_profiles.get(ha, {})
+        ap = season_profiles.get(aa, {})
+        last_home = float(hp.get("off_pts", 23.0)) * float(ap.get("def_factor", 1.0)) * HOME_ADJ
+        last_away = float(ap.get("off_pts", 23.0)) * float(hp.get("def_factor", 1.0))
+        # Last completed season anchors the model while L5 captures current
+        # form. A missing team profile falls back to league average.
+        stat_home = 0.45 * recent_home + 0.55 * last_home
+        stat_away = 0.45 * recent_away + 0.55 * last_away
+
+        # H2H is a matchup adjustment, with venue-specific averages preferred.
+        h2h = h2h_payloads[game_index] if game_index < len(h2h_payloads) else {}
+        hgames = h2h.get("games", []) if h2h else []
+        def _weighted_h2h_score(team, target_side):
+            total_score = total_weight = 0.0
+            for pos, meeting in enumerate(hgames):
+                if meeting.get("home_abbr") == team:
+                    score, side = meeting.get("home_score"), "home"
+                else:
+                    score, side = meeting.get("away_score"), "away"
+                if score is None:
+                    continue
+                # Newer meetings matter much more; matching today's venue gets
+                # an additional boost while reverse-venue games still count.
+                weight = (0.72 ** pos) * (1.35 if side == target_side else 1.0)
+                total_score += float(score) * weight
+                total_weight += weight
+            return total_score / total_weight if total_weight else None
+
+        h2h_home_avg = _weighted_h2h_score(ha, "home")
+        h2h_away_avg = _weighted_h2h_score(aa, "away")
+        try:
+            target_year = int(str(date_str)[:4])
+            latest_h2h_year = int(str(hgames[0].get("date", ""))[:4]) if hgames else target_year
+            meeting_age = max(0, target_year - latest_h2h_year)
+        except Exception:
+            meeting_age = 0
+        # Historical matchup signal is intentionally secondary. Its maximum
+        # influence is 25%, and it fades when the latest meeting is years old.
+        h2h_recency = max(0.35, 1.0 - meeting_age * 0.10)
+        h2h_weight = (min(0.25, 0.08 + len(hgames) * 0.034) * h2h_recency
+                      if hgames else 0.0)
+        proj_home = round(stat_home * (1 - h2h_weight) +
+                          (h2h_home_avg if h2h_home_avg is not None else stat_home) * h2h_weight, 1)
+        proj_away = round(stat_away * (1 - h2h_weight) +
+                          (h2h_away_avg if h2h_away_avg is not None else stat_away) * h2h_weight, 1)
         proj_total = round(proj_home + proj_away, 1)
         win_home, win_away = _nfl_pythagorean(proj_home, proj_away)
         pick_home = win_home >= win_away
@@ -1255,10 +1520,18 @@ async def _build_nfl_game_predictions(espn_games: list, df, date_str: str,
             drivers.append(f"{ha} projects {proj_home} pts vs {aa} projects {proj_away} pts")
         else:
             drivers.append(f"{aa} projects {proj_away} pts vs {ha} projects {proj_home} pts")
-        if home_def_str < 0.95:
-            drivers.append(f"{ha} defense has allowed fewer yards than average")
-        elif away_def_str < 0.95:
+        if away_def_str < 0.95:
             drivers.append(f"{aa} defense has allowed fewer yards than average")
+        elif home_def_str < 0.95:
+            drivers.append(f"{ha} defense has allowed fewer yards than average")
+        if hgames:
+            h2h_winner = (sum(1 for m in hgames if m.get("winner") == ha),
+                          sum(1 for m in hgames if m.get("winner") == aa))
+            drivers.append(f"last {len(hgames)} H2H: {ha} {h2h_winner[0]} wins, "
+                           f"{aa} {h2h_winner[1]} wins; recency/venue weight "
+                           f"{round(h2h_weight * 100)}%")
+        if reference_season is not None:
+            drivers.append(f"{reference_season} full-season offense/defense anchors recent L5 form")
         if value_flag and mkt_edge:
             drivers.append(f"model {pick_abbr} {model_pct}% vs market {mkt_pct}% — +{mkt_edge}% value edge")
         elif mkt_edge is not None:
@@ -1275,6 +1548,16 @@ async def _build_nfl_game_predictions(espn_games: list, df, date_str: str,
             "mkt_home_pct": mkt_home_pct, "mkt_away_pct": mkt_away_pct,
             "mkt_edge": mkt_edge, "value_flag": value_flag,
             "drivers": drivers, "game_start": g.get("start", ""),
+            "h2h_games": len(hgames),
+            "h2h_home_avg": round(h2h_home_avg, 1) if h2h_home_avg is not None else None,
+            "h2h_away_avg": round(h2h_away_avg, 1) if h2h_away_avg is not None else None,
+            "h2h_home_wins": sum(1 for m in hgames if m.get("winner") == ha),
+            "h2h_away_wins": sum(1 for m in hgames if m.get("winner") == aa),
+            "h2h_weight_pct": round(h2h_weight * 100),
+            "reference_season": reference_season,
+            "recent_home": round(recent_home, 1), "recent_away": round(recent_away, 1),
+            "last_home": round(last_home, 1), "last_away": round(last_away, 1),
+            "stat_home": round(stat_home, 1), "stat_away": round(stat_away, 1),
         })
     return predictions, fetched
 
@@ -2473,7 +2756,7 @@ tr:last-child td{border-bottom:none}
   </div>
   <div id="nfl-gp-card" style="display:none;max-width:960px;margin:18px auto 0;padding:0 16px">
     <div style="font-size:1rem;font-weight:900;color:#a78bfa;margin-bottom:6px">&#128302; Game Predictor &#8212; Today&#39;s Winners</div>
-    <div style="font-size:.72rem;color:#64748b;margin-bottom:14px">Model picks each game&#39;s winner from L5 team offensive yards, opponent defensive strength, and home-field advantage. Tap a game for the full breakdown.</div>
+    <div style="font-size:.72rem;color:#64748b;margin-bottom:14px">Model blends recent L5 form, last completed season offense/defense, home-field advantage, and venue-aware results from the last five head-to-head meetings. Tap a game for the full breakdown.</div>
     <div id="nfl-gp-body"></div>
   </div>
   <div id="results"></div>
@@ -3024,6 +3307,46 @@ function _nflGpCard(g,i){
     +_nflGpBetPanel(g,i)
     +'</div>';
 }
+function _nflGpHistoryRow(m,home,away){
+  var winner=m.winner==='TIE'?'TIE':('Winner '+(m.winner||'—'));
+  var venueSide=(m.home_abbr===home?home+' HOME':home+' AWAY')+' · '+
+    (m.home_abbr===away?away+' HOME':away+' AWAY');
+  var score=_esc(m.away_abbr)+' '+m.away_score+' — '+_esc(m.home_abbr)+' '+m.home_score;
+  var total=(Number(m.home_score)||0)+(Number(m.away_score)||0);
+  var type=m.season_type==='POST'?'PLAYOFF':'REG';
+  return '<div style="padding:10px 0;border-top:1px solid #1e293b">'
+    +'<div style="display:flex;justify-content:space-between;gap:8px;align-items:center">'
+    +'<span style="font-size:.72rem;font-weight:900;color:#e2e8f0">'+_esc(m.date_label||'')+'</span>'
+    +'<span style="font-size:.58rem;font-weight:900;color:#a78bfa;letter-spacing:.05em">'+type+'</span></div>'
+    +'<div style="display:flex;justify-content:space-between;gap:8px;margin-top:4px;font-size:.72rem">'
+    +'<span style="color:#4ade80;font-weight:900">'+_esc(winner)+'</span>'
+    +'<span style="color:#fbbf24;font-weight:900">Total '+total+'</span></div>'
+    +'<div style="margin-top:4px;color:#cbd5e1;font-size:.74rem;font-weight:800">'+score+'</div>'
+    +'<div style="margin-top:3px;color:#94a3b8;font-size:.64rem">'+_esc(venueSide)+' · '+_esc(m.venue||'Stadium unavailable')
+    +(m.city_state?' · '+_esc(m.city_state):'')+'</div>'
+    +'</div>';
+}
+function _nflGpLoadHistory(g){
+  var box=document.getElementById('nfl-gp-history'); if(!box) return;
+  var home=g.home_abbr||'',away=g.away_abbr||'';
+  var key=away+'@'+home;
+  box.dataset.key=key;
+  fetch('/api/nfl/game-history?home='+encodeURIComponent(home)+'&away='+encodeURIComponent(away)
+    +'&before='+encodeURIComponent(window.__NFL_DATE__||''))
+    .then(function(r){return r.json();})
+    .then(function(d){
+      if(box.dataset.key!==key) return;
+      if(d.error){box.innerHTML='<div style="color:#f87171">'+_esc(d.error)+'</div>';return;}
+      var games=d.games||[];
+      if(!games.length){
+        box.innerHTML='<div style="color:#64748b">No completed meetings found in the available schedule history.</div>';
+        return;
+      }
+      box.innerHTML='<div style="font-size:.68rem;color:#c4b5fd;font-weight:900;letter-spacing:.04em;margin-bottom:2px">LAST '+games.length+' MEETINGS · VENUE &amp; FINAL SCORE</div>'
+        +games.map(function(m){return _nflGpHistoryRow(m,home,away);}).join('');
+    })
+    .catch(function(){if(box.dataset.key===key)box.innerHTML='<div style="color:#f87171">Could not load matchup history. Try again.</div>';});
+}
 function _openNflGamePred(i){
   var gp=(window.__NFL_GP__||[])[i]; if(!gp) return;
   var ov=document.getElementById('nfl-gp-modal');
@@ -3042,21 +3365,35 @@ function _openNflGamePred(i){
   }
   var totStr=(gp.total_line!=null?('proj <b>'+_nflGpFix(gp.proj_total)+'</b> · book line <b>'+_nflGpFix(gp.total_line)+'</b>'):'proj <b>'+_nflGpFix(gp.proj_total)+'</b> · no line posted');
   var driversHtml=(gp.drivers||[]).map(function(d){return '<li style="margin-bottom:4px">'+_esc(d)+'</li>';}).join('');
+  var h2hBlendLine=gp.h2h_games
+    ?(gp.h2h_games+' recency/venue-weighted H2H meetings: '+gp.h2h_weight_pct+'% adjustment')
+    :'No completed H2H meetings available · stats baseline used without a matchup adjustment';
+  var blendHtml='<div style="background:#11162a;border:1px solid #312e81;border-radius:8px;padding:9px 12px;margin-bottom:10px;font-size:.7rem;color:#94a3b8">'
+    +'<div style="color:#c4b5fd;font-weight:900;margin-bottom:4px">BLENDED MODEL INPUTS</div>'
+    +'<div>Recent L5 adjusted: '+_esc(gp.away_abbr)+' '+_nflGpFix(gp.recent_away)+' · '+_esc(gp.home_abbr)+' '+_nflGpFix(gp.recent_home)+'</div>'
+    +'<div style="margin-top:3px">'+_esc(gp.reference_season||'Last season')+' offense/defense: '+_esc(gp.away_abbr)+' '+_nflGpFix(gp.last_away)+' · '+_esc(gp.home_abbr)+' '+_nflGpFix(gp.last_home)+'</div>'
+    +'<div style="margin-top:3px">Stats baseline (45% L5 / 55% season): '+_esc(gp.away_abbr)+' '+_nflGpFix(gp.stat_away)+' · '+_esc(gp.home_abbr)+' '+_nflGpFix(gp.stat_home)+'</div>'
+    +'<div style="margin-top:3px">'+h2hBlendLine+'</div>'
+    +(gp.h2h_games?('<div style="margin-top:3px;color:#e2e8f0">Venue-aware H2H scoring: '+_esc(gp.home_abbr)+' '+_nflGpFix(gp.h2h_home_avg)+' · '+_esc(gp.away_abbr)+' '+_nflGpFix(gp.h2h_away_avg)+'</div>'):'')
+    +'</div>';
   ov.innerHTML='<div style="background:#0d1117;border:1px solid #7c3aed;border-radius:18px;max-width:500px;width:100%;padding:22px;box-shadow:0 20px 60px rgba(0,0,0,.7)">'
     +'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">'
     +'<div style="font-size:1rem;font-weight:900;color:#c4b5fd">'+_esc(gp.away_abbr)+' @ '+_esc(gp.home_abbr)+'</div>'
     +'<button onclick="document.getElementById(&#39;nfl-gp-modal&#39;).style.display=&#39;none&#39;" style="background:none;border:none;color:#64748b;font-size:1.2rem;cursor:pointer">&#10005;</button></div>'
-    +'<div style="font-size:.68rem;color:#64748b;margin-bottom:12px">Model picks the winner from L5 team offensive yards + opponent defensive strength + home-field advantage</div>'
+    +'<div style="font-size:.68rem;color:#64748b;margin-bottom:12px">Winner and total blend recent form, last-season offense/defense, venue-aware H2H history, and home-field advantage</div>'
     +'<div style="display:flex;gap:10px;margin-bottom:14px">'+gpBig(gp.away_abbr,gp.proj_away,gp.win_away,!gp.pick_home)+gpBig(gp.home_abbr,gp.proj_home,gp.win_home,gp.pick_home)+'</div>'
     +'<div style="margin-bottom:10px;color:#94a3b8;font-size:.76rem">'+totStr+'</div>'
+    +blendHtml
     +(gp.mkt_edge!=null?('<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;background:#0a1120;border-radius:8px;padding:8px 12px">'
       +'<div><div style="font-size:.7rem;font-weight:800;color:#c4b5fd">Model pick: '+_esc(gp.pick_abbr)+'</div>'
       +'<div style="color:#e2e8f0;font-size:.8rem;margin-top:2px">model <b>'+(gp.pick_home?gp.win_home:gp.win_away)+'%</b> · market <b>'+(gp.pick_home?gp.mkt_home_pct:gp.mkt_away_pct)+'%</b></div></div>'
       +'<span style="background:'+(gp.mkt_edge>0?'#166534':(gp.mkt_edge<0?'#7f1d1d':'#334155'))+';color:#fff;font-weight:900;font-size:.74rem;border-radius:8px;padding:4px 11px">'+(gp.value_flag?'VALUE ':'EDGE ')+(gp.mkt_edge>0?'+':'')+gp.mkt_edge+'%</span>'
       +'</div>'):'')
     +'<div style="background:#0a1120;border-radius:8px;padding:10px 14px;font-size:.72rem;color:#94a3b8"><span style="color:#7c3aed;font-weight:800">Key factors:</span><ul style="margin:6px 0 0;padding-left:18px;line-height:1.7">'+driversHtml+'</ul></div>'
-    +'<div style="color:#64748b;font-size:.62rem;margin-top:10px;text-align:center">Display only · not tracked · based on L5 team offensive production</div>'
+     +'<div id="nfl-gp-history" style="background:#0a1120;border-radius:8px;padding:11px 14px;margin-top:10px;font-size:.72rem;color:#94a3b8"><div style="color:#64748b">Loading last 5 meetings…</div></div>'
+    +'<div style="color:#64748b;font-size:.62rem;margin-top:10px;text-align:center">Display only · not tracked · blended matchup projection</div>'
     +'</div>';
+  _nflGpLoadHistory(gp);
 }
 function _nflGpBetForm(key){
   var src=(window.__NFL_GP_BET__||{})[key]; if(!src) return;
