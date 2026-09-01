@@ -523,9 +523,13 @@ async def get_espn_games(date_str: str) -> List[Dict]:
             games = []
             for ev in r.json().get("events", []):
                 comp  = ev.get("competitions", [{}])[0]
-                teams = {t["homeAway"]: t["team"] for t in comp.get("competitors", [])}
+                competitors = comp.get("competitors", [])
+                teams = {t["homeAway"]: t["team"] for t in competitors}
+                team_rows = {t["homeAway"]: t for t in competitors}
                 home  = teams.get("home", {})
                 away  = teams.get("away", {})
+                home_row = team_rows.get("home", {})
+                away_row = team_rows.get("away", {})
                 season_obj = ev.get("season") or {}
                 season_type_num = season_obj.get("type")
                 week_obj = ev.get("week") or {}
@@ -541,6 +545,9 @@ async def get_espn_games(date_str: str) -> List[Dict]:
                     "season":    season_obj.get("year"),
                     "season_type": "POST" if str(season_type_num) == "3" else "REG",
                     "week":      week_obj.get("number"),
+                    "home_score": home_row.get("score"),
+                    "away_score": away_row.get("score"),
+                    "completed": ev.get("status", {}).get("type", {}).get("completed", False),
                 })
             print(f"[ESPN] {len(games)} NFL games for {date_str}")
             return games
@@ -1562,14 +1569,14 @@ async def _build_nfl_game_predictions(espn_games: list, df, date_str: str,
     return predictions, fetched
 
 # ── Pipeline ───────────────────────────────────────────────────────────────────
-async def run_pipeline(date_str: str, progress=None) -> Dict:
+async def run_pipeline(date_str: str, progress=None, simulate: bool = False) -> Dict:
     def _p(msg):
         print(f"[Pipeline] {msg}")
         if progress:
             try: progress(msg)
             except Exception: pass
 
-    cached = _cache_get(date_str)
+    cached = None if simulate else _cache_get(date_str)
     if cached:
         return cached
 
@@ -1578,8 +1585,14 @@ async def run_pipeline(date_str: str, progress=None) -> Dict:
     espn_games = await get_espn_games(date_str)
     if not espn_games:
         return {"picks":[],"all":[],"error":f"No NFL games found for {date_str} — NFL season runs Sept–Feb. (Note: check the exact date — e.g. Championship Sunday was Jan 26, not Jan 25.)"}
-    _p("Loading current post-preseason rosters…")
-    roster_map = await get_espn_roster_map(espn_games, date_str)
+    if simulate:
+        # Historical replays use the players listed by the archived sportsbook
+        # board. Current ESPN rosters would incorrectly remove traded/retired
+        # players from a past slate.
+        roster_map = {}
+    else:
+        _p("Loading current post-preseason rosters…")
+        roster_map = await get_espn_roster_map(espn_games, date_str)
 
     # 2+3. Odds layer — ONE call per game fetches props + h2h + totals together.
     #      All games are fetched concurrently (asyncio.gather) then cached for 6h.
@@ -1605,6 +1618,9 @@ async def run_pipeline(date_str: str, progress=None) -> Dict:
                 l["away_abbr"] = away_abbr
                 l["game"]      = ev.get("game","")
                 l["game_start"]= ev.get("start","")
+                l["target_season"] = ev.get("season")
+                l["target_week"] = ev.get("week")
+                l["target_type"] = ev.get("season_type", "REG")
             all_lines.extend(lines)
         if all_lines:
             _odds_cache_set(date_str, all_lines, {})
@@ -1638,15 +1654,48 @@ async def run_pipeline(date_str: str, progress=None) -> Dict:
     if df is None:
         return {"picks":[],"all":[],"error":"Could not load NFL stats data — try again in a moment"}
 
+    # Historical replay analysis is strictly point-in-time: only rows from
+    # before the selected game's week may influence picks. The selected-week
+    # row is consulted only to identify the player's team on that past slate.
+    analysis_df = df
+    target_rows = None
+    if simulate and espn_games:
+        tg = espn_games[0]
+        ts, tw, tt = tg.get("season"), tg.get("week"), tg.get("season_type", "REG")
+        try:
+            target_rows = df[
+                (df["season"].fillna(0).astype(int) == int(ts)) &
+                (df["week"].fillna(0).astype(int) == int(tw))
+            ]
+            if "season_type" in target_rows.columns:
+                target_rows = target_rows[
+                    target_rows["season_type"].fillna("REG").astype(str).str.upper() == str(tt).upper()
+                ]
+            target_teams = {}
+            for _, tr in target_rows.iterrows():
+                raw_name = tr.get("player_display_name", "")
+                nm = _norm(str(raw_name)) if raw_name is not None else ""
+                tm = str(tr.get("recent_team") or "")
+                if nm and tm:
+                    target_teams[nm] = tm
+            for line in all_lines:
+                tm = target_teams.get(_norm(line.get("name", "")))
+                if tm in (line.get("home_abbr"), line.get("away_abbr")):
+                    line["roster_team"] = tm
+            analysis_df = _nfl_stats_before_game(df, ts, tw, tt)
+        except Exception as exc:
+            print(f"[nfl_sim] point-in-time filter failed closed: {exc}")
+            analysis_df = df.iloc[0:0]
+
     # 5. Analyze props synchronously (pandas is fast, no I/O)
     raw_line_count = len(all_lines)
-    all_lines = _trim_prop_lines(all_lines, df)
+    all_lines = _trim_prop_lines(all_lines, analysis_df)
     _p(f"Analyzing {len(all_lines)} player prop histories"
        + (f" (reduced from {raw_line_count})" if len(all_lines) < raw_line_count else "")
        + "…")
     all_results = []
     for pl in all_lines:
-        result = _analyze_prop(pl, df, pl.get("home_abbr",""), pl.get("away_abbr",""))
+        result = _analyze_prop(pl, analysis_df, pl.get("home_abbr",""), pl.get("away_abbr",""))
         if result:
             all_results.append(result)
 
@@ -1660,8 +1709,8 @@ async def run_pipeline(date_str: str, progress=None) -> Dict:
             col = PROP_TO_COL.get(r.get("market",""), "")
             if not col or col not in df.columns:
                 return 0
-            mask = df["player_display_name"].str.lower() == nm
-            return float(df[mask][col].fillna(0).sum())
+            mask = analysis_df["player_display_name"].str.lower() == nm
+            return float(analysis_df[mask][col].fillna(0).sum())
         except Exception:
             return 0
 
@@ -1719,6 +1768,17 @@ async def run_pipeline(date_str: str, progress=None) -> Dict:
                "data_warning": data_warning,
                "data_note": data_note,
                "game_predictions": game_predictions}
+    if simulate:
+        result["simulation"] = True
+        result["historicalTrackRecord"] = _nfl_historical_replay_payload(
+            result, espn_games, _nfl_box_from_stats_rows(target_rows))
+        result["simulationNotice"] = (
+            "Point-in-time historical replay: player-form and Game Predictor "
+            f"inputs use only data available before {date_str}. Archived sportsbook "
+            "lines are used for grading. Replay results are view-only and never "
+            "enter the official NFL Track Record."
+        )
+        return result
     _cache_set(date_str, result)
     _nfl_save_picks_snapshot(date_str, result)
     try:
@@ -1850,6 +1910,23 @@ async def api_cached(request: Request, target_date: str = "", token: str = ""):
     if cached:
         return cached
     raise HTTPException(status_code=404, detail="No saved picks for this date.")
+
+@app.get("/api/picks")
+async def api_picks(request: Request, target_date: str = "", token: str = "",
+                    simulate: bool = False):
+    tok = token or request.headers.get("Authorization", "").replace("Bearer ", "").strip()
+    if not _verify_hub_token(tok):
+        raise HTTPException(status_code=401, detail="Subscription required — please log in via moneypicksarena.com")
+    date_str = target_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if simulate:
+        try:
+            replay_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="A valid completed NFL date is required")
+        if replay_date >= datetime.now(timezone.utc).date():
+            raise HTTPException(status_code=400, detail="Historical replays are available only for completed dates")
+    result = await run_pipeline(date_str, simulate=simulate)
+    return JSONResponse(result)
 
 @app.get("/api/whoami")
 async def whoami(request: Request, token: str = ""):
@@ -2187,12 +2264,12 @@ def _nfl_list_snap_dates() -> list:
     return sorted({r["date"] for r in rows if r.get("date")})
 
 # ── Grading ───────────────────────────────────────────────────────────────────
-def _nfl_grade_date(date_str: str, snap: list) -> dict:
+def _nfl_grade_date(date_str: str, snap: list, box_override: dict = None) -> dict:
     """Grade every pick in snap against ESPN box scores.
     Groups by market+direction, ranks by score desc.
     Top _NFL_TRK_TOP per group -> main record; extras -> NFL Overflow."""
     from collections import defaultdict
-    box = _nfl_box_lookup(date_str)
+    box = box_override if box_override is not None else _nfl_box_lookup(date_str)
     any_game = bool(box)
     all_final = any_game and all(v.get("final", False) for v in box.values())
 
@@ -2279,6 +2356,108 @@ def _nfl_detail_graded(graded: dict) -> list:
             "line", "odds", "rank", "result", "actual", "profit",
         )})
     return out
+
+def _nfl_box_from_stats_rows(rows) -> dict:
+    """Normalize selected-week nfl-verse rows into the settlement box contract."""
+    box = {}
+    if rows is None:
+        return box
+    try:
+        for _, row in rows.iterrows():
+            raw_name = row.get("player_display_name", "")
+            name = str(raw_name).lower().strip() if raw_name is not None else ""
+            if not name or name == "nan":
+                continue
+            stats = box.setdefault(name, {"final": True})
+            for market, col in PROP_TO_COL.items():
+                val = row.get(col)
+                try:
+                    if val is None or val != val:
+                        continue
+                    num = float(val)
+                except (TypeError, ValueError):
+                    continue
+                stats[market] = float(stats.get(market, 0)) + num
+        return box
+    except Exception as exc:
+        print(f"[nfl_sim] nfl-verse grading box failed: {exc}")
+        return {}
+
+def _nfl_historical_replay_payload(result: dict, espn_games: list = None,
+                                   replay_box: dict = None) -> dict:
+    """Build a view-only Track Record payload for one completed historical date."""
+    date_str = result.get("date") or ""
+    graded = _nfl_grade_date(
+        date_str, result.get("picks") or [], box_override=replay_box)
+    detail = _nfl_detail_graded(graded)
+
+    # Grade the display-only Game Predictor too, so a replay evaluates both
+    # player props and the winner/total model without changing its live status.
+    game_map = {
+        (g.get("home_abbr"), g.get("away_abbr")): g
+        for g in (espn_games or [])
+    }
+    gp_rows = []
+    for gp in result.get("game_predictions") or []:
+        game = game_map.get((gp.get("home_abbr"), gp.get("away_abbr"))) or {}
+        if not game.get("completed"):
+            continue
+        try:
+            hs = float(game.get("home_score"))
+            aws = float(game.get("away_score"))
+        except (TypeError, ValueError):
+            continue
+        pick_home = bool(gp.get("pick_home"))
+        picked = gp.get("home_abbr") if pick_home else gp.get("away_abbr")
+        winner = gp.get("home_abbr") if hs > aws else (
+            gp.get("away_abbr") if aws > hs else "TIE")
+        win_result = "PUSH" if winner == "TIE" else ("WIN" if picked == winner else "LOSS")
+        ml_odds = gp.get("home_ml_odds") if pick_home else gp.get("away_ml_odds")
+        gp_rows.append({
+            "name": f"{gp.get('away_abbr','')} @ {gp.get('home_abbr','')}",
+            "team": picked, "category": "Game Predictor (Winner)",
+            "side": "WIN", "market": "gp_winner", "line": None,
+            "odds": ml_odds, "rank": len(gp_rows) + 1,
+            "result": win_result, "actual": winner,
+            "profit": round(_nfl_american_profit(
+                ml_odds, _NFL_TRK_STAKE, win_result), 2
+            ) if ml_odds is not None else None,
+        })
+        total_line = gp.get("total_line")
+        total_side = gp.get("total_pick")
+        if total_line is not None and total_side in ("OVER", "UNDER"):
+            actual_total = hs + aws
+            if actual_total == float(total_line):
+                total_result = "PUSH"
+            elif total_side == "OVER":
+                total_result = "WIN" if actual_total > float(total_line) else "LOSS"
+            else:
+                total_result = "WIN" if actual_total < float(total_line) else "LOSS"
+            total_odds = (
+                gp.get("total_over_odds") if total_side == "OVER"
+                else gp.get("total_under_odds")
+            )
+            gp_rows.append({
+                "name": f"{gp.get('away_abbr','')} @ {gp.get('home_abbr','')}",
+                "team": "", "category": "Game Predictor (Total)",
+                "side": total_side, "market": "gp_total",
+                "line": total_line, "odds": total_odds,
+                "rank": len(gp_rows) + 1, "result": total_result,
+                "actual": actual_total,
+                "profit": round(_nfl_american_profit(
+                    total_odds, _NFL_TRK_STAKE, total_result), 2
+                ) if total_odds is not None else None,
+            })
+    detail.extend(gp_rows)
+    return {
+        "dates": [{"date": date_str, "detail": detail}],
+        "stake": _NFL_TRK_STAKE,
+        "historical": True,
+        "notice": (
+            "Historical Replay — reconstructed point-in-time results for review "
+            "only; excluded from the official NFL Track Record."
+        ),
+    }
 
 # ── Track ledger update ───────────────────────────────────────────────────────
 _NFL_TRK_LOCK = _bt_th.Lock()
@@ -2927,24 +3106,44 @@ async function pollJob(){
   }
 }
 
-// Get Picks: load saved picks for the chosen date (read-only, never runs the pipeline).
+// Get Picks loads today's saved board, or builds a view-only replay for a past date.
 async function getPicks(){
   var date=document.getElementById('datePicker').value;
   if(!date){alert('Please select a date');return;}
   var btn=document.getElementById('getBtn');
   var status=document.getElementById('statusMsg');
   var orig=btn.textContent;
+  var isHistorical=date<new Date().toISOString().slice(0,10);
   btn.disabled=true;
-  btn.innerHTML='<span class="spinner"></span>Loading...';
-  status.innerHTML='<span class="spinner"></span>Loading saved picks...';
+  btn.innerHTML='<span class="spinner"></span>'+(isHistorical?'Replaying...':'Loading...');
+  status.innerHTML='<span class="spinner"></span>'+(isHistorical
+    ?'Building point-in-time picks and grading the historical results...'
+    :'Loading saved picks...');
   document.getElementById('results').innerHTML='';
   try{
-    var r=await fetch('/api/cached?target_date='+encodeURIComponent(date)+'&token='+encodeURIComponent(_nflTok));
+    var url=isHistorical
+      ?'/api/picks?target_date='+encodeURIComponent(date)+'&simulate=true&token='+encodeURIComponent(_nflTok)
+      :'/api/cached?target_date='+encodeURIComponent(date)+'&token='+encodeURIComponent(_nflTok);
+    var r=await fetch(url);
     if(r.status===404){ status.textContent=''; alert("Today's picks aren't ready yet -- check back a little later."); return; }
-    if(!r.ok) throw new Error('Server error '+r.status);
+    if(!r.ok){
+      var er=await r.json().catch(function(){return{};});
+      throw new Error(er.detail||('Server error '+r.status));
+    }
     var d=await r.json();
+    if(d.error) throw new Error(d.error);
     renderResults(d);
-    status.textContent='';
+    if(isHistorical&&d.historicalTrackRecord){
+      _nflTrkData=d.historicalTrackRecord;
+      var trkDate=document.getElementById('nflTrkDate');
+      if(trkDate)trkDate.value=date;
+      _nflTrkDayName();
+      renderNflTrackDay();
+      document.getElementById('nfl-track-section').scrollIntoView({behavior:'smooth',block:'start'});
+    }
+    status.textContent=isHistorical
+      ?'HISTORICAL REPLAY — picks and results reconstructed for '+date+'; not added to the official record'
+      :'';
   }catch(e){
     status.textContent='Error: '+e.message;
   }finally{
@@ -3073,9 +3272,10 @@ function nflCard(p,i){
        <span style="display:flex;gap:6px">${_nflBetBtn(p)}<button class="pc-tap" onclick="openNflLadder('${key}')">📊 Game Log</button></span></div>
    </div>`;
 }
-function nflCardGrid(picks){
+function nflCardGrid(picks,startRank){
   if(!picks||!picks.length) return '<div class="no-picks">No qualifying picks for this market.</div>';
-  return '<div class="picks-grid">'+picks.map(function(p,i){return nflCard(p,i+1);}).join('')+'</div>';
+   startRank=(startRank==null?1:startRank);
+   return '<div class="picks-grid">'+picks.map(function(p,i){return nflCard(p,startRank+i);}).join('')+'</div>';
 }
 function _spRow(p){
   var key=_ladKey(p); window.__NFLLAD__[key]=p;
@@ -3506,6 +3706,16 @@ function _nflPaint(q){
     return ai-bi||(a.name||'').localeCompare(b.name||'');
   });
   if(lockPicks.length){
+     var lockTop=lockPicks.slice(0,20), lockMore=lockPicks.slice(20);
+     var lockBody=nflCardGrid(lockTop,1);
+     if(lockMore.length){
+       lockBody+='<details style="margin:14px 16px 16px">'
+         +'<summary style="cursor:pointer;list-style:none;display:flex;align-items:center;justify-content:center;gap:8px;padding:10px 14px;border:1px solid rgba(245,158,11,.45);border-radius:10px;background:rgba(245,158,11,.08);color:#fbbf24;font-weight:800;font-size:.8rem">'
+         +'&#9654; Show '+lockMore.length+' more lock'+(lockMore.length!==1?'s':'')+' (ranks 21+)'
+         +'</summary>'
+         +'<div style="margin-top:14px">'+nflCardGrid(lockMore,21)+'</div>'
+         +'</details>';
+     }
     h+='<div style="background:linear-gradient(135deg,rgba(245,158,11,.1),rgba(74,222,128,.05));border:1px solid rgba(245,158,11,.4);border-radius:14px;margin-bottom:14px;overflow:hidden">'
       +'<div style="display:flex;align-items:center;gap:10px;padding:12px 16px;cursor:pointer;user-select:none" onclick="_secToggle(&#39;lock8100&#39;)">'
       +'<span style="font-size:1.4rem;flex-shrink:0">&#128274;</span>'
@@ -3516,7 +3726,7 @@ function _nflPaint(q){
       +'<div style="background:rgba(245,158,11,.2);border:1px solid rgba(245,158,11,.5);border-radius:20px;padding:3px 12px;font-size:.73rem;font-weight:900;color:#f59e0b;flex-shrink:0">'+lockPicks.length+' lock'+(lockPicks.length!==1?'s':'')+'</div>'
       +'<span id="car_lock8100" style="color:#f59e0b;font-size:1rem;flex-shrink:0">&#9660;</span>'
       +'</div>'
-      +'<div id="sec_lock8100">'+nflCardGrid(lockPicks)+'</div>'
+       +'<div id="sec_lock8100">'+lockBody+'</div>'
       +'</div>';
   }
 
@@ -3803,7 +4013,11 @@ function renderNflTrackDay(){
   var rate=decided.length?(wins/decided.length*100):null;
   var plColor=netPL>=0?'#4ade80':'#f87171';
   var plSign=netPL>=0?'+$':'-$';
-  sumEl.innerHTML='<div class="nfl-trk-sum">'
+  var replayNotice=_nflTrkData.historical
+    ?'<div style="background:rgba(245,158,11,.1);border:1px solid rgba(245,158,11,.35);border-radius:9px;padding:9px 12px;margin-bottom:10px;color:#fbbf24;font-size:.76rem;font-weight:800">'
+      +(_nflTrkData.notice||'Historical Replay — view only; excluded from the official record.')+'</div>'
+    :'';
+  sumEl.innerHTML=replayNotice+'<div class="nfl-trk-sum">'
     +'<span style="font-size:1.05rem;font-weight:900;color:#fff"><span style="color:#4ade80">'+wins+'</span>/<span style="color:#f87171">'+(wins+losses)+'</span>'
     +(rate!=null?' <span style="color:#9ca3af;font-size:.85rem;font-weight:600">('+rate.toFixed(1)+'%)</span>':'')+'</span>'
     +'<span style="font-family:monospace;font-weight:800;color:'+plColor+'">Net '+plSign+Math.abs(netPL).toFixed(0)+'</span>'
