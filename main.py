@@ -3713,16 +3713,8 @@ async def index(admin: str = "", token: str = ""):
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     is_admin = (bool(admin) and admin == os.environ.get("INTERNAL_API_TOKEN", "__none__")) or _is_admin_token(token)
     js_flag = "true" if is_admin else "false"
-    now = datetime.now(timezone.utc)
-    latest_completed = now.year - 1 if now.month >= 3 else now.year - 2
-    season_options = "".join(
-        f'<option value="{year}">{year}–{str(year + 1)[-2:]}</option>'
-        for year in NFL_SEASONS if year <= latest_completed
-    )
     html = (
         HTML.replace("__TODAY__", today)
-        .replace("__LAST_SEASON__", str(_cur_season - 1))
-        .replace("__NFL_SEASON_OPTIONS__", season_options)
         .replace("__NFL_BASE_PATH__", json.dumps(os.environ.get("BASE_PATH", "").rstrip("/")))
         .replace("</head>", f"<script>window.IS_ADMIN = {js_flag};</script></head>", 1)
     )
@@ -3764,33 +3756,12 @@ input[type=date]::-webkit-calendar-picker-indicator{filter:invert(1);opacity:.7;
 .btn:hover{background:#fbbf24;transform:translateY(-1px);box-shadow:0 4px 20px rgba(245,158,11,.4)}
 .btn:disabled{background:#2a2a2a;color:#4b5563;cursor:not-allowed;transform:none;box-shadow:none}
 .status-msg{margin-top:14px;color:#6b7280;font-size:13px;min-height:20px}
-.nfl-batch-card{text-align:left;border-color:#78350f;background:linear-gradient(145deg,#19130e,#161616)}
-.nfl-batch-card h3{font-family:'Playfair Display',serif;color:#fbbf24;font-size:1.35rem;margin-bottom:6px}
-.nfl-batch-copy{color:#a8a29e;font-size:.78rem;line-height:1.55;margin-bottom:16px}
-.nfl-batch-controls{display:flex;align-items:end;gap:12px;flex-wrap:wrap}
-.nfl-batch-controls label{display:flex;flex-direction:column;gap:5px;color:#a8a29e;font-size:.7rem;font-weight:800;text-transform:uppercase;letter-spacing:.08em}
-.nfl-batch-controls select{min-width:150px}
-.nfl-batch-metrics{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}
-.nfl-batch-metric{background:#0e0e0e;border:1px solid #2d241d;border-radius:9px;padding:9px 12px;min-width:118px}
-.nfl-batch-metric .k{color:#78716c;font-size:.62rem;text-transform:uppercase;letter-spacing:.07em;font-weight:800}
-.nfl-batch-metric .v{color:#f5f5f4;font-size:1.05rem;font-weight:900;margin-top:3px}
-.nfl-batch-meter{height:9px;background:#292524;border-radius:8px;overflow:hidden;margin:15px 0 8px}
-.nfl-batch-meter>div{height:100%;width:0;background:linear-gradient(90deg,#f59e0b,#4ade80);transition:width .25s}
-.nfl-batch-status{color:#d6d3d1;font-size:.78rem;min-height:20px}
-.nfl-batch-note{color:#a8a29e;font-size:.7rem;line-height:1.5;margin-top:8px}
-.nfl-batch-list{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
-.nfl-batch-date{border-radius:7px;padding:5px 8px;font-family:monospace;font-size:.68rem}
-.nfl-batch-done{background:rgba(22,101,52,.22);border:1px solid rgba(74,222,128,.28);color:#86efac}
-.nfl-batch-fail{background:rgba(127,29,29,.2);border:1px solid rgba(248,113,113,.32);color:#fca5a5;display:flex;align-items:center;gap:7px}
-.nfl-batch-fail button{background:#7f1d1d;color:#fecaca;border:0;border-radius:5px;padding:3px 6px;font-size:.62rem;font-weight:800;cursor:pointer}
-.nfl-batch-subhead{color:#a8a29e;font-size:.66rem;font-weight:900;text-transform:uppercase;letter-spacing:.09em;margin-top:15px}
 .spinner{display:inline-block;width:13px;height:13px;border:2px solid rgba(245,158,11,.3);border-top-color:#f59e0b;border-radius:50%;animation:spin .7s linear infinite;margin-right:6px;vertical-align:middle}
 @keyframes spin{to{transform:rotate(360deg)}}
 footer{text-align:center;padding:32px 24px;color:#4b5563;font-size:.78rem;border-top:1px solid #1c1c1c;margin-top:24px;font-family:'Source Sans Pro',sans-serif}
 .ft-logo{font-family:'Playfair Display',serif;color:#f59e0b;font-weight:700;font-size:.95rem;margin-bottom:6px}
 .admin-only{display:none !important}
 body.is-admin .admin-only{display:inline-block !important}
-body.is-admin #nfl-season-batch-card{display:block !important}
 #parlayCard{display:none}
 body.is-admin #parlayCard{display:block}
 /* chips + sections + games */
@@ -3970,37 +3941,6 @@ tr:last-child td{border-bottom:none}
     <button class="btn" id="getBtn" onclick="getPicks()">🎯 Get Picks</button>
     <button class="btn admin-only" id="runBtn" onclick="runPicks()" style="margin-left:10px">Run Picks</button>
     <div class="status-msg" id="statusMsg"></div>
-    <div class="admin-only" style="margin-top:18px;padding-top:16px;border-top:1px solid #2a2a2a;text-align:left;width:100%">
-      <div style="font-weight:900;color:#f59e0b;margin-bottom:8px">Full-Season Historical Analysis</div>
-      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
-        <label style="color:#9ca3af;font-size:.78rem;font-weight:700">NFL Season</label>
-        <input type="number" id="nflSeasonYear" class="date-input" value="__LAST_SEASON__" min="1999" max="__LAST_SEASON__" style="width:110px">
-        <button class="btn" id="nflSeasonBtn" onclick="runNflSeason()" style="margin:0;background:#92400e;color:#fff">Run Full Season</button>
-      </div>
-      <div id="nflSeasonStatus" style="margin-top:10px;color:#9ca3af;font-size:.78rem;line-height:1.5"></div>
-    </div>
-  </div>
-  <div class="card admin-only nfl-batch-card" id="nfl-season-batch-card">
-    <h3>Run Full Season Historical Analysis</h3>
-    <div class="nfl-batch-copy">
-      Replays every completed game date one at a time using the existing point-in-time
-      filter. Results are saved to <strong style="color:#fbbf24">Historical Analysis</strong>
-      only and never enter the official Track Record.
-    </div>
-    <div class="nfl-batch-controls">
-      <label>Season
-        <select id="nflBatchSeason" class="date-input" onchange="loadNflBatchEstimate()">
-          __NFL_SEASON_OPTIONS__
-        </select>
-      </label>
-      <button class="btn" id="nflBatchStart" onclick="startNflBatch()" disabled>Analyze Full Season</button>
-      <button class="btn" id="nflBatchRetry" onclick="retryNflBatch()" style="display:none;background:#7c2d12;color:#fff">Retry Failed Dates</button>
-    </div>
-    <div id="nflBatchEstimate" class="nfl-batch-metrics"></div>
-    <div id="nflBatchEstimateNote" class="nfl-batch-note">Loading season size before any Odds API request…</div>
-    <div id="nflBatchMeter" class="nfl-batch-meter" style="display:none"><div></div></div>
-    <div id="nflBatchStatus" class="nfl-batch-status"></div>
-    <div id="nflBatchDates"></div>
   </div>
   <div class="card" id="parlayCard" style="text-align:center;max-width:600px;margin:0 auto 16px">
     <h2 style="font-family:'Playfair Display',serif;font-size:1.3rem;font-weight:700;color:#fff;margin-bottom:6px">🎰 Auto Parlay Builder <span style="font-size:.7rem;color:#777;font-family:sans-serif">admin only</span></h2>
@@ -4102,170 +4042,8 @@ if(_nflUrlTok){localStorage.setItem(_nflKey,_nflUrlTok);window.history.replaceSt
 var _nflTok=localStorage.getItem(_nflKey)||'';
 if(!_nflTok){window.location.href='https://moneypicksarena.com';}
 var _nflAdminParam=_nflParams.get('admin')||'';
-function _applyAdmin(){if(window.IS_ADMIN){document.body&&document.body.classList.add('is-admin');initNflBatchPanel();}else{if(_nflTok){fetch('/api/whoami?token='+encodeURIComponent(_nflTok)).then(function(r){return r.json();}).then(function(d){if(d&&d.is_admin){window.IS_ADMIN=true;document.body&&document.body.classList.add('is-admin');initNflBatchPanel();}}).catch(function(){});}}}
+function _applyAdmin(){if(window.IS_ADMIN){document.body&&document.body.classList.add('is-admin');}else{if(_nflTok){fetch('/api/whoami?token='+encodeURIComponent(_nflTok)).then(function(r){return r.json();}).then(function(d){if(d&&d.is_admin){window.IS_ADMIN=true;document.body&&document.body.classList.add('is-admin');}}).catch(function(){});}}}
 if(document.readyState==='loading'){document.addEventListener('DOMContentLoaded',_applyAdmin);}else{_applyAdmin();}
-
-// ===== Admin Full-Season Historical Replay =====
-var _nflBatchId=localStorage.getItem('__nfl_hist_batch_id')||'';
-var _nflBatchEstimate=null,_nflBatchTimer=null,_nflBatchInit=false,_nflBatchFinalLoaded='';
-function _nflBatchHeaders(json){
-  var headers={Authorization:'Bearer '+_nflTok};
-  if(_nflAdminParam)headers['X-Internal-Token']=_nflAdminParam;
-  if(json)headers['Content-Type']='application/json';
-  return headers;
-}
-function _nflBatchBody(extra){
-  return Object.assign({},extra||{});
-}
-function _nflBatchMetric(label,value){
-  return '<div class="nfl-batch-metric"><div class="k">'+_esc(label)+'</div><div class="v">'+_esc(value)+'</div></div>';
-}
-function initNflBatchPanel(){
-  if(!window.IS_ADMIN)return;
-  var sel=document.getElementById('nflBatchSeason');
-  if(!sel)return;
-  if(!_nflBatchInit){
-    _nflBatchInit=true;
-    if(sel.options.length)sel.selectedIndex=sel.options.length-1;
-  }
-  if(_nflBatchId) pollNflBatch();
-  else loadNflBatchEstimate();
-}
-async function loadNflBatchEstimate(){
-  var sel=document.getElementById('nflBatchSeason'),btn=document.getElementById('nflBatchStart');
-  var metrics=document.getElementById('nflBatchEstimate'),note=document.getElementById('nflBatchEstimateNote');
-  if(!sel||!btn||!metrics||!note)return;
-  btn.disabled=true;_nflBatchEstimate=null;
-  metrics.innerHTML='';
-  note.innerHTML='<span class="spinner"></span>Checking ESPN season dates. This preflight does not use the Odds API.';
-  try{
-    var r=await fetch('/api/nfl/historical-batch/estimate?season='+encodeURIComponent(sel.value),{
-      headers:_nflBatchHeaders(false)
-    });
-    var d=await r.json().catch(function(){return{};});
-    if(!r.ok)throw new Error(d.detail||('Estimate failed ('+r.status+')'));
-    _nflBatchEstimate=d;
-    metrics.innerHTML=_nflBatchMetric('Game dates',String(d.date_count))
-      +_nflBatchMetric('Scheduled games',String(d.games_total))
-      +_nflBatchMetric('Odds API maximum',String(d.estimated_odds_api_calls)+' calls');
-    note.textContent=d.odds_bound_note;
-    btn.disabled=!d.date_count;
-  }catch(e){
-    note.textContent='Could not estimate this season: '+(e.message||'Unknown error');
-  }
-}
-async function startNflBatch(){
-  if(!_nflBatchEstimate)return;
-  var season=_nflBatchEstimate.season;
-  var bound=_nflBatchEstimate.estimated_odds_api_calls||0;
-  var ok=confirm('Analyze the full '+season+' NFL season?\\n\\nThis will process '
-    +_nflBatchEstimate.date_count+' game dates sequentially. Worst-case Odds API usage is '
-    +bound+' historical requests; existing caches reduce that number.\\n\\nResults go only to Historical Analysis.');
-  if(!ok)return;
-  var btn=document.getElementById('nflBatchStart');
-  btn.disabled=true;btn.innerHTML='<span class="spinner"></span>Starting…';
-  try{
-    var r=await fetch('/api/nfl/historical-batch',{
-      method:'POST',headers:_nflBatchHeaders(true),
-      body:JSON.stringify(_nflBatchBody({season:season}))
-    });
-    var d=await r.json().catch(function(){return{};});
-    if(!r.ok&&r.status!==409)throw new Error(d.detail||('Start failed ('+r.status+')'));
-    var job=d.job||{};
-    _nflBatchId=job.job_id||'';
-    if(!_nflBatchId)throw new Error('Batch did not return a job ID');
-    localStorage.setItem('__nfl_hist_batch_id',_nflBatchId);
-    renderNflBatch(job);
-    clearInterval(_nflBatchTimer);
-    _nflBatchTimer=setInterval(pollNflBatch,2500);
-  }catch(e){
-    document.getElementById('nflBatchStatus').textContent='Could not start batch: '+(e.message||'Unknown error');
-    btn.disabled=false;
-  }finally{
-    btn.textContent='Analyze Full Season';
-  }
-}
-async function pollNflBatch(){
-  if(!_nflBatchId)return;
-  try{
-    var r=await fetch('/api/nfl/historical-batch/'+encodeURIComponent(_nflBatchId),{
-      headers:_nflBatchHeaders(false)
-    });
-    var d=await r.json().catch(function(){return{};});
-    if(!r.ok){
-      if(r.status===404){
-        localStorage.removeItem('__nfl_hist_batch_id');_nflBatchId='';
-        clearInterval(_nflBatchTimer);
-        loadNflBatchEstimate();
-      }
-      throw new Error(d.detail||('Status failed ('+r.status+')'));
-    }
-    renderNflBatch(d);
-    if(d.status==='running'||d.status==='queued'){
-      clearInterval(_nflBatchTimer);
-      _nflBatchTimer=setInterval(pollNflBatch,2500);
-    }else{
-      clearInterval(_nflBatchTimer);
-    }
-  }catch(e){
-    var status=document.getElementById('nflBatchStatus');
-    if(status)status.textContent='Batch status unavailable: '+(e.message||'Unknown error');
-  }
-}
-function renderNflBatch(d){
-  if(!d)return;
-  var total=Number(d.total_dates)||0,done=(d.completed_dates||[]).length,failed=(d.failures||[]).length;
-  var processed=done+failed,pct=total?Math.min(100,Math.round(processed/total*100)):0;
-  var meter=document.getElementById('nflBatchMeter'),status=document.getElementById('nflBatchStatus');
-  var dates=document.getElementById('nflBatchDates'),retry=document.getElementById('nflBatchRetry');
-  var start=document.getElementById('nflBatchStart');
-  if(meter){meter.style.display='block';var fill=meter.querySelector('div');if(fill)fill.style.width=pct+'%';}
-  if(status){
-    var now=d.current_date?(' · '+d.current_date):'';
-    status.textContent=processed+' of '+total+' dates processed'+now+' · '+(d.current_progress||d.status||'');
-  }
-  if(start)start.disabled=d.status==='running'||d.status==='queued';
-  if(retry)retry.style.display=failed&&d.status!=='running'&&d.status!=='queued'?'inline-block':'none';
-  if(dates){
-    var doneHtml=(d.completed_dates||[]).map(function(x){
-      return '<span class="nfl-batch-date nfl-batch-done">'+_esc(x)+'</span>';
-    }).join('');
-    var failHtml=(d.failures||[]).map(function(x){
-      return '<span class="nfl-batch-date nfl-batch-fail" title="'+_esc(x.error||'Failed')+'">'
-        +_esc(x.date)+' <button onclick="retryNflBatch(&#39;'+_esc(x.date)+'&#39;)">Retry</button></span>';
-    }).join('');
-    dates.innerHTML=(doneHtml?'<div class="nfl-batch-subhead">Completed dates</div><div class="nfl-batch-list">'+doneHtml+'</div>':'')
-      +(failHtml?'<div class="nfl-batch-subhead">Failed dates</div><div class="nfl-batch-list">'+failHtml+'</div>':'');
-  }
-  if((d.status==='completed'||d.status==='failed')&&_nflBatchFinalLoaded!==d.job_id){
-    _nflBatchFinalLoaded=d.job_id;
-    _nflTrkReplayDate='';
-    var src=document.getElementById('nflTrkSource'),period=document.getElementById('nflTrkPeriod');
-    var trkDate=document.getElementById('nflTrkDate');
-    if(src)src.value='historical';
-    if(period)period.value='season';
-    if(trkDate&&(d.completed_dates||[]).length)trkDate.value=d.completed_dates[d.completed_dates.length-1];
-    loadNflTrackRecord(false);
-  }
-}
-async function retryNflBatch(date){
-  if(!_nflBatchId)return;
-  var body=date?{dates:[date]}:{};
-  try{
-    var r=await fetch('/api/nfl/historical-batch/'+encodeURIComponent(_nflBatchId)+'/retry',{
-      method:'POST',headers:_nflBatchHeaders(true),
-      body:JSON.stringify(_nflBatchBody(body))
-    });
-    var d=await r.json().catch(function(){return{};});
-    if(!r.ok)throw new Error(d.detail||('Retry failed ('+r.status+')'));
-    _nflBatchFinalLoaded='';
-    renderNflBatch(d.job||d);
-    clearInterval(_nflBatchTimer);
-    _nflBatchTimer=setInterval(pollNflBatch,2500);
-  }catch(e){
-    document.getElementById('nflBatchStatus').textContent='Could not retry: '+(e.message||'Unknown error');
-  }
-}
 
 // ===== Admin Auto Parlay Builder (NFL) =====
 function _amToDec(a){var s=String(a==null?'':a).replace('+','').trim();var n=parseFloat(s);if(!n||isNaN(n))return null;return n>0?1+n/100:1+100/Math.abs(n);}
@@ -4412,69 +4190,6 @@ async function pollJob(){
       document.getElementById('runBtn').disabled=false;
       document.getElementById('runBtn').textContent='Run Picks';
     }
-  }
-}
-
-var nflSeasonJobId=null,nflSeasonPollTimer=null;
-async function runNflSeason(){
-  var year=parseInt(document.getElementById('nflSeasonYear').value,10);
-  if(!year){alert('Enter a completed NFL season.');return;}
-  if(!confirm('Run the complete '+year+' NFL season from first game through the Super Bowl? Existing saved dates will be skipped. Historical Odds API quota may be used for unsaved dates.')) return;
-  var btn=document.getElementById('nflSeasonBtn');
-  var status=document.getElementById('nflSeasonStatus');
-  btn.disabled=true;btn.innerHTML='<span class="spinner"></span>Starting Season...';
-  status.textContent='Checking player data before requesting historical odds...';
-  try{
-    var response=await fetch('/api/historical-season',{
-      method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({season:year,token:_nflTok})
-    });
-    var data=await response.json().catch(function(){return{};});
-    if(!response.ok) throw new Error(data.detail||('Server error '+response.status));
-    nflSeasonJobId=data.job_id;
-    clearInterval(nflSeasonPollTimer);
-    nflSeasonPollTimer=setInterval(pollNflSeason,2500);
-    pollNflSeason();
-  }catch(error){
-    status.textContent='Error: '+error.message;
-    btn.disabled=false;btn.textContent='Run Full Season';
-  }
-}
-async function pollNflSeason(){
-  if(!nflSeasonJobId)return;
-  var btn=document.getElementById('nflSeasonBtn');
-  var status=document.getElementById('nflSeasonStatus');
-  try{
-    var response=await fetch('/api/historical-season/'+encodeURIComponent(nflSeasonJobId)
-      +'?token='+encodeURIComponent(_nflTok));
-    var job=await response.json().catch(function(){return{};});
-    if(!response.ok) throw new Error(job.detail||('Server error '+response.status));
-    var total=job.total||0,completed=job.completed||0;
-    var pct=total?Math.round(completed/total*100):0;
-    status.innerHTML='<strong style="color:#f59e0b">'+completed+'/'+total+' dates ('+pct+'%)</strong>'
-      +' &middot; saved '+(job.saved||0)+' &middot; skipped '+(job.skipped||0)
-      +' &middot; failed '+(job.failed||0)+'<br>'+_esc(job.progress||'Running...');
-    if(job.status==='done'||job.status==='error'){
-      clearInterval(nflSeasonPollTimer);nflSeasonPollTimer=null;
-      btn.disabled=false;btn.textContent='Run Full Season';
-      if(job.status==='error'){
-        status.innerHTML='<span style="color:#f87171;font-weight:800">Stopped: '+_esc(job.error||job.progress||'Unknown error')+'</span>';
-        return;
-      }
-      var source=document.getElementById('nflTrkSource');
-      var period=document.getElementById('nflTrkPeriod');
-      var date=document.getElementById('nflTrkDate');
-      if(source)source.value='historical';
-      if(period)period.value='season';
-      if(date)date.value=String(job.season)+'-09-01';
-      _nflTrkReplayDate='';
-      await loadNflTrackRecord(true);
-      document.getElementById('nfl-track-section').scrollIntoView({behavior:'smooth'});
-    }
-  }catch(error){
-    clearInterval(nflSeasonPollTimer);nflSeasonPollTimer=null;
-    status.textContent='Season status error: '+error.message;
-    btn.disabled=false;btn.textContent='Run Full Season';
   }
 }
 
