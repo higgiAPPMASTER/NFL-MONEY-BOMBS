@@ -142,6 +142,7 @@ def _take_odds(entry, price_field, book_field, price, book_key):
 
 app  = FastAPI(title="NFL Money Bombs", docs_url=None, redoc_url=None)
 JOBS: Dict[str, Dict] = {}
+SEASON_JOBS: Dict[str, Dict] = {}
 
 # ── File cache ─────────────────────────────────────────────────────────────────
 _CACHE_DIR = pathlib.Path("/tmp/mpa_cache")
@@ -1045,11 +1046,12 @@ def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str) -> Optional[Dict
         return None
 
     # Find player
-    mask = df["player_display_name"].str.lower() == name.lower()
+    player_names = df["player_display_name"].fillna("").astype(str).str.lower()
+    mask = player_names == name.lower()
     pdf  = df[mask]
     if pdf.empty:
         last = name.split()[-1].lower()
-        pdf  = df[df["player_display_name"].str.lower().str.endswith(last)]
+        pdf  = df[player_names.str.endswith(last, na=False)]
     if pdf.empty:
         return None
 
@@ -1781,6 +1783,8 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False) -> 
         result["simulation"] = True
         result["historicalTrackRecord"] = _nfl_historical_replay_payload(
             result, espn_games, _nfl_box_from_stats_rows(target_rows))
+        result["historical_saved"] = _nfl_save_historical_replay(
+            date_str, result["historicalTrackRecord"])
         result["simulationNotice"] = (
             "Point-in-time historical replay: player-form and Game Predictor "
             f"inputs use only data available before {date_str}. Archived sportsbook "
@@ -1912,6 +1916,126 @@ async def api_run(request: Request):
 async def api_poll(job_id: str):
     job = JOBS.get(job_id)
     if not job: raise HTTPException(404, "Job not found")
+    return job
+
+async def _nfl_season_game_dates(season: int) -> list:
+    """Return every regular-season and playoff game date for one NFL season."""
+    async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
+        response = await client.get(_NFL_GAMES_HISTORY_URL)
+        response.raise_for_status()
+    rows = csv.DictReader(io.StringIO(response.text))
+    valid_types = {"REG", "WC", "DIV", "CON", "SB", "POST"}
+    return sorted({
+        row.get("gameday", "")
+        for row in rows
+        if str(row.get("season", "")) == str(season)
+        and str(row.get("game_type", "")).upper() in valid_types
+        and re.fullmatch(r"\d{4}-\d{2}-\d{2}", row.get("gameday", ""))
+    })
+
+@app.post("/api/historical-season")
+async def api_historical_season(request: Request):
+    """Run one full NFL season into the separate historical archive."""
+    body = await request.json() if request.headers.get(
+        "content-type", "").startswith("application/json") else {}
+    tok = body.get("token", "") or request.headers.get(
+        "Authorization", "").replace("Bearer ", "").strip()
+    if not _is_admin_token(tok):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    try:
+        season = int(body.get("season"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="A valid NFL season is required")
+    if season < 1999 or season >= _cur_season:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Choose a completed NFL season from 1999 to {_cur_season - 1}")
+    for existing_id, existing in SEASON_JOBS.items():
+        if existing.get("season") == season and existing.get("status") == "running":
+            return {"job_id": existing_id, "already_running": True}
+
+    job_id = "season-" + str(uuid.uuid4())[:8]
+    SEASON_JOBS[job_id] = {
+        "status": "running", "season": season, "total": 0,
+        "completed": 0, "saved": 0, "skipped": 0, "failed": 0,
+        "failures": [], "current_date": "", "progress": "Checking dependencies…",
+    }
+
+    async def _run_season():
+        job = SEASON_JOBS[job_id]
+        try:
+            # Fail before the first historical Odds API request if the model's
+            # required dataframe dependency/data cannot load.
+            stats = await get_nfl_stats()
+            if stats is None or getattr(stats, "empty", True):
+                raise RuntimeError(
+                    "NFL player stats could not load; no historical odds were requested.")
+            dates = await _nfl_season_game_dates(season)
+            if not dates:
+                raise RuntimeError(f"No NFL schedule dates found for {season}.")
+            saved_rows = _nfl_sb_get("mpa_track_ledger", {
+                "app": f"eq.{_NFL_TRK_APP}",
+                "category": f"eq.{_NFL_HIST_CAT}",
+                "select": "date", "limit": "730",
+            })
+            already_saved = {row.get("date") for row in (saved_rows or [])}
+            job["total"] = len(dates)
+            for index, date_str in enumerate(dates, 1):
+                job["current_date"] = date_str
+                if date_str in already_saved:
+                    job["completed"] += 1
+                    job["skipped"] += 1
+                    job["progress"] = (
+                        f"{index}/{len(dates)} {date_str} already saved — skipping")
+                    continue
+                try:
+                    def _progress(message, i=index, ds=date_str):
+                        job["progress"] = f"{i}/{len(dates)} {ds}: {message}"
+                    result = await asyncio.wait_for(
+                        run_pipeline(date_str, progress=_progress, simulate=True),
+                        timeout=420)
+                    replay = result.get("historicalTrackRecord") or {}
+                    has_props = any(
+                        day.get("detail") for day in replay.get("dates") or [])
+                    has_gp = any(
+                        day.get("games")
+                        for day in (replay.get("game_predictor") or {}).get("daily") or [])
+                    if result.get("error") or not (has_props or has_gp):
+                        raise RuntimeError(
+                            result.get("error") or "Replay produced no graded results")
+                    if result.get("historical_saved") is not True:
+                        raise RuntimeError(
+                            "Replay completed but Supabase did not confirm the archive write")
+                    job["saved"] += 1
+                except Exception as exc:
+                    job["failed"] += 1
+                    job["failures"].append({
+                        "date": date_str, "error": str(exc)[:300]})
+                finally:
+                    job["completed"] += 1
+            job["status"] = "done"
+            job["current_date"] = ""
+            job["progress"] = (
+                f"Finished {season}: {job['saved']} saved, "
+                f"{job['skipped']} already present, {job['failed']} failed")
+        except Exception as exc:
+            job["status"] = "error"
+            job["error"] = str(exc)
+            job["progress"] = str(exc)
+
+    asyncio.create_task(_run_season())
+    return {"job_id": job_id}
+
+@app.get("/api/historical-season/{job_id}")
+async def api_historical_season_poll(request: Request, job_id: str,
+                                     token: str = ""):
+    tok = token or request.headers.get(
+        "Authorization", "").replace("Bearer ", "").strip()
+    if not _is_admin_token(tok):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    job = SEASON_JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Season job not found")
     return job
 
 @app.get("/api/cached")
@@ -2248,6 +2372,8 @@ _NFL_PICKS_CAT = "__official_picks__"
 _NFL_GP_CAT    = "__official_gp__"
 _NFL_LEDGER_CAT = "__official_ledger__"
 _NFL_DETAIL_CAT = "__official_detail__"
+_NFL_OVERFLOW_CAT = "__official_overflow__"
+_NFL_HIST_CAT = "__historical_replay__"
 _NFL_TRK_STAKE = 20.0
 _NFL_TRK_TOP   = 10   # picks per market+direction that count in main record
 
@@ -2278,6 +2404,30 @@ def _nfl_official_capture_allowed(date_str: str, result: dict) -> bool:
         if now >= kickoff:
             return False
     return True
+
+def _nfl_save_historical_replay(date_str: str, replay: dict):
+    """Persist replay analytics separately from official pregame records."""
+    if not date_str or not isinstance(replay, dict):
+        return False
+    daily = replay.get("dates") or []
+    overflow_daily = replay.get("overflow_dates") or []
+    props = daily[0].get("detail") if daily else []
+    overflow = overflow_daily[0].get("detail") if overflow_daily else []
+    gp = replay.get("game_predictor") or {}
+    if not props and not overflow and not gp.get("daily"):
+        return False
+    ok = _nfl_sb_upsert("mpa_track_ledger", [{
+        "app": _NFL_TRK_APP, "date": date_str, "category": _NFL_HIST_CAT,
+        "side": "ALL", "wins": 0, "losses": 0, "locked": True,
+        "detail": {
+            "source": "historical_replay",
+            "props": props if isinstance(props, list) else [],
+            "overflow": overflow if isinstance(overflow, list) else [],
+            "game_predictor": gp,
+        },
+    }], on_conflict="app,date,category,side")
+    print(f"[nfl_track] historical replay {'saved' if ok else 'FAILED'}: {date_str}")
+    return ok
 
 def _nfl_save_picks_snapshot(date_str: str, result: dict):
     """Persist today's qualified picks to Supabase so they survive redeploys
@@ -2569,7 +2719,7 @@ def _nfl_grade_date(date_str: str, snap: list, box_override: dict = None) -> dic
             if rank <= _NFL_TRK_TOP:
                 main_rows.append(row)
             else:
-                ovf_rows.append({**row, "category": "NFL Overflow"})
+                ovf_rows.append({**row, "pool": "NFL Overflow"})
             # Cross-market 80-100% Locks category
             if float(p.get("score") or p.get("dispScore") or 0) >= 80:
                 lock_rows.append({**row, "category": "80-100% Locks"})
@@ -2591,14 +2741,20 @@ def _nfl_aggregate_graded(graded: dict) -> dict:
             rec[1] += 1
     return agg
 
-def _nfl_detail_graded(graded: dict) -> list:
+def _nfl_detail_graded(graded: dict, include_overflow: bool = True,
+                       overflow_only: bool = False) -> list:
     out = []
-    for row in graded.get("main", []) + graded.get("overflow", []) + graded.get("locks", []):
+    rows = []
+    if not overflow_only:
+        rows += graded.get("main", []) + graded.get("locks", [])
+    if include_overflow or overflow_only:
+        rows += graded.get("overflow", [])
+    for row in rows:
         if row.get("result") not in ("WIN", "LOSS"):
             continue
         out.append({k: row.get(k) for k in (
             "name", "team", "category", "side", "market",
-            "line", "odds", "rank", "result", "actual", "profit",
+            "line", "odds", "rank", "result", "actual", "profit", "pool",
         )})
     return out
 
@@ -2634,7 +2790,8 @@ def _nfl_historical_replay_payload(result: dict, espn_games: list = None,
     date_str = result.get("date") or ""
     graded = _nfl_grade_date(
         date_str, result.get("picks") or [], box_override=replay_box)
-    detail = _nfl_detail_graded(graded)
+    detail = _nfl_detail_graded(graded, include_overflow=False)
+    overflow_detail = _nfl_detail_graded(graded, overflow_only=True)
 
     # Grade the display-only Game Predictor too, so a replay evaluates both
     # player props and the winner/total model without changing its live status.
@@ -2717,6 +2874,7 @@ def _nfl_historical_replay_payload(result: dict, espn_games: list = None,
     gp_summary = _nfl_gp_summary(gp_daily_games)
     return {
         "dates": [{"date": date_str, "detail": detail}],
+        "overflow_dates": [{"date": date_str, "detail": overflow_detail}],
         "stake": _NFL_TRK_STAKE,
         "historical": True,
         "game_predictor": {
@@ -2768,17 +2926,20 @@ def _nfl_update_track_ledger(include_date: str = ""):
             if not graded.get("all_final") and not old_enough:
                 continue   # wait for all scores to be final
             agg = _nfl_aggregate_graded(graded)
-            det = _nfl_detail_graded(graded)
+            det = _nfl_detail_graded(graded, include_overflow=False)
+            overflow_det = _nfl_detail_graded(graded, overflow_only=True)
             upserts += [
                 {"app": _NFL_TRK_APP, "date": d, "category": _NFL_LEDGER_CAT, "side": "ALL",
                  "wins": 0, "losses": 0, "locked": True, "detail": agg},
                 {"app": _NFL_TRK_APP, "date": d, "category": _NFL_DETAIL_CAT, "side": "ALL",
                  "wins": 0, "losses": 0, "locked": True, "detail": det},
+                {"app": _NFL_TRK_APP, "date": d, "category": _NFL_OVERFLOW_CAT, "side": "ALL",
+                 "wins": 0, "losses": 0, "locked": True, "detail": overflow_det},
             ]
         if upserts:
             for i in range(0, len(upserts), 10):
                 _nfl_sb_upsert("mpa_track_ledger", upserts[i:i+10], "app,date,category,side")
-            print(f"[nfl_track] locked {len(upserts)//2} dates into ledger")
+            print(f"[nfl_track] saved {len(upserts)//3} official dates into main and overflow records")
     try:
         _nfl_update_gp_ledger(include_date)
     except Exception as e:
@@ -2996,9 +3157,41 @@ async def nfl_track_record(grade: bool = False, date_str: str = ""):
             "net_pl": net_pl, "roi": roi,
             "by_cat": by_cat, "detail": det,
         })
+    overflow_rows = _nfl_sb_get("mpa_track_ledger", {
+        "app": f"eq.{_NFL_TRK_APP}", "category": f"eq.{_NFL_OVERFLOW_CAT}",
+        "locked": "eq.true", "select": "date,detail", "limit": "365",
+    })
+    overflow_dates = [
+        {"date": r.get("date"), "detail": r.get("detail") or []}
+        for r in (overflow_rows or []) if r.get("date")
+    ]
+    overflow_dates.sort(key=lambda x: x["date"], reverse=True)
+
+    historical_rows = _nfl_sb_get("mpa_track_ledger", {
+        "app": f"eq.{_NFL_TRK_APP}", "category": f"eq.{_NFL_HIST_CAT}",
+        "locked": "eq.true", "select": "date,detail", "limit": "730",
+    })
+    historical_dates, historical_overflow_dates, historical_gp_daily = [], [], []
+    for saved in historical_rows or []:
+        d = saved.get("date")
+        payload = saved.get("detail") or {}
+        if not d or not isinstance(payload, dict):
+            continue
+        historical_dates.append({"date": d, "detail": payload.get("props") or []})
+        historical_overflow_dates.append({
+            "date": d, "detail": payload.get("overflow") or [],
+        })
+        gp = payload.get("game_predictor") or {}
+        historical_gp_daily.extend(gp.get("daily") or [])
+    historical_dates.sort(key=lambda x: x["date"], reverse=True)
+    historical_overflow_dates.sort(key=lambda x: x["date"], reverse=True)
     return JSONResponse({
         "dates": result, "stake": _NFL_TRK_STAKE,
         "game_predictor": _nfl_gp_record_payload(),
+        "overflow_dates": overflow_dates,
+        "historical_dates": historical_dates,
+        "historical_overflow_dates": historical_overflow_dates,
+        "historical_game_predictor": {"daily": historical_gp_daily},
     })
 
 
@@ -3007,7 +3200,9 @@ async def index(admin: str = "", token: str = ""):
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     is_admin = (bool(admin) and admin == os.environ.get("INTERNAL_API_TOKEN", "__none__")) or _is_admin_token(token)
     js_flag = "true" if is_admin else "false"
-    html = HTML.replace("__TODAY__", today).replace("</head>", f"<script>window.IS_ADMIN = {js_flag};</script></head>", 1)
+    html = (HTML.replace("__TODAY__", today)
+            .replace("__LAST_SEASON__", str(_cur_season - 1))
+            .replace("</head>", f"<script>window.IS_ADMIN = {js_flag};</script></head>", 1))
     return HTMLResponse(html)
 
 # ── HTML ───────────────────────────────────────────────────────────────────────
@@ -3215,6 +3410,15 @@ tr:last-child td{border-bottom:none}
     <button class="btn" id="getBtn" onclick="getPicks()">🎯 Get Picks</button>
     <button class="btn admin-only" id="runBtn" onclick="runPicks()" style="margin-left:10px">Run Picks</button>
     <div class="status-msg" id="statusMsg"></div>
+    <div class="admin-only" style="margin-top:18px;padding-top:16px;border-top:1px solid #2a2a2a;text-align:left;width:100%">
+      <div style="font-weight:900;color:#f59e0b;margin-bottom:8px">Full-Season Historical Analysis</div>
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+        <label style="color:#9ca3af;font-size:.78rem;font-weight:700">NFL Season</label>
+        <input type="number" id="nflSeasonYear" class="date-input" value="__LAST_SEASON__" min="1999" max="__LAST_SEASON__" style="width:110px">
+        <button class="btn" id="nflSeasonBtn" onclick="runNflSeason()" style="margin:0;background:#92400e;color:#fff">Run Full Season</button>
+      </div>
+      <div id="nflSeasonStatus" style="margin-top:10px;color:#9ca3af;font-size:.78rem;line-height:1.5"></div>
+    </div>
   </div>
   <div class="card" id="parlayCard" style="text-align:center;max-width:600px;margin:0 auto 16px">
     <h2 style="font-family:'Playfair Display',serif;font-size:1.3rem;font-weight:700;color:#fff;margin-bottom:6px">🎰 Auto Parlay Builder <span style="font-size:.7rem;color:#777;font-family:sans-serif">admin only</span></h2>
@@ -3257,17 +3461,41 @@ tr:last-child td{border-bottom:none}
   <div class="card" style="padding:20px 22px">
     <div style="margin-bottom:14px">
       <h2 style="font-family:'Playfair Display',serif;font-size:1.4rem;font-weight:700;color:#fff">&#128202; NFL Track Record</h2>
+      <div style="color:#7c8aa0;font-size:.76rem;margin-top:4px">Top 10 picks per category. Historical Analysis remains separate from the official pre-game record.</div>
     </div>
     <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:14px">
+      <label style="color:#9ca3af;font-size:.78rem;font-weight:700;text-transform:uppercase;letter-spacing:.1em">Record</label>
+      <select id="nflTrkSource" class="date-input" onchange="renderNflTrackDay();renderNflGpRecord()">
+        <option value="official">Official</option>
+        <option value="historical">Historical Analysis</option>
+      </select>
+      <label style="color:#9ca3af;font-size:.78rem;font-weight:700;text-transform:uppercase;letter-spacing:.1em">Period</label>
+      <select id="nflTrkPeriod" class="date-input" onchange="renderNflTrackDay()">
+        <option value="day">Day</option>
+        <option value="week">Week</option>
+        <option value="month">Month</option>
+        <option value="season">Season</option>
+        <option value="all">All Time</option>
+      </select>
       <label style="color:#9ca3af;font-size:.78rem;font-weight:700;text-transform:uppercase;letter-spacing:.1em">Date</label>
       <input type="date" id="nflTrkDate" class="date-input" style="width:auto" onchange="_nflTrkDayName();renderNflTrackDay()">
       <span id="nflTrkDayName" style="color:#34d399;font-weight:700;font-size:.9rem"></span>
+      <label style="color:#9ca3af;font-size:.78rem;font-weight:700;text-transform:uppercase;letter-spacing:.1em">Bet $</label>
+      <input type="number" id="nflTrkStake" class="date-input" value="20" min="0.01" step="0.01" style="width:105px" oninput="renderNflTrackDay()">
       <button onclick="loadNflTrackRecord()" style="background:#065f46;color:#fff;border:none;border-radius:8px;padding:8px 14px;font-weight:700;cursor:pointer;font-size:.82rem">&#8635; Get Results</button>
       <button id="nflTrkBtnCat" onclick="nflTrkSetTab('cat')" style="background:#065f46;color:#fff;border:none;border-radius:8px;padding:8px 14px;font-weight:700;cursor:pointer;font-size:.82rem">By Category</button>
       <button id="nflTrkBtnList" onclick="nflTrkSetTab('list')" style="background:#1f2937;color:#fff;border:none;border-radius:8px;padding:8px 14px;font-weight:700;cursor:pointer;font-size:.82rem">Full List</button>
     </div>
     <div id="nflTrkSummary"></div>
     <div id="nflTrkBody"></div>
+  </div>
+  <div class="card" style="padding:20px 22px;border-color:#92400e">
+    <div style="margin-bottom:14px">
+      <h2 style="font-family:'Playfair Display',serif;font-size:1.4rem;font-weight:700;color:#fff">&#128200; NFL Overflow Track Record</h2>
+      <div style="color:#9a7b63;font-size:.76rem;margin-top:4px">Ranks 11+ tracked separately from each category&#39;s Top 10 picks.</div>
+    </div>
+    <div id="nflOvfSummary"></div>
+    <div id="nflOvfBody"></div>
   </div>
 </div>
 <script>
@@ -3393,6 +3621,8 @@ async function pollJob(){
       if(d.result&&d.result.historicalTrackRecord){
         _nflTrkReplayDate=d.result.date||'';
         _nflTrkData=d.result.historicalTrackRecord;
+        var replaySource=document.getElementById('nflTrkSource');
+        if(replaySource) replaySource.value='historical';
         var replayDate=document.getElementById('nflTrkDate');
         if(replayDate) replayDate.value=d.result.date||'';
         _nflTrkDayName();
@@ -3428,6 +3658,69 @@ async function pollJob(){
   }
 }
 
+var nflSeasonJobId=null,nflSeasonPollTimer=null;
+async function runNflSeason(){
+  var year=parseInt(document.getElementById('nflSeasonYear').value,10);
+  if(!year){alert('Enter a completed NFL season.');return;}
+  if(!confirm('Run the complete '+year+' NFL season from first game through the Super Bowl? Existing saved dates will be skipped. Historical Odds API quota may be used for unsaved dates.')) return;
+  var btn=document.getElementById('nflSeasonBtn');
+  var status=document.getElementById('nflSeasonStatus');
+  btn.disabled=true;btn.innerHTML='<span class="spinner"></span>Starting Season...';
+  status.textContent='Checking player data before requesting historical odds...';
+  try{
+    var response=await fetch('/api/historical-season',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({season:year,token:_nflTok})
+    });
+    var data=await response.json().catch(function(){return{};});
+    if(!response.ok) throw new Error(data.detail||('Server error '+response.status));
+    nflSeasonJobId=data.job_id;
+    clearInterval(nflSeasonPollTimer);
+    nflSeasonPollTimer=setInterval(pollNflSeason,2500);
+    pollNflSeason();
+  }catch(error){
+    status.textContent='Error: '+error.message;
+    btn.disabled=false;btn.textContent='Run Full Season';
+  }
+}
+async function pollNflSeason(){
+  if(!nflSeasonJobId)return;
+  var btn=document.getElementById('nflSeasonBtn');
+  var status=document.getElementById('nflSeasonStatus');
+  try{
+    var response=await fetch('/api/historical-season/'+encodeURIComponent(nflSeasonJobId)
+      +'?token='+encodeURIComponent(_nflTok));
+    var job=await response.json().catch(function(){return{};});
+    if(!response.ok) throw new Error(job.detail||('Server error '+response.status));
+    var total=job.total||0,completed=job.completed||0;
+    var pct=total?Math.round(completed/total*100):0;
+    status.innerHTML='<strong style="color:#f59e0b">'+completed+'/'+total+' dates ('+pct+'%)</strong>'
+      +' &middot; saved '+(job.saved||0)+' &middot; skipped '+(job.skipped||0)
+      +' &middot; failed '+(job.failed||0)+'<br>'+_esc(job.progress||'Running...');
+    if(job.status==='done'||job.status==='error'){
+      clearInterval(nflSeasonPollTimer);nflSeasonPollTimer=null;
+      btn.disabled=false;btn.textContent='Run Full Season';
+      if(job.status==='error'){
+        status.innerHTML='<span style="color:#f87171;font-weight:800">Stopped: '+_esc(job.error||job.progress||'Unknown error')+'</span>';
+        return;
+      }
+      var source=document.getElementById('nflTrkSource');
+      var period=document.getElementById('nflTrkPeriod');
+      var date=document.getElementById('nflTrkDate');
+      if(source)source.value='historical';
+      if(period)period.value='season';
+      if(date)date.value=String(job.season)+'-09-01';
+      _nflTrkReplayDate='';
+      await loadNflTrackRecord(true);
+      document.getElementById('nfl-track-section').scrollIntoView({behavior:'smooth'});
+    }
+  }catch(error){
+    clearInterval(nflSeasonPollTimer);nflSeasonPollTimer=null;
+    status.textContent='Season status error: '+error.message;
+    btn.disabled=false;btn.textContent='Run Full Season';
+  }
+}
+
 // Get Picks loads today's saved board, or builds a view-only replay for a past date.
 async function getPicks(){
   var date=document.getElementById('datePicker').value;
@@ -3458,6 +3751,8 @@ async function getPicks(){
     if(isHistorical&&d.historicalTrackRecord){
       _nflTrkReplayDate=date;
       _nflTrkData=d.historicalTrackRecord;
+      var replaySource=document.getElementById('nflTrkSource');
+      if(replaySource) replaySource.value='historical';
       var trkDate=document.getElementById('nflTrkDate');
       if(trkDate)trkDate.value=date;
       _nflTrkDayName();
@@ -4282,6 +4577,61 @@ async function _nflDeleteBet(id){
 }
 // ── NFL Track Record ──────────────────────────────────────────────────────────
 var _nflTrkData=null,_nflTrkTabMode='cat',_nflTrkReplayDate='',_nflTrkLoadSeq=0;
+function _nflTrkStake(){
+  var el=document.getElementById('nflTrkStake'),n=parseFloat(el&&el.value);
+  return isFinite(n)&&n>0?n:20;
+}
+function _nflTrkProfit(r,stake){
+  if(r.odds==null||!(r.result==='WIN'||r.result==='LOSS')) return null;
+  if(r.result==='LOSS') return -stake;
+  var o=parseFloat(r.odds);
+  if(!isFinite(o)||o===0) return null;
+  return o>0?stake*(o/100):stake*(100/Math.abs(o));
+}
+function _nflSeasonKey(ds){
+  var y=parseInt(String(ds||'').slice(0,4),10),m=parseInt(String(ds||'').slice(5,7),10);
+  return isFinite(y)&&isFinite(m)?(m>=9?y:y-1):null;
+}
+function _nflWeekKey(ds){
+  var d=new Date(String(ds||'')+'T12:00:00Z');
+  if(isNaN(d.getTime())) return '';
+  // NFL reporting week runs Tuesday through Monday so Thursday/Sunday/Monday
+  // games from the same football week stay together.
+  var day=(d.getUTCDay()+5)%7;
+  d.setUTCDate(d.getUTCDate()-day);
+  return d.toISOString().slice(0,10);
+}
+function _nflTrkSource(){
+  var el=document.getElementById('nflTrkSource');
+  return el&&el.value==='historical'?'historical':'official';
+}
+function _nflTrkPeriod(){
+  var el=document.getElementById('nflTrkPeriod');
+  return el?el.value:'day';
+}
+function _nflTrkFilterDates(dates,sel,period){
+  if(period==='all') return dates;
+  if(period==='season'){
+    var sk=_nflSeasonKey(sel);
+    return dates.filter(function(d){return _nflSeasonKey(d.date)===sk;});
+  }
+  if(period==='month'){
+    var mk=String(sel||'').slice(0,7);
+    return dates.filter(function(d){return String(d.date||'').slice(0,7)===mk;});
+  }
+  if(period==='week'){
+    var wk=_nflWeekKey(sel);
+    return dates.filter(function(d){return _nflWeekKey(d.date)===wk;});
+  }
+  return dates.filter(function(d){return d.date===sel;});
+}
+function _nflTrkPeriodLabel(sel,period){
+  if(period==='all') return 'All Time';
+  if(period==='season') return 'NFL Season '+_nflSeasonKey(sel);
+  if(period==='month') return String(sel||'').slice(0,7);
+  if(period==='week') return 'NFL Week of '+_nflWeekKey(sel);
+  return sel||'Selected Day';
+}
 function openNflTrackRecord(){
   var sec=document.getElementById('nfl-track-section');
   if(sec) sec.scrollIntoView({behavior:'smooth',block:'start'});
@@ -4335,7 +4685,10 @@ function nflTrkSetTab(tab){
 function renderNflGpRecord(){
   var sumEl=document.getElementById('nflGpTrkSummary'),bodyEl=document.getElementById('nflGpTrkBody');
   if(!sumEl||!bodyEl) return;
-  var gp=_nflTrkData&&_nflTrkData.game_predictor;
+  var hist=_nflTrkSource()==='historical';
+  var gp=_nflTrkData&&(hist
+    ?(_nflTrkData.historical_game_predictor||_nflTrkData.game_predictor)
+    :_nflTrkData.game_predictor);
   var daily=(gp&&gp.daily)||[];
   if(!daily.length){
     sumEl.innerHTML='';
@@ -4394,49 +4747,71 @@ function renderNflTrackDay(){
   if(!_nflTrkData) return;
   var dp=document.getElementById('nflTrkDate');
   var selDate=dp?dp.value:'';
-  var dates=_nflTrkData.dates||[];
-  var dayData=selDate?dates.find(function(d){return d.date===selDate;}):null;
-  var sumEl=document.getElementById('nflTrkSummary'),bodyEl=document.getElementById('nflTrkBody');
+  var source=_nflTrkSource(),period=_nflTrkPeriod(),stake=_nflTrkStake();
+  var mainDates=source==='historical'
+    ?(_nflTrkData.historical_dates||_nflTrkData.dates||[])
+    :(_nflTrkData.dates||[]);
+  var overflowDates=source==='historical'
+    ?(_nflTrkData.historical_overflow_dates||_nflTrkData.overflow_dates||[])
+    :(_nflTrkData.overflow_dates||[]);
+  var selectedMain=_nflTrkFilterDates(mainDates,selDate,period);
+  var selectedOverflow=_nflTrkFilterDates(overflowDates,selDate,period);
+  function flatten(days){
+    var out=[];
+    days.forEach(function(d){(d.detail||[]).forEach(function(r){
+      out.push(Object.assign({record_date:d.date},r));
+    });});
+    return out.filter(function(r){return r.result==='WIN'||r.result==='LOSS';});
+  }
+  var label=_nflTrkPeriodLabel(selDate,period);
+  _nflRenderRecordBook(
+    flatten(selectedMain),stake,label,
+    document.getElementById('nflTrkSummary'),document.getElementById('nflTrkBody'),
+    false,source);
+  _nflRenderRecordBook(
+    flatten(selectedOverflow),stake,label,
+    document.getElementById('nflOvfSummary'),document.getElementById('nflOvfBody'),
+    true,source);
+}
+function _nflRenderRecordBook(decided,stake,label,sumEl,bodyEl,isOverflow,source){
   if(!sumEl||!bodyEl) return;
-  // Flatten rows from selected date (or all dates if none selected)
-  var rows=[];
-  if(selDate) rows=dayData?(dayData.detail||[]):[];
-  else dates.forEach(function(d){(d.detail||[]).forEach(function(r){rows.push(r);});});
-  var decided=rows.filter(function(r){return r.result==='WIN'||r.result==='LOSS';});
-  if(!decided.length&&selDate){
-    sumEl.innerHTML='<p style="color:#9ca3af;padding:12px;text-align:center">No graded picks for '+selDate+'. Games may not be final yet.</p>';
+  if(!decided.length){
+    sumEl.innerHTML='<p style="color:#9ca3af;padding:12px;text-align:center">No '
+      +(source==='historical'?'saved historical':'official graded')+' '
+      +(isOverflow?'overflow ':'')+'picks for '+label+'.</p>';
     bodyEl.innerHTML='';return;
   }
-  var stake=_nflTrkData.stake||20;
   var wins=decided.filter(function(r){return r.result==='WIN';}).length;
   var losses=decided.length-wins;
   var priced=decided.filter(function(r){return r.odds!=null;});
-  var netPL=priced.reduce(function(a,r){return a+(r.profit||0);},0);
+  var netPL=priced.reduce(function(a,r){return a+(_nflTrkProfit(r,stake)||0);},0);
   var totalStaked=priced.length*stake;
   var roi=totalStaked?(netPL/totalStaked*100):null;
   var rate=decided.length?(wins/decided.length*100):null;
   var plColor=netPL>=0?'#4ade80':'#f87171';
   var plSign=netPL>=0?'+$':'-$';
-  var replayNotice=_nflTrkData.historical
+  var replayNotice=source==='historical'
     ?'<div style="background:rgba(245,158,11,.1);border:1px solid rgba(245,158,11,.35);border-radius:9px;padding:9px 12px;margin-bottom:10px;color:#fbbf24;font-size:.76rem;font-weight:800">'
-      +(_nflTrkData.notice||'Historical Replay — view only; excluded from the official record.')+'</div>'
+      +'Historical Analysis — saved point-in-time replays; excluded from the official record.</div>'
     :'';
   sumEl.innerHTML=replayNotice+'<div class="nfl-trk-sum">'
+    +'<span style="color:#9ca3af;font-size:.78rem;font-weight:800">'+label+'</span>'
     +'<span style="font-size:1.05rem;font-weight:900;color:#fff"><span style="color:#4ade80">'+wins+'</span>/<span style="color:#f87171">'+(wins+losses)+'</span>'
     +(rate!=null?' <span style="color:#9ca3af;font-size:.85rem;font-weight:600">('+rate.toFixed(1)+'%)</span>':'')+'</span>'
     +'<span style="font-family:monospace;font-weight:800;color:'+plColor+'">Net '+plSign+Math.abs(netPL).toFixed(0)+'</span>'
     +(roi!=null?'<span style="font-family:monospace;font-weight:700;color:'+plColor+'">ROI '+(roi>=0?'+':'')+roi.toFixed(1)+'%</span>':'')
     +'<span style="color:#6b7280;font-size:.8rem">$'+stake+'/play \u00b7 ROI uses priced plays only</span>'
     +'</div>';
-  bodyEl.innerHTML=_nflTrkTabMode==='cat'?_nflTrkCatHtml(decided):_nflTrkListHtml(decided);
+  bodyEl.innerHTML=_nflTrkTabMode==='cat'
+    ?_nflTrkCatHtml(decided,stake):_nflTrkListHtml(decided,stake);
 }
-function _nflTrkCatHtml(decided){
+function _nflTrkCatHtml(decided,stake){
   if(!decided.length) return '<p style="color:#6b7280;padding:20px;text-align:center">No graded picks yet.</p>';
   var cats={};
   decided.forEach(function(r){
     var c=cats[r.category]=cats[r.category]||{w:0,l:0,pl:0,staked:0};
     if(r.result==='WIN') c.w++; else c.l++;
-    if(r.odds!=null){c.pl+=(r.profit||0);c.staked+=20;}
+    if(r.odds!=null){c.pl+=(_nflTrkProfit(r,stake)||0);c.staked+=stake;}
   });
   var entries=Object.entries(cats).sort(function(a,b){
     return ((b[1].pl/b[1].staked)||0)-((a[1].pl/a[1].staked)||0);
@@ -4462,14 +4837,18 @@ function _nflTrkCatHtml(decided){
     +'<thead><tr><th>Category</th><th>Record</th><th>Hit Rate</th><th>Net P/L</th><th>ROI</th></tr></thead>'
     +'<tbody>'+rows+'</tbody></table></div>';
 }
-function _nflTrkListHtml(decided){
+function _nflTrkListHtml(decided,stake){
   if(!decided.length) return '<p style="color:#6b7280;padding:20px;text-align:center">No graded picks yet.</p>';
-  var sorted=[].concat(decided).sort(function(a,b){return(b.profit||0)-(a.profit||0);});
+  var sorted=[].concat(decided).sort(function(a,b){
+    return (_nflTrkProfit(b,stake)||0)-(_nflTrkProfit(a,stake)||0);
+  });
   var rows=sorted.map(function(r){
     var plColor=r.result==='WIN'?'#4ade80':'#f87171';
-    var pl=r.profit!=null?((r.profit>=0?'+$':'-$')+Math.abs(r.profit).toFixed(0)):'—';
+    var profit=_nflTrkProfit(r,stake);
+    var pl=profit!=null?((profit>=0?'+$':'-$')+Math.abs(profit).toFixed(2)):'—';
     var odds=r.odds!=null?(r.odds>0?'+':'')+r.odds:'—';
     return '<tr>'
+      +'<td style="color:#9ca3af;font-family:monospace;font-size:.76rem">'+(r.record_date||'')+'</td>'
       +'<td style="color:#9ca3af;font-size:.78rem">'+r.category+'</td>'
       +'<td style="color:#fff;font-weight:700">'+r.name+'</td>'
       +'<td style="color:#6b7280">'+r.team+'</td>'
@@ -4481,7 +4860,7 @@ function _nflTrkListHtml(decided){
       +'</tr>';
   }).join('');
   return '<div class="tbl-wrap"><table class="nfl-trk-tbl">'
-    +'<thead><tr><th>Category</th><th>Player</th><th>Team</th><th>Pick</th><th>Odds</th><th>Actual</th><th>Result</th><th>P/L</th></tr></thead>'
+    +'<thead><tr><th>Date</th><th>Category</th><th>Player</th><th>Team</th><th>Pick</th><th>Odds</th><th>Actual</th><th>Result</th><th>P/L</th></tr></thead>'
     +'<tbody>'+rows+'</tbody></table></div>';
 }
 
