@@ -1393,6 +1393,17 @@ def _book_tag_nfl(pick, score, gap, under_rate):
         return "FADE"   # score is side-aware — for UNDER picks it already measures under-hits
     return ""
 
+def _nfl_implied_prob(odds):
+    """Break-even probability for an American price, as a 0-100 percentage."""
+    try:
+        o = float(odds)
+        if o == 0:
+            return None
+        return (100.0 / (o + 100.0) * 100.0) if o > 0 else (
+            abs(o) / (abs(o) + 100.0) * 100.0)
+    except Exception:
+        return None
+
 
 def _first_str(series):
     """Return the first non-empty string value in a pandas series, else ''."""
@@ -1567,6 +1578,32 @@ def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str) -> Optional[Dict
     rates = [r for r in [rate_a, rate_b] if r is not None]
     score = round(sum(rates)/len(rates), 1) if rates else 0
     tag     = _book_tag_nfl(pick, score, gap, under_rate)
+    # Anytime TD is a binary, price-sensitive market. A raw historical hit
+    # rate is not enough: a 44% TD rate loses at +100 and only starts to clear
+    # the break-even point around +127. Keep the signal in `all` for review,
+    # but only promote it to the bet board when it has a real over price,
+    # enough recent observations, and a 5-point probability cushion over the
+    # book's break-even rate.
+    bet_qualified = True
+    value_edge = None
+    value_reason = ""
+    if market == "player_anytime_td":
+        td_odds = pl.get("over_odds")
+        implied = _nfl_implied_prob(td_odds)
+        value_edge = round(score - implied, 1) if implied is not None else None
+        bet_qualified = bool(
+            pick == "OVER" and implied is not None
+            and tot_b >= 5 and value_edge is not None and value_edge >= 5
+        )
+        if not bet_qualified:
+            if implied is None:
+                value_reason = "No TD price available"
+            elif tot_b < 5:
+                value_reason = "Needs at least 5 recent games"
+            elif value_edge is None or value_edge < 5:
+                value_reason = "Model edge below 5 points over break-even"
+            else:
+                value_reason = "Model does not project an OVER"
 
     # Recent game log (newest first) for the ladder modal
     glog = []
@@ -1626,6 +1663,7 @@ def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str) -> Optional[Dict
         "projAvg": adj_avg,
         # score / pick
         "score": score, "dispScore": score, "gap": gap, "pick": pick, "tag": tag,
+        "betQualified": bet_qualified, "valueEdge": value_edge, "valueReason": value_reason,
         "glog": glog, "vsOppLog": vs_opp_log,
         # ── legacy keys (kept for backward compatibility with cached payloads /
         #    any downstream consumer that predates the normalized contract) ──
@@ -2184,7 +2222,8 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False) -> 
             _team_mkt_best[key] = (r, score)
     all_results = [v[0] for v in _team_mkt_best.values()]
 
-    picks   = sorted([r for r in all_results if r.get("pick")],
+    picks   = sorted([r for r in all_results
+                      if r.get("pick") and r.get("betQualified", True)],
                      key=lambda x: abs(x.get("gap") or 0), reverse=True)
     games_out = [{"home_team":g.get("home_team",""), "away_team":g.get("away_team",""),
                   "home_abbr":g.get("home_abbr",""), "away_abbr":g.get("away_abbr",""),
@@ -3882,15 +3921,31 @@ tr:last-child td{border-bottom:none}
 .nfl-bets-tbl tr:last-child td{border-bottom:none}
 .nfl-bets-tbl tr:hover td{background:rgba(255,255,255,.02)}
 /* NFL Track Record */
-.nfl-trk-sum{background:#1a1a1a;border-radius:12px;padding:14px 18px;display:flex;flex-wrap:wrap;gap:18px;align-items:center;margin-bottom:14px}
-.nfl-trk-tbl{width:100%;border-collapse:collapse;font-size:.82rem;background:#161616}
-.nfl-trk-tbl thead tr{border-bottom:1px solid rgba(52,211,153,.2)}
-.nfl-trk-tbl th{padding:10px 12px;text-align:left;color:#34d399;font-size:.7rem;font-weight:700;text-transform:uppercase;letter-spacing:.1em;background:#1a1a1a;white-space:nowrap}
-.nfl-trk-tbl td{padding:9px 12px;border-bottom:1px solid #1c1c1c;white-space:nowrap}
+ .nfl-trk-sum{background:linear-gradient(135deg,#172033,#111827);border:1px solid rgba(52,211,153,.18);border-radius:14px;padding:16px 18px;display:flex;flex-wrap:wrap;gap:18px;align-items:center;margin-bottom:16px}
+ .nfl-trk-tbl{width:100%;border-collapse:collapse;font-size:.94rem;background:#101827}
+ .nfl-trk-tbl thead tr{border-bottom:1px solid rgba(52,211,153,.28)}
+ .nfl-trk-tbl th{padding:13px 14px;text-align:left;color:#6ee7b7;font-size:.74rem;font-weight:900;text-transform:uppercase;letter-spacing:.1em;background:#111c2e;white-space:nowrap}
+ .nfl-trk-tbl td{padding:12px 14px;border-bottom:1px solid rgba(51,65,85,.55);white-space:nowrap;vertical-align:middle}
 .nfl-trk-tbl tr:last-child td{border-bottom:none}
-.nfl-trk-tbl tr:hover td{background:rgba(255,255,255,.02)}
-.nfl-trk-bar-wrap{width:80px;background:#1f2937;border-radius:4px;height:8px;overflow:hidden;display:inline-block;vertical-align:middle}
+ .nfl-trk-tbl tr:hover td{background:rgba(56,189,248,.06)}
+ .nfl-trk-bar-wrap{width:96px;background:#1f2937;border-radius:999px;height:10px;overflow:hidden;display:inline-block;vertical-align:middle}
 .nfl-trk-bar{height:100%;border-radius:4px}
+ .nfl-trk-group{margin:0 0 18px;border:1px solid #263449;border-left:5px solid var(--trk-accent,#22d3ee);border-radius:16px;overflow:hidden;background:linear-gradient(145deg,rgba(15,23,42,.98),rgba(10,15,26,.98));box-shadow:0 8px 22px rgba(0,0,0,.18)}
+ .nfl-trk-group-head{display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap;padding:16px 18px;background:linear-gradient(90deg,color-mix(in srgb,var(--trk-accent,#22d3ee) 15%,transparent),transparent);border-bottom:1px solid rgba(148,163,184,.16)}
+ .nfl-trk-group-title{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+ .nfl-trk-group-kicker{font-size:.7rem;color:#94a3b8;text-transform:uppercase;letter-spacing:.14em;font-weight:900}
+ .nfl-trk-group-name{font-size:1.12rem;color:#fff;font-weight:950;letter-spacing:.01em}
+ .nfl-trk-group-side{font-size:.74rem;font-weight:950;letter-spacing:.1em;padding:5px 10px;border-radius:999px;color:var(--trk-accent,#67e8f9);border:1px solid color-mix(in srgb,var(--trk-accent,#67e8f9) 55%,transparent);background:color-mix(in srgb,var(--trk-accent,#67e8f9) 12%,transparent)}
+ .nfl-trk-group-summary{display:flex;align-items:center;gap:14px;flex-wrap:wrap;color:#cbd5e1;font-size:.86rem;font-weight:800}
+ .nfl-trk-group-rate{font-size:1.12rem;font-family:monospace;font-weight:950;color:var(--trk-accent,#67e8f9)}
+ .nfl-trk-group-pl{font-family:monospace;font-weight:950}
+ .nfl-trk-table-scroll{overflow-x:auto}
+ .nfl-trk-result{display:inline-block;min-width:68px;text-align:center;padding:5px 10px;border-radius:999px;font-size:.74rem;letter-spacing:.05em;font-weight:950}
+ .nfl-trk-result.win{color:#86efac;background:rgba(34,197,94,.15);border:1px solid rgba(74,222,128,.35)}
+ .nfl-trk-result.loss{color:#fca5a5;background:rgba(239,68,68,.15);border:1px solid rgba(248,113,113,.35)}
+ .nfl-trk-result.push{color:#fde68a;background:rgba(234,179,8,.15);border:1px solid rgba(250,204,21,.35)}
+ .nfl-trk-result.pending{color:#cbd5e1;background:rgba(100,116,139,.15);border:1px solid rgba(148,163,184,.25)}
+ @media(max-width:680px){.nfl-trk-group-head{padding:14px}.nfl-trk-group-name{font-size:1.02rem}.nfl-trk-tbl{font-size:.88rem}.nfl-trk-tbl th{font-size:.68rem;padding:11px}.nfl-trk-tbl td{padding:11px 12px}}
 </style>
 <div id="nfl-mybets-card" style="display:none;max-width:960px;margin:18px auto 0;padding:0 16px">
   <div class="card" style="padding:20px 22px">
@@ -4544,6 +4599,15 @@ function fmtGap(g){
   var sign = g>0?'+':'';
   return '<span class="'+cls+'">'+sign+g+'</span>';
 }
+function _nflSideOdds(p,side){
+  side=side||(p&&p.pick)||'OVER';
+  if(side==='UNDER') return p&&p.realUnderOdds!=null?p.realUnderOdds:null;
+  return p&&p.realOdds!=null?p.realOdds:null;
+}
+function _nflIsRoiFocusPick(p){
+  var odds=_nflSideOdds(p,'UNDER');
+  return !!p&&p.pick==='UNDER'&&odds!=null&&Number(odds)>=-150;
+}
 function fmtVsLine(p){
   if(p.realLine==null||!p.vsLineTotal) return '<span class="gray">—</span>';
   return '<span class="'+rateClass(p.vsLineRate)+'">'+p.vsLineHits+'/'+p.vsLineTotal+' ('+p.vsLineRate+'%)</span>';
@@ -4554,8 +4618,9 @@ function nflCard(p,i){
   var hasHA=(p.homeRoad==='H'||p.homeRoad==='R');
   var head=p.head||'';
   var logo='https://a.espncdn.com/i/teamlogos/nfl/500/'+_logoAbbr(p.team)+'.png';
+  var shownOdds=_nflSideOdds(p);
   var lineHtml=(p.realLine!=null)
-    ? `<span class="ln">${p.dispLine}</span> <span class="od">${p.realOdds||''}</span>`
+    ? `<span class="ln">${p.dispLine}</span> <span class="od">${shownOdds!=null?shownOdds:''}</span>`
     : `<span class="est">~${p.dispLine}</span>`;
   var lastStat=(p.realLine!=null&&p.vsLineTotal)
     ? `<div class="pc-stat"><div class="k">vs Book L10</div><div class="v ${rateClass(p.vsLineRate)}">${p.vsLineHits}/${p.vsLineTotal} (${p.vsLineRate}%)</div></div>`
@@ -4721,7 +4786,7 @@ function buildNormTable(picks, startNum){
       '<td><span class="tbadge">' + p.team + '</span></td>' +
       '<td><span class="tbadge">' + p.opponent + '</span></td>' +
       '<td>' + (hasHA ? '<span class="' + (ha ? 'home' : 'away') + '">' + (ha ? 'HOME' : 'AWAY') + '</span>' : '<span class="gray">—</span>') + '</td>' +
-      '<td>' + (p.realLine!=null ? '<span class="real-line">' + p.dispLine + '</span> <span class="odds-txt">' + (p.realOdds||'') + '</span>' : '<span class="est">~' + p.dispLine + '</span>') + '</td>' +
+      '<td>' + (p.realLine!=null ? '<span class="real-line">' + p.dispLine + '</span> <span class="odds-txt">' + (_nflSideOdds(p)!=null?_nflSideOdds(p):'') + '</span>' : '<span class="est">~' + p.dispLine + '</span>') + '</td>' +
       '<td><span class="gold">' + p.avgA + '</span></td>' +
       '<td><span class="gold">' + p.avg + '</span></td>' +
       '<td>' + fmtVsLine(p) + '</td>' +
@@ -4985,7 +5050,14 @@ function renderResults(d){
   window.__NFL_DATE__=d.date||'';
   var note=d.data_note?('<div style="margin-bottom:10px;padding:11px 14px;border:1px solid #24506b;background:#0b2230;border-radius:10px;color:#9bd5f5;font-size:.82rem">'+d.data_note+'</div>'):'';
   var warn=d.data_warning?('<div class="err-box" style="margin-bottom:10px">'+d.data_warning+'</div>'):'';
-  res.innerHTML=note+warn+'<div class="nfl-toolbar"><input id="nflSearch" type="text" placeholder="Search player…" oninput="_nflPaint(this.value)"/></div><div id="nflBody"></div>';
+  var tdAll=(d.all||[]).filter(function(p){return p.market==='player_anytime_td'&&p.pick==='OVER';});
+  var tdQualified=tdAll.filter(function(p){return p.betQualified!==false;}).length;
+  var tdNote=tdAll.length
+    ?'<div style="margin-bottom:10px;padding:11px 14px;border:1px solid rgba(56,189,248,.35);background:rgba(14,116,144,.14);border-radius:10px;color:#bae6fd;font-size:.78rem">'
+      +'<strong>Anytime TD value gate:</strong> '+tdQualified+' of '+tdAll.length
+      +' signals clear the book break-even probability by at least 5 points with 5+ recent games. The rest remain review-only.</div>'
+    :'';
+  res.innerHTML=note+warn+tdNote+'<div class="nfl-toolbar"><input id="nflSearch" type="text" placeholder="Search player…" oninput="_nflPaint(this.value)"/></div><div id="nflBody"></div>';
   _renderNflGamePredictor(d);
   _nflPaint('');
 }
@@ -5015,9 +5087,37 @@ function _nflPaint(q){
   _MORDER.forEach(function(m){ if(byM[m]&&byM[m].length){ h+='<div class="chip" style="cursor:pointer" onclick="_marketModal(&#39;'+m+'&#39;)"><div class="val">'+byM[m].length+'</div><div class="lbl">'+(_MLBL[m]||m)+'</div></div>'; }});
   h+='</div>';
 
+  // ROI Focus keeps every existing market board below, but promotes the
+  // conservative slice that finished positive in the saved 2025 replay:
+  // UNDER picks with a real price of -150 or better.
+  var roiFocus=picks.filter(function(p){
+    return !_nflGameDone(p)&&_nflIsRoiFocusPick(p);
+  }).sort(function(a,b){
+    return Number(b.score||b.dispScore||0)-Number(a.score||a.dispScore||0)
+      ||_edge(b)-_edge(a);
+  });
+  if(roiFocus.length){
+    var focusTop=roiFocus.slice(0,10),focusMore=roiFocus.slice(10);
+    var focusBody=nflCardGrid(focusTop,1);
+    if(focusMore.length){
+      focusBody+='<details style="margin:14px 16px 16px">'
+        +'<summary style="cursor:pointer;list-style:none;text-align:center;padding:10px 14px;border:1px solid rgba(52,211,153,.4);border-radius:10px;background:rgba(52,211,153,.08);color:#6ee7b7;font-weight:800;font-size:.8rem">'
+        +'Show '+focusMore.length+' more ROI Focus pick'+(focusMore.length!==1?'s':'')+'</summary>'
+        +'<div style="margin-top:14px">'+nflCardGrid(focusMore,11)+'</div></details>';
+    }
+    h+='<div style="background:linear-gradient(135deg,rgba(6,95,70,.22),rgba(15,23,42,.8));border:1px solid rgba(52,211,153,.48);border-radius:14px;margin:14px 0;overflow:hidden">'
+      +'<div style="padding:13px 16px;border-bottom:1px solid rgba(52,211,153,.2)">'
+      +'<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap">'
+      +'<div><div style="font-weight:900;font-size:1rem;color:#6ee7b7">ROI Focus</div>'
+      +'<div style="font-size:.72rem;color:#a7f3d0;margin-top:3px">UNDER picks priced -150 or better — the positive-ROI slice in the saved 2025 replay. Past results do not guarantee future profit.</div></div>'
+      +'<div style="background:rgba(52,211,153,.14);border:1px solid rgba(52,211,153,.35);border-radius:20px;padding:4px 12px;color:#6ee7b7;font-size:.75rem;font-weight:900">'+roiFocus.length+' today</div>'
+      +'</div></div>'+focusBody+'</div>';
+  }
+
   // ── 🔒 80–100% Locks — every tracked sample hit at 80%+ ─────────────────
   var lockPicks=(d.all||[]).filter(function(p){
-    return !_nflGameDone(p) && Number(p.score||p.dispScore)>=80 && p.pick;
+    return !_nflGameDone(p) && p.betQualified!==false
+      && Number(p.score||p.dispScore)>=80 && p.pick;
   });
   if(q) lockPicks=lockPicks.filter(function(p){return (p.name||'').toLowerCase().indexOf(q)>=0;});
   lockPicks.sort(function(a,b){
@@ -5129,9 +5229,10 @@ function _nflBetToast(msg){
 var _nflBetN=0;
 window.__NFL_BET_SRC__=window.__NFL_BET_SRC__||{};
 function _nflBetBtn(p,forceSide){
-  if(p.realLine==null||!p.market) return '';
+  if(p.realLine==null||!p.market||p.betQualified===false) return '';
   var side=forceSide||(p.pick==='UNDER'?'UNDER':'OVER');
-  var odds=side==='OVER'?(p.realOdds!=null?p.realOdds:p.realUnderOdds):(p.realUnderOdds!=null?p.realUnderOdds:p.realOdds);
+  var odds=_nflSideOdds(p,side);
+  if(odds==null) return '';
   var k='nf'+(++_nflBetN);
   window.__NFL_BET_SRC__[k]={
     name:p.name,pid:(p.pid!=null?String(p.pid):''),team:(p.team||''),opp:(p.opponent||''),
@@ -5493,6 +5594,28 @@ function renderNflTrackDay(){
     document.getElementById('nflOvfSummary'),document.getElementById('nflOvfBody'),
     true,source);
 }
+function _nflRoiFocusSummary(decided,stake){
+  var focus=decided.filter(function(r){
+    return r.category!=='80-100% Locks'
+      &&r.side==='UNDER'&&r.odds!=null&&Number(r.odds)>=-150;
+  });
+  if(!focus.length) return '';
+  var wins=focus.filter(function(r){return r.result==='WIN';}).length;
+  var losses=focus.length-wins;
+  var net=focus.reduce(function(total,r){return total+(_nflTrkProfit(r,stake)||0);},0);
+  var roi=focus.length?net/(focus.length*stake)*100:0;
+  var color=net>=0?'#4ade80':'#f87171';
+  return '<div style="background:rgba(6,95,70,.18);border:1px solid rgba(52,211,153,.38);border-radius:10px;padding:11px 13px;margin-bottom:10px">'
+    +'<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap">'
+    +'<div><div style="color:#6ee7b7;font-size:.76rem;font-weight:900;text-transform:uppercase;letter-spacing:.08em">ROI Focus</div>'
+    +'<div style="color:#a7f3d0;font-size:.71rem;margin-top:2px">UNDER picks priced -150 or better · excludes duplicate Locks rows</div></div>'
+    +'<div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;font-family:monospace;font-weight:800">'
+    +'<span style="color:#fff">'+wins+'-'+losses+'</span>'
+    +'<span style="color:'+color+'">'+(net>=0?'+$':'-$')+Math.abs(net).toFixed(0)+'</span>'
+    +'<span style="color:'+color+'">ROI '+(roi>=0?'+':'')+roi.toFixed(1)+'%</span>'
+    +'</div></div>'
+    +'<div style="color:#6b7280;font-size:.68rem;margin-top:7px">A positive historical filter is not a guarantee of future profit.</div></div>';
+}
 function _nflRenderRecordBook(decided,stake,label,sumEl,bodyEl,isOverflow,source){
   if(!sumEl||!bodyEl) return;
   if(!decided.length){
@@ -5514,7 +5637,8 @@ function _nflRenderRecordBook(decided,stake,label,sumEl,bodyEl,isOverflow,source
     ?'<div style="background:rgba(245,158,11,.1);border:1px solid rgba(245,158,11,.35);border-radius:9px;padding:9px 12px;margin-bottom:10px;color:#fbbf24;font-size:.76rem;font-weight:800">'
       +'Historical Analysis — saved point-in-time replays; excluded from the official record.</div>'
     :'';
-  sumEl.innerHTML=replayNotice+'<div class="nfl-trk-sum">'
+  var roiFocusNotice=isOverflow?'':_nflRoiFocusSummary(decided,stake);
+  sumEl.innerHTML=replayNotice+roiFocusNotice+'<div class="nfl-trk-sum">'
     +'<span style="color:#9ca3af;font-size:.78rem;font-weight:800">'+label+'</span>'
     +'<span style="font-size:1.05rem;font-weight:900;color:#fff"><span style="color:#4ade80">'+wins+'</span>/<span style="color:#f87171">'+(wins+losses)+'</span>'
     +(rate!=null?' <span style="color:#9ca3af;font-size:.85rem;font-weight:600">('+rate.toFixed(1)+'%)</span>':'')+'</span>'
@@ -5559,29 +5683,72 @@ function _nflTrkCatHtml(decided,stake){
 }
 function _nflTrkListHtml(decided,stake){
   if(!decided.length) return '<p style="color:#6b7280;padding:20px;text-align:center">No graded picks yet.</p>';
-  var sorted=[].concat(decided).sort(function(a,b){
-    return (_nflTrkProfit(b,stake)||0)-(_nflTrkProfit(a,stake)||0);
+  var catOrder=['Pass Yds','Pass TDs','Completions','Pass Att','INT Thrown',
+    'Rush Yds','Rush Att','Rec Yds','Receptions','Anytime TD','Tackles+Ast',
+    'Sacks','Def INT','Kick Pts','FG Made','80-100% Locks'];
+  var catColors={'Pass Yds':'#38bdf8','Pass TDs':'#818cf8','Completions':'#60a5fa',
+    'Pass Att':'#22d3ee','INT Thrown':'#f87171','Rush Yds':'#34d399',
+    'Rush Att':'#2dd4bf','Rec Yds':'#a78bfa','Receptions':'#c084fc',
+    'Anytime TD':'#fbbf24','Tackles+Ast':'#fb923c','Sacks':'#f97316',
+    'Def INT':'#f43f5e','Kick Pts':'#facc15','FG Made':'#fde047',
+    '80-100% Locks':'#facc15'};
+  var groups={},order=[];
+  function baseCategory(cat){
+    return String(cat||'Other').replace(/\s+\((Over|Under)\)$/i,'');
+  }
+  decided.forEach(function(r){
+    var cat=baseCategory(r.category),side=(r.side||'OVER').toUpperCase();
+    var key=cat+'|'+side;
+    if(!groups[key]){groups[key]=[];order.push(key);}
+    groups[key].push(r);
   });
-  var rows=sorted.map(function(r){
-    var plColor=r.result==='WIN'?'#4ade80':'#f87171';
-    var profit=_nflTrkProfit(r,stake);
-    var pl=profit!=null?((profit>=0?'+$':'-$')+Math.abs(profit).toFixed(2)):'—';
-    var odds=r.odds!=null?(r.odds>0?'+':'')+r.odds:'—';
-    return '<tr>'
-      +'<td style="color:#9ca3af;font-family:monospace;font-size:.76rem">'+(r.record_date||'')+'</td>'
-      +'<td style="color:#9ca3af;font-size:.78rem">'+r.category+'</td>'
-      +'<td style="color:#fff;font-weight:700">'+r.name+'</td>'
-      +'<td style="color:#6b7280">'+r.team+'</td>'
-      +'<td style="color:#d1d5db">'+(r.side||'')+(r.line!=null?' '+r.line:'')+'</td>'
-      +'<td style="font-family:monospace;color:#9ca3af">'+odds+'</td>'
-      +'<td style="color:#6b7280">'+((r.actual!=null)?r.actual:'—')+'</td>'
-      +'<td style="font-weight:800;color:'+plColor+'">'+r.result+'</td>'
-      +'<td style="font-family:monospace;font-weight:700;color:'+plColor+'">'+pl+'</td>'
-      +'</tr>';
-  }).join('');
-  return '<div class="tbl-wrap"><table class="nfl-trk-tbl">'
-    +'<thead><tr><th>Date</th><th>Category</th><th>Player</th><th>Team</th><th>Pick</th><th>Odds</th><th>Actual</th><th>Result</th><th>P/L</th></tr></thead>'
-    +'<tbody>'+rows+'</tbody></table></div>';
+  function orderKey(key){
+    var bits=key.split('|'),idx=catOrder.indexOf(bits[0]);
+    return (idx<0?catOrder.length:idx)*2+(bits[1]==='UNDER'?1:0);
+  }
+  order.sort(function(a,b){return orderKey(a)-orderKey(b);});
+  function money(v){return v==null?'—':(v>=0?'+$':'-$')+Math.abs(Number(v)).toFixed(2);}
+  function groupBlock(key){
+    var bits=key.split('|'),cat=bits[0],side=bits[1],list=groups[key].slice().sort(function(a,b){
+      var ar=a.rank==null?999:Number(a.rank),br=b.rank==null?999:Number(b.rank);
+      return ar-br||String(b.record_date||'').localeCompare(String(a.record_date||''))
+        ||String(a.name||'').localeCompare(String(b.name||''));
+    });
+    var w=list.filter(function(r){return r.result==='WIN';}).length;
+    var l=list.filter(function(r){return r.result==='LOSS';}).length;
+    var pushes=list.filter(function(r){return r.result==='PUSH';}).length;
+    var pending=list.length-w-l-pushes;
+    var priced=list.filter(function(r){return r.odds!=null;});
+    var pl=priced.reduce(function(x,r){return x+(_nflTrkProfit(r,stake)||0);},0);
+    var rate=(w+l)?w/(w+l)*100:null;
+    var accent=catColors[cat]||'#22d3ee';
+    var meta=w+'W · '+l+'L'+(pushes?' · '+pushes+'P':'')+(pending?' · '+pending+' pending':'');
+    var rows=list.map(function(r){
+      var result=(r.result||'PENDING').toUpperCase();
+      var resultClass=result.toLowerCase();
+      var profit=_nflTrkProfit(r,stake);
+      var odds=r.odds!=null?(Number(r.odds)>0?'+':'')+r.odds:'—';
+      var plColor=result==='WIN'?'#4ade80':(result==='LOSS'?'#f87171':'#facc15');
+      return '<tr>'
+        +'<td style="color:#94a3b8;font-family:monospace;font-size:.82rem">'+_nflEsc(r.record_date||'')+'</td>'
+        +'<td style="color:#f8fafc;font-weight:900;font-size:.98rem">'+_nflEsc(r.name||'')+'</td>'
+        +'<td style="color:#c4b5fd;font-weight:900">'+_nflEsc(r.team||'')+'</td>'
+        +'<td style="color:#e2e8f0;font-weight:800">'+_nflEsc((r.side||'')+(r.line!=null?' '+r.line:''))+'</td>'
+        +'<td style="font-family:monospace;color:#cbd5e1;font-weight:800">'+odds+'</td>'
+        +'<td style="color:#cbd5e1;font-weight:800">'+(r.actual!=null?_nflEsc(String(r.actual)):'—')+'</td>'
+        +'<td><span class="nfl-trk-result '+resultClass+'">'+_nflEsc(result)+'</span></td>'
+        +'<td style="font-family:monospace;font-weight:950;color:'+plColor+'">'+money(profit)+'</td>'
+        +'</tr>';
+    }).join('');
+    return '<section class="nfl-trk-group" style="--trk-accent:'+accent+'">'
+      +'<div class="nfl-trk-group-head"><div class="nfl-trk-group-title">'
+      +'<span class="nfl-trk-group-kicker">Category</span><span class="nfl-trk-group-name">'+_nflEsc(cat)+'</span><span class="nfl-trk-group-side">'+_nflEsc(side)+'</span></div>'
+      +'<div class="nfl-trk-group-summary"><span>'+meta+'</span><span class="nfl-trk-group-rate">'+(rate!=null?rate.toFixed(1)+'%':'—')+'</span><span class="nfl-trk-group-pl" style="color:'+(pl>=0?'#4ade80':'#f87171')+'">'+money(pl)+'</span></div></div>'
+      +'<div class="nfl-trk-table-scroll"><table class="nfl-trk-tbl"><thead><tr>'
+      +'<th>Date</th><th>Player</th><th>Team</th><th>Pick</th><th>Odds</th><th>Actual</th><th>Result</th><th>P/L</th>'
+      +'</tr></thead><tbody>'+rows+'</tbody></table></div></section>';
+  }
+  return order.map(groupBlock).join('');
 }
 
 function downloadNflMyBetsCSV(){
