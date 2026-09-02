@@ -3939,6 +3939,7 @@ tr:last-child td{border-bottom:none}
       <input type="date" id="datePicker" class="date-input" value="__TODAY__" >
     </div>
     <button class="btn" id="getBtn" onclick="getPicks()">🎯 Get Picks</button>
+    <button class="btn" id="lastSeasonBtn" onclick="openNflLastSeason()" style="margin-left:10px;background:#6d28d9;color:#fff">📚 View Last Season</button>
     <button class="btn admin-only" id="runBtn" onclick="runPicks()" style="margin-left:10px">Run Picks</button>
     <div class="status-msg" id="statusMsg"></div>
   </div>
@@ -5171,6 +5172,29 @@ function _nflTrkPeriodLabel(sel,period){
 function openNflTrackRecord(){
   var sec=document.getElementById('nfl-track-section');
   if(sec) sec.scrollIntoView({behavior:'smooth',block:'start'});
+}
+async function openNflLastSeason(){
+  var btn=document.getElementById('lastSeasonBtn');
+  var original=btn?btn.innerHTML:'📚 View Last Season';
+  if(btn){btn.disabled=true;btn.innerHTML='<span class="spinner"></span>Loading archive…';}
+  try{
+    if(!_nflTrkData||!(_nflTrkData.historical_dates||[]).length){
+      await loadNflTrackRecord(false);
+    }
+    var source=document.getElementById('nflTrkSource');
+    if(!source||!_nflTrkData||!(_nflTrkData.historical_dates||[]).length){
+      throw new Error('No saved Historical Analysis archive is available yet.');
+    }
+    source.value='historical';
+    // Switching the source selects the latest archived date and the matching
+    // NFL season, then redraws both the prop and Game Predictor records.
+    nflTrkSourceChanged();
+    openNflTrackRecord();
+  }catch(e){
+    alert(e.message||'Could not load the saved Historical Analysis archive.');
+  }finally{
+    if(btn){btn.disabled=false;btn.innerHTML=original;}
+  }
 }
 function openNflGpRecord(){
   renderNflGpRecord();
