@@ -6,8 +6,10 @@ Schedule:          ESPN scoreboard API
 """
 
 import os, re, asyncio, uuid, time, json, pathlib, csv, io
+import threading as _bt_th
 from typing import Dict, List, Optional
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import httpx
 from fastapi import FastAPI, Request, HTTPException
@@ -554,6 +556,424 @@ async def get_espn_games(date_str: str) -> List[Dict]:
             return games
     except Exception as e:
         print(f"[ESPN] {e}"); return []
+
+# ── Historical season batch scheduling ─────────────────────────────────────────
+# Season discovery is ESPN-only. It deliberately does not call the Odds API, so
+# an admin can see the size and worst-case historical request count before
+# starting a batch. Individual dates are still processed through run_pipeline,
+# which owns the point-in-time filter and historical-only persistence boundary.
+_NFL_BATCH_SCHEDULE_CACHE: dict = {}
+_NFL_BATCH_SCHEDULE_TTL = 6 * 3600
+_NFL_BATCH_MAX_SEASON_DATES = 100
+_NFL_HIST_BATCHES: dict = {}
+_NFL_HIST_BATCH_LOCK = _bt_th.RLock()
+_NFL_HIST_BATCH_JOB_CAT = "__historical_batch_job__"
+
+def _nfl_batch_season_year(value) -> int:
+    try:
+        year = int(str(value).strip())
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Choose a valid NFL season")
+    now = datetime.now(timezone.utc)
+    latest_completed = now.year - 1 if now.month >= 3 else now.year - 2
+    if year not in NFL_SEASONS or year > latest_completed:
+        raise HTTPException(
+            status_code=400,
+            detail="Choose a completed season from the available NFL seasons",
+        )
+    return year
+
+async def _nfl_season_schedule(season: int) -> dict:
+    """Return unique completed-season game dates and game counts from ESPN.
+
+    ESPN's weekly scoreboard is much cheaper and more reliable than probing
+    every calendar date. Regular-season and postseason weeks are requested in
+    parallel, then collapsed by the event's game date.
+    """
+    season = _nfl_batch_season_year(season)
+    now = time.time()
+    cached = _NFL_BATCH_SCHEDULE_CACHE.get(season)
+    if cached and now - cached.get("ts", 0) < _NFL_BATCH_SCHEDULE_TTL:
+        return cached["schedule"]
+
+    sem = asyncio.Semaphore(8)
+    found: dict = {}
+    seen_events = set()
+    fetched_weeks = set()
+    failed_weeks = []
+
+    async def fetch_week(client, season_type: int, week: int):
+        async with sem:
+            try:
+                response = await client.get(
+                    "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard",
+                    params={
+                        "seasontype": season_type,
+                        "week": week,
+                        # ESPN ignores `season` on this endpoint and silently
+                        # returns the current year. `dates=YYYY` is the actual
+                        # season selector for weekly scoreboard requests.
+                        "dates": season,
+                    },
+                )
+                if not response.is_success:
+                    failed_weeks.append(
+                        f"type {season_type} week {week} returned HTTP {response.status_code}"
+                    )
+                    return
+                fetched_weeks.add((season_type, week))
+                for event in response.json().get("events", []):
+                    comp = (event.get("competitions") or [{}])[0]
+                    raw_date = event.get("date") or comp.get("date") or ""
+                    try:
+                        date_key = (
+                            datetime.fromisoformat(str(raw_date).replace("Z", "+00:00"))
+                            .astimezone(ZoneInfo("America/New_York"))
+                            .strftime("%Y-%m-%d")
+                        )
+                    except Exception:
+                        date_key = str(raw_date)[:10]
+                    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_key):
+                        continue
+                    # Never queue a future date as a historical replay.
+                    if date_key >= datetime.now(timezone.utc).strftime("%Y-%m-%d"):
+                        continue
+                    event_id = str(event.get("id") or "")
+                    if event_id and event_id in seen_events:
+                        continue
+                    if event_id:
+                        seen_events.add(event_id)
+                    bucket = found.setdefault(date_key, {"games": 0, "events": []})
+                    bucket["games"] += 1
+                    bucket["events"].append(event_id)
+            except Exception as exc:
+                print(f"[NFL batch schedule] {season} type={season_type} week={week}: {exc}")
+                failed_weeks.append(f"type {season_type} week {week}: {exc}")
+
+    async with httpx.AsyncClient(timeout=12) as client:
+        requests = [
+            fetch_week(client, season_type, week)
+            for season_type, max_week in ((2, 18), (3, 5))
+            for week in range(1, max_week + 1)
+        ]
+        await asyncio.gather(*requests)
+
+    if failed_weeks or len(fetched_weeks) != 23:
+        detail = "; ".join(failed_weeks[:4]) or "one or more ESPN weeks were not returned"
+        raise HTTPException(
+            status_code=502,
+            detail=f"Could not verify the complete {season} NFL schedule: {detail}",
+        )
+    dates = sorted(found)
+    schedule = {
+        "season": season,
+        "dates": dates,
+        "games_by_date": {d: int(found[d]["games"]) for d in dates},
+        "games_total": sum(int(found[d]["games"]) for d in dates),
+        "schedule_requests": 23,
+    }
+    _NFL_BATCH_SCHEDULE_CACHE[season] = {"ts": now, "schedule": schedule}
+    return schedule
+
+def _nfl_batch_odds_bound(schedule: dict) -> int:
+    """Worst-case historical Odds API request count for one fresh batch.
+
+    get_odds_events can make two historical event snapshots per date, and the
+    pipeline makes one props and one game-lines request per scheduled game.
+    Existing odds caches reduce actual usage below this upper bound.
+    """
+    dates = len(schedule.get("dates") or [])
+    games = int(schedule.get("games_total") or 0)
+    return dates * 2 + games * 2
+
+def _nfl_batch_public(job: dict) -> dict:
+    with _NFL_HIST_BATCH_LOCK:
+        failures = [dict(item) for item in job.get("failures", [])]
+        return {
+            "job_id": job.get("job_id"),
+            "status": job.get("status"),
+            "season": job.get("season"),
+            "total_dates": len(job.get("dates") or []),
+            "dates": list(job.get("dates") or []),
+            "completed_dates": list(job.get("completed_dates") or []),
+            "failures": failures,
+            "failed_dates": [item.get("date") for item in failures if item.get("date")],
+            "current_date": job.get("current_date"),
+            "current_progress": job.get("current_progress") or "",
+            "estimated_odds_api_calls": job.get("estimated_odds_api_calls", 0),
+            "odds_bound_note": job.get("odds_bound_note", ""),
+            "started_at": job.get("started_at"),
+            "finished_at": job.get("finished_at"),
+            "retry_count": int(job.get("retry_count") or 0),
+        }
+
+def _nfl_batch_persist(job: dict) -> bool:
+    """Persist resumable batch state in the existing Supabase ledger."""
+    if "_nfl_sb_upsert" not in globals():
+        return False
+    payload = _nfl_batch_public(job)
+    payload["games_by_date"] = dict(job.get("games_by_date") or {})
+    payload["heartbeat_at"] = datetime.now(timezone.utc).isoformat()
+    return _nfl_sb_upsert("mpa_track_ledger", [{
+        "app": "nfl",
+        "date": f"{int(job.get('season'))}-01-01",
+        "category": _NFL_HIST_BATCH_JOB_CAT,
+        "side": str(job.get("job_id") or ""),
+        "wins": len(job.get("completed_dates") or []),
+        "losses": len(job.get("failures") or []),
+        "locked": False,
+        "detail": payload,
+    }], on_conflict="app,date,category,side")
+
+def _nfl_batch_restore(job_id: str) -> Optional[dict]:
+    if "_nfl_sb_get" not in globals():
+        return None
+    rows = _nfl_sb_get("mpa_track_ledger", {
+        "app": "eq.nfl",
+        "category": f"eq.{_NFL_HIST_BATCH_JOB_CAT}",
+        "side": f"eq.{job_id}",
+        "select": "detail",
+        "limit": "1",
+    })
+    detail = (rows[0] or {}).get("detail") if rows else None
+    if isinstance(detail, str):
+        try:
+            detail = json.loads(detail)
+        except Exception:
+            detail = None
+    if not isinstance(detail, dict) or not detail.get("job_id"):
+        return None
+    return {
+        "job_id": detail["job_id"],
+        "status": detail.get("status") or "queued",
+        "season": int(detail.get("season") or 0),
+        "dates": list(detail.get("dates") or []),
+        "games_by_date": dict(detail.get("games_by_date") or {}),
+        "completed_dates": list(detail.get("completed_dates") or []),
+        "failures": list(detail.get("failures") or []),
+        "current_date": detail.get("current_date"),
+        "current_progress": detail.get("current_progress") or "",
+        "estimated_odds_api_calls": int(detail.get("estimated_odds_api_calls") or 0),
+        "odds_bound_note": detail.get("odds_bound_note") or "",
+        "started_at": detail.get("started_at"),
+        "finished_at": detail.get("finished_at"),
+        "retry_count": int(detail.get("retry_count") or 0),
+    }
+
+def _nfl_batch_restore_active() -> Optional[dict]:
+    if "_nfl_sb_get" not in globals():
+        return None
+    rows = _nfl_sb_get("mpa_track_ledger", {
+        "app": "eq.nfl",
+        "category": f"eq.{_NFL_HIST_BATCH_JOB_CAT}",
+        "select": "detail",
+        "order": "date.desc",
+        "limit": "10",
+    })
+    for row in rows or []:
+        detail = (row or {}).get("detail")
+        if isinstance(detail, str):
+            try:
+                detail = json.loads(detail)
+            except Exception:
+                continue
+        if isinstance(detail, dict) and detail.get("status") in ("queued", "running"):
+            return _nfl_batch_restore(str(detail.get("job_id") or ""))
+    return None
+
+async def _nfl_run_historical_batch(job_id: str):
+    while True:
+        with _NFL_HIST_BATCH_LOCK:
+            job = _NFL_HIST_BATCHES.get(job_id)
+            if not job:
+                return
+            pending = [
+                d for d in job.get("dates", [])
+                if d not in job.get("completed_dates", [])
+                and d not in {x.get("date") for x in job.get("failures", [])}
+            ]
+            if not pending:
+                job["status"] = "completed" if not job.get("failures") else "failed"
+                job["current_date"] = None
+                job["current_progress"] = (
+                    "Season replay complete."
+                    if job["status"] == "completed"
+                    else "Season replay finished with failed dates."
+                )
+                job["finished_at"] = datetime.now(timezone.utc).isoformat()
+                _nfl_batch_persist(job)
+                return
+            date_str = pending[0]
+            job["status"] = "running"
+            job["current_date"] = date_str
+            job["current_progress"] = f"Starting historical replay for {date_str}…"
+            _nfl_batch_persist(job)
+
+        def progress(message):
+            with _NFL_HIST_BATCH_LOCK:
+                active = _NFL_HIST_BATCHES.get(job_id)
+                if active:
+                    active["current_progress"] = str(message)
+
+        try:
+            result = await asyncio.wait_for(
+                run_pipeline(date_str, progress=progress, simulate=True),
+                timeout=360,
+            )
+            error = result.get("error") if isinstance(result, dict) else "Invalid replay result"
+            if error:
+                raise RuntimeError(str(error))
+            expected_games = int((job.get("games_by_date") or {}).get(date_str) or 0)
+            actual_games = len(result.get("games") or []) if isinstance(result, dict) else 0
+            if expected_games and actual_games != expected_games:
+                raise RuntimeError(
+                    f"Schedule completeness check failed: expected {expected_games} games, "
+                    f"replay returned {actual_games}"
+                )
+            if not result.get("historicalSaved"):
+                raise RuntimeError("Historical Analysis save was not confirmed")
+            with _NFL_HIST_BATCH_LOCK:
+                active = _NFL_HIST_BATCHES.get(job_id)
+                if active:
+                    active["completed_dates"].append(date_str)
+                    active["current_progress"] = f"Completed historical replay for {date_str}."
+                    _nfl_batch_persist(active)
+        except Exception as exc:
+            with _NFL_HIST_BATCH_LOCK:
+                active = _NFL_HIST_BATCHES.get(job_id)
+                if active:
+                    failures = active.setdefault("failures", [])
+                    existing = next((x for x in failures if x.get("date") == date_str), None)
+                    attempts = int((existing or {}).get("attempts") or 0) + 1
+                    item = {"date": date_str, "error": str(exc), "attempts": attempts}
+                    if existing:
+                        failures[failures.index(existing)] = item
+                    else:
+                        failures.append(item)
+                    active["current_progress"] = f"Failed {date_str}: {exc}"
+                    _nfl_batch_persist(active)
+
+@app.get("/api/nfl/historical-batch/estimate")
+async def nfl_historical_batch_estimate(
+    request: Request, season: int = 0, token: str = "", admin: str = ""
+):
+    if not _nfl_batch_admin_ok(request, token, admin):
+        raise HTTPException(status_code=403, detail="Admin only")
+    selected = _nfl_batch_season_year(season)
+    schedule = await _nfl_season_schedule(selected)
+    if not schedule["dates"]:
+        raise HTTPException(status_code=404, detail="No completed game dates found for that season")
+    if len(schedule["dates"]) > _NFL_BATCH_MAX_SEASON_DATES:
+        raise HTTPException(status_code=400, detail="Season contains more dates than the batch limit")
+    return {
+        "season": selected,
+        "dates": schedule["dates"],
+        "date_count": len(schedule["dates"]),
+        "games_total": schedule["games_total"],
+        "estimated_odds_api_calls": _nfl_batch_odds_bound(schedule),
+        "odds_bound_note": (
+            "Worst case: 2 historical event snapshots per date plus 2 historical "
+            "Odds API calls per scheduled game (props and game lines). Cached dates "
+            "and already-cached lines use fewer or zero Odds API calls."
+        ),
+        "historical_only": True,
+    }
+
+@app.post("/api/nfl/historical-batch")
+async def nfl_historical_batch_start(request: Request):
+    body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
+    if not _nfl_batch_admin_ok(request, body.get("token", ""), body.get("admin", "")):
+        raise HTTPException(status_code=403, detail="Admin only")
+    selected = _nfl_batch_season_year(body.get("season"))
+    schedule = await _nfl_season_schedule(selected)
+    dates = schedule.get("dates") or []
+    if not dates:
+        raise HTTPException(status_code=404, detail="No completed game dates found for that season")
+    if len(dates) > _NFL_BATCH_MAX_SEASON_DATES:
+        raise HTTPException(status_code=400, detail="Season contains more dates than the batch limit")
+    with _NFL_HIST_BATCH_LOCK:
+        running = next(
+            (item for item in _NFL_HIST_BATCHES.values() if item.get("status") in ("queued", "running")),
+            None,
+        )
+        restored = False
+        if not running:
+            running = _nfl_batch_restore_active()
+            if running:
+                restored = True
+                _NFL_HIST_BATCHES[running["job_id"]] = running
+        if running:
+            if restored and running.get("status") in ("queued", "running"):
+                running["status"] = "queued"
+                asyncio.create_task(_nfl_run_historical_batch(running["job_id"]))
+            return JSONResponse({"job": _nfl_batch_public(running), "already_running": True}, status_code=409)
+        job_id = str(uuid.uuid4())[:8]
+        job = {
+            "job_id": job_id,
+            "status": "queued",
+            "season": selected,
+            "dates": dates,
+            "games_by_date": dict(schedule.get("games_by_date") or {}),
+            "completed_dates": [],
+            "failures": [],
+            "current_date": None,
+            "current_progress": "Queued — historical replays run one date at a time.",
+            "estimated_odds_api_calls": _nfl_batch_odds_bound(schedule),
+            "odds_bound_note": (
+                "Worst case: 2 historical event snapshots per date plus 2 historical "
+                "Odds API calls per scheduled game. Cached dates and lines reduce usage."
+            ),
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "finished_at": None,
+            "retry_count": 0,
+        }
+        _NFL_HIST_BATCHES[job_id] = job
+        _nfl_batch_persist(job)
+    asyncio.create_task(_nfl_run_historical_batch(job_id))
+    return {"job": _nfl_batch_public(job), "already_running": False}
+
+@app.get("/api/nfl/historical-batch/{job_id}")
+async def nfl_historical_batch_status(
+    job_id: str, request: Request, token: str = "", admin: str = ""
+):
+    if not _nfl_batch_admin_ok(request, token, admin):
+        raise HTTPException(status_code=403, detail="Admin only")
+    with _NFL_HIST_BATCH_LOCK:
+        job = _NFL_HIST_BATCHES.get(job_id)
+        if not job:
+            job = _nfl_batch_restore(job_id)
+            if not job:
+                raise HTTPException(status_code=404, detail="Historical batch not found")
+            _NFL_HIST_BATCHES[job_id] = job
+            if job.get("status") in ("queued", "running"):
+                job["status"] = "queued"
+                asyncio.create_task(_nfl_run_historical_batch(job_id))
+        return _nfl_batch_public(job)
+
+@app.post("/api/nfl/historical-batch/{job_id}/retry")
+async def nfl_historical_batch_retry(job_id: str, request: Request):
+    body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
+    if not _nfl_batch_admin_ok(request, body.get("token", ""), body.get("admin", "")):
+        raise HTTPException(status_code=403, detail="Admin only")
+    requested = body.get("dates") or []
+    with _NFL_HIST_BATCH_LOCK:
+        job = _NFL_HIST_BATCHES.get(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Historical batch not found")
+        if job.get("status") in ("queued", "running"):
+            raise HTTPException(status_code=409, detail="Batch is still running")
+        failure_dates = [x.get("date") for x in job.get("failures", [])]
+        dates = [d for d in requested if d in failure_dates] if requested else failure_dates
+        if not dates:
+            raise HTTPException(status_code=400, detail="There are no failed dates to retry")
+        job["failures"] = [x for x in job.get("failures", []) if x.get("date") not in dates]
+        job["retry_count"] = int(job.get("retry_count") or 0) + 1
+        job["status"] = "queued"
+        job["finished_at"] = None
+        job["current_progress"] = f"Queued {len(dates)} failed date(s) for retry."
+        _nfl_batch_persist(job)
+    asyncio.create_task(_nfl_run_historical_batch(job_id))
+    return {"job": _nfl_batch_public(job)}
 
 # ── NFL Game Predictor matchup history ─────────────────────────────────────────
 # This is free nfl-verse schedule data only — it does not touch the Odds API.
@@ -1613,6 +2033,17 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False) -> 
         # 2. Match Odds API event IDs
         _p(f"Matching {len(espn_games)} games with sportsbook events…")
         espn_games = await get_odds_events(date_str, espn_games)
+        if simulate:
+            unmatched = [g.get("game") or "Unknown game" for g in espn_games if not g.get("id")]
+            if unmatched:
+                return {
+                    "picks": [], "all": [], "games": len(espn_games),
+                    "error": (
+                        "Historical event matching was incomplete for "
+                        + ", ".join(unmatched[:4])
+                        + (" and more." if len(unmatched) > 4 else ".")
+                    ),
+                }
 
         # 3. Fetch prop lines per game
         all_lines = []
@@ -1643,6 +2074,26 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False) -> 
         else:
             msg = "No prop lines available yet — check back closer to game time"
         return {"picks":[],"all":[],"games":len(espn_games),"error":msg}
+    if simulate:
+        uncovered = []
+        for game in espn_games:
+            home = game.get("home_abbr", "") or _name_to_abbr(game.get("home_team", ""))
+            away = game.get("away_abbr", "") or _name_to_abbr(game.get("away_team", ""))
+            covered = any(
+                line.get("home_abbr") == home and line.get("away_abbr") == away
+                for line in all_lines
+            )
+            if not covered:
+                uncovered.append(game.get("game") or f"{away} at {home}")
+        if uncovered:
+            return {
+                "picks": [], "all": [], "games": len(espn_games),
+                "error": (
+                    "Archived prop coverage was incomplete for "
+                    + ", ".join(uncovered[:4])
+                    + (" and more." if len(uncovered) > 4 else ".")
+                ),
+            }
 
     # Sportsbook-listed players are the expected game lineup. Stamp each one
     # with ESPN's current post-cut team so Week 1 trades/free-agent moves do not
@@ -1783,8 +2234,12 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False) -> 
         result["simulation"] = True
         result["historicalTrackRecord"] = _nfl_historical_replay_payload(
             result, espn_games, _nfl_box_from_stats_rows(target_rows))
-        result["historical_saved"] = _nfl_save_historical_replay(
+        historical_saved = _nfl_save_historical_replay(
             date_str, result["historicalTrackRecord"])
+        result["historical_saved"] = historical_saved
+        result["historicalSaved"] = historical_saved
+        if not historical_saved:
+            result["error"] = "Historical replay was analyzed but could not be saved to Historical Analysis."
         result["simulationNotice"] = (
             "Point-in-time historical replay: player-form and Game Predictor "
             f"inputs use only data available before {date_str}. Archived sportsbook "
@@ -1860,6 +2315,25 @@ def _token_email(token: str) -> str:
 
 def _is_admin_token(token: str) -> bool:
     return bool(_ADMIN_EMAILS) and _token_email(token) in _ADMIN_EMAILS
+
+def _nfl_batch_admin_ok(request: Request, token: str = "", admin: str = "") -> bool:
+    """Accept an admin hub JWT or the existing internal admin token.
+
+    The internal token is supported through the header as well as the legacy
+    admin query/body value so the season controls work in the same admin
+    session that already reveals the NFL admin UI.
+    """
+    tok = token or request.headers.get("Authorization", "").replace("Bearer ", "").strip()
+    if _is_admin_token(tok):
+        return True
+    import hmac
+    secret = os.environ.get("INTERNAL_API_TOKEN", "")
+    supplied = (
+        request.headers.get("X-Internal-Token", "")
+        or admin
+        or request.query_params.get("admin", "")
+    )
+    return bool(secret and supplied) and hmac.compare_digest(supplied, secret)
 
 _CRON_BUSY_NFL = False
 
@@ -3200,9 +3674,19 @@ async def index(admin: str = "", token: str = ""):
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     is_admin = (bool(admin) and admin == os.environ.get("INTERNAL_API_TOKEN", "__none__")) or _is_admin_token(token)
     js_flag = "true" if is_admin else "false"
-    html = (HTML.replace("__TODAY__", today)
-            .replace("__LAST_SEASON__", str(_cur_season - 1))
-            .replace("</head>", f"<script>window.IS_ADMIN = {js_flag};</script></head>", 1))
+    now = datetime.now(timezone.utc)
+    latest_completed = now.year - 1 if now.month >= 3 else now.year - 2
+    season_options = "".join(
+        f'<option value="{year}">{year}–{str(year + 1)[-2:]}</option>'
+        for year in NFL_SEASONS if year <= latest_completed
+    )
+    html = (
+        HTML.replace("__TODAY__", today)
+        .replace("__LAST_SEASON__", str(_cur_season - 1))
+        .replace("__NFL_SEASON_OPTIONS__", season_options)
+        .replace("__NFL_BASE_PATH__", json.dumps(os.environ.get("BASE_PATH", "").rstrip("/")))
+        .replace("</head>", f"<script>window.IS_ADMIN = {js_flag};</script></head>", 1)
+    )
     return HTMLResponse(html)
 
 # ── HTML ───────────────────────────────────────────────────────────────────────
@@ -3241,12 +3725,33 @@ input[type=date]::-webkit-calendar-picker-indicator{filter:invert(1);opacity:.7;
 .btn:hover{background:#fbbf24;transform:translateY(-1px);box-shadow:0 4px 20px rgba(245,158,11,.4)}
 .btn:disabled{background:#2a2a2a;color:#4b5563;cursor:not-allowed;transform:none;box-shadow:none}
 .status-msg{margin-top:14px;color:#6b7280;font-size:13px;min-height:20px}
+.nfl-batch-card{text-align:left;border-color:#78350f;background:linear-gradient(145deg,#19130e,#161616)}
+.nfl-batch-card h3{font-family:'Playfair Display',serif;color:#fbbf24;font-size:1.35rem;margin-bottom:6px}
+.nfl-batch-copy{color:#a8a29e;font-size:.78rem;line-height:1.55;margin-bottom:16px}
+.nfl-batch-controls{display:flex;align-items:end;gap:12px;flex-wrap:wrap}
+.nfl-batch-controls label{display:flex;flex-direction:column;gap:5px;color:#a8a29e;font-size:.7rem;font-weight:800;text-transform:uppercase;letter-spacing:.08em}
+.nfl-batch-controls select{min-width:150px}
+.nfl-batch-metrics{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}
+.nfl-batch-metric{background:#0e0e0e;border:1px solid #2d241d;border-radius:9px;padding:9px 12px;min-width:118px}
+.nfl-batch-metric .k{color:#78716c;font-size:.62rem;text-transform:uppercase;letter-spacing:.07em;font-weight:800}
+.nfl-batch-metric .v{color:#f5f5f4;font-size:1.05rem;font-weight:900;margin-top:3px}
+.nfl-batch-meter{height:9px;background:#292524;border-radius:8px;overflow:hidden;margin:15px 0 8px}
+.nfl-batch-meter>div{height:100%;width:0;background:linear-gradient(90deg,#f59e0b,#4ade80);transition:width .25s}
+.nfl-batch-status{color:#d6d3d1;font-size:.78rem;min-height:20px}
+.nfl-batch-note{color:#a8a29e;font-size:.7rem;line-height:1.5;margin-top:8px}
+.nfl-batch-list{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+.nfl-batch-date{border-radius:7px;padding:5px 8px;font-family:monospace;font-size:.68rem}
+.nfl-batch-done{background:rgba(22,101,52,.22);border:1px solid rgba(74,222,128,.28);color:#86efac}
+.nfl-batch-fail{background:rgba(127,29,29,.2);border:1px solid rgba(248,113,113,.32);color:#fca5a5;display:flex;align-items:center;gap:7px}
+.nfl-batch-fail button{background:#7f1d1d;color:#fecaca;border:0;border-radius:5px;padding:3px 6px;font-size:.62rem;font-weight:800;cursor:pointer}
+.nfl-batch-subhead{color:#a8a29e;font-size:.66rem;font-weight:900;text-transform:uppercase;letter-spacing:.09em;margin-top:15px}
 .spinner{display:inline-block;width:13px;height:13px;border:2px solid rgba(245,158,11,.3);border-top-color:#f59e0b;border-radius:50%;animation:spin .7s linear infinite;margin-right:6px;vertical-align:middle}
 @keyframes spin{to{transform:rotate(360deg)}}
 footer{text-align:center;padding:32px 24px;color:#4b5563;font-size:.78rem;border-top:1px solid #1c1c1c;margin-top:24px;font-family:'Source Sans Pro',sans-serif}
 .ft-logo{font-family:'Playfair Display',serif;color:#f59e0b;font-weight:700;font-size:.95rem;margin-bottom:6px}
 .admin-only{display:none !important}
 body.is-admin .admin-only{display:inline-block !important}
+body.is-admin #nfl-season-batch-card{display:block !important}
 #parlayCard{display:none}
 body.is-admin #parlayCard{display:block}
 /* chips + sections + games */
@@ -3420,6 +3925,28 @@ tr:last-child td{border-bottom:none}
       <div id="nflSeasonStatus" style="margin-top:10px;color:#9ca3af;font-size:.78rem;line-height:1.5"></div>
     </div>
   </div>
+  <div class="card admin-only nfl-batch-card" id="nfl-season-batch-card">
+    <h3>Run Full Season Historical Analysis</h3>
+    <div class="nfl-batch-copy">
+      Replays every completed game date one at a time using the existing point-in-time
+      filter. Results are saved to <strong style="color:#fbbf24">Historical Analysis</strong>
+      only and never enter the official Track Record.
+    </div>
+    <div class="nfl-batch-controls">
+      <label>Season
+        <select id="nflBatchSeason" class="date-input" onchange="loadNflBatchEstimate()">
+          __NFL_SEASON_OPTIONS__
+        </select>
+      </label>
+      <button class="btn" id="nflBatchStart" onclick="startNflBatch()" disabled>Analyze Full Season</button>
+      <button class="btn" id="nflBatchRetry" onclick="retryNflBatch()" style="display:none;background:#7c2d12;color:#fff">Retry Failed Dates</button>
+    </div>
+    <div id="nflBatchEstimate" class="nfl-batch-metrics"></div>
+    <div id="nflBatchEstimateNote" class="nfl-batch-note">Loading season size before any Odds API request…</div>
+    <div id="nflBatchMeter" class="nfl-batch-meter" style="display:none"><div></div></div>
+    <div id="nflBatchStatus" class="nfl-batch-status"></div>
+    <div id="nflBatchDates"></div>
+  </div>
   <div class="card" id="parlayCard" style="text-align:center;max-width:600px;margin:0 auto 16px">
     <h2 style="font-family:'Playfair Display',serif;font-size:1.3rem;font-weight:700;color:#fff;margin-bottom:6px">🎰 Auto Parlay Builder <span style="font-size:.7rem;color:#777;font-family:sans-serif">admin only</span></h2>
     <p style="font-size:.74rem;color:#888;margin-bottom:14px">Best available legs from today&#39;s board — priced odds combined</p>
@@ -3465,7 +3992,7 @@ tr:last-child td{border-bottom:none}
     </div>
     <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:14px">
       <label style="color:#9ca3af;font-size:.78rem;font-weight:700;text-transform:uppercase;letter-spacing:.1em">Record</label>
-      <select id="nflTrkSource" class="date-input" onchange="renderNflTrackDay();renderNflGpRecord()">
+      <select id="nflTrkSource" class="date-input" onchange="nflTrkSourceChanged()">
         <option value="official">Official</option>
         <option value="historical">Historical Analysis</option>
       </select>
@@ -3500,6 +4027,18 @@ tr:last-child td{border-bottom:none}
 </div>
 <script>
 
+window.NFL_BASE_PATH=__NFL_BASE_PATH__;
+if(window.NFL_BASE_PATH){
+  (function(){
+    var nativeFetch=window.fetch.bind(window);
+    window.fetch=function(resource,options){
+      if(typeof resource==='string'&&resource.indexOf('/api/')===0){
+        resource=window.NFL_BASE_PATH+resource;
+      }
+      return nativeFetch(resource,options);
+    };
+  })();
+}
 
 var _nflKey='__mpa_token';
 var _nflParams=new URLSearchParams(window.location.search);
@@ -3507,8 +4046,171 @@ var _nflUrlTok=_nflParams.get('token');
 if(_nflUrlTok){localStorage.setItem(_nflKey,_nflUrlTok);window.history.replaceState({},'',window.location.pathname);}
 var _nflTok=localStorage.getItem(_nflKey)||'';
 if(!_nflTok){window.location.href='https://moneypicksarena.com';}
-function _applyAdmin(){if(window.IS_ADMIN){document.body&&document.body.classList.add('is-admin');}else{if(_nflTok){fetch('/api/whoami?token='+encodeURIComponent(_nflTok)).then(function(r){return r.json();}).then(function(d){if(d&&d.is_admin){window.IS_ADMIN=true;document.body&&document.body.classList.add('is-admin');}}).catch(function(){});}}}
+var _nflAdminParam=_nflParams.get('admin')||'';
+function _applyAdmin(){if(window.IS_ADMIN){document.body&&document.body.classList.add('is-admin');initNflBatchPanel();}else{if(_nflTok){fetch('/api/whoami?token='+encodeURIComponent(_nflTok)).then(function(r){return r.json();}).then(function(d){if(d&&d.is_admin){window.IS_ADMIN=true;document.body&&document.body.classList.add('is-admin');initNflBatchPanel();}}).catch(function(){});}}}
 if(document.readyState==='loading'){document.addEventListener('DOMContentLoaded',_applyAdmin);}else{_applyAdmin();}
+
+// ===== Admin Full-Season Historical Replay =====
+var _nflBatchId=localStorage.getItem('__nfl_hist_batch_id')||'';
+var _nflBatchEstimate=null,_nflBatchTimer=null,_nflBatchInit=false,_nflBatchFinalLoaded='';
+function _nflBatchHeaders(json){
+  var headers={Authorization:'Bearer '+_nflTok};
+  if(_nflAdminParam)headers['X-Internal-Token']=_nflAdminParam;
+  if(json)headers['Content-Type']='application/json';
+  return headers;
+}
+function _nflBatchBody(extra){
+  return Object.assign({},extra||{});
+}
+function _nflBatchMetric(label,value){
+  return '<div class="nfl-batch-metric"><div class="k">'+_esc(label)+'</div><div class="v">'+_esc(value)+'</div></div>';
+}
+function initNflBatchPanel(){
+  if(!window.IS_ADMIN)return;
+  var sel=document.getElementById('nflBatchSeason');
+  if(!sel)return;
+  if(!_nflBatchInit){
+    _nflBatchInit=true;
+    if(sel.options.length)sel.selectedIndex=sel.options.length-1;
+  }
+  if(_nflBatchId) pollNflBatch();
+  else loadNflBatchEstimate();
+}
+async function loadNflBatchEstimate(){
+  var sel=document.getElementById('nflBatchSeason'),btn=document.getElementById('nflBatchStart');
+  var metrics=document.getElementById('nflBatchEstimate'),note=document.getElementById('nflBatchEstimateNote');
+  if(!sel||!btn||!metrics||!note)return;
+  btn.disabled=true;_nflBatchEstimate=null;
+  metrics.innerHTML='';
+  note.innerHTML='<span class="spinner"></span>Checking ESPN season dates. This preflight does not use the Odds API.';
+  try{
+    var r=await fetch('/api/nfl/historical-batch/estimate?season='+encodeURIComponent(sel.value),{
+      headers:_nflBatchHeaders(false)
+    });
+    var d=await r.json().catch(function(){return{};});
+    if(!r.ok)throw new Error(d.detail||('Estimate failed ('+r.status+')'));
+    _nflBatchEstimate=d;
+    metrics.innerHTML=_nflBatchMetric('Game dates',String(d.date_count))
+      +_nflBatchMetric('Scheduled games',String(d.games_total))
+      +_nflBatchMetric('Odds API maximum',String(d.estimated_odds_api_calls)+' calls');
+    note.textContent=d.odds_bound_note;
+    btn.disabled=!d.date_count;
+  }catch(e){
+    note.textContent='Could not estimate this season: '+(e.message||'Unknown error');
+  }
+}
+async function startNflBatch(){
+  if(!_nflBatchEstimate)return;
+  var season=_nflBatchEstimate.season;
+  var bound=_nflBatchEstimate.estimated_odds_api_calls||0;
+  var ok=confirm('Analyze the full '+season+' NFL season?\\n\\nThis will process '
+    +_nflBatchEstimate.date_count+' game dates sequentially. Worst-case Odds API usage is '
+    +bound+' historical requests; existing caches reduce that number.\\n\\nResults go only to Historical Analysis.');
+  if(!ok)return;
+  var btn=document.getElementById('nflBatchStart');
+  btn.disabled=true;btn.innerHTML='<span class="spinner"></span>Starting…';
+  try{
+    var r=await fetch('/api/nfl/historical-batch',{
+      method:'POST',headers:_nflBatchHeaders(true),
+      body:JSON.stringify(_nflBatchBody({season:season}))
+    });
+    var d=await r.json().catch(function(){return{};});
+    if(!r.ok&&r.status!==409)throw new Error(d.detail||('Start failed ('+r.status+')'));
+    var job=d.job||{};
+    _nflBatchId=job.job_id||'';
+    if(!_nflBatchId)throw new Error('Batch did not return a job ID');
+    localStorage.setItem('__nfl_hist_batch_id',_nflBatchId);
+    renderNflBatch(job);
+    clearInterval(_nflBatchTimer);
+    _nflBatchTimer=setInterval(pollNflBatch,2500);
+  }catch(e){
+    document.getElementById('nflBatchStatus').textContent='Could not start batch: '+(e.message||'Unknown error');
+    btn.disabled=false;
+  }finally{
+    btn.textContent='Analyze Full Season';
+  }
+}
+async function pollNflBatch(){
+  if(!_nflBatchId)return;
+  try{
+    var r=await fetch('/api/nfl/historical-batch/'+encodeURIComponent(_nflBatchId),{
+      headers:_nflBatchHeaders(false)
+    });
+    var d=await r.json().catch(function(){return{};});
+    if(!r.ok){
+      if(r.status===404){
+        localStorage.removeItem('__nfl_hist_batch_id');_nflBatchId='';
+        clearInterval(_nflBatchTimer);
+        loadNflBatchEstimate();
+      }
+      throw new Error(d.detail||('Status failed ('+r.status+')'));
+    }
+    renderNflBatch(d);
+    if(d.status==='running'||d.status==='queued'){
+      clearInterval(_nflBatchTimer);
+      _nflBatchTimer=setInterval(pollNflBatch,2500);
+    }else{
+      clearInterval(_nflBatchTimer);
+    }
+  }catch(e){
+    var status=document.getElementById('nflBatchStatus');
+    if(status)status.textContent='Batch status unavailable: '+(e.message||'Unknown error');
+  }
+}
+function renderNflBatch(d){
+  if(!d)return;
+  var total=Number(d.total_dates)||0,done=(d.completed_dates||[]).length,failed=(d.failures||[]).length;
+  var processed=done+failed,pct=total?Math.min(100,Math.round(processed/total*100)):0;
+  var meter=document.getElementById('nflBatchMeter'),status=document.getElementById('nflBatchStatus');
+  var dates=document.getElementById('nflBatchDates'),retry=document.getElementById('nflBatchRetry');
+  var start=document.getElementById('nflBatchStart');
+  if(meter){meter.style.display='block';var fill=meter.querySelector('div');if(fill)fill.style.width=pct+'%';}
+  if(status){
+    var now=d.current_date?(' · '+d.current_date):'';
+    status.textContent=processed+' of '+total+' dates processed'+now+' · '+(d.current_progress||d.status||'');
+  }
+  if(start)start.disabled=d.status==='running'||d.status==='queued';
+  if(retry)retry.style.display=failed&&d.status!=='running'&&d.status!=='queued'?'inline-block':'none';
+  if(dates){
+    var doneHtml=(d.completed_dates||[]).map(function(x){
+      return '<span class="nfl-batch-date nfl-batch-done">'+_esc(x)+'</span>';
+    }).join('');
+    var failHtml=(d.failures||[]).map(function(x){
+      return '<span class="nfl-batch-date nfl-batch-fail" title="'+_esc(x.error||'Failed')+'">'
+        +_esc(x.date)+' <button onclick="retryNflBatch(&#39;'+_esc(x.date)+'&#39;)">Retry</button></span>';
+    }).join('');
+    dates.innerHTML=(doneHtml?'<div class="nfl-batch-subhead">Completed dates</div><div class="nfl-batch-list">'+doneHtml+'</div>':'')
+      +(failHtml?'<div class="nfl-batch-subhead">Failed dates</div><div class="nfl-batch-list">'+failHtml+'</div>':'');
+  }
+  if((d.status==='completed'||d.status==='failed')&&_nflBatchFinalLoaded!==d.job_id){
+    _nflBatchFinalLoaded=d.job_id;
+    _nflTrkReplayDate='';
+    var src=document.getElementById('nflTrkSource'),period=document.getElementById('nflTrkPeriod');
+    var trkDate=document.getElementById('nflTrkDate');
+    if(src)src.value='historical';
+    if(period)period.value='season';
+    if(trkDate&&(d.completed_dates||[]).length)trkDate.value=d.completed_dates[d.completed_dates.length-1];
+    loadNflTrackRecord(false);
+  }
+}
+async function retryNflBatch(date){
+  if(!_nflBatchId)return;
+  var body=date?{dates:[date]}:{};
+  try{
+    var r=await fetch('/api/nfl/historical-batch/'+encodeURIComponent(_nflBatchId)+'/retry',{
+      method:'POST',headers:_nflBatchHeaders(true),
+      body:JSON.stringify(_nflBatchBody(body))
+    });
+    var d=await r.json().catch(function(){return{};});
+    if(!r.ok)throw new Error(d.detail||('Retry failed ('+r.status+')'));
+    _nflBatchFinalLoaded='';
+    renderNflBatch(d.job||d);
+    clearInterval(_nflBatchTimer);
+    _nflBatchTimer=setInterval(pollNflBatch,2500);
+  }catch(e){
+    document.getElementById('nflBatchStatus').textContent='Could not retry: '+(e.message||'Unknown error');
+  }
+}
 
 // ===== Admin Auto Parlay Builder (NFL) =====
 function _amToDec(a){var s=String(a==null?'':a).replace('+','').trim();var n=parseFloat(s);if(!n||isNaN(n))return null;return n>0?1+n/100:1+100/Math.abs(n);}
@@ -4604,6 +5306,24 @@ function _nflWeekKey(ds){
 function _nflTrkSource(){
   var el=document.getElementById('nflTrkSource');
   return el&&el.value==='historical'?'historical':'official';
+}
+function nflTrkSourceChanged(){
+  if(_nflTrkSource()==='historical'&&_nflTrkData){
+    var dates=_nflTrkData.historical_dates||[];
+    if(dates.length){
+      var latest=dates.reduce(function(best,row){
+        var ds=String(row&&row.date||'');
+        return ds>best?ds:best;
+      },'');
+      var dateEl=document.getElementById('nflTrkDate');
+      var periodEl=document.getElementById('nflTrkPeriod');
+      if(dateEl&&latest) dateEl.value=latest;
+      if(periodEl) periodEl.value='season';
+      _nflTrkDayName();
+    }
+  }
+  renderNflTrackDay();
+  renderNflGpRecord();
 }
 function _nflTrkPeriod(){
   var el=document.getElementById('nflTrkPeriod');
