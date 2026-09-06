@@ -1639,7 +1639,8 @@ def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str) -> Optional[Dict
 
     return {
         # identity
-        "name": name, "pid": pid, "team": game_team, "opponent": opp_abbr or "--",
+        "name": name, "pid": pid, "position": pl.get("roster_position", ""),
+        "team": game_team, "opponent": opp_abbr or "--",
         "homeRoad": home_road, "side": side, "head": head, "game": pl.get("game",""),
         "game_start": pl.get("game_start",""),
         # market
@@ -3896,12 +3897,33 @@ tr:last-child td{border-bottom:none}
 .nfl-coach-play>summary::-webkit-details-marker{display:none}
 .nfl-coach-play>summary:after{content:"Expand";color:#38bdf8;font-size:.61rem;text-transform:uppercase}
 .nfl-coach-play[open]>summary:after{content:"Collapse"}
+.nfl-coach-ident{display:flex;align-items:center;gap:10px;min-width:0}
+.nfl-coach-avatar{position:relative;width:42px;height:42px;flex:0 0 42px;border-radius:50%;background:#1e293b;border:1px solid #475569;display:flex;align-items:center;justify-content:center;color:#cbd5e1;font-size:.7rem;font-weight:950}
+.nfl-coach-avatar>img:first-of-type{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;border-radius:50%}
+.nfl-coach-avatar .team-logo{position:absolute;right:-4px;bottom:-3px;width:18px;height:18px;object-fit:contain;background:#0b1220;border-radius:50%;padding:1px}
+.nfl-coach-name{font-size:.82rem;font-weight:950;color:#fff}
+.nfl-coach-meta{display:flex;gap:6px;align-items:center;flex-wrap:wrap;color:#94a3b8;font-size:.62rem;margin-top:3px}
+.nfl-coach-pos{color:#7dd3fc;border:1px solid rgba(56,189,248,.35);background:rgba(14,116,144,.14);border-radius:999px;padding:2px 6px;font-weight:950}
+.nfl-coach-pickmeta{text-align:right;color:#e2e8f0;white-space:nowrap;font-size:.72rem;line-height:1.45}
 .nfl-coach-copy{color:#94a3b8;font-size:.7rem;line-height:1.5;margin-top:8px}
 .nfl-coach-stats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px;margin-top:10px}
 .nfl-coach-stat{background:#111827;border:1px solid #263449;border-radius:8px;padding:8px}
 .nfl-coach-stat .k{color:#64748b;font-size:.56rem;font-weight:900;text-transform:uppercase}
 .nfl-coach-stat .v{color:#f8fafc;font-size:.75rem;font-weight:900;margin-top:3px}
-@media(max-width:620px){.nfl-coach-row{display:block}.nfl-coach-send{width:100%;padding:11px;margin-top:8px}.nfl-coach-stats{grid-template-columns:repeat(2,minmax(0,1fr))}}
+.nfl-coach-accord{margin-top:10px;border-top:1px solid #1e293b}
+.nfl-coach-accord>details{border-bottom:1px solid #1e293b}
+.nfl-coach-accord>details>summary{display:flex;justify-content:space-between;align-items:center;list-style:none;cursor:pointer;padding:11px 2px;color:#e2e8f0;font-size:.68rem;font-weight:950}
+.nfl-coach-accord>details>summary::-webkit-details-marker{display:none}
+.nfl-coach-accord>details>summary:after{content:"+";color:#38bdf8;font-size:.9rem}
+.nfl-coach-accord>details[open]>summary:after{content:"−"}
+.nfl-coach-accord-body{padding:0 2px 12px;color:#94a3b8;font-size:.67rem;line-height:1.5}
+.nfl-coach-ratebar{height:4px;background:#1e293b;border-radius:99px;overflow:hidden;margin-top:8px}
+.nfl-coach-ratebar span{display:block;height:100%;background:#38bdf8;border-radius:99px}
+.nfl-coach-games{display:flex;gap:6px;flex-wrap:wrap;margin-top:10px}
+.nfl-coach-game{min-width:48px;background:#0b1220;border:1px solid #263449;border-radius:7px;padding:6px;text-align:center}
+.nfl-coach-game.hit{border-color:rgba(74,222,128,.45)}.nfl-coach-game.miss{border-color:rgba(248,113,113,.4)}
+.nfl-coach-game .d{color:#64748b;font-size:.52rem}.nfl-coach-game .v{font-weight:950;margin-top:2px}.nfl-coach-game.hit .v{color:#4ade80}.nfl-coach-game.miss .v{color:#f87171}
+@media(max-width:620px){.nfl-coach-row{display:block}.nfl-coach-send{width:100%;padding:11px;margin-top:8px}.nfl-coach-stats{grid-template-columns:repeat(2,minmax(0,1fr))}.nfl-coach-play>summary{align-items:flex-start}.nfl-coach-pickmeta{white-space:normal;text-align:left}.nfl-coach-play>summary:after{display:none}}
 </style>
 </head>
 <body>
@@ -4824,7 +4846,7 @@ function _nflCoachProps(){
     var key=String(p.pid||p.name)+'|'+String(p.mkt||p.label)+'|'+side+'|'+line+'|'+odds;
     if(seen[key])return;seen[key]=1;
     out.push({
-      player:p.name||'',team:p.team||'',opponent:p.opponent||p.opp||'',
+      player:p.name||'',position:p.position||p.roster_position||'',team:p.team||'',opponent:p.opponent||p.opp||'',
       market:p.mkt||p.label||'NFL Prop',side:side,line:Number(line),odds:Number(odds),
       oppositeOdds:_nflSideOdds(p,side==='OVER'?'UNDER':'OVER'),
       appProb:Math.max(0,Math.min(100,prob)),implied:implied,
@@ -4880,6 +4902,79 @@ function _nflCoachFamily(m){
   if(m.indexOf('kick')>=0||m.indexOf('fg made')>=0)return 'kick';
   return '';
 }
+function _nflCoachHit(side,value,line){
+  var v=Number(value),l=Number(line);if(!isFinite(v)||!isFinite(l)||v===l)return null;
+  return side==='UNDER'?v<l:v>l;
+}
+function _nflCoachLogRate(p,count){
+  var games=(p.source.glog||[]).slice(0,count),hits=0,total=0;
+  games.forEach(function(g){var hit=_nflCoachHit(p.side,g.v,p.line);if(hit==null)return;total++;if(hit)hits++;});
+  return {hits:hits,total:total,rate:total?(hits/total*100):null};
+}
+function _nflCoachRateTile(label,rate,hits,total){
+  var shown=rate!=null&&Number(total)>0,pct=shown?Math.max(0,Math.min(100,Number(rate))):0;
+  return '<div class="nfl-coach-stat"><div class="k">'+_esc(label)+'</div><div class="v">'+(shown?Number(rate).toFixed(0)+'% · '+hits+'/'+total:'N/A')+'</div><div class="nfl-coach-ratebar"><span style="width:'+pct+'%"></span></div></div>';
+}
+function _nflCoachRateTiles(p){
+  var s=p.source||{},l5=_nflCoachLogRate(p,5),l10=_nflCoachLogRate(p,10);
+  var venueRate=p.side==='UNDER'?(s.totB?100-Number(s.rateB||0):null):Number(s.rateB);
+  var venueHits=p.side==='UNDER'?Math.max(0,Number(s.totB||0)-Number(s.hitsB||0)):Number(s.hitsB||0);
+  var bookRate=p.side==='UNDER'?(s.vsLineTotal?100-Number(s.vsLineRate||0):null):Number(s.vsLineRate);
+  var bookHits=p.side==='UNDER'?Math.max(0,Number(s.vsLineTotal||0)-Number(s.vsLineHits||0)):Number(s.vsLineHits||0);
+  var oppRate=p.side==='UNDER'?(s.totA?100-Number(s.rateA||0):null):Number(s.rateA);
+  var oppHits=p.side==='UNDER'?Math.max(0,Number(s.totA||0)-Number(s.hitsA||0)):Number(s.hitsA||0);
+  var oppositeRate=l10.total?100-l10.rate:null,oppositeHits=l10.total-l10.hits;
+  return '<div class="nfl-coach-stats">'
+    +_nflCoachRateTile('L5',l5.rate,l5.hits,l5.total)
+    +_nflCoachRateTile('L10',l10.rate,l10.hits,l10.total)
+    +_nflCoachRateTile(s.homeRoad==='H'?'Home split':(s.homeRoad==='R'?'Away split':'Venue split'),venueRate,venueHits,s.totB)
+    +_nflCoachRateTile('vs Book Line',bookRate,bookHits,s.vsLineTotal)
+    +_nflCoachRateTile('vs Opponent',oppRate,oppHits,s.totA)
+    +_nflCoachRateTile(p.side==='OVER'?'Under L10':'Over L10',oppositeRate,oppositeHits,l10.total)
+    +'</div>';
+}
+function _nflCoachGameTiles(p){
+  var games=(p.source.glog||[]).slice(0,10);
+  if(!games.length)return '<div style="margin-top:9px">No game-by-game log is available.</div>';
+  return '<div class="nfl-coach-games">'+games.map(function(g){
+    var hit=_nflCoachHit(p.side,g.v,p.line),cls=hit==null?'':(hit?'hit':'miss');
+    return '<div class="nfl-coach-game '+cls+'"><div class="d">'+_esc(g.d)+(g.o?' · '+_esc(g.o):'')+'</div><div class="v">'+Number(g.v).toFixed(1)+'</div></div>';
+  }).join('')+'</div>';
+}
+function _nflCoachAccordions(p){
+  var s=p.source||{},opp=_nflCoachNum(p.oppositeOdds),oppImp=opp!=null?_nflCoachImplied(opp):null;
+  var other=p.side==='OVER'?'UNDER':'OVER',projection=p.projection!=null&&isFinite(p.projection)?p.projection.toFixed(2):'N/A';
+  var avg=s.avg!=null&&isFinite(Number(s.avg))?Number(s.avg).toFixed(2):'N/A';
+  var gap=p.projection!=null&&isFinite(p.projection)?Number(p.projection)-Number(p.line):null;
+  var venue=s.homeRoad==='H'?'Home':(s.homeRoad==='R'?'Away':'N/A');
+  var def=(s.defRank!=null?('#'+s.defRank+' '+_esc(s.defLbl||'defense')):'N/A');
+  var defAdj=s.defAdj!=null?((Number(s.defAdj)>=0?'+':'')+Number(s.defAdj).toFixed(1)+'%'):'N/A';
+  var gameTime=s.game_start?new Date(s.game_start).toLocaleString():'N/A';
+  return '<div class="nfl-coach-accord">'
+    +'<details><summary>Odds Comparison</summary><div class="nfl-coach-accord-body"><div class="nfl-coach-stats">'
+    +'<div class="nfl-coach-stat"><div class="k">Selected side</div><div class="v">'+p.side+' '+_nflCoachOdds(p.odds)+' · '+p.implied.toFixed(1)+'% implied</div></div>'
+    +'<div class="nfl-coach-stat"><div class="k">Other side</div><div class="v">'+(opp!=null?other+' '+_nflCoachOdds(opp)+' · '+oppImp.toFixed(1)+'% implied':'N/A')+'</div></div>'
+    +'<div class="nfl-coach-stat"><div class="k">Source</div><div class="v">'+_esc(p.book||'Sportsbook line')+'</div></div>'
+    +'</div><div style="margin-top:7px">Only genuine prices carried by the loaded NFL prop are shown. This is not a full multi-book screen unless the source provides those books.</div></div></details>'
+    +'<details open><summary>Hit Rate Chart</summary><div class="nfl-coach-accord-body">'+_nflCoachRateTiles(p)+_nflCoachGameTiles(p)+'</div></details>'
+    +'<details><summary>Line Movement</summary><div class="nfl-coach-accord-body">Line movement is unavailable because the NFL app does not store timestamped opening and closing prices. No movement or sharp-money claim is generated.</div></details>'
+    +'<details><summary>Key Stats</summary><div class="nfl-coach-accord-body"><div class="nfl-coach-stats">'
+    +'<div class="nfl-coach-stat"><div class="k">Projection</div><div class="v">'+projection+'</div></div>'
+    +'<div class="nfl-coach-stat"><div class="k">Recent average</div><div class="v">'+avg+'</div></div>'
+    +'<div class="nfl-coach-stat"><div class="k">Projection gap</div><div class="v">'+(gap!=null?_nflCoachSigned(gap):'N/A')+'</div></div>'
+    +'<div class="nfl-coach-stat"><div class="k">App probability</div><div class="v">'+p.appProb.toFixed(1)+'%</div></div>'
+    +'<div class="nfl-coach-stat"><div class="k">Implied probability</div><div class="v">'+p.implied.toFixed(1)+'%</div></div>'
+    +'<div class="nfl-coach-stat"><div class="k">Coach Edge</div><div class="v" style="color:'+(p.edge>=0?'#4ade80':'#f87171')+'">'+_nflCoachSigned(p.edge)+' pts</div></div>'
+    +'</div></div></details>'
+    +'<details><summary>Player &amp; Team Stats</summary><div class="nfl-coach-accord-body"><div class="nfl-coach-stats">'
+    +'<div class="nfl-coach-stat"><div class="k">Matchup</div><div class="v">'+_esc(p.team)+' vs '+_esc(p.opponent)+'</div></div>'
+    +'<div class="nfl-coach-stat"><div class="k">Venue</div><div class="v">'+venue+'</div></div>'
+    +'<div class="nfl-coach-stat"><div class="k">Opponent defense</div><div class="v">'+def+'</div></div>'
+    +'<div class="nfl-coach-stat"><div class="k">Defense adjustment</div><div class="v">'+defAdj+'</div></div>'
+    +'<div class="nfl-coach-stat"><div class="k">Recent games</div><div class="v">'+(s.glog||[]).length+'</div></div>'
+    +'<div class="nfl-coach-stat"><div class="k">Game time</div><div class="v">'+_esc(gameTime)+'</div></div>'
+    +'</div></div></details></div>';
+}
 function _nflCoachRender(question,rows,total,mode){
   var el=document.getElementById('nflCoachAnswer');if(!el)return;
   el.style.display='block';
@@ -4888,18 +4983,18 @@ function _nflCoachRender(question,rows,total,mode){
     :'I checked '+total+' priced NFL board plays and ranked the matching positive Coach Edge results. Coach Edge is probability edge, not guaranteed monetary profit.';
   if(!rows.length){el.innerHTML='<div class="nfl-coach-question">'+_esc(question)+'</div><div class="nfl-coach-summary">No loaded priced NFL prop matched that request.</div>';return;}
   var cards=rows.map(function(p,i){
-    var opp=_nflCoachNum(p.oppositeOdds),oppImp=opp!=null?_nflCoachImplied(opp):null,other=p.side==='OVER'?'UNDER':'OVER';
-    return '<details class="nfl-coach-play" open><summary><span>'+(i+1)+'. '+_esc(p.player)+' '+p.side+' '+p.line+' '+_esc(p.market)+' ('+_nflCoachOdds(p.odds)+')</span></summary>'
+    var s=p.source||{},head=_esc(s.head||''),logo='https://a.espncdn.com/i/teamlogos/nfl/500/'+_logoAbbr(p.team)+'.png';
+    var venue=s.homeRoad==='H'?'HOME':(s.homeRoad==='R'?'AWAY':'');
+    return '<details class="nfl-coach-play" open><summary><span class="nfl-coach-ident"><span class="nfl-coach-avatar">'+_esc(_initials(p.player))
+      +(head?'<img src="'+head+'" alt="" onerror="this.style.display=\\'none\\'"/>':'')
+      +'<img class="team-logo" src="'+_esc(logo)+'" alt="" onerror="this.style.display=\\'none\\'"/></span>'
+      +'<span><span class="nfl-coach-name">'+(i+1)+'. '+_esc(p.player)+'</span><span class="nfl-coach-meta">'
+      +(p.position?'<span class="nfl-coach-pos">'+_esc(p.position)+'</span>':'')
+      +'<span>'+_esc(p.team)+' vs '+_esc(p.opponent)+'</span>'+(venue?'<span>· '+venue+'</span>':'')+'</span></span></span>'
+      +'<span class="nfl-coach-pickmeta">'+_esc(p.market)+'<br><b style="color:'+(p.side==='OVER'?'#4ade80':'#f87171')+'">'+p.side+' '+p.line+' · '+_nflCoachOdds(p.odds)+'</b></span></summary>'
       +'<div class="nfl-coach-copy">'+(mode==='safe'?'<b style="color:#fbbf24">Safety rank: '+p.implied.toFixed(1)+'% sportsbook-implied.</b> ':'')
       +'App probability '+p.appProb.toFixed(1)+'% vs '+p.implied.toFixed(1)+'% implied = <b style="color:'+(p.edge>=0?'#4ade80':'#f87171')+'">'+_nflCoachSigned(p.edge)+' Coach Edge points</b>.</div>'
-      +'<div class="nfl-coach-stats">'
-      +'<div class="nfl-coach-stat"><div class="k">Selected side</div><div class="v">'+p.side+' '+_nflCoachOdds(p.odds)+' · '+p.implied.toFixed(1)+'% implied</div></div>'
-      +'<div class="nfl-coach-stat"><div class="k">Other side</div><div class="v">'+(opp!=null?other+' '+_nflCoachOdds(opp)+' · '+oppImp.toFixed(1)+'% implied':'N/A')+'</div></div>'
-      +'<div class="nfl-coach-stat"><div class="k">Projection</div><div class="v">'+(p.projection!=null&&isFinite(p.projection)?p.projection.toFixed(2):'N/A')+'</div></div>'
-      +'<div class="nfl-coach-stat"><div class="k">Recent vs line</div><div class="v">'+(p.recentTotal?p.recentRate.toFixed(0)+'% · '+p.recentHits+'/'+p.recentTotal:'N/A')+'</div></div>'
-      +'<div class="nfl-coach-stat"><div class="k">vs Opponent</div><div class="v">'+(p.oppTotal?p.oppRate.toFixed(0)+'% · '+p.oppHits+'/'+p.oppTotal:'N/A')+'</div></div>'
-      +'<div class="nfl-coach-stat"><div class="k">Matchup</div><div class="v">'+_esc(p.team)+' vs '+_esc(p.opponent)+'</div></div>'
-      +'</div></details>';
+      +_nflCoachAccordions(p)+'</details>';
   }).join('');
   el.innerHTML='<div class="nfl-coach-question">'+_esc(question)+'</div><div class="nfl-coach-summary">'+summary+'</div>'+cards;
 }
@@ -4918,6 +5013,12 @@ function askNflCoach(){
     return true;
   });
   rows.sort(f.mode==='safe'?function(a,b){return b.implied-a.implied||b.appProb-a.appProb;}:function(a,b){return b.edge-a.edge||b.appProb-a.appProb;});
+  var seenPlayers={};
+  rows=rows.filter(function(p){
+    var key=String(p.player||'').trim().toLowerCase();
+    if(!key||seenPlayers[key])return false;
+    seenPlayers[key]=1;return true;
+  });
   _nflCoachRender(question,rows.slice(0,f.limit),candidates.length,f.mode);
 }
 function renderResults(d){
