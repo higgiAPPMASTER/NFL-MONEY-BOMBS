@@ -4879,10 +4879,13 @@ function _nflCoachSafest(props){
   return out;
 }
 function _nflCoachParse(question,props){
-  var q=String(question||'').toLowerCase(),f={mode:'edge',limit:5,side:'',market:'',players:[],teams:[],minOdds:null,maxOdds:null};
+  var q=String(question||'').toLowerCase(),words=' '+q.replace(/[^a-z0-9]+/g,' ').replace(/ +/g,' ').trim()+' ';
+  var f={mode:'edge',limit:100,side:'',market:'',marketExact:'',players:[],teams:[],minOdds:null,maxOdds:null};
   if(q.indexOf('safe')>=0||q.indexOf('most likely')>=0||q.indexOf('highest probability')>=0)f.mode='safe';
-  var top=q.match(/top +([0-9]{1,2})/);if(top)f.limit=Math.max(1,Math.min(10,Number(top[1])));
-  if((' '+q+' ').indexOf(' under ')>=0)f.side='UNDER';else if((' '+q+' ').indexOf(' over ')>=0)f.side='OVER';
+  var top=words.match(/ top +([0-9]{1,2}) /);if(top)f.limit=Math.max(1,Math.min(50,Number(top[1])));
+  if(words.indexOf(' under ')>=0)f.side='UNDER';else if(words.indexOf(' over ')>=0)f.side='OVER';
+  var passYardTerms=['passing yards','passing yard','passing yds','passing yd','pass yards','pass yard','pass yds','pass yd'];
+  if(passYardTerms.some(function(term){return q.indexOf(term)>=0;}))f.marketExact='Pass Yds';
   var markets=[['passing','pass'],['pass ','pass'],['rushing','rush'],['rush ','rush'],['receiving','rec'],['reception','rec'],['touchdown','td'],[' td','td'],['tackle','def'],['sack','def'],['defense','def'],['kicking','kick'],['field goal','kick']];
   markets.some(function(x){if(q.indexOf(x[0])>=0){f.market=x[1];return true;}return false;});
   var neg=q.match(/-[0-9]{2,4}/g)||[];if(neg.length>=2){var ns=neg.slice(0,2).map(Number);f.minOdds=Math.min.apply(null,ns);f.maxOdds=Math.max.apply(null,ns);}
@@ -5002,10 +5005,11 @@ function askNflCoachPreset(q){var input=document.getElementById('nflCoachInput')
 function askNflCoach(){
   var input=document.getElementById('nflCoachInput'),question=String(input&&input.value||'').trim();if(!question){if(input)input.focus();return;}
   var props=_nflCoachProps();if(!props.length){_nflCoachRender(question,[],0,'edge');return;}
-  var f=_nflCoachParse(question,props),candidates=f.mode==='safe'?_nflCoachSafest(props):props;
+  var f=_nflCoachParse(question,props),candidates=_nflCoachSafest(props);
   var rows=candidates.filter(function(p){
     if(f.mode!=='safe'&&p.edge<=0)return false;
     if(f.side&&p.side!==f.side)return false;
+    if(f.marketExact&&String(p.market)!==f.marketExact)return false;
     if(f.market&&_nflCoachFamily(p.market)!==f.market)return false;
     if(f.minOdds!=null&&(p.odds<f.minOdds||p.odds>f.maxOdds))return false;
     if(f.players.length&&f.players.indexOf(String(p.player).toLowerCase())<0)return false;
