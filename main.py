@@ -40,6 +40,21 @@ PROP_MARKETS = [
     # kicking
     "player_kicking_points", "player_field_goals",
 ]
+ALT_PROP_MARKET_TO_BASE = {
+    "player_pass_yds_alternate": "player_pass_yds",
+    "player_pass_tds_alternate": "player_pass_tds",
+    "player_pass_completions_alternate": "player_pass_completions",
+    "player_pass_attempts_alternate": "player_pass_attempts",
+    "player_pass_interceptions_alternate": "player_pass_interceptions",
+    "player_rush_yds_alternate": "player_rush_yds",
+    "player_rush_attempts_alternate": "player_rush_attempts",
+    "player_reception_yds_alternate": "player_reception_yds",
+    "player_receptions_alternate": "player_receptions",
+    "player_sacks_alternate": "player_sacks",
+    "player_kicking_points_alternate": "player_kicking_points",
+    "player_field_goals_alternate": "player_field_goals",
+}
+ALT_PROP_MARKETS = list(ALT_PROP_MARKET_TO_BASE)
 PROP_LABELS = {
     "player_pass_yds":"Pass Yds", "player_pass_tds":"Pass TDs",
     "player_pass_completions":"Completions", "player_pass_attempts":"Pass Att",
@@ -208,6 +223,24 @@ def _odds_cache_set(date_key, props, game_lines):
         print(f"[OddsCache] SET nfl/{date_key} ({len(props)} props, {len(game_lines)} games)")
     except Exception as e:
         print(f"[OddsCache] write error: {e}")
+
+_ALT_COACH_TTL = 2 * 3600
+
+def _alt_coach_cache_get(date_key):
+    p = _CACHE_DIR / f"nfl_alt_coach_v1_{date_key}.json"
+    try:
+        if p.exists() and (time.time() - p.stat().st_mtime) < _ALT_COACH_TTL:
+            return json.loads(p.read_text(encoding="utf-8"))
+    except Exception as e:
+        print(f"[AltCoachCache] read error: {e}")
+    return None
+
+def _alt_coach_cache_set(date_key, result):
+    try:
+        (_CACHE_DIR / f"nfl_alt_coach_v1_{date_key}.json").write_text(
+            json.dumps(result, ensure_ascii=False), encoding="utf-8")
+    except Exception as e:
+        print(f"[AltCoachCache] write error: {e}")
 
 # ── nfl_data_py stats loader ───────────────────────────────────────────────────
 _nfl_df = None
@@ -1193,7 +1226,8 @@ async def get_odds_events(date_str: str, espn_games: List[Dict]) -> List[Dict]:
     except Exception as e:
         print(f"[OddsAPI events] {e}"); return espn_games
 
-async def get_prop_lines(event_id: str, date_str: str) -> List[Dict]:
+async def get_prop_lines(event_id: str, date_str: str,
+                         alternate_only: bool = False) -> List[Dict]:
     """Fetch player prop lines for one NFL game. Returns a list of prop dicts.
     Kept as a props-only call (PROP_MARKETS only) so it stays within Odds API
     plan market limits. Game-level lines (h2h/totals) are fetched separately."""
@@ -1202,15 +1236,16 @@ async def get_prop_lines(event_id: str, date_str: str) -> List[Dict]:
     is_past = date_str < today
     try:
         async with httpx.AsyncClient(timeout=20) as c:
+            requested_markets = ALT_PROP_MARKETS if alternate_only else PROP_MARKETS
             if is_past:
                 base = f"{ODDS_BASE}/historical/sports/americanfootball_nfl/events/{event_id}/odds"
                 params = {"apiKey": ODDS_API_KEY, "bookmakers": ODDS_BOOKMAKERS,
-                         "markets": ",".join(PROP_MARKETS), "oddsFormat": "american",
+                         "markets": ",".join(requested_markets), "oddsFormat": "american",
                          "date": f"{date_str}T12:00:00Z"}
             else:
                 base = f"{ODDS_BASE}/sports/americanfootball_nfl/events/{event_id}/odds"
                 params = {"apiKey": ODDS_API_KEY, "bookmakers": ODDS_BOOKMAKERS,
-                         "markets": ",".join(PROP_MARKETS), "oddsFormat": "american"}
+                         "markets": ",".join(requested_markets), "oddsFormat": "american"}
             r = await c.get(base, params=params)
             if not r.is_success:
                 print(f"[OddsAPI props] {event_id} HTTP {r.status_code}")
@@ -1222,8 +1257,10 @@ async def get_prop_lines(event_id: str, date_str: str) -> List[Dict]:
             for bm in data.get("bookmakers", []):
                 bkey = bm.get("key", "")
                 for mkt in bm.get("markets", []):
-                    mk = mkt.get("key", "")
-                    if mk not in PROP_MARKETS: continue
+                    raw_mk = mkt.get("key", "")
+                    if raw_mk not in requested_markets: continue
+                    mk = ALT_PROP_MARKET_TO_BASE.get(raw_mk, raw_mk)
+                    is_alternate = raw_mk in ALT_PROP_MARKET_TO_BASE
                     for oc in mkt.get("outcomes", []):
                         name  = oc.get("description") or oc.get("name", "")
                         side  = oc.get("name", "")
@@ -1238,14 +1275,19 @@ async def get_prop_lines(event_id: str, date_str: str) -> List[Dict]:
                             point = 0.5
                             side  = "Over"
                         if not name or point is None: continue
-                        key = f"{_norm(name)}_{mk}"
+                        key = (
+                            f"{_norm(name)}_{raw_mk}_{float(point):g}"
+                            if is_alternate else f"{_norm(name)}_{mk}")
                         if key not in lines:
                             lines[key] = {"name": name, "market": mk,
                                 "label": PROP_LABELS.get(mk, mk),
                                 "stat_col": PROP_TO_COL.get(mk, ""),
                                 "line": float(point), "over_odds": None, "under_odds": None,
-                                "over_book": None, "under_book": None}
-                        if abs(float(point) - lines[key]["line"]) > 1e-9:
+                                "over_book": None, "under_book": None,
+                                "source_market": raw_mk,
+                                "is_alternate": is_alternate}
+                        if (not is_alternate
+                                and abs(float(point) - lines[key]["line"]) > 1e-9):
                             continue
                         if side == "Over":
                             _take_odds(lines[key], "over_odds", "over_book", price, bkey)
@@ -1648,6 +1690,9 @@ def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str) -> Optional[Dict
         "line": line, "dispLine": line, "realLine": line,
         "realOdds": pl.get("over_odds"), "realUnderOdds": pl.get("under_odds"),
         "over_odds": pl.get("over_odds"), "under_odds": pl.get("under_odds"),
+        "over_book": pl.get("over_book", ""), "under_book": pl.get("under_book", ""),
+        "isAlternate": bool(pl.get("is_alternate")),
+        "sourceMarket": pl.get("source_market", market),
         # averages
         "avg": avg_b if avg_b is not None else (avg_a if avg_a is not None else 0),
         "avgA": avg_a if avg_a is not None else 0,
@@ -2341,6 +2386,67 @@ def _verify_hub_token(token: str) -> bool:
         return True
     except Exception:
         return False
+
+async def _build_alt_coach(date_str: str) -> dict:
+    cached = _alt_coach_cache_get(date_str)
+    if cached:
+        return cached
+    games = await get_espn_games(date_str)
+    if not games:
+        return {"date": date_str, "picks": [], "error": "No NFL games found for this date."}
+    games = await get_odds_events(date_str, games)
+    roster_map = await get_espn_roster_map(games, date_str)
+    requests = [
+        get_prop_lines(game.get("id", ""), date_str, alternate_only=True)
+        if game.get("id") else asyncio.sleep(0, result=[])
+        for game in games
+    ]
+    batches = await asyncio.gather(*requests)
+    lines = []
+    for game, batch in zip(games, batches):
+        home = game.get("home_abbr", "") or _name_to_abbr(game.get("home_team", ""))
+        away = game.get("away_abbr", "") or _name_to_abbr(game.get("away_team", ""))
+        for line in batch:
+            info = roster_map.get(_norm(line.get("name", ""))) if roster_map else None
+            if info and not info.get("eligible", True):
+                continue
+            line.update({
+                "home_team": game.get("home_team", ""),
+                "away_team": game.get("away_team", ""),
+                "home_abbr": home, "away_abbr": away,
+                "game": game.get("game", ""), "game_start": game.get("start", ""),
+                "roster_team": (info or {}).get("team", ""),
+                "roster_position": (info or {}).get("position", ""),
+            })
+            lines.append(line)
+    df = await get_nfl_stats()
+    if df is None:
+        return {"date": date_str, "picks": [], "error": "NFL stats are unavailable."}
+    picks = []
+    for line in lines:
+        result = _analyze_prop(
+            line, df, line.get("home_abbr", ""), line.get("away_abbr", ""))
+        if result and (result.get("realOdds") is not None
+                       or result.get("realUnderOdds") is not None):
+            picks.append(result)
+    payload = {"date": date_str, "picks": picks, "lines": len(lines)}
+    _alt_coach_cache_set(date_str, payload)
+    return payload
+
+@app.get("/api/nfl/coach-alternates")
+async def api_nfl_coach_alternates(request: Request, date_str: str = "",
+                                   token: str = ""):
+    tok = token or request.headers.get("Authorization", "").replace("Bearer ", "").strip()
+    if not _verify_hub_token(tok):
+        raise HTTPException(
+            status_code=401,
+            detail="Subscription required — please log in via moneypicksarena.com")
+    ds = date_str or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if ds < datetime.now(timezone.utc).strftime("%Y-%m-%d"):
+        raise HTTPException(
+            status_code=400,
+            detail="Alternate-line Coach scans are available for current and upcoming slates.")
+    return JSONResponse(await _build_alt_coach(ds))
 
 _ADMIN_EMAILS = {e.strip().lower() for e in os.environ.get("ADMIN_EMAIL", "higgi117711@gmail.com").split(",") if e.strip()}
 
@@ -4015,6 +4121,7 @@ tr:last-child td{border-bottom:none}
     <div class="nfl-coach-presets">
       <button class="nfl-coach-preset" onclick="askNflCoachPreset('Show me the safest bets')">Safest bets</button>
       <button class="nfl-coach-preset" onclick="askNflCoachPreset('Show the best positive Coach Edge plays')">Coach Edge</button>
+      <button class="nfl-coach-preset" id="nflAltCoachBtn" onclick="askNflAltCoach()" style="border-color:#f59e0b;color:#fde68a">Best Alt-Line Edge Plays · Top 10</button>
       <button class="nfl-coach-preset" onclick="askNflCoachPreset('Show the best passing plays')">Passing</button>
       <button class="nfl-coach-preset" onclick="askNflCoachPreset('Show the best rushing plays')">Rushing</button>
       <button class="nfl-coach-preset" onclick="askNflCoachPreset('Show the best receiving plays')">Receiving</button>
@@ -4837,7 +4944,7 @@ function _nflCoachOdds(v){var n=Number(v);return n>0?'+'+n:String(n);}
 function _nflCoachSigned(v){var n=Number(v||0);return (n>=0?'+':'')+n.toFixed(2);}
 function _nflCoachProps(){
   var d=(window._nflState||{}).d||{},seen={},out=[];
-  (d.picks||[]).forEach(function(p){
+  (d.coach_candidates||d.picks||[]).forEach(function(p){
     var side=String(p.pick||'OVER').toUpperCase();
     var odds=_nflSideOdds(p,side),implied=_nflCoachImplied(odds);
     var line=p.realLine!=null?p.realLine:p.dispLine;
@@ -4854,7 +4961,7 @@ function _nflCoachProps(){
       recentRate:Number(p.vsLineRate||p.rateB||0),recentHits:Number(p.vsLineHits||p.hitsB||0),
       recentTotal:Number(p.vsLineTotal||p.totB||0),oppRate:Number(p.rateA||0),
       oppHits:Number(p.hitsA||0),oppTotal:Number(p.totA||0),book:side==='UNDER'?(p.under_book||''):(p.over_book||''),
-      source:p
+      isAlternate:!!p.isAlternate,source:p
     });
   });
   out.forEach(function(p){p.edge=p.appProb-p.implied;});
@@ -4880,9 +4987,9 @@ function _nflCoachSafest(props){
 }
 function _nflCoachParse(question,props){
   var q=String(question||'').toLowerCase(),words=' '+q.replace(/[^a-z0-9]+/g,' ').replace(/ +/g,' ').trim()+' ';
-  var f={mode:'edge',limit:100,side:'',market:'',marketExact:'',players:[],teams:[],minOdds:null,maxOdds:null};
+  var f={mode:'edge',limit:5,side:'',market:'',marketExact:'',players:[],teams:[],minOdds:null,maxOdds:null};
   if(q.indexOf('safe')>=0||q.indexOf('most likely')>=0||q.indexOf('highest probability')>=0)f.mode='safe';
-  var top=words.match(/ top +([0-9]{1,2}) /);if(top)f.limit=Math.max(1,Math.min(50,Number(top[1])));
+  var top=words.match(/ top +([0-9]{1,2}) /);if(top)f.limit=Math.max(1,Math.min(5,Number(top[1])));
   if(words.indexOf(' under ')>=0)f.side='UNDER';else if(words.indexOf(' over ')>=0)f.side='OVER';
   var passYardTerms=['passing yards','passing yard','passing yds','passing yd','pass yards','pass yard','pass yds','pass yd'];
   if(passYardTerms.some(function(term){return q.indexOf(term)>=0;}))f.marketExact='Pass Yds';
@@ -4983,7 +5090,9 @@ function _nflCoachRender(question,rows,total,mode){
   el.style.display='block';
   var summary=mode==='safe'
     ?'I checked both sides of '+total+' priced NFL candidates and ranked these by sportsbook-implied win probability. Safer favorites can require substantially more risk for a smaller return.'
-    :'I checked '+total+' priced NFL board plays and ranked the matching positive Coach Edge results. Coach Edge is probability edge, not guaranteed monetary profit.';
+    :(window.__NFL_COACH_ALT_ACTIVE__
+      ?'I checked '+total+' genuine alternate-line candidates and ranked the top positive Coach Edge plays. Only the strongest alternate line per player survives, with a maximum of 10 plays.'
+      :'I checked '+total+' priced NFL board plays and ranked the matching positive Coach Edge results. Coach Edge is probability edge, not guaranteed monetary profit.');
   if(!rows.length){el.innerHTML='<div class="nfl-coach-question">'+_esc(question)+'</div><div class="nfl-coach-summary">No loaded priced NFL prop matched that request.</div>';return;}
   var cards=rows.map(function(p,i){
     var s=p.source||{},head=_esc(s.head||''),logo='https://a.espncdn.com/i/teamlogos/nfl/500/'+_logoAbbr(p.team)+'.png';
@@ -4994,7 +5103,7 @@ function _nflCoachRender(question,rows,total,mode){
       +'<span><span class="nfl-coach-name">'+(i+1)+'. '+_esc(p.player)+'</span><span class="nfl-coach-meta">'
       +(p.position?'<span class="nfl-coach-pos">'+_esc(p.position)+'</span>':'')
       +'<span>'+_esc(p.team)+' vs '+_esc(p.opponent)+'</span>'+(venue?'<span>· '+venue+'</span>':'')+'</span></span></span>'
-      +'<span class="nfl-coach-pickmeta">'+_esc(p.market)+'<br><b style="color:'+(p.side==='OVER'?'#4ade80':'#f87171')+'">'+p.side+' '+p.line+' · '+_nflCoachOdds(p.odds)+'</b></span></summary>'
+      +'<span class="nfl-coach-pickmeta">'+_esc(p.market)+(p.isAlternate?' · <b style="color:#fbbf24">ALT LINE</b>':'')+'<br><b style="color:'+(p.side==='OVER'?'#4ade80':'#f87171')+'">'+p.side+' '+p.line+' · '+_nflCoachOdds(p.odds)+'</b></span></summary>'
       +'<div class="nfl-coach-copy">'+(mode==='safe'?'<b style="color:#fbbf24">Safety rank: '+p.implied.toFixed(1)+'% sportsbook-implied.</b> ':'')
       +'App probability '+p.appProb.toFixed(1)+'% vs '+p.implied.toFixed(1)+'% implied = <b style="color:'+(p.edge>=0?'#4ade80':'#f87171')+'">'+_nflCoachSigned(p.edge)+' Coach Edge points</b>.</div>'
       +_nflCoachAccordions(p)+'</details>';
@@ -5002,10 +5111,40 @@ function _nflCoachRender(question,rows,total,mode){
   el.innerHTML='<div class="nfl-coach-question">'+_esc(question)+'</div><div class="nfl-coach-summary">'+summary+'</div>'+cards;
 }
 function askNflCoachPreset(q){var input=document.getElementById('nflCoachInput');if(input)input.value=q;askNflCoach();}
+async function askNflAltCoach(){
+  var btn=document.getElementById('nflAltCoachBtn'),answer=document.getElementById('nflCoachAnswer');
+  var oldText=btn?btn.textContent:'';
+  var state=window._nflState||{},d=state.d||{},previous=d.coach_candidates;
+  var hadPrevious=Object.prototype.hasOwnProperty.call(d,'coach_candidates');
+  if(btn){btn.disabled=true;btn.textContent='Loading alternate lines…';}
+  if(answer){answer.style.display='block';answer.innerHTML='<div class="nfl-coach-summary">Fetching genuine sportsbook alternate-line ladders. Cached scans reuse the same data.</div>';}
+  try{
+    var token=localStorage.getItem('__mpa_token')||'';
+    var dateEl=document.getElementById('datePicker');
+    var date=(dateEl&&dateEl.value)||window.__NFL_DATE__||'';
+    var res=await fetch('/api/nfl/coach-alternates?date_str='+encodeURIComponent(date)+'&token='+encodeURIComponent(token));
+    var data=await res.json();
+    if(!res.ok||data.error)throw new Error(data.detail||data.error||('HTTP '+res.status));
+    d.coach_candidates=data.picks||[];
+    window.__NFL_COACH_LIMIT_OVERRIDE__=10;
+    window.__NFL_COACH_ALT_ACTIVE__=true;
+    var input=document.getElementById('nflCoachInput');
+    if(input)input.value='Show the top 10 positive edge alternate-line plays';
+    askNflCoach();
+  }catch(e){
+    if(answer)answer.innerHTML='<div class="nfl-coach-summary" style="color:#f87171">'+_esc(e.message||'Alternate-line scan failed.')+'</div>';
+  }finally{
+    if(hadPrevious)d.coach_candidates=previous;else delete d.coach_candidates;
+    delete window.__NFL_COACH_LIMIT_OVERRIDE__;
+    delete window.__NFL_COACH_ALT_ACTIVE__;
+    if(btn){btn.disabled=false;btn.textContent=oldText;}
+  }
+}
 function askNflCoach(){
   var input=document.getElementById('nflCoachInput'),question=String(input&&input.value||'').trim();if(!question){if(input)input.focus();return;}
   var props=_nflCoachProps();if(!props.length){_nflCoachRender(question,[],0,'edge');return;}
   var f=_nflCoachParse(question,props),candidates=_nflCoachSafest(props);
+  if(window.__NFL_COACH_LIMIT_OVERRIDE__)f.limit=Number(window.__NFL_COACH_LIMIT_OVERRIDE__)||f.limit;
   var rows=candidates.filter(function(p){
     if(f.mode!=='safe'&&p.edge<=0)return false;
     if(f.side&&p.side!==f.side)return false;
