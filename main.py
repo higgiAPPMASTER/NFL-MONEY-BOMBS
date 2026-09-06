@@ -3881,6 +3881,27 @@ tr:last-child td{border-bottom:none}
 .lad-stat:last-child{border-bottom:none}
 .lad-stat .k{color:#9ca3af}
 .lad-stat .v{font-weight:700}
+.nfl-coach{border:1px solid rgba(56,189,248,.45)!important;background:linear-gradient(145deg,#101827,#0b1220)!important}
+.nfl-coach-presets{display:flex;gap:7px;flex-wrap:wrap;margin:14px 0 10px}
+.nfl-coach-preset{background:#111827;color:#cbd5e1;border:1px solid #334155;border-radius:999px;padding:7px 11px;font-size:.69rem;font-weight:900;cursor:pointer}
+.nfl-coach-preset:hover{border-color:#38bdf8;color:#bae6fd}
+.nfl-coach-row{display:flex;gap:8px}
+.nfl-coach-input{flex:1;min-width:0;background:#070d18;color:#fff;border:1px solid #334155;border-radius:11px;padding:12px 14px;font:inherit;font-size:.84rem}
+.nfl-coach-send{background:#0284c7;color:#fff;border:0;border-radius:11px;padding:0 18px;font-weight:900;cursor:pointer}
+.nfl-coach-answer{display:none;margin-top:14px;border-top:1px solid rgba(56,189,248,.25);padding-top:14px}
+.nfl-coach-question{margin-left:auto;max-width:82%;background:#10243a;border:1px solid rgba(56,189,248,.3);border-radius:12px 12px 3px 12px;padding:9px 12px;color:#bae6fd;font-size:.75rem}
+.nfl-coach-summary{margin:11px 0;color:#cbd5e1;font-size:.76rem;line-height:1.5}
+.nfl-coach-play{margin-top:16px;background:#0b1220;border:2px solid rgba(56,189,248,.4);border-left:5px solid #38bdf8;border-radius:12px;padding:12px 14px;box-shadow:0 5px 14px rgba(0,0,0,.34)}
+.nfl-coach-play>summary{display:flex;justify-content:space-between;gap:12px;list-style:none;cursor:pointer;color:#fff;font-size:.8rem;font-weight:900}
+.nfl-coach-play>summary::-webkit-details-marker{display:none}
+.nfl-coach-play>summary:after{content:"Expand";color:#38bdf8;font-size:.61rem;text-transform:uppercase}
+.nfl-coach-play[open]>summary:after{content:"Collapse"}
+.nfl-coach-copy{color:#94a3b8;font-size:.7rem;line-height:1.5;margin-top:8px}
+.nfl-coach-stats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px;margin-top:10px}
+.nfl-coach-stat{background:#111827;border:1px solid #263449;border-radius:8px;padding:8px}
+.nfl-coach-stat .k{color:#64748b;font-size:.56rem;font-weight:900;text-transform:uppercase}
+.nfl-coach-stat .v{color:#f8fafc;font-size:.75rem;font-weight:900;margin-top:3px}
+@media(max-width:620px){.nfl-coach-row{display:block}.nfl-coach-send{width:100%;padding:11px;margin-top:8px}.nfl-coach-stats{grid-template-columns:repeat(2,minmax(0,1fr))}}
 </style>
 </head>
 <body>
@@ -3902,7 +3923,9 @@ tr:last-child td{border-bottom:none}
  .nfl-trk-bar-wrap{width:96px;background:#1f2937;border-radius:999px;height:10px;overflow:hidden;display:inline-block;vertical-align:middle}
 .nfl-trk-bar{height:100%;border-radius:4px}
  .nfl-trk-group{margin:0 0 18px;border:1px solid #263449;border-left:5px solid var(--trk-accent,#22d3ee);border-radius:16px;overflow:hidden;background:linear-gradient(145deg,rgba(15,23,42,.98),rgba(10,15,26,.98));box-shadow:0 8px 22px rgba(0,0,0,.18)}
- .nfl-trk-group-head{display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap;padding:16px 18px;background:linear-gradient(90deg,color-mix(in srgb,var(--trk-accent,#22d3ee) 15%,transparent),transparent);border-bottom:1px solid rgba(148,163,184,.16)}
+.nfl-trk-group-head{display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap;padding:16px 18px;background:linear-gradient(90deg,color-mix(in srgb,var(--trk-accent,#22d3ee) 15%,transparent),transparent);cursor:pointer;list-style:none}
+.nfl-trk-group-head::-webkit-details-marker{display:none}
+.nfl-trk-group[open]>.nfl-trk-group-head{border-bottom:1px solid rgba(148,163,184,.16)}
  .nfl-trk-group-title{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
  .nfl-trk-group-kicker{font-size:.7rem;color:#94a3b8;text-transform:uppercase;letter-spacing:.14em;font-weight:900}
  .nfl-trk-group-name{font-size:1.12rem;color:#fff;font-weight:950;letter-spacing:.01em}
@@ -3910,6 +3933,9 @@ tr:last-child td{border-bottom:none}
  .nfl-trk-group-summary{display:flex;align-items:center;gap:14px;flex-wrap:wrap;color:#cbd5e1;font-size:.86rem;font-weight:800}
  .nfl-trk-group-rate{font-size:1.12rem;font-family:monospace;font-weight:950;color:var(--trk-accent,#67e8f9)}
  .nfl-trk-group-pl{font-family:monospace;font-weight:950}
+.nfl-trk-group-toggle{display:inline-flex;align-items:center;justify-content:center;width:25px;height:25px;border:1px solid #475569;border-radius:7px;color:#e2e8f0;font-size:1rem;font-weight:900;line-height:1;background:#111827}
+.nfl-trk-group-toggle:after{content:"+"}
+.nfl-trk-group[open] .nfl-trk-group-toggle:after{content:"−"}
  .nfl-trk-table-scroll{overflow-x:auto}
  .nfl-trk-result{display:inline-block;min-width:68px;text-align:center;padding:5px 10px;border-radius:999px;font-size:.74rem;letter-spacing:.05em;font-weight:950}
  .nfl-trk-result.win{color:#86efac;background:rgba(34,197,94,.15);border:1px solid rgba(74,222,128,.35)}
@@ -3956,6 +3982,28 @@ tr:last-child td{border-bottom:none}
       <button class="btn" onclick="generateParlay()" style="background:#1f2937;color:#fff">🎲 Generate New</button>
     </div>
     <div id="parlayResult" style="margin-top:16px;text-align:left"></div>
+  </div>
+  <div class="card nfl-coach" id="nflCoachCard" style="max-width:960px;margin:0 auto 16px">
+    <div style="display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap">
+      <div><div style="color:#38bdf8;font-size:.66rem;font-weight:900;letter-spacing:.12em;text-transform:uppercase">Grounded NFL analysis</div>
+      <h2 style="font-family:'Playfair Display',serif;color:#fff;font-size:1.35rem;margin-top:4px">The Edge Coach · NFL Props Analyst</h2>
+      <div style="color:#94a3b8;font-size:.76rem;margin-top:5px">Find safer sportsbook sides or scan the loaded NFL board for positive Coach Edge.</div></div>
+      <div style="color:#86efac;border:1px solid rgba(74,222,128,.35);border-radius:999px;padding:5px 9px;height:max-content;font-size:.62rem;font-weight:900">NO INVENTED PLAYS</div>
+    </div>
+    <div class="nfl-coach-presets">
+      <button class="nfl-coach-preset" onclick="askNflCoachPreset('Show me the safest bets')">Safest bets</button>
+      <button class="nfl-coach-preset" onclick="askNflCoachPreset('Show the best positive Coach Edge plays')">Coach Edge</button>
+      <button class="nfl-coach-preset" onclick="askNflCoachPreset('Show the best passing plays')">Passing</button>
+      <button class="nfl-coach-preset" onclick="askNflCoachPreset('Show the best rushing plays')">Rushing</button>
+      <button class="nfl-coach-preset" onclick="askNflCoachPreset('Show the best receiving plays')">Receiving</button>
+      <button class="nfl-coach-preset" onclick="askNflCoachPreset('Show the best under plays')">Best unders</button>
+    </div>
+    <div class="nfl-coach-row">
+      <input id="nflCoachInput" class="nfl-coach-input" placeholder="Example: Safest rushing unders from -300 to -150" onkeydown="if(event.key==='Enter')askNflCoach()"/>
+      <button class="nfl-coach-send" onclick="askNflCoach()">Analyze</button>
+    </div>
+    <div style="color:#64748b;font-size:.65rem;line-height:1.45;margin-top:8px">Requires a loaded NFL board and genuine sportsbook prices. Safest Bets ranks both sides by implied probability; Coach Edge equals app probability minus sportsbook-implied probability.</div>
+    <div id="nflCoachAnswer" class="nfl-coach-answer"></div>
   </div>
   <div id="nfl-gp-card" style="display:none;max-width:960px;margin:18px auto 0;padding:0 16px">
     <div style="font-size:1rem;font-weight:900;color:#a78bfa;margin-bottom:6px">&#128302; Game Predictor &#8212; Today&#39;s Winners</div>
@@ -4754,6 +4802,124 @@ function _renderNflGamePredictor(d){
   html+='</div>';
   document.getElementById('nfl-gp-body').innerHTML=html;
 }
+function _nflCoachNum(v){
+  if(v==null||v==='')return null;
+  var n=Number(String(v).replace('+','').trim());
+  return isFinite(n)&&n!==0?n:null;
+}
+function _nflCoachImplied(v){
+  var n=_nflCoachNum(v);if(n==null)return null;
+  return n<0?(-n/(-n+100)*100):(100/(n+100)*100);
+}
+function _nflCoachOdds(v){var n=Number(v);return n>0?'+'+n:String(n);}
+function _nflCoachSigned(v){var n=Number(v||0);return (n>=0?'+':'')+n.toFixed(2);}
+function _nflCoachProps(){
+  var d=(window._nflState||{}).d||{},seen={},out=[];
+  (d.picks||[]).forEach(function(p){
+    var side=String(p.pick||'OVER').toUpperCase();
+    var odds=_nflSideOdds(p,side),implied=_nflCoachImplied(odds);
+    var line=p.realLine!=null?p.realLine:p.dispLine;
+    var prob=Number(p.dispScore!=null?p.dispScore:p.score);
+    if(line==null||implied==null||!isFinite(prob)||prob<=0)return;
+    var key=String(p.pid||p.name)+'|'+String(p.mkt||p.label)+'|'+side+'|'+line+'|'+odds;
+    if(seen[key])return;seen[key]=1;
+    out.push({
+      player:p.name||'',team:p.team||'',opponent:p.opponent||p.opp||'',
+      market:p.mkt||p.label||'NFL Prop',side:side,line:Number(line),odds:Number(odds),
+      oppositeOdds:_nflSideOdds(p,side==='OVER'?'UNDER':'OVER'),
+      appProb:Math.max(0,Math.min(100,prob)),implied:implied,
+      projection:p.projAvg!=null?Number(p.projAvg):(p.avg!=null?Number(p.avg):null),
+      recentRate:Number(p.vsLineRate||p.rateB||0),recentHits:Number(p.vsLineHits||p.hitsB||0),
+      recentTotal:Number(p.vsLineTotal||p.totB||0),oppRate:Number(p.rateA||0),
+      oppHits:Number(p.hitsA||0),oppTotal:Number(p.totA||0),book:side==='UNDER'?(p.under_book||''):(p.over_book||''),
+      source:p
+    });
+  });
+  out.forEach(function(p){p.edge=p.appProb-p.implied;});
+  return out;
+}
+function _nflCoachSafest(props){
+  var seen={},out=[];
+  (props||[]).forEach(function(p){var k=p.player+'|'+p.market+'|'+p.side+'|'+p.line+'|'+p.odds;if(!seen[k]){seen[k]=1;out.push(p);}});
+  (props||[]).forEach(function(p){
+    var odds=_nflCoachNum(p.oppositeOdds);if(odds==null)return;
+    var side=p.side==='OVER'?'UNDER':'OVER',k=p.player+'|'+p.market+'|'+side+'|'+p.line+'|'+odds;
+    if(seen[k])return;seen[k]=1;
+    var q=Object.assign({},p,{side:side,odds:odds,oppositeOdds:p.odds,implied:_nflCoachImplied(odds),
+      appProb:Math.max(0,Math.min(100,100-p.appProb)),
+      recentRate:p.recentTotal?Math.max(0,100-p.recentRate):0,
+      recentHits:p.recentTotal?Math.max(0,p.recentTotal-p.recentHits):0,
+      oppRate:p.oppTotal?Math.max(0,100-p.oppRate):0,
+      oppHits:p.oppTotal?Math.max(0,p.oppTotal-p.oppHits):0,
+      book:side==='UNDER'?(p.source.under_book||''):(p.source.over_book||'')});
+    q.edge=q.appProb-q.implied;out.push(q);
+  });
+  return out;
+}
+function _nflCoachParse(question,props){
+  var q=String(question||'').toLowerCase(),f={mode:'edge',limit:5,side:'',market:'',players:[],teams:[],minOdds:null,maxOdds:null};
+  if(q.indexOf('safe')>=0||q.indexOf('most likely')>=0||q.indexOf('highest probability')>=0)f.mode='safe';
+  var top=q.match(/top +([0-9]{1,2})/);if(top)f.limit=Math.max(1,Math.min(10,Number(top[1])));
+  if((' '+q+' ').indexOf(' under ')>=0)f.side='UNDER';else if((' '+q+' ').indexOf(' over ')>=0)f.side='OVER';
+  var markets=[['passing','pass'],['pass ','pass'],['rushing','rush'],['rush ','rush'],['receiving','rec'],['reception','rec'],['touchdown','td'],[' td','td'],['tackle','def'],['sack','def'],['defense','def'],['kicking','kick'],['field goal','kick']];
+  markets.some(function(x){if(q.indexOf(x[0])>=0){f.market=x[1];return true;}return false;});
+  var neg=q.match(/-[0-9]{2,4}/g)||[];if(neg.length>=2){var ns=neg.slice(0,2).map(Number);f.minOdds=Math.min.apply(null,ns);f.maxOdds=Math.max.apply(null,ns);}
+  props.forEach(function(p){
+    var n=String(p.player||'').toLowerCase();if(n&&q.indexOf(n)>=0&&f.players.indexOf(n)<0)f.players.push(n);
+    [p.team,p.opponent].forEach(function(t){var x=String(t||'').toLowerCase();if(x&&q.indexOf(x)>=0&&f.teams.indexOf(x)<0)f.teams.push(x);});
+  });
+  return f;
+}
+function _nflCoachFamily(m){
+  m=String(m||'').toLowerCase();
+  if(m.indexOf('pass')>=0||m.indexOf('completion')>=0||m.indexOf('int thrown')>=0)return 'pass';
+  if(m.indexOf('rush')>=0)return 'rush';
+  if(m.indexOf('rec')>=0)return 'rec';
+  if(m.indexOf('touchdown')>=0||m.indexOf('anytime td')>=0)return 'td';
+  if(m.indexOf('tackle')>=0||m.indexOf('sack')>=0||m.indexOf('def int')>=0)return 'def';
+  if(m.indexOf('kick')>=0||m.indexOf('fg made')>=0)return 'kick';
+  return '';
+}
+function _nflCoachRender(question,rows,total,mode){
+  var el=document.getElementById('nflCoachAnswer');if(!el)return;
+  el.style.display='block';
+  var summary=mode==='safe'
+    ?'I checked both sides of '+total+' priced NFL candidates and ranked these by sportsbook-implied win probability. Safer favorites can require substantially more risk for a smaller return.'
+    :'I checked '+total+' priced NFL board plays and ranked the matching positive Coach Edge results. Coach Edge is probability edge, not guaranteed monetary profit.';
+  if(!rows.length){el.innerHTML='<div class="nfl-coach-question">'+_esc(question)+'</div><div class="nfl-coach-summary">No loaded priced NFL prop matched that request.</div>';return;}
+  var cards=rows.map(function(p,i){
+    var opp=_nflCoachNum(p.oppositeOdds),oppImp=opp!=null?_nflCoachImplied(opp):null,other=p.side==='OVER'?'UNDER':'OVER';
+    return '<details class="nfl-coach-play" open><summary><span>'+(i+1)+'. '+_esc(p.player)+' '+p.side+' '+p.line+' '+_esc(p.market)+' ('+_nflCoachOdds(p.odds)+')</span></summary>'
+      +'<div class="nfl-coach-copy">'+(mode==='safe'?'<b style="color:#fbbf24">Safety rank: '+p.implied.toFixed(1)+'% sportsbook-implied.</b> ':'')
+      +'App probability '+p.appProb.toFixed(1)+'% vs '+p.implied.toFixed(1)+'% implied = <b style="color:'+(p.edge>=0?'#4ade80':'#f87171')+'">'+_nflCoachSigned(p.edge)+' Coach Edge points</b>.</div>'
+      +'<div class="nfl-coach-stats">'
+      +'<div class="nfl-coach-stat"><div class="k">Selected side</div><div class="v">'+p.side+' '+_nflCoachOdds(p.odds)+' · '+p.implied.toFixed(1)+'% implied</div></div>'
+      +'<div class="nfl-coach-stat"><div class="k">Other side</div><div class="v">'+(opp!=null?other+' '+_nflCoachOdds(opp)+' · '+oppImp.toFixed(1)+'% implied':'N/A')+'</div></div>'
+      +'<div class="nfl-coach-stat"><div class="k">Projection</div><div class="v">'+(p.projection!=null&&isFinite(p.projection)?p.projection.toFixed(2):'N/A')+'</div></div>'
+      +'<div class="nfl-coach-stat"><div class="k">Recent vs line</div><div class="v">'+(p.recentTotal?p.recentRate.toFixed(0)+'% · '+p.recentHits+'/'+p.recentTotal:'N/A')+'</div></div>'
+      +'<div class="nfl-coach-stat"><div class="k">vs Opponent</div><div class="v">'+(p.oppTotal?p.oppRate.toFixed(0)+'% · '+p.oppHits+'/'+p.oppTotal:'N/A')+'</div></div>'
+      +'<div class="nfl-coach-stat"><div class="k">Matchup</div><div class="v">'+_esc(p.team)+' vs '+_esc(p.opponent)+'</div></div>'
+      +'</div></details>';
+  }).join('');
+  el.innerHTML='<div class="nfl-coach-question">'+_esc(question)+'</div><div class="nfl-coach-summary">'+summary+'</div>'+cards;
+}
+function askNflCoachPreset(q){var input=document.getElementById('nflCoachInput');if(input)input.value=q;askNflCoach();}
+function askNflCoach(){
+  var input=document.getElementById('nflCoachInput'),question=String(input&&input.value||'').trim();if(!question){if(input)input.focus();return;}
+  var props=_nflCoachProps();if(!props.length){_nflCoachRender(question,[],0,'edge');return;}
+  var f=_nflCoachParse(question,props),candidates=f.mode==='safe'?_nflCoachSafest(props):props;
+  var rows=candidates.filter(function(p){
+    if(f.mode!=='safe'&&p.edge<=0)return false;
+    if(f.side&&p.side!==f.side)return false;
+    if(f.market&&_nflCoachFamily(p.market)!==f.market)return false;
+    if(f.minOdds!=null&&(p.odds<f.minOdds||p.odds>f.maxOdds))return false;
+    if(f.players.length&&f.players.indexOf(String(p.player).toLowerCase())<0)return false;
+    if(f.teams.length&&f.teams.indexOf(String(p.team).toLowerCase())<0&&f.teams.indexOf(String(p.opponent).toLowerCase())<0)return false;
+    return true;
+  });
+  rows.sort(f.mode==='safe'?function(a,b){return b.implied-a.implied||b.appProb-a.appProb;}:function(a,b){return b.edge-a.edge||b.appProb-a.appProb;});
+  _nflCoachRender(question,rows.slice(0,f.limit),candidates.length,f.mode);
+}
 function renderResults(d){
   var res=document.getElementById('results');
   if(!d){ res.innerHTML=''; return; }
@@ -5479,13 +5645,13 @@ function _nflTrkListHtml(decided,stake){
         +'<td style="font-family:monospace;font-weight:950;color:'+plColor+'">'+money(profit)+'</td>'
         +'</tr>';
     }).join('');
-    return '<section class="nfl-trk-group" style="--trk-accent:'+accent+'">'
-      +'<div class="nfl-trk-group-head"><div class="nfl-trk-group-title">'
+    return '<details class="nfl-trk-group" style="--trk-accent:'+accent+'">'
+      +'<summary class="nfl-trk-group-head"><div class="nfl-trk-group-title">'
       +'<span class="nfl-trk-group-kicker">Category</span><span class="nfl-trk-group-name">'+_nflEsc(cat)+'</span><span class="nfl-trk-group-side">'+_nflEsc(side)+'</span></div>'
-      +'<div class="nfl-trk-group-summary"><span>'+meta+'</span><span class="nfl-trk-group-rate">'+(rate!=null?rate.toFixed(1)+'%':'—')+'</span><span class="nfl-trk-group-pl" style="color:'+(pl>=0?'#4ade80':'#f87171')+'">'+money(pl)+'</span></div></div>'
+      +'<div class="nfl-trk-group-summary"><span>'+meta+'</span><span class="nfl-trk-group-rate">'+(rate!=null?rate.toFixed(1)+'%':'—')+'</span><span class="nfl-trk-group-pl" style="color:'+(pl>=0?'#4ade80':'#f87171')+'">'+money(pl)+'</span><span class="nfl-trk-group-toggle" aria-hidden="true"></span></div></summary>'
       +'<div class="nfl-trk-table-scroll"><table class="nfl-trk-tbl"><thead><tr>'
       +'<th>Date</th><th>Player</th><th>Team</th><th>Pick</th><th>Odds</th><th>Actual</th><th>Result</th><th>P/L</th>'
-      +'</tr></thead><tbody>'+rows+'</tbody></table></div></section>';
+      +'</tr></thead><tbody>'+rows+'</tbody></table></div></details>';
   }
   return order.map(groupBlock).join('');
 }
