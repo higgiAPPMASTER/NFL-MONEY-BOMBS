@@ -225,6 +225,7 @@ def _odds_cache_set(date_key, props, game_lines):
         print(f"[OddsCache] write error: {e}")
 
 _ALT_COACH_TTL = 2 * 3600
+_ALT_COACH_INFLIGHT: Dict[str, asyncio.Task] = {}
 
 def _alt_coach_cache_get(date_key):
     p = _CACHE_DIR / f"nfl_alt_coach_v1_{date_key}.json"
@@ -241,6 +242,32 @@ def _alt_coach_cache_set(date_key, result):
             json.dumps(result, ensure_ascii=False), encoding="utf-8")
     except Exception as e:
         print(f"[AltCoachCache] write error: {e}")
+
+async def _warm_alt_coach(date_str: str) -> dict:
+    """Share one live alternate-line scan between normal runs and Coach requests."""
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if date_str < today:
+        return {}
+    cached = _alt_coach_cache_get(date_str)
+    if cached is not None:
+        return cached
+    task = _ALT_COACH_INFLIGHT.get(date_str)
+    if task is None or task.done():
+        task = asyncio.create_task(_build_alt_coach(date_str))
+        _ALT_COACH_INFLIGHT[date_str] = task
+    try:
+        return await asyncio.shield(task)
+    finally:
+        if task.done() and _ALT_COACH_INFLIGHT.get(date_str) is task:
+            _ALT_COACH_INFLIGHT.pop(date_str, None)
+
+def _schedule_alt_coach_warm(date_str: str) -> None:
+    """Start the dedicated alternate cache without delaying standard boards."""
+    try:
+        if date_str >= datetime.now(timezone.utc).strftime("%Y-%m-%d"):
+            asyncio.create_task(_warm_alt_coach(date_str))
+    except Exception as e:
+        print(f"[AltCoachCache] warm schedule error: {e}")
 
 # ── nfl_data_py stats loader ───────────────────────────────────────────────────
 _nfl_df = None
@@ -1416,11 +1443,19 @@ def _trim_prop_lines(lines: list, df) -> list:
         return lines
 
 # ── Analysis using nfl_data_py ─────────────────────────────────────────────────
+def _espn_ha_week(season_type, week):
+    """Translate nfl-verse postseason weeks (19-22) to ESPN rounds (1-4)."""
+    week = int(week)
+    if str(season_type or "REG").upper() == "POST" and 19 <= week <= 22:
+        return week - 18
+    return week
+
 def _ha_side(row, is_home):
     if not _HA_LOADED:
         return True
     season_type = str(row.get("season_type", "REG") or "REG").upper()
-    key = (int(row["season"]), season_type, int(row["week"]), str(row["recent_team"]))
+    week = _espn_ha_week(season_type, row["week"])
+    key = (int(row["season"]), season_type, week, str(row["recent_team"]))
     val = _HA_LOOKUP.get(key)
     if val is None:
         return True
@@ -2091,6 +2126,11 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False) -> 
                 simulate = True
         except Exception:
             pass
+    # Alternate markets have their own Coach-only cache and must never leak into
+    # the standard props, picks, or tracking path.  Warm it only for a live run;
+    # replays/past dates must retain their historical Odds API request behavior.
+    if not simulate:
+        _schedule_alt_coach_warm(date_str)
     cached = None if simulate else _cache_get(date_str)
     if cached:
         return cached
@@ -2446,7 +2486,12 @@ async def api_nfl_coach_alternates(request: Request, date_str: str = "",
         raise HTTPException(
             status_code=400,
             detail="Alternate-line Coach scans are available for current and upcoming slates.")
-    return JSONResponse(await _build_alt_coach(ds))
+    try:
+        return JSONResponse(await asyncio.wait_for(_warm_alt_coach(ds), timeout=120))
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=504,
+            detail="The alternate-line scan timed out after 2 minutes. Please try again; completed data will be reused from cache.")
 
 _ADMIN_EMAILS = {e.strip().lower() for e in os.environ.get("ADMIN_EMAIL", "higgi117711@gmail.com").split(",") if e.strip()}
 
@@ -2986,6 +3031,25 @@ def _nfl_sb_upsert(table, rows, on_conflict=None):
         print(f"[nfl_sb_upsert] {e}")
     return False
 
+def _nfl_sb_insert_ignore(table, rows, on_conflict):
+    """Insert without ever replacing an existing ledger snapshot.
+    The returned representation is empty when PostgREST ignored a duplicate."""
+    if not _SB_URL or not _SB_KEY or not rows:
+        return None
+    try:
+        r = httpx.post(
+            f"{_SB_URL}/rest/v1/{table}?on_conflict={on_conflict}",
+            headers={"apikey": _SB_KEY, "Authorization": f"Bearer {_SB_KEY}",
+                     "Content-Type": "application/json",
+                     "Prefer": "resolution=ignore-duplicates,return=representation"},
+            json=rows, timeout=20)
+        if r.status_code not in (200, 201):
+            return None
+        return r.json() if r.content else []
+    except Exception as e:
+        print(f"[nfl_sb_insert_ignore] {e}")
+        return None
+
 # ── Pick snapshot ─────────────────────────────────────────────────────────────
 _NFL_TRK_APP   = "nfl"
 _NFL_PICKS_CAT = "__official_picks__"
@@ -2996,6 +3060,87 @@ _NFL_OVERFLOW_CAT = "__official_overflow__"
 _NFL_HIST_CAT = "__historical_replay__"
 _NFL_TRK_STAKE = 20.0
 _NFL_TRK_TOP   = 10   # picks per market+direction that count in main record
+_NFL_COACH_TRK_APP = "nfl_coach_track"
+_NFL_COACH_CATS = ("safest_bets", "coach_edge", "alt_line_edge", "passing",
+                   "rushing", "receiving", "best_unders")
+
+def _nfl_coach_market_key(value):
+    """Coach cards use display labels; settlement needs the canonical market key."""
+    raw = str(value or "")
+    if raw in PROP_TO_COL:
+        return raw
+    folded = raw.lower().replace("alternate", "").strip()
+    for key, label in PROP_LABELS.items():
+        if folded == label.lower():
+            return key
+    return ""
+
+def _nfl_coach_kickoff(value):
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+def _nfl_coach_grade_snapshot(date_str, detail, box=None):
+    """Settle Coach-only rows. Existing terminal values are immutable."""
+    if box is None:
+        box = _nfl_box_lookup(date_str)
+        # Only VOID an absent player when the wrapper confirmed that every
+        # event and summary fetch for the date completed successfully.
+        complete = bool((_NFL_BOX_CACHE.get(date_str) or {}).get("final"))
+    else:
+        complete = bool(box) and all(bool(v.get("final")) for v in box.values())
+    out = []
+    for saved in detail or []:
+        row = dict(saved or {})
+        if row.get("result") in ("WIN", "LOSS", "PUSH", "VOID"):
+            out.append(row)
+            continue
+        stat = (box or {}).get(str(row.get("player") or "").lower().strip())
+        actual = stat.get(row.get("market")) if stat else None
+        # A completed ESPN box where the frozen participant is absent is a
+        # confirmed DNP/absent participant, not an artificial 0-stat loss.
+        if complete and not stat:
+            row.update(result="VOID", actual=None, units=0.0,
+                       settled_at=datetime.now(timezone.utc).isoformat())
+        elif stat and stat.get("final") and actual is not None:
+            try:
+                line = float(row["line"])
+                actual = float(actual)
+                result = ("PUSH" if actual == line else
+                          ("WIN" if actual > line else "LOSS") if row.get("side") == "OVER"
+                          else ("WIN" if actual < line else "LOSS"))
+                row.update(result=result, actual=actual,
+                           units=round(_nfl_american_profit(row.get("odds"), _NFL_TRK_STAKE, result) / _NFL_TRK_STAKE, 4),
+                           settled_at=datetime.now(timezone.utc).isoformat())
+            except (TypeError, ValueError, KeyError):
+                row.setdefault("result", "PENDING")
+        else:
+            row["result"] = "PENDING"
+        out.append(row)
+    return out
+
+def _nfl_coach_summary(rows):
+    totals = {"wins": 0, "losses": 0, "pushes": 0, "voids": 0, "pending": 0,
+              "units": 0.0, "staked": 0.0}
+    for row in rows:
+        result = str(row.get("result") or "PENDING").upper()
+        if result == "WIN": totals["wins"] += 1
+        elif result == "LOSS": totals["losses"] += 1
+        elif result == "PUSH": totals["pushes"] += 1
+        elif result == "VOID": totals["voids"] += 1
+        else: totals["pending"] += 1
+        if result in ("WIN", "LOSS"):
+            totals["staked"] += _NFL_TRK_STAKE
+            totals["units"] += float(row.get("units") or 0)
+    denom = totals["wins"] + totals["losses"]
+    # Units are already profit divided by stake, so ROI is units per graded
+    # wager—not units divided by dollar stake.
+    totals["roi"] = round(totals["units"] / denom * 100, 1) if denom else None
+    totals["rate"] = round(totals["wins"] / denom * 100, 1) if denom else None
+    totals["units"] = round(totals["units"], 2)
+    return totals
 
 def _nfl_official_capture_allowed(date_str: str, result: dict) -> bool:
     """Official records require a slate captured before every kickoff.
@@ -3814,6 +3959,84 @@ async def nfl_track_record(grade: bool = False, date_str: str = ""):
         "historical_game_predictor": {"daily": historical_gp_daily},
     })
 
+# ── AI Coach Track Record (isolated namespace; never used by main/overflow) ───
+def _nfl_coach_ledger_rows():
+    return _nfl_sb_get("mpa_track_ledger", {"app": f"eq.{_NFL_COACH_TRK_APP}",
+        "side": "eq.ALL", "select": "date,category,detail,locked", "limit": "1000"}) or []
+
+def _nfl_grade_coach_ledger():
+    for saved in _nfl_coach_ledger_rows():
+        if saved.get("locked") or not isinstance(saved.get("detail"), list):
+            continue
+        try:
+            graded = _nfl_coach_grade_snapshot(saved["date"], saved["detail"])
+            terminal = bool(graded) and all(r.get("result") in ("WIN","LOSS","PUSH","VOID") for r in graded)
+            _nfl_sb_upsert("mpa_track_ledger", [{"app": _NFL_COACH_TRK_APP,
+                "date": saved["date"], "category": saved["category"], "side": "ALL",
+                "wins": sum(r.get("result") == "WIN" for r in graded),
+                "losses": sum(r.get("result") == "LOSS" for r in graded), "locked": terminal,
+                "locked_at": datetime.now(timezone.utc).isoformat() if terminal else None,
+                "detail": graded}], "app,date,category,side")
+        except Exception as exc: print(f"[nfl_coach_track] grade failed: {exc}")
+
+@app.post("/api/nfl/coach-track/capture")
+async def nfl_coach_track_capture(request: Request, token: str = ""):
+    tok = token or request.headers.get("Authorization", "").replace("Bearer ", "").strip()
+    if not _verify_hub_token(tok): raise HTTPException(401, "Subscription required — please log in via moneypicksarena.com")
+    if not _SB_URL or not _SB_KEY: raise HTTPException(503, "AI Coach Track Record persistence is unavailable; nothing was saved.")
+    body = await request.json(); category = str(body.get("category") or ""); date_str = str(body.get("date") or ""); rows = body.get("rows")
+    if category not in _NFL_COACH_CATS or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_str) or not isinstance(rows, list) or not rows:
+        raise HTTPException(400, "Invalid preset capture; no snapshot was saved.")
+    exists = _nfl_sb_get("mpa_track_ledger", {"app":f"eq.{_NFL_COACH_TRK_APP}","date":f"eq.{date_str}","category":f"eq.{category}","side":"eq.ALL","select":"date","limit":"1"})
+    if exists: return {"ok":True,"status":"already_saved","message":"This preset is already saved for this date/category."}
+    now, frozen = datetime.now(timezone.utc), []
+    for raw in rows:
+        if not isinstance(raw, dict):
+            raise HTTPException(400, "Coach capture rejected: invalid displayed row.")
+        market, kickoff = _nfl_coach_market_key(raw.get("market")), _nfl_coach_kickoff(raw.get("game_start"))
+        required = ("player","team","opponent","side","line","odds",
+                    "model_probability","implied_probability","coach_edge")
+        if not market or not kickoff or kickoff <= now or any(raw.get(k) in (None,"") for k in required) or str(raw["side"]).upper() not in ("OVER","UNDER"):
+            raise HTTPException(400, "Coach capture rejected: each displayed row needs complete data and a future game start.")
+        try:
+            frozen.append({"player":str(raw["player"]),"team":str(raw["team"]),"opponent":str(raw["opponent"]),
+                "game_start":kickoff.isoformat(),"market":market,"market_label":str(raw["market"]),"side":str(raw["side"]).upper(),
+                "line":float(raw["line"]),"odds":int(float(raw["odds"])),
+                "book":str(raw.get("book") or "OddsAPI"),
+                "model_probability":float(raw["model_probability"]),"implied_probability":float(raw["implied_probability"]),
+                "coach_edge":float(raw["coach_edge"]),
+                "projection":(float(raw["projection"])
+                              if raw.get("projection") not in (None, "") else None),
+                "alternate":bool(raw.get("alternate")),
+                "captured_at":now.isoformat(),"result":"PENDING","actual":None,"units":None})
+        except (TypeError, ValueError): raise HTTPException(400, "Coach capture rejected: invalid displayed play values.")
+    inserted = _nfl_sb_insert_ignore("mpa_track_ledger", [{"app":_NFL_COACH_TRK_APP,"date":date_str,"category":category,"side":"ALL","wins":0,"losses":0,"locked":False,"detail":frozen}], "app,date,category,side")
+    if inserted is None: raise HTTPException(503, "AI Coach Track Record could not be persisted; nothing was saved.")
+    return {"ok":True,"status":"saved" if inserted else "already_saved","message":"Coach snapshot saved." if inserted else "This preset is already saved for this date/category."}
+
+@app.get("/api/nfl/coach-track")
+async def nfl_coach_track(request: Request, token: str = "", grade: bool = False):
+    tok = token or request.headers.get("Authorization", "").replace("Bearer ", "").strip()
+    if not _verify_hub_token(tok): raise HTTPException(401, "Subscription required — please log in via moneypicksarena.com")
+    if not _SB_URL or not _SB_KEY: raise HTTPException(503, "AI Coach Track Record persistence is unavailable.")
+    if grade: await asyncio.get_running_loop().run_in_executor(None, _nfl_grade_coach_ledger)
+    grouped = {c:[] for c in _NFL_COACH_CATS}
+    for saved in _nfl_coach_ledger_rows():
+        if saved.get("category") in grouped:
+            grouped[saved["category"]].extend([
+                {**row, "date": saved.get("date"), "category": saved.get("category")}
+                for row in (saved.get("detail") or []) if isinstance(row, dict)
+            ])
+    return {"stake":_NFL_TRK_STAKE,"categories":[{"category":c,"summary":_nfl_coach_summary(grouped[c]),"rows":grouped[c]} for c in _NFL_COACH_CATS]}
+
+@app.post("/api/nfl/coach-track/grade")
+async def nfl_coach_track_grade(request: Request, token: str = ""):
+    tok = token or request.headers.get("Authorization", "").replace("Bearer ", "").strip()
+    if not _verify_hub_token(tok): raise HTTPException(401, "Subscription required — please log in via moneypicksarena.com")
+    if not _SB_URL or not _SB_KEY: raise HTTPException(503, "AI Coach Track Record persistence is unavailable.")
+    await asyncio.get_running_loop().run_in_executor(None, _nfl_grade_coach_ledger)
+    return {"ok": True}
+
 
 @app.get("/", response_class=HTMLResponse)
 async def index(admin: str = "", token: str = ""):
@@ -4116,16 +4339,16 @@ tr:last-child td{border-bottom:none}
       <div><div style="color:#38bdf8;font-size:.66rem;font-weight:900;letter-spacing:.12em;text-transform:uppercase">Grounded NFL analysis</div>
       <h2 style="font-family:'Playfair Display',serif;color:#fff;font-size:1.35rem;margin-top:4px">The Edge Coach · NFL Props Analyst</h2>
       <div style="color:#94a3b8;font-size:.76rem;margin-top:5px">Find safer sportsbook sides or scan the loaded NFL board for positive Coach Edge.</div></div>
-      <div style="color:#86efac;border:1px solid rgba(74,222,128,.35);border-radius:999px;padding:5px 9px;height:max-content;font-size:.62rem;font-weight:900">NO INVENTED PLAYS</div>
+      <div><button onclick="openNflCoachTrack()" style="background:#0e7490;color:#fff;border:0;border-radius:8px;padding:8px 11px;font-weight:900;font-size:.7rem;cursor:pointer">AI Coach Track Record</button><div style="color:#86efac;border:1px solid rgba(74,222,128,.35);border-radius:999px;padding:5px 9px;height:max-content;font-size:.62rem;font-weight:900;margin-top:6px">NO INVENTED PLAYS</div></div>
     </div>
     <div class="nfl-coach-presets">
-      <button class="nfl-coach-preset" onclick="askNflCoachPreset('Show me the safest bets')">Safest bets</button>
-      <button class="nfl-coach-preset" onclick="askNflCoachPreset('Show the best positive Coach Edge plays')">Coach Edge</button>
+      <button class="nfl-coach-preset" onclick="askNflCoachPreset('Show me the safest bets','safest_bets')">Safest bets</button>
+      <button class="nfl-coach-preset" onclick="askNflCoachPreset('Show the best positive Coach Edge plays','coach_edge')">Coach Edge</button>
       <button class="nfl-coach-preset" id="nflAltCoachBtn" onclick="askNflAltCoach()" style="border-color:#f59e0b;color:#fde68a">Best Alt-Line Edge Plays · Top 10</button>
-      <button class="nfl-coach-preset" onclick="askNflCoachPreset('Show the best passing plays')">Passing</button>
-      <button class="nfl-coach-preset" onclick="askNflCoachPreset('Show the best rushing plays')">Rushing</button>
-      <button class="nfl-coach-preset" onclick="askNflCoachPreset('Show the best receiving plays')">Receiving</button>
-      <button class="nfl-coach-preset" onclick="askNflCoachPreset('Show the best under plays')">Best unders</button>
+      <button class="nfl-coach-preset" onclick="askNflCoachPreset('Show the best passing plays','passing')">Passing</button>
+      <button class="nfl-coach-preset" onclick="askNflCoachPreset('Show the best rushing plays','rushing')">Rushing</button>
+      <button class="nfl-coach-preset" onclick="askNflCoachPreset('Show the best receiving plays','receiving')">Receiving</button>
+      <button class="nfl-coach-preset" onclick="askNflCoachPreset('Show the best under plays','best_unders')">Best unders</button>
     </div>
     <div class="nfl-coach-row">
       <input id="nflCoachInput" class="nfl-coach-input" placeholder="Example: Safest rushing unders from -300 to -150" onkeydown="if(event.key==='Enter')askNflCoach()"/>
@@ -4133,6 +4356,11 @@ tr:last-child td{border-bottom:none}
     </div>
     <div style="color:#64748b;font-size:.65rem;line-height:1.45;margin-top:8px">Requires a loaded NFL board and genuine sportsbook prices. Safest Bets ranks both sides by implied probability; Coach Edge equals app probability minus sportsbook-implied probability.</div>
     <div id="nflCoachAnswer" class="nfl-coach-answer"></div>
+    <div id="nflCoachCaptureStatus" style="min-height:1.2em;margin-top:8px;color:#94a3b8;font-size:.7rem"></div>
+  </div>
+  <div id="nfl-coach-track-section" class="card" style="display:none;max-width:960px;margin:0 auto 16px;padding:18px">
+    <div style="display:flex;justify-content:space-between;gap:8px"><h2 style="color:#fff;font-size:1.2rem">AI Coach Track Record</h2><button onclick="loadNflCoachTrack()" style="background:#0e7490;color:#fff;border:0;border-radius:7px;padding:7px 10px;cursor:pointer">Refresh & Grade</button></div>
+    <div id="nflCoachTrackTabs" class="nfl-coach-presets"></div><div id="nflCoachTrackBody" style="overflow:auto"></div>
   </div>
   <div id="nfl-gp-card" style="display:none;max-width:960px;margin:18px auto 0;padding:0 16px">
     <div style="font-size:1rem;font-weight:900;color:#a78bfa;margin-bottom:6px">&#128302; Game Predictor &#8212; Today&#39;s Winners</div>
@@ -4961,7 +5189,7 @@ function _nflCoachProps(){
       recentRate:Number(p.vsLineRate||p.rateB||0),recentHits:Number(p.vsLineHits||p.hitsB||0),
       recentTotal:Number(p.vsLineTotal||p.totB||0),oppRate:Number(p.rateA||0),
       oppHits:Number(p.hitsA||0),oppTotal:Number(p.totA||0),book:side==='UNDER'?(p.under_book||''):(p.over_book||''),
-      isAlternate:!!p.isAlternate,source:p
+       isAlternate:!!p.isAlternate,game_start:p.game_start||'',source:p
     });
   });
   out.forEach(function(p){p.edge=p.appProb-p.implied;});
@@ -5110,19 +5338,35 @@ function _nflCoachRender(question,rows,total,mode){
   }).join('');
   el.innerHTML='<div class="nfl-coach-question">'+_esc(question)+'</div><div class="nfl-coach-summary">'+summary+'</div>'+cards;
 }
-function askNflCoachPreset(q){var input=document.getElementById('nflCoachInput');if(input)input.value=q;askNflCoach();}
+function _nflCoachCapture(category,rows){
+  var status=document.getElementById('nflCoachCaptureStatus'),dp=document.getElementById('datePicker'),token=localStorage.getItem('__mpa_token')||'';
+  if(!rows||!rows.length){if(status)status.textContent='Nothing saved: no qualifying displayed plays.';return;}
+  var payload={category:category,date:(dp&&dp.value)||window.__NFL_DATE__||'',rows:rows.map(function(p){return {player:p.player,team:p.team,opponent:p.opponent,game_start:p.game_start,market:p.market,side:p.side,line:p.line,odds:p.odds,book:p.book,model_probability:p.appProb,implied_probability:p.implied,coach_edge:p.edge,projection:p.projection,alternate:p.isAlternate};})};
+  if(status)status.textContent='Saving displayed snapshot…';
+  fetch('/api/nfl/coach-track/capture?token='+encodeURIComponent(token),{method:'POST',headers:{'Content-Type':'application/json','Authorization':token?'Bearer '+token:''},body:JSON.stringify(payload)}).then(function(r){return r.json().then(function(x){if(!r.ok)throw new Error(x.detail||'Save failed');return x;});}).then(function(x){if(status){status.style.color=x.status==='saved'?'#86efac':'#fbbf24';status.textContent=x.message;}}).catch(function(e){if(status){status.style.color='#f87171';status.textContent='Not saved: '+e.message;}});
+}
+function askNflCoachPreset(q,category){var input=document.getElementById('nflCoachInput');if(input)input.value=q;_nflCoachCapture(category,askNflCoach());}
 async function askNflAltCoach(){
   var btn=document.getElementById('nflAltCoachBtn'),answer=document.getElementById('nflCoachAnswer');
+  if(window.__NFL_ALT_COACH_ABORT__){
+    window.__NFL_ALT_COACH_ABORT__.abort();
+    delete window.__NFL_ALT_COACH_ABORT__;
+    if(btn){btn.disabled=false;btn.textContent='Best Alt-Line Edge Plays · Top 10';}
+    if(answer){answer.style.display='block';answer.innerHTML='<div class="nfl-coach-summary">Alternate-line scan cancelled. Click the button again to retry.</div>';}
+    return;
+  }
   var oldText=btn?btn.textContent:'';
   var state=window._nflState||{},d=state.d||{},previous=d.coach_candidates;
   var hadPrevious=Object.prototype.hasOwnProperty.call(d,'coach_candidates');
-  if(btn){btn.disabled=true;btn.textContent='Loading alternate lines…';}
-  if(answer){answer.style.display='block';answer.innerHTML='<div class="nfl-coach-summary">Fetching genuine sportsbook alternate-line ladders. Cached scans reuse the same data.</div>';}
+  var controller=new AbortController(),timer=setTimeout(function(){controller.abort();},125000);
+  window.__NFL_ALT_COACH_ABORT__=controller;
+  if(btn){btn.disabled=false;btn.textContent='Cancel alternate-line scan';}
+  if(answer){answer.style.display='block';answer.innerHTML='<div class="nfl-coach-summary">Fetching genuine sportsbook alternate-line ladders. This can take up to two minutes on a cold start. Click the button again to cancel.</div>';}
   try{
     var token=localStorage.getItem('__mpa_token')||'';
     var dateEl=document.getElementById('datePicker');
     var date=(dateEl&&dateEl.value)||window.__NFL_DATE__||'';
-    var res=await fetch('/api/nfl/coach-alternates?date_str='+encodeURIComponent(date)+'&token='+encodeURIComponent(token));
+    var res=await fetch('/api/nfl/coach-alternates?date_str='+encodeURIComponent(date)+'&token='+encodeURIComponent(token),{signal:controller.signal});
     var data=await res.json();
     if(!res.ok||data.error)throw new Error(data.detail||data.error||('HTTP '+res.status));
     d.coach_candidates=data.picks||[];
@@ -5130,10 +5374,15 @@ async function askNflAltCoach(){
     window.__NFL_COACH_ALT_ACTIVE__=true;
     var input=document.getElementById('nflCoachInput');
     if(input)input.value='Show the top 10 safe-value alternate-line plays at 85% model probability and 70% book probability or better';
-    askNflCoach();
+    _nflCoachCapture('alt_line_edge',askNflCoach());
   }catch(e){
-    if(answer)answer.innerHTML='<div class="nfl-coach-summary" style="color:#f87171">'+_esc(e.message||'Alternate-line scan failed.')+'</div>';
+    var msg=e&&e.name==='AbortError'
+      ?'The alternate-line scan was cancelled or exceeded two minutes. Click the button to retry.'
+      :(e.message||'Alternate-line scan failed.');
+    if(answer)answer.innerHTML='<div class="nfl-coach-summary" style="color:#f87171">'+_esc(msg)+'</div>';
   }finally{
+    clearTimeout(timer);
+    if(window.__NFL_ALT_COACH_ABORT__===controller)delete window.__NFL_ALT_COACH_ABORT__;
     if(hadPrevious)d.coach_candidates=previous;else delete d.coach_candidates;
     delete window.__NFL_COACH_LIMIT_OVERRIDE__;
     delete window.__NFL_COACH_ALT_ACTIVE__;
@@ -5142,7 +5391,7 @@ async function askNflAltCoach(){
 }
 function askNflCoach(){
   var input=document.getElementById('nflCoachInput'),question=String(input&&input.value||'').trim();if(!question){if(input)input.focus();return;}
-  var props=_nflCoachProps();if(!props.length){_nflCoachRender(question,[],0,'edge');return;}
+  var props=_nflCoachProps();if(!props.length){_nflCoachRender(question,[],0,'edge');return [];}
   var f=_nflCoachParse(question,props),candidates=_nflCoachSafest(props);
   if(window.__NFL_COACH_LIMIT_OVERRIDE__)f.limit=Number(window.__NFL_COACH_LIMIT_OVERRIDE__)||f.limit;
   var rows=candidates.filter(function(p){
@@ -5168,7 +5417,19 @@ function askNflCoach(){
     if(!key||seenPlayers[key])return false;
     seenPlayers[key]=1;return true;
   });
-  _nflCoachRender(question,rows.slice(0,f.limit),candidates.length,f.mode);
+  var shown=rows.slice(0,f.limit);_nflCoachRender(question,shown,candidates.length,f.mode);return shown;
+}
+var _nflCoachTrackData=null,_nflCoachTrackTab='safest_bets';
+function openNflCoachTrack(){var e=document.getElementById('nfl-coach-track-section');if(e){e.style.display='block';e.scrollIntoView({behavior:'smooth',block:'center'});}loadNflCoachTrack();}
+function loadNflCoachTrack(){
+  var out=document.getElementById('nflCoachTrackBody'),token=localStorage.getItem('__mpa_token')||'';if(out)out.innerHTML='<p style="color:#94a3b8">Loading Coach record…</p>';
+  fetch('/api/nfl/coach-track?grade=true&token='+encodeURIComponent(token),{headers:{'Authorization':token?'Bearer '+token:''}}).then(function(r){return r.json().then(function(x){if(!r.ok)throw new Error(x.detail||'Could not load');return x;});}).then(function(x){_nflCoachTrackData=x;renderNflCoachTrack();}).catch(function(e){if(out)out.innerHTML='<p style="color:#f87171">'+_esc(e.message)+'</p>';});
+}
+function renderNflCoachTrack(){
+  var d=_nflCoachTrackData||{},tabs=document.getElementById('nflCoachTrackTabs'),out=document.getElementById('nflCoachTrackBody'),items=d.categories||[];if(!tabs||!out)return;
+  tabs.innerHTML=items.map(function(x){return '<button class="nfl-coach-preset" onclick="_nflCoachTrackTab='+JSON.stringify(x.category)+';renderNflCoachTrack()">'+_esc(x.category.replace(/_/g,' '))+'</button>';}).join('');
+  var item=items.filter(function(x){return x.category===_nflCoachTrackTab;})[0]||items[0];if(!item){out.innerHTML='No Coach snapshots yet.';return;}var s=item.summary||{},rows=item.rows||[];
+  out.innerHTML='<div class="nfl-coach-summary"><b>'+_esc(item.category.replace(/_/g,' '))+'</b> · '+s.wins+'W-'+s.losses+'L · '+s.pushes+' PUSH · '+s.voids+' VOID · '+s.pending+' pending · Hit rate '+(s.rate==null?'—':s.rate+'%')+' · '+(s.units>=0?'+':'')+s.units+'u · ROI '+(s.roi==null?'—':s.roi+'%')+'</div><table class="nfl-trk-tbl"><thead><tr><th>Date</th><th>Player</th><th>Play</th><th>Actual</th><th>Result</th><th>Units</th></tr></thead><tbody>'+rows.map(function(r){var res=r.result||'PENDING';return '<tr><td>'+_esc(r.date||'—')+'</td><td>'+_esc(r.player)+'<br><small>'+_esc(r.team)+' vs '+_esc(r.opponent)+'</small></td><td>'+_esc(r.market_label||r.market)+' '+_esc(r.side)+' '+r.line+' ('+_nflCoachOdds(r.odds)+')</td><td>'+(r.actual==null?'—':r.actual)+'</td><td><span class="nfl-trk-result '+String(res).toLowerCase()+'">'+_esc(res)+'</span></td><td>'+(r.units==null?'—':(r.units>=0?'+':'')+r.units+'u')+'</td></tr>';}).join('')+'</tbody></table>';
 }
 function renderResults(d){
   var res=document.getElementById('results');
