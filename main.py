@@ -5091,7 +5091,7 @@ function _nflCoachRender(question,rows,total,mode){
   var summary=mode==='safe'
     ?'I checked both sides of '+total+' priced NFL candidates and ranked these by sportsbook-implied win probability. Safer favorites can require substantially more risk for a smaller return.'
     :(window.__NFL_COACH_ALT_ACTIVE__
-      ?'I checked '+total+' genuine alternate-line candidates and ranked the top positive Coach Edge plays. Only the strongest alternate line per player survives, with a maximum of 10 plays.'
+      ?'I checked '+total+' genuine alternate-line candidates for the safer-value sweet spot. Every result has at least 85% app probability, at least 70% sportsbook-implied probability, and positive Coach Edge; each player keeps the qualifying line with the largest edge, with a maximum of 10 plays.'
       :'I checked '+total+' priced NFL board plays and ranked the matching positive Coach Edge results. Coach Edge is probability edge, not guaranteed monetary profit.');
   if(!rows.length){el.innerHTML='<div class="nfl-coach-question">'+_esc(question)+'</div><div class="nfl-coach-summary">No loaded priced NFL prop matched that request.</div>';return;}
   var cards=rows.map(function(p,i){
@@ -5129,7 +5129,7 @@ async function askNflAltCoach(){
     window.__NFL_COACH_LIMIT_OVERRIDE__=10;
     window.__NFL_COACH_ALT_ACTIVE__=true;
     var input=document.getElementById('nflCoachInput');
-    if(input)input.value='Show the top 10 positive edge alternate-line plays';
+    if(input)input.value='Show the top 10 safe-value alternate-line plays at 85% model probability and 70% book probability or better';
     askNflCoach();
   }catch(e){
     if(answer)answer.innerHTML='<div class="nfl-coach-summary" style="color:#f87171">'+_esc(e.message||'Alternate-line scan failed.')+'</div>';
@@ -5147,6 +5147,8 @@ function askNflCoach(){
   if(window.__NFL_COACH_LIMIT_OVERRIDE__)f.limit=Number(window.__NFL_COACH_LIMIT_OVERRIDE__)||f.limit;
   var rows=candidates.filter(function(p){
     if(f.mode!=='safe'&&p.edge<=0)return false;
+    if(window.__NFL_COACH_ALT_ACTIVE__&&p.appProb<85)return false;
+    if(window.__NFL_COACH_ALT_ACTIVE__&&p.implied<70)return false;
     if(f.side&&p.side!==f.side)return false;
     if(f.marketExact&&String(p.market)!==f.marketExact)return false;
     if(f.market&&_nflCoachFamily(p.market)!==f.market)return false;
@@ -5155,7 +5157,11 @@ function askNflCoach(){
     if(f.teams.length&&f.teams.indexOf(String(p.team).toLowerCase())<0&&f.teams.indexOf(String(p.opponent).toLowerCase())<0)return false;
     return true;
   });
-  rows.sort(f.mode==='safe'?function(a,b){return b.implied-a.implied||b.appProb-a.appProb;}:function(a,b){return b.edge-a.edge||b.appProb-a.appProb;});
+  rows.sort(window.__NFL_COACH_ALT_ACTIVE__
+    ?function(a,b){return b.edge-a.edge||b.appProb-a.appProb;}
+    :(f.mode==='safe'
+      ?function(a,b){return b.implied-a.implied||b.appProb-a.appProb;}
+      :function(a,b){return b.edge-a.edge||b.appProb-a.appProb;}));
   var seenPlayers={};
   rows=rows.filter(function(p){
     var key=String(p.player||'').trim().toLowerCase();
