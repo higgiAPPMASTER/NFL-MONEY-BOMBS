@@ -2311,6 +2311,14 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False) -> 
     picks   = sorted([r for r in all_results
                       if r.get("pick") and r.get("betQualified", True)],
                      key=lambda x: abs(x.get("gap") or 0), reverse=True)
+    td_picks = sorted(
+        [r for r in all_results
+         if r.get("market") == "player_anytime_td"
+         and r.get("pick") == "OVER"
+         and r.get("betQualified", True)],
+        key=lambda x: (float(x.get("score") or x.get("dispScore") or 0),
+                       float(x.get("valueEdge") or 0)),
+        reverse=True)
     games_out = [{"home_team":g.get("home_team",""), "away_team":g.get("away_team",""),
                   "home_abbr":g.get("home_abbr",""), "away_abbr":g.get("away_abbr",""),
                   "game":g.get("game","")} for g in espn_games]
@@ -2350,7 +2358,7 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False) -> 
     except Exception:
         pass
 
-    result  = {"picks":picks, "all":all_results, "date":date_str,
+    result  = {"picks":picks, "all":all_results, "td_picks":td_picks, "date":date_str,
                "games":games_out, "qualified":len(picks),
                "data_warning": data_warning,
                "data_note": data_note,
@@ -3062,7 +3070,7 @@ _NFL_TRK_STAKE = 20.0
 _NFL_TRK_TOP   = 10   # picks per market+direction that count in main record
 _NFL_COACH_TRK_APP = "nfl_coach_track"
 _NFL_COACH_CATS = ("safest_bets", "coach_edge", "alt_line_edge", "passing",
-                   "rushing", "receiving", "best_unders")
+                   "rushing", "receiving", "td_scorers", "best_unders")
 
 def _nfl_coach_market_key(value):
     """Coach cards use display labels; settlement needs the canonical market key."""
@@ -4308,6 +4316,22 @@ tr:last-child td{border-bottom:none}
  .nfl-parlay-source{display:inline-block;margin-left:6px;padding:2px 5px;border-radius:5px;font-size:.54rem;font-weight:950;letter-spacing:.04em;vertical-align:1px}
  .nfl-parlay-source.normal{color:#93c5fd;background:rgba(59,130,246,.15)}
  .nfl-parlay-source.coach{color:#86efac;background:rgba(34,197,94,.15)}
+ .nfl-td-card{display:none;max-width:960px;margin:0 auto 16px;border-color:rgba(250,204,21,.42)!important;background:radial-gradient(circle at top right,rgba(250,204,21,.08),transparent 38%),#151515!important}
+ .nfl-td-head{display:flex;justify-content:space-between;align-items:flex-start;gap:14px;flex-wrap:wrap}
+ .nfl-td-kicker{color:#facc15;font-size:.64rem;font-weight:950;letter-spacing:.13em;text-transform:uppercase}
+ .nfl-td-title{font-family:'Playfair Display',serif;color:#fff;font-size:1.4rem;margin-top:4px}
+ .nfl-td-sub{color:#94a3b8;font-size:.74rem;line-height:1.5;margin-top:5px;max-width:720px}
+ .nfl-td-count{color:#fde68a;background:rgba(250,204,21,.1);border:1px solid rgba(250,204,21,.3);border-radius:999px;padding:6px 11px;font-size:.68rem;font-weight:950}
+ .nfl-td-table-wrap{overflow-x:auto;margin-top:14px;border:1px solid #2d2d22;border-radius:12px}
+ .nfl-td-table{width:100%;border-collapse:collapse;min-width:790px;font-size:.72rem}
+ .nfl-td-table th{background:#11110d;color:#a3a38d;text-align:left;padding:9px 10px;font-size:.58rem;text-transform:uppercase;letter-spacing:.07em}
+ .nfl-td-table td{padding:11px 10px;border-top:1px solid #29291f;color:#e5e7eb;vertical-align:middle}
+ .nfl-td-player{appearance:none;background:none;border:0;padding:0;color:#fff;font:inherit;font-weight:950;cursor:pointer;text-align:left}
+ .nfl-td-player:hover,.nfl-td-player:focus-visible{color:#facc15;outline:none}
+ .nfl-td-rank{display:inline-flex;width:24px;height:24px;align-items:center;justify-content:center;border-radius:50%;background:rgba(250,204,21,.12);color:#fde68a;font-weight:950}
+ .nfl-td-prob{color:#86efac;font-weight:950;font-family:monospace}
+ .nfl-td-edge{color:#4ade80;font-weight:950;font-family:monospace}
+ .nfl-td-method{margin-top:10px;color:#6b7280;font-size:.64rem;line-height:1.45}
  @media(max-width:620px){.nfl-parlay-filters{grid-template-columns:1fr}}
  @media(max-width:680px){.nfl-trk-group-head{padding:14px}.nfl-trk-group-name{font-size:1.02rem}.nfl-trk-tbl{font-size:.88rem}.nfl-trk-tbl th{font-size:.68rem;padding:11px}.nfl-trk-tbl td{padding:11px 12px}}
 </style>
@@ -4374,6 +4398,7 @@ tr:last-child td{border-bottom:none}
       <button class="nfl-coach-preset" onclick="askNflCoachPreset('Show the best passing plays','passing')">Passing</button>
       <button class="nfl-coach-preset" onclick="askNflCoachPreset('Show the best rushing plays','rushing')">Rushing</button>
       <button class="nfl-coach-preset" onclick="askNflCoachPreset('Show the best receiving plays','receiving')">Receiving</button>
+      <button class="nfl-coach-preset" onclick="askNflCoachPreset('Show the best positive Coach Edge Anytime TD scorers','td_scorers')" style="border-color:#eab308;color:#fde68a">TD Scorers</button>
       <button class="nfl-coach-preset" onclick="askNflCoachPreset('Show the best under plays','best_unders')">Best unders</button>
     </div>
     <div class="nfl-coach-row">
@@ -4387,7 +4412,7 @@ tr:last-child td{border-bottom:none}
   <div id="nfl-coach-track-section" class="card" style="display:none;max-width:960px;margin:0 auto 16px;padding:20px 22px">
     <div style="margin-bottom:14px">
       <h2 style="font-family:'Playfair Display',serif;font-size:1.4rem;font-weight:700;color:#fff">&#128202; NFL AI Coach Track Record</h2>
-      <div style="color:#7c8aa0;font-size:.76rem;margin-top:4px">Write-once pre-kickoff recommendations from all seven Coach presets. Kept separate from the main, Overflow, Game Predictor, and historical records.</div>
+      <div style="color:#7c8aa0;font-size:.76rem;margin-top:4px">Write-once pre-kickoff recommendations from all eight Coach presets. Kept separate from the main, Overflow, Game Predictor, and historical records.</div>
     </div>
     <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:14px">
       <label style="color:#9ca3af;font-size:.78rem;font-weight:700;text-transform:uppercase;letter-spacing:.1em">Record</label>
@@ -4418,6 +4443,14 @@ tr:last-child td{border-bottom:none}
     <div style="font-size:1rem;font-weight:900;color:#a78bfa;margin-bottom:6px">&#128302; Game Predictor &#8212; Today&#39;s Winners</div>
     <div style="font-size:.72rem;color:#64748b;margin-bottom:14px">Model blends recent L5 form, last completed season offense/defense, home-field advantage, and venue-aware results from the last five head-to-head meetings. Tap a game for the full breakdown.</div>
     <div id="nfl-gp-body"></div>
+  </div>
+  <div id="nfl-td-predictor-card" class="card nfl-td-card">
+    <div class="nfl-td-head">
+      <div><div class="nfl-td-kicker">Touchdown Intelligence</div><h2 class="nfl-td-title">Anytime TD Predictor</h2>
+      <div class="nfl-td-sub">Qualified touchdown scorers ranked from recent scoring frequency, opponent history, defensive adjustment, genuine sportsbook probability, and positive model-versus-price edge.</div></div>
+      <div id="nflTdPredictorCount" class="nfl-td-count"></div>
+    </div>
+    <div id="nfl-td-predictor-body"></div>
   </div>
   <div id="results"></div>
 </main>
@@ -5302,6 +5335,7 @@ function _nflCoachSafest(props){
   var seen={},out=[];
   (props||[]).forEach(function(p){var k=p.player+'|'+p.market+'|'+p.side+'|'+p.line+'|'+p.odds;if(!seen[k]){seen[k]=1;out.push(p);}});
   (props||[]).forEach(function(p){
+    if(_nflCoachFamily(p.market)==='td')return;
     var odds=_nflCoachNum(p.oppositeOdds);if(odds==null)return;
     var side=p.side==='OVER'?'UNDER':'OVER',k=p.player+'|'+p.market+'|'+side+'|'+p.line+'|'+odds;
     if(seen[k])return;seen[k]=1;
@@ -5526,7 +5560,7 @@ var _nflCoachTrackData=null,_nflCoachTrackTabMode='cat';
 var _NFL_COACH_TRACK_LABELS={
   safest_bets:'Safest Bets',coach_edge:'Coach Edge',
   alt_line_edge:'Best Alt-Line Edge Plays',passing:'Passing',
-  rushing:'Rushing',receiving:'Receiving',best_unders:'Best Unders'
+  rushing:'Rushing',receiving:'Receiving',td_scorers:'TD Scorers',best_unders:'Best Unders'
 };
 function _nflCoachTrackLabel(category){return _NFL_COACH_TRACK_LABELS[category]||String(category||'Coach').replace(/_/g,' ');}
 function _nflCoachTrkStake(){
@@ -5646,6 +5680,40 @@ function renderNflCoachTrack(){
     ?(_nflCoachTrackTabMode==='cat'?_nflCoachTrackCategoryHtml(rows,stake):_nflCoachTrackListHtml(rows,stake))
     :'';
 }
+function _renderNflTdPredictor(d){
+  var card=document.getElementById('nfl-td-predictor-card'),body=document.getElementById('nfl-td-predictor-body');
+  if(!card||!body)return;
+  var source=(d&&d.td_picks)||((d&&d.all)||[]).filter(function(p){
+    return p.market==='player_anytime_td'&&p.pick==='OVER'&&p.betQualified!==false;
+  });
+  var rows=source.filter(function(p){return !_nflGameDone(p);}).slice().sort(function(a,b){
+    return Number(b.score||b.dispScore||0)-Number(a.score||a.dispScore||0)
+      ||Number(b.valueEdge||0)-Number(a.valueEdge||0);
+  }).slice(0,10);
+  if(!rows.length){card.style.display='none';body.innerHTML='';return;}
+  card.style.display='block';
+  var count=document.getElementById('nflTdPredictorCount');
+  if(count)count.textContent=rows.length+' QUALIFIED SCORER'+(rows.length===1?'':'S');
+  var table=rows.map(function(p,i){
+    var key=_ladKey(p);window.__NFLLAD__[key]=p;
+    var odds=_nflSideOdds(p,'OVER'),implied=_nflCoachImplied(odds);
+    var prob=Number(p.score!=null?p.score:p.dispScore||0);
+    var edge=p.valueEdge!=null?Number(p.valueEdge):(implied==null?null:prob-implied);
+    var recent=p.vsLineTotal?Number(p.vsLineHits||0)+'/'+Number(p.vsLineTotal||0)+' ('+Number(p.vsLineRate||0).toFixed(0)+'%)':'—';
+    var versus=p.totA?Number(p.hitsA||0)+'/'+Number(p.totA||0)+' ('+Number(p.rateA||0).toFixed(0)+'%)':'—';
+    var defense=p.defRank!=null?'#'+p.defRank+' '+_esc(p.defLbl||'defense'):(p.defLbl?_esc(p.defLbl):'—');
+    return '<tr><td><span class="nfl-td-rank">'+(i+1)+'</span></td>'
+      +'<td><button type="button" class="nfl-td-player" onclick="openNflLadder(\\''+key+'\\')">'+_esc(p.name)+'</button><br><small style="color:#6b7280">'+_esc(p.team||'')+' vs '+_esc(p.opponent||'')+'</small></td>'
+      +'<td style="font-weight:900;color:#fde68a">OVER 0.5 TD</td>'
+      +'<td style="font-family:monospace;color:#fbbf24;font-weight:900">'+(_fmtOdds(odds)||'—')+'<br><small style="color:#6b7280">'+_esc(p.over_book||'')+'</small></td>'
+      +'<td>'+(implied==null?'—':implied.toFixed(1)+'%')+'</td>'
+      +'<td class="nfl-td-prob">'+prob.toFixed(1)+'%</td>'
+      +'<td class="nfl-td-edge">'+(edge==null?'—':(edge>=0?'+':'')+edge.toFixed(1)+' pts')+'</td>'
+      +'<td>'+recent+'</td><td>'+versus+'</td><td>'+defense+'</td></tr>';
+  }).join('');
+  body.innerHTML='<div class="nfl-td-table-wrap"><table class="nfl-td-table"><thead><tr><th>#</th><th>Player</th><th>Play</th><th>Best Odds</th><th>Implied</th><th>TD Confidence</th><th>Value Edge</th><th>L10 vs Line</th><th>Vs Opponent</th><th>Opponent Defense</th></tr></thead><tbody>'+table+'</tbody></table></div>'
+    +'<div class="nfl-td-method">Qualification requires a genuine Anytime TD price, at least five recent home/away games, and model confidence at least five percentage points above sportsbook break-even. Passing touchdowns do not count; only rushing or receiving touchdowns settle this market. Click any player for the full game log.</div>';
+}
 function renderResults(d){
   var res=document.getElementById('results');
   if(!d){ res.innerHTML=''; return; }
@@ -5668,6 +5736,7 @@ function renderResults(d){
     :'';
   res.innerHTML=note+warn+tdNote+'<div class="nfl-toolbar"><input id="nflSearch" type="text" placeholder="Search player…" oninput="_nflPaint(this.value)"/></div><div id="nflBody"></div>';
   _renderNflGamePredictor(d);
+  _renderNflTdPredictor(d);
   _nflPaint('');
 }
 
