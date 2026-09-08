@@ -1234,7 +1234,8 @@ async def get_odds_events(date_str: str, espn_games: List[Dict]) -> List[Dict]:
                             "commenceTimeFrom": f"{date_str}T00:00:00Z",
                             "commenceTimeTo":   f"{tomorrow}T06:00:00Z"})
                 odds_evs = r.json() if r.is_success and isinstance(r.json(), list) else []
-                _match_events(odds_evs)
+                matched = _match_events(odds_evs)
+                print(f"[OddsAPI events] HTTP {r.status_code} found={len(odds_evs)} matched={matched}/{len(espn_games)}")
             else:
                 # Try two snapshots: pre-game (T18:00:00Z = 1pm ET) then post-game (next day T04:00:00Z).
                 # T18:00:00Z catches lines before any kickoff; the next-day fallback grabs games
@@ -2175,6 +2176,18 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False) -> 
             ev_id = ev.get("id", "")
             _p(f"Fetching prop lines — game {gi+1}/{len(espn_games)}: {ev.get('game','')}…")
             lines = await get_prop_lines(ev_id, date_str) if ev_id else []
+            # A live Odds API response can occasionally be successful but contain
+            # no bookmaker markets. Do not erase a slate on that one transient
+            # response; retry briefly before reporting that lines are unavailable.
+            if ev_id and not simulate and not lines:
+                for retry in range(2):
+                    wait_s = 1.5 * (retry + 1)
+                    print(f"[OddsAPI props] empty for {ev_id}; retry {retry + 1}/2 in {wait_s:.1f}s")
+                    await asyncio.sleep(wait_s)
+                    lines = await get_prop_lines(ev_id, date_str)
+                    if lines:
+                        print(f"[OddsAPI props] retry recovered {len(lines)} lines for {ev_id}")
+                        break
             home_abbr = ev.get("home_abbr", "") or _name_to_abbr(ev.get("home_team",""))
             away_abbr = ev.get("away_abbr", "") or _name_to_abbr(ev.get("away_team",""))
             for l in lines:
@@ -2233,6 +2246,10 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False) -> 
                 continue
         roster_filtered.append(line)
     all_lines = roster_filtered
+    # Keep the complete sportsbook set for later game-line cache updates.
+    # _trim_prop_lines intentionally reduces analysis volume, but that reduced
+    # list must never overwrite the raw odds cache.
+    raw_cached_lines = list(all_lines)
 
     # 4. Load NFL stats (nfl_data_py — downloads once, cached in memory)
     _p(f"Loading player stats ({len(all_lines)} props to analyze) — first run after deploy downloads ~20s…")
@@ -2330,7 +2347,7 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False) -> 
     if new_gl:
         # Persist freshly-bought game lines so re-runs never re-buy them
         merged_gl = {**(game_lines_by_id or {}), **new_gl}
-        _odds_cache_set(date_str, all_lines, merged_gl)
+        _odds_cache_set(date_str, raw_cached_lines, merged_gl)
     _p("Finishing up…")
     # Data health: the current season is normally absent before its first games.
     # That is expected for Week 1, so show it as an informational note; only
