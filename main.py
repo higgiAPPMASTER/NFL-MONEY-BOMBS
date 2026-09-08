@@ -4294,6 +4294,21 @@ tr:last-child td{border-bottom:none}
  .nfl-trk-result.push{color:#fde68a;background:rgba(234,179,8,.15);border:1px solid rgba(250,204,21,.35)}
  .nfl-trk-result.void{color:#cbd5e1;background:rgba(100,116,139,.15);border:1px solid rgba(148,163,184,.25)}
  .nfl-trk-result.pending{color:#cbd5e1;background:rgba(100,116,139,.15);border:1px solid rgba(148,163,184,.25)}
+ .nfl-parlay-filters{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:14px;text-align:left}
+ .nfl-parlay-filter-group{background:#101010;border:1px solid #292929;border-radius:11px;padding:11px}
+ .nfl-parlay-filter-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px}
+ .nfl-parlay-filter-title{color:#e5e7eb;font-size:.72rem;font-weight:950;letter-spacing:.05em;text-transform:uppercase}
+ .nfl-parlay-filter-actions{display:flex;gap:5px}
+ .nfl-parlay-filter-actions button{background:#1f2937;color:#cbd5e1;border:1px solid #374151;border-radius:6px;padding:4px 7px;font-size:.6rem;font-weight:900;cursor:pointer}
+ .nfl-parlay-filter-actions button:hover{border-color:#f59e0b;color:#fbbf24}
+ .nfl-parlay-cat-list{display:grid;grid-template-columns:1fr;gap:5px;max-height:190px;overflow:auto;padding-right:3px}
+ .nfl-parlay-cat{display:flex;align-items:flex-start;gap:7px;color:#9ca3af;font-size:.67rem;line-height:1.3;cursor:pointer}
+ .nfl-parlay-cat input{accent-color:#f59e0b;margin-top:1px}
+ .nfl-parlay-cat-empty{color:#64748b;font-size:.65rem;line-height:1.4}
+ .nfl-parlay-source{display:inline-block;margin-left:6px;padding:2px 5px;border-radius:5px;font-size:.54rem;font-weight:950;letter-spacing:.04em;vertical-align:1px}
+ .nfl-parlay-source.normal{color:#93c5fd;background:rgba(59,130,246,.15)}
+ .nfl-parlay-source.coach{color:#86efac;background:rgba(34,197,94,.15)}
+ @media(max-width:620px){.nfl-parlay-filters{grid-template-columns:1fr}}
  @media(max-width:680px){.nfl-trk-group-head{padding:14px}.nfl-trk-group-name{font-size:1.02rem}.nfl-trk-tbl{font-size:.88rem}.nfl-trk-tbl th{font-size:.68rem;padding:11px}.nfl-trk-tbl td{padding:11px 12px}}
 </style>
 <div id="nfl-mybets-card" style="display:none;max-width:960px;margin:18px auto 0;padding:0 16px">
@@ -4332,6 +4347,16 @@ tr:last-child td{border-bottom:none}
       </label>
       <button class="btn" onclick="buildParlay()">Build Best Parlay</button>
       <button class="btn" onclick="generateParlay()" style="background:#1f2937;color:#fff">🎲 Generate New</button>
+    </div>
+    <div class="nfl-parlay-filters">
+      <div class="nfl-parlay-filter-group">
+        <div class="nfl-parlay-filter-head"><div class="nfl-parlay-filter-title">Normal Plays</div><div class="nfl-parlay-filter-actions"><button type="button" onclick="_nflParlaySetAll('normal',true)">All</button><button type="button" onclick="_nflParlaySetAll('normal',false)">None</button></div></div>
+        <div id="nflParlayNormalCats" class="nfl-parlay-cat-list"><div class="nfl-parlay-cat-empty">Run today&#39;s picks to load categories.</div></div>
+      </div>
+      <div class="nfl-parlay-filter-group" style="border-color:rgba(34,197,94,.3)">
+        <div class="nfl-parlay-filter-head"><div class="nfl-parlay-filter-title" style="color:#86efac">Coach Edge Plays</div><div class="nfl-parlay-filter-actions"><button type="button" onclick="_nflParlaySetAll('coach',true)">All</button><button type="button" onclick="_nflParlaySetAll('coach',false)">None</button></div></div>
+        <div id="nflParlayCoachCats" class="nfl-parlay-cat-list"><div class="nfl-parlay-cat-empty">Run today&#39;s picks to load positive-edge categories.</div></div>
+      </div>
     </div>
     <div id="parlayResult" style="margin-top:16px;text-align:left"></div>
   </div>
@@ -4489,16 +4514,67 @@ function _nflLeg(p){
   var line=(p.realLine!=null?p.realLine:(p.dispLine!=null?p.dispLine:0));
   var rate=(p.vsLineRate||p.rateB||p.rateA||p.dispScore||0);
   var odds=(dir==='OVER')?p.realOdds:(dir==='UNDER')?p.realUnderOdds:null;var dec=_amToDec(odds);
-  return {player:p.name,team:p.team||'',opp:p.opponent||'',market:p.mkt||p.label||'',dir:dir,line:line,rate:Math.round(rate||0),odds:odds,dec:dec,hasOdds:!!dec};
+  return {player:p.name,team:p.team||'',opp:p.opponent||'',market:p.mkt||p.label||'',dir:dir,line:line,rate:Math.round(rate||0),odds:odds,dec:dec,hasOdds:!!dec,source:'normal'};
 }
-function _parlayPool(){
-  var plays=window.__NFL_PLAYS__||[];var byP={};
+function _nflParlayCatKey(c){return String(c.market||'NFL Prop')+'|'+String(c.dir||'');}
+function _nflParlayCatLabel(c){return String(c.market||'NFL Prop')+(c.dir?' · '+c.dir:'');}
+function _nflNormalParlayCandidates(){
+  var plays=window.__NFL_PLAYS__||[],out=[];
   plays.forEach(function(p){
     if(!p||!p.name||!p.pick)return;
     if(p.score==null||p.score<55)return;
     var c=_nflLeg(p);
     if(!c.dir)return;
     if(!_floorOk(c.odds))return;
+    out.push(c);
+  });
+  return out;
+}
+function _nflCoachParlayCandidates(){
+  if(typeof _nflCoachProps!=='function'||typeof _nflCoachSafest!=='function')return [];
+  return _nflCoachSafest(_nflCoachProps()).filter(function(p){return p.edge>0;}).map(function(p){
+    var dec=_amToDec(p.odds);
+    return {player:p.player,team:p.team||'',opp:p.opponent||'',market:p.market||'NFL Prop',
+      dir:p.side,line:p.line,rate:Math.round(p.appProb||0),odds:p.odds,dec:dec,hasOdds:!!dec,
+      edge:Number(p.edge||0),source:'coach'};
+  }).filter(function(c){return c.player&&c.dir&&_floorOk(c.odds);});
+}
+window.__NFL_PARLAY_FILTERS__={normal:{},coach:{}};
+function _nflParlayFilterOn(source,key){
+  var group=(window.__NFL_PARLAY_FILTERS__||{})[source]||{};
+  return group[key]!==false;
+}
+function _nflParlaySyncFilters(){
+  document.querySelectorAll('.nfl-parlay-cat input[data-source]').forEach(function(cb){
+    var source=cb.getAttribute('data-source'),key=decodeURIComponent(cb.getAttribute('data-key')||'');
+    if(!window.__NFL_PARLAY_FILTERS__[source])window.__NFL_PARLAY_FILTERS__[source]={};
+    window.__NFL_PARLAY_FILTERS__[source][key]=!!cb.checked;
+  });
+}
+function _nflParlaySetAll(source,on){
+  document.querySelectorAll('.nfl-parlay-cat input[data-source="'+source+'"]').forEach(function(cb){cb.checked=!!on;});
+  _nflParlaySyncFilters();
+}
+function _nflParlayCategoryHtml(source,cands){
+  var seen={},cats=[];
+  (cands||[]).forEach(function(c){var key=_nflParlayCatKey(c);if(!seen[key]){seen[key]=1;cats.push({key:key,label:_nflParlayCatLabel(c)});}});
+  cats.sort(function(a,b){return a.label.localeCompare(b.label);});
+  if(!cats.length)return '<div class="nfl-parlay-cat-empty">'+(source==='coach'?'No positive Coach Edge categories are available on this loaded board.':'No qualifying normal categories are available.')+'</div>';
+  return cats.map(function(cat){
+    return '<label class="nfl-parlay-cat"><input type="checkbox" data-source="'+source+'" data-key="'+encodeURIComponent(cat.key)+'"'+(_nflParlayFilterOn(source,cat.key)?' checked':'')+' onchange="_nflParlaySyncFilters()"> <span>'+_esc(cat.label)+'</span></label>';
+  }).join('');
+}
+function _renderNflParlayFilters(){
+  var normal=document.getElementById('nflParlayNormalCats'),coach=document.getElementById('nflParlayCoachCats');
+  if(normal)normal.innerHTML=_nflParlayCategoryHtml('normal',_nflNormalParlayCandidates());
+  if(coach)coach.innerHTML=_nflParlayCategoryHtml('coach',_nflCoachParlayCandidates());
+}
+function _parlayPool(){
+  _nflParlaySyncFilters();
+  var combined=_nflNormalParlayCandidates().concat(_nflCoachParlayCandidates()).filter(function(c){
+    return _nflParlayFilterOn(c.source,_nflParlayCatKey(c));
+  }),byP={};
+  combined.forEach(function(c){
     var cur=byP[c.player];
     if(!cur||_legScore(c)>_legScore(cur))byP[c.player]=c;
   });
@@ -4527,7 +4603,7 @@ function _renderParlay(randomize){
   var dirColor=function(d){return d==='OVER'?'#4ade80':d==='UNDER'?'#f87171':'#9ca3af';};
   var rows=legs.map(function(l,i){var fo=_fmtOdds(l.odds);return '<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;padding:10px 12px;border-bottom:1px solid #1a1a1a">'
     +'<div style="min-width:0">'
-    +'<div style="font-weight:800;color:#fff;font-size:.85rem">'+(i+1)+'. '+l.player+' <span style="color:#777;font-size:.7rem">'+l.team+(l.opp?(' vs '+l.opp):'')+'</span></div>'
+    +'<div style="font-weight:800;color:#fff;font-size:.85rem">'+(i+1)+'. '+l.player+' <span style="color:#777;font-size:.7rem">'+l.team+(l.opp?(' vs '+l.opp):'')+'</span><span class="nfl-parlay-source '+(l.source==='coach'?'coach':'normal')+'">'+(l.source==='coach'?'COACH EDGE':'NORMAL')+'</span></div>'
     +'<div style="color:#999;font-size:.72rem;margin-top:2px">'+l.market+(l.line!=null?(' · line '+l.line):'')+(l.rate?(' · '+l.rate+'% hit'):'')+'</div>'
     +'</div>'
     +'<div style="text-align:right;white-space:nowrap">'
@@ -5580,6 +5656,7 @@ function renderResults(d){
   window._nflState={d:d, all:(d.all||[])};
   window.__NFL_PLAYS__=d.all||[];
   window.__NFL_DATE__=d.date||'';
+  _renderNflParlayFilters();
   var note=d.data_note?('<div style="margin-bottom:10px;padding:11px 14px;border:1px solid #24506b;background:#0b2230;border-radius:10px;color:#9bd5f5;font-size:.82rem">'+d.data_note+'</div>'):'';
   var warn=d.data_warning?('<div class="err-box" style="margin-bottom:10px">'+d.data_warning+'</div>'):'';
   var tdAll=(d.all||[]).filter(function(p){return p.market==='player_anytime_td'&&p.pick==='OVER';});
