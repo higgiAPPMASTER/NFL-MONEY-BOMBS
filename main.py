@@ -354,7 +354,14 @@ _NFL_NEW_FMT_START = 2025
 _KEEP_COLS   = ["player_display_name","player_id","headshot_url","recent_team","opponent_team",
                 "season","week","season_type","rushing_yards","receiving_yards","passing_yards",
                 "receptions","targets","passing_tds","rushing_tds","receiving_tds",
-                "completions","attempts","interceptions","carries"]
+                "completions","attempts","interceptions","carries",
+                # Opportunity fields retained when nflverse publishes them. The
+                # weekly player-stat feed currently supplies target_share; the
+                # remaining names make the model forward-compatible without
+                # inventing unavailable red-zone/end-zone or snap data.
+                "target_share","air_yards_share","wopr","offense_pct","snap_share",
+                "red_zone_carries","redzone_carries","carries_inside_10",
+                "end_zone_targets","endzone_targets"]
 
 def _dl_csv(url):
     """Download one nfl-verse CSV (regular season + playoffs) as a DataFrame.
@@ -1451,6 +1458,13 @@ def _espn_ha_week(season_type, week):
         return week - 18
     return week
 
+def _nflverse_week(season_type, week):
+    """Translate ESPN postseason rounds (1-4) to nflverse weeks (19-22)."""
+    week = int(week)
+    if str(season_type or "REG").upper() == "POST" and 1 <= week <= 4:
+        return week + 18
+    return week
+
 def _ha_side(row, is_home):
     if not _HA_LOADED:
         return True
@@ -1508,6 +1522,264 @@ _OPP_ADJ_COLS = {
     "anytime_td": "TD D",
 }
 _DEFF_CACHE: dict = {"df_ref": None, "maps": {}}
+_TD_CAL_CACHE: dict = {"df_ref": None, "bins": None, "report": None}
+_TD_OPP_CACHE: dict = {"df_ref": None, "values": {}}
+
+def _td_mean(rows, col, default=None):
+    try:
+        vals = [float(v) for v in rows[col].dropna().tolist()]
+        return sum(vals) / len(vals) if vals else default
+    except Exception:
+        return default
+
+def _td_recent(rows, n=10):
+    """Newest player/team rows with REG weeks before POST weeks each season."""
+    try:
+        d = rows.copy()
+        if "season_type" in d.columns:
+            d["_td_phase"] = d["season_type"].fillna("REG").astype(str).str.upper().map(
+                {"REG": 0, "POST": 1}).fillna(0)
+            return d.sort_values(["season", "_td_phase", "week"], ascending=False).head(n)
+        return d.sort_values(["season", "week"], ascending=False).head(n)
+    except Exception:
+        return rows.head(n)
+
+def _td_opportunity_features(pdf, df, team):
+    """Point-in-time TD opportunity inputs from the retained nflverse rows.
+
+    Weekly player stats do not currently publish goal-line carries, end-zone
+    targets, or offensive snap share. We use them only when present; otherwise
+    carries/targets and target_share provide the supported workload signal.
+    """
+    if _TD_OPP_CACHE["df_ref"] is not df:
+        _TD_OPP_CACHE.update({"df_ref": df, "values": {}})
+    try:
+        player_key = str(pdf["player_display_name"].dropna().iloc[0]).lower()
+    except Exception:
+        player_key = str(id(pdf))
+    cache_key = (player_key, team)
+    if cache_key in _TD_OPP_CACHE["values"]:
+        return dict(_TD_OPP_CACHE["values"][cache_key])
+    offense_pdf = pdf[pdf["anytime_td"].notna()] if "anytime_td" in pdf.columns else pdf
+    recent = _td_recent(offense_pdf, 10)
+    out = {"games": len(recent)}
+    carries = _td_mean(recent, "carries", 0.0) or 0.0
+    targets = _td_mean(recent, "targets", 0.0) or 0.0
+    out["carries"] = round(carries, 1)
+    out["targets"] = round(targets, 1)
+    shares = []
+    for col in ("target_share", "offense_pct", "snap_share"):
+        if col in recent.columns:
+            v = _td_mean(recent, col)
+            if v is not None:
+                if v > 1.5:
+                    v /= 100.0
+                shares.append(max(0.0, min(1.0, v)))
+                out[col] = round(v * 100, 1)
+    rz = None
+    for col in ("red_zone_carries", "redzone_carries", "carries_inside_10"):
+        if col in recent.columns:
+            rz = _td_mean(recent, col)
+            if rz is not None:
+                out["red_zone_carries"] = round(rz, 2)
+                break
+    ez = None
+    for col in ("end_zone_targets", "endzone_targets"):
+        if col in recent.columns:
+            ez = _td_mean(recent, col)
+            if ez is not None:
+                out["end_zone_targets"] = round(ez, 2)
+                break
+    # Team scoring environment uses only rows already available before kickoff.
+    team_rows = df[df["recent_team"] == team] if team and "recent_team" in df.columns else df.iloc[0:0]
+    if not team_rows.empty:
+        team_rows = team_rows.copy()
+        if "season_type" in team_rows.columns:
+            team_rows["_td_phase"] = team_rows["season_type"].fillna("REG").astype(str).str.upper().map(
+                {"REG": 0, "POST": 1}).fillna(0)
+            tg_cols = ["season", "_td_phase", "week"]
+        else:
+            tg_cols = ["season", "week"]
+        tg = team_rows.groupby(tg_cols)[["rushing_tds", "receiving_tds"]].sum().reset_index()
+        tg["team_td"] = tg[["rushing_tds", "receiving_tds"]].sum(axis=1)
+        team_td = float(tg.sort_values(tg_cols, ascending=False).head(8)["team_td"].mean()) if len(tg) else 2.0
+    else:
+        team_td = 2.0
+    out["team_td_per_game"] = round(team_td, 2)
+    # Convert supported workload to a conservative 0..1 scorer-opportunity rate.
+    volume = min(1.0, (carries + targets) / 22.0)
+    share = sum(shares) / len(shares) if shares else volume
+    rz_signal = min(1.0, (rz or 0.0) / 3.0) if rz is not None else None
+    ez_signal = min(1.0, (ez or 0.0) / 2.0) if ez is not None else None
+    components = [volume, share]
+    if rz_signal is not None:
+        components.extend([rz_signal, rz_signal])
+    if ez_signal is not None:
+        components.extend([ez_signal, ez_signal])
+    out["signal"] = sum(components) / len(components)
+    out["available"] = [k for k in ("target_share", "offense_pct", "snap_share",
+                                      "red_zone_carries", "end_zone_targets") if k in out]
+    _TD_OPP_CACHE["values"][cache_key] = dict(out)
+    return out
+
+def _td_walk_forward_calibration(df):
+    """Build reliability bins from completed player-games without hindsight.
+
+    Each example is predicted from that player's earlier games only. The first
+    season is warm-up, at least five prior games are required, and each bin is
+    shrunk toward its raw midpoint until it has 100 outcomes.
+    """
+    if _TD_CAL_CACHE["df_ref"] is df and _TD_CAL_CACHE["bins"] is not None:
+        return _TD_CAL_CACHE["bins"], _TD_CAL_CACHE["report"]
+    bins = {i: {"n": 0, "hits": 0, "raw_sum": 0.0} for i in range(10)}
+    try:
+        d = df[df["anytime_td"].notna()].copy()
+        d = d.sort_values(["season", "week"])
+        first_season = int(d["season"].min())
+        history, team_history, defense_history, examples = {}, {}, {}, []
+        # Process a whole week as one block. Updating state only after every
+        # player in that week is predicted prevents same-week teammate leakage.
+        if "season_type" in d.columns:
+            d["_td_phase"] = d["season_type"].fillna("REG").astype(str).str.upper().map(
+                {"REG": 0, "POST": 1}).fillna(0)
+            group_cols = ["season", "_td_phase", "week"]
+        else:
+            group_cols = ["season", "week"]
+        for _, week_rows in d.groupby(group_cols, sort=True):
+            pending = []
+            league_allowed = [v for vals in defense_history.values() for v in vals[-8:]]
+            league_allowed_avg = (sum(league_allowed) / len(league_allowed)
+                                  if league_allowed else None)
+            for _, r in week_rows.iterrows():
+                name = str(r.get("player_display_name") or "").lower()
+                if not name:
+                    continue
+                h = history.setdefault(name, [])
+                team = str(r.get("recent_team") or "")
+                opp = str(r.get("opponent_team") or "")
+                if len(h) >= 5 and int(r.get("season") or 0) > first_season:
+                    recent = h[-10:]
+                    td_rate = (sum(x["td"] for x in recent) + 1.0) / (len(recent) + 3.0)
+                    opp_rows = [x for x in h if x["opp"] == opp]
+                    opp_rate = ((sum(x["td"] for x in opp_rows) + 1.0) / (len(opp_rows) + 3.0)
+                                if opp_rows else td_rate)
+                    volume = min(1.0, (sum(x["carries"] + x["targets"] for x in recent)
+                                       / len(recent)) / 22.0)
+                    known_shares = [x["target_share"] for x in recent
+                                    if x.get("target_share") is not None]
+                    share = sum(known_shares) / len(known_shares) if known_shares else volume
+                    opportunity = (volume + max(0.0, min(1.0, share))) / 2.0
+                    team_games = team_history.get(team, [])[-8:]
+                    team_rate = sum(team_games) / len(team_games) if team_games else 2.0
+                    team_env = max(.65, min(1.35, team_rate / 2.6))
+                    allowed = defense_history.get(opp, [])[-8:]
+                    if allowed and league_allowed_avg and league_allowed_avg > 0:
+                        def_factor = max(.90, min(1.10,
+                            (sum(allowed) / len(allowed)) / league_allowed_avg))
+                    else:
+                        def_factor = 1.0
+                    raw = (.50 * td_rate + .15 * opp_rate + .20 * opportunity
+                           + .10 * min(1.0, team_env / 1.35) + .05 * .50)
+                    raw = max(.03, min(.90, raw * def_factor))
+                    examples.append((int(r.get("season") or 0), raw,
+                                     int(float(r.get("anytime_td") or 0) > 0)))
+                ts = r.get("target_share")
+                try:
+                    ts = float(ts)
+                    if ts != ts:
+                        ts = None
+                    elif ts > 1.5:
+                        ts /= 100.0
+                except Exception:
+                    ts = None
+                td_count = float(r.get("anytime_td") or 0)
+                pending.append((name, team, opp, {
+                    "td": int(td_count > 0), "td_count": td_count,
+                    "opp": opp, "carries": float(r.get("carries") or 0),
+                    "targets": float(r.get("targets") or 0), "target_share": ts,
+                }))
+            team_totals = {}
+            for name, team, opp, item in pending:
+                history.setdefault(name, []).append(item)
+                team_totals[team] = team_totals.get(team, 0.0) + item["td_count"]
+            for team, total in team_totals.items():
+                team_history.setdefault(team, []).append(total)
+            for team, total in team_totals.items():
+                # The opponent defense allowed this team's scorer touchdowns.
+                opponents = [opp for _, tm, opp, _ in pending if tm == team and opp]
+                if opponents:
+                    defense_history.setdefault(opponents[0], []).append(total)
+        example_seasons = sorted({s for s, _, _ in examples})
+        holdout_season = example_seasons[-1] if len(example_seasons) >= 2 else None
+        training = [x for x in examples if holdout_season is None or x[0] < holdout_season]
+        evaluation = [x for x in examples if holdout_season is not None and x[0] == holdout_season]
+        if not training:
+            training, evaluation, holdout_season = examples, [], None
+        for _, raw, actual in training:
+            b = min(9, int(raw * 10))
+            bins[b]["n"] += 1
+            bins[b]["hits"] += actual
+            bins[b]["raw_sum"] += raw
+        report = []
+        for b, rec in bins.items():
+            midpoint = (b + .5) / 10.0
+            n = rec["n"]
+            actual = rec["hits"] / n if n else midpoint
+            weight = min(1.0, n / 100.0)
+            rec["calibrated"] = actual * weight + midpoint * (1.0 - weight)
+        eval_bins = {i: {"n": 0, "hits": 0, "raw_sum": 0.0,
+                         "calibrated_sum": 0.0} for i in range(10)}
+        for _, raw, actual in evaluation:
+            b = min(9, int(raw * 10))
+            trained = bins[b]
+            calibrated = trained["calibrated"] if trained["n"] >= 25 else raw
+            eval_bins[b]["n"] += 1
+            eval_bins[b]["hits"] += actual
+            eval_bins[b]["raw_sum"] += raw
+            eval_bins[b]["calibrated_sum"] += calibrated
+        for b, rec in bins.items():
+            midpoint = (b + .5) / 10.0
+            n = rec["n"]
+            actual = rec["hits"] / n if n else midpoint
+            ev = eval_bins[b]
+            report.append({
+                "range": f"{b*10}-{b*10+9}%",
+                "training_n": n,
+                "training_predicted": round((rec["raw_sum"] / n if n else midpoint) * 100, 1),
+                "training_actual": round(actual * 100, 1),
+                "holdout_season": holdout_season,
+                "holdout_n": ev["n"],
+                "holdout_raw": round((ev["raw_sum"] / ev["n"]) * 100, 1) if ev["n"] else None,
+                "holdout_predicted": round((ev["calibrated_sum"] / ev["n"]) * 100, 1) if ev["n"] else None,
+                "holdout_actual": round((ev["hits"] / ev["n"]) * 100, 1) if ev["n"] else None,
+            })
+    except Exception as e:
+        print(f"[TD calibration] failed: {e}")
+        for b, rec in bins.items():
+            rec["calibrated"] = (b + .5) / 10.0
+        report = []
+    _TD_CAL_CACHE.update({"df_ref": df, "bins": bins, "report": report})
+    return bins, report
+
+def _td_calibrated_probability(pdf, df, team, opp_abbr, def_factor):
+    offense_pdf = pdf[pdf["anytime_td"].notna()] if "anytime_td" in pdf.columns else pdf
+    recent = _td_recent(offense_pdf, 10)
+    td_hits = int((recent["anytime_td"].fillna(0) > 0).sum())
+    td_rate = (td_hits + 1.0) / (len(recent) + 3.0)
+    opp_rows = (offense_pdf[offense_pdf["opponent_team"] == opp_abbr]
+                if opp_abbr else offense_pdf.iloc[0:0])
+    opp_hits = int((opp_rows["anytime_td"].fillna(0) > 0).sum()) if not opp_rows.empty else 0
+    opp_rate = ((opp_hits + 1.0) / (len(opp_rows) + 3.0)) if len(opp_rows) else td_rate
+    opportunity = _td_opportunity_features(offense_pdf, df, team)
+    team_env = max(.65, min(1.35, opportunity["team_td_per_game"] / 2.6))
+    raw = (.50 * td_rate + .15 * opp_rate + .20 * opportunity["signal"]
+           + .10 * min(1.0, team_env / 1.35) + .05 * .50)
+    raw = max(.03, min(.90, raw * def_factor))
+    bins, report = _td_walk_forward_calibration(df)
+    rec = bins[min(9, int(raw * 10))]
+    # Sparse bins remain mostly raw; populated bins apply empirical reliability.
+    calibrated = rec.get("calibrated", raw) if rec.get("n", 0) >= 25 else raw
+    return round(calibrated * 100, 1), round(raw * 100, 1), opportunity, rec.get("n", 0), report
 
 def _def_factor_map(df, stat_col: str, n_games: int = 8) -> dict:
     """{team_abbr: (factor, rank)} — factor clamped 0.90-1.10, rank 1 = stingiest
@@ -1641,6 +1913,11 @@ def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str) -> Optional[Dict
     pick    = None
     if adj_avg is not None:
         pick = "OVER" if adj_avg > line else "UNDER"
+    # Anytime TD is a one-sided Yes/OVER market. Its side is determined by the
+    # calibrated scoring probability and price below, never by average TD count
+    # (a multi-TD game must not distort side eligibility).
+    if market == "player_anytime_td" and tot_b:
+        pick = "OVER"
 
     # Side-aware stats: on an UNDER card every rate + the score describe the
     # UNDER side (times the player stayed BELOW the line). A green 100% must
@@ -1655,6 +1932,14 @@ def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str) -> Optional[Dict
 
     rates = [r for r in [rate_a, rate_b] if r is not None]
     score = round(sum(rates)/len(rates), 1) if rates else 0
+    td_raw_score = None
+    td_opportunity = {}
+    td_calibration_n = 0
+    td_calibration_report = []
+    if market == "player_anytime_td" and pick == "OVER":
+        score, td_raw_score, td_opportunity, td_calibration_n, td_calibration_report = (
+            _td_calibrated_probability(pdf, df, game_team, opp_abbr, def_factor)
+        )
     tag     = _book_tag_nfl(pick, score, gap, under_rate)
     # Anytime TD is a binary, price-sensitive market. A raw historical hit
     # rate is not enough: a 44% TD rate loses at +100 and only starts to clear
@@ -1746,6 +2031,9 @@ def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str) -> Optional[Dict
         # score / pick
         "score": score, "dispScore": score, "gap": gap, "pick": pick, "tag": tag,
         "betQualified": bet_qualified, "valueEdge": value_edge, "valueReason": value_reason,
+        "tdRawProbability": td_raw_score, "tdOpportunity": td_opportunity,
+        "tdCalibrationSample": td_calibration_n,
+        "tdCalibrationReport": td_calibration_report if market == "player_anytime_td" else [],
         "glog": glog, "vsOppLog": vs_opp_log,
         # ── legacy keys (kept for backward compatibility with cached payloads /
         #    any downstream consumer that predates the normalized contract) ──
@@ -1770,7 +2058,7 @@ def _nfl_stats_before_game(df, target_season=None, target_week=None,
         older = seasons < int(target_season)
         same_season = seasons == int(target_season)
         weeks = df["week"].fillna(0).astype(int)
-        target_week = int(target_week or 1)
+        target_week = _nflverse_week(target_type, target_week or 1)
         if "season_type" in df.columns:
             types = df["season_type"].fillna("REG").astype(str).str.upper()
             if str(target_type or "REG").upper() == "POST":
@@ -2266,9 +2554,10 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False) -> 
         tg = espn_games[0]
         ts, tw, tt = tg.get("season"), tg.get("week"), tg.get("season_type", "REG")
         try:
+            stats_week = _nflverse_week(tt, tw or 1)
             target_rows = df[
                 (df["season"].fillna(0).astype(int) == int(ts)) &
-                (df["week"].fillna(0).astype(int) == int(tw))
+                (df["week"].fillna(0).astype(int) == int(stats_week))
             ]
             if "season_type" in target_rows.columns:
                 target_rows = target_rows[
@@ -2375,10 +2664,20 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False) -> 
     except Exception:
         pass
 
+    td_calibration = next((r.get("tdCalibrationReport") for r in td_picks
+                           if r.get("tdCalibrationReport")), [])
     result  = {"picks":picks, "all":all_results, "td_picks":td_picks, "date":date_str,
                "games":games_out, "qualified":len(picks),
                "data_warning": data_warning,
                "data_note": data_note,
+               "td_calibration": {
+                   "method": "walk-forward reliability bins",
+                   "seasons": NFL_SEASONS,
+                   "minimum_player_history": 5,
+                   "full_bin_sample": 100,
+                   "passing_touchdowns_excluded": True,
+                   "bins": td_calibration,
+               },
                "game_predictions": game_predictions}
     if simulate:
         result["simulation"] = True
@@ -4582,13 +4881,54 @@ function _nflNormalParlayCandidates(){
 }
 function _nflCoachParlayCandidates(){
   if(typeof _nflCoachProps!=='function'||typeof _nflCoachSafest!=='function')return [];
-  return _nflCoachSafest(_nflCoachProps()).filter(function(p){return p.edge>0;}).map(function(p){
+  function leg(p){
     var dec=_amToDec(p.odds);
     return {player:p.player,team:p.team||'',opp:p.opponent||'',market:p.market||'NFL Prop',
       dir:p.side,line:p.line,rate:Math.round(p.appProb||0),odds:p.odds,dec:dec,hasOdds:!!dec,
-      edge:Number(p.edge||0),source:'coach'};
-  }).filter(function(c){return c.player&&c.dir&&_floorOk(c.odds);});
+      edge:Number(p.edge||0),isAlternate:!!p.isAlternate,source:'coach',coachCats:[]};
+  }
+  function select(rows,sorter,limit){
+    var seen={};
+    return rows.slice().sort(sorter).filter(function(p){
+      var key=String(p.player||'').trim().toLowerCase();
+      if(!key||seen[key])return false;seen[key]=1;return true;
+    }).slice(0,limit||5);
+  }
+  var positive=_nflCoachSafest(_nflCoachProps()).filter(function(p){return p.edge>0;});
+  var byEdge=function(a,b){return b.edge-a.edge||b.appProb-a.appProb;};
+  var bySafe=function(a,b){return b.implied-a.implied||b.appProb-a.appProb;};
+  var pools={
+    safest_bets:select(positive,bySafe,5),
+    coach_edge:select(positive,byEdge,5),
+    passing:select(positive.filter(function(p){return _nflCoachFamily(p.market)==='pass';}),byEdge,5),
+    rushing:select(positive.filter(function(p){return _nflCoachFamily(p.market)==='rush';}),byEdge,5),
+    receiving:select(positive.filter(function(p){return _nflCoachFamily(p.market)==='rec';}),byEdge,5),
+    td_scorers:select(positive.filter(function(p){return _nflCoachFamily(p.market)==='td'&&p.side==='OVER';}),byEdge,5),
+    best_unders:select(positive.filter(function(p){return p.side==='UNDER';}),byEdge,5),
+    alt_line_edge:(window.__NFL_ALT_PARLAY_CANDIDATES__||[]).filter(function(p){
+      return p&&p.edge>0&&p.appProb>=85&&p.implied>=70;
+    }).slice(0,10)
+  },merged={};
+  Object.keys(pools).forEach(function(cat){
+    pools[cat].forEach(function(p){
+      var c=leg(p),key=[c.player,c.market,c.dir,c.line,c.odds].join('|');
+      if(!c.player||!c.dir||!_floorOk(c.odds))return;
+      if(!merged[key])merged[key]=c;
+      if(merged[key].coachCats.indexOf(cat)<0)merged[key].coachCats.push(cat);
+    });
+  });
+  return Object.keys(merged).map(function(key){return merged[key];});
 }
+var _NFL_PARLAY_COACH_CATS=[
+  {key:'safest_bets',label:'Safest Bets'},
+  {key:'coach_edge',label:'Coach Edge'},
+  {key:'alt_line_edge',label:'Best Alt-Line Edge Plays · Top 10'},
+  {key:'passing',label:'Passing'},
+  {key:'rushing',label:'Rushing'},
+  {key:'receiving',label:'Receiving'},
+  {key:'td_scorers',label:'TD Scorers'},
+  {key:'best_unders',label:'Best Unders'}
+];
 window.__NFL_PARLAY_FILTERS__={normal:{},coach:{}};
 function _nflParlayFilterOn(source,key){
   var group=(window.__NFL_PARLAY_FILTERS__||{})[source]||{};
@@ -4606,6 +4946,11 @@ function _nflParlaySetAll(source,on){
   _nflParlaySyncFilters();
 }
 function _nflParlayCategoryHtml(source,cands){
+  if(source==='coach'){
+    return _NFL_PARLAY_COACH_CATS.map(function(cat){
+      return '<label class="nfl-parlay-cat"><input type="checkbox" data-source="coach" data-key="'+encodeURIComponent(cat.key)+'"'+(_nflParlayFilterOn('coach',cat.key)?' checked':'')+' onchange="_nflParlaySyncFilters()"> <span>'+_esc(cat.label)+'</span></label>';
+    }).join('');
+  }
   var seen={},cats=[];
   (cands||[]).forEach(function(c){var key=_nflParlayCatKey(c);if(!seen[key]){seen[key]=1;cats.push({key:key,label:_nflParlayCatLabel(c)});}});
   cats.sort(function(a,b){return a.label.localeCompare(b.label);});
@@ -4622,7 +4967,10 @@ function _renderNflParlayFilters(){
 function _parlayPool(){
   _nflParlaySyncFilters();
   var combined=_nflNormalParlayCandidates().concat(_nflCoachParlayCandidates()).filter(function(c){
-    return _nflParlayFilterOn(c.source,_nflParlayCatKey(c));
+    if(c.source==='coach'){
+      return (c.coachCats||[]).some(function(cat){return _nflParlayFilterOn('coach',cat);});
+    }
+    return _nflParlayFilterOn('normal',_nflParlayCatKey(c));
   }),byP={};
   combined.forEach(function(c){
     var cur=byP[c.player];
@@ -5528,7 +5876,10 @@ async function askNflAltCoach(){
     window.__NFL_COACH_ALT_ACTIVE__=true;
     var input=document.getElementById('nflCoachInput');
     if(input)input.value='Show the top 10 safe-value alternate-line plays at 85% model probability and 70% book probability or better';
-    _nflCoachCapture('alt_line_edge',askNflCoach());
+    var shown=askNflCoach();
+    window.__NFL_ALT_PARLAY_CANDIDATES__=shown.slice();
+    _nflCoachCapture('alt_line_edge',shown);
+    _renderNflParlayFilters();
   }catch(e){
     var msg=e&&e.name==='AbortError'
       ?'The alternate-line scan was cancelled or exceeded two minutes. Click the button to retry.'
@@ -5729,7 +6080,7 @@ function _renderNflTdPredictor(d){
       +'<td>'+recent+'</td><td>'+versus+'</td><td>'+defense+'</td></tr>';
   }).join('');
   body.innerHTML='<div class="nfl-td-table-wrap"><table class="nfl-td-table"><thead><tr><th>#</th><th>Player</th><th>Play</th><th>Best Odds</th><th>Implied</th><th>TD Confidence</th><th>Value Edge</th><th>L10 vs Line</th><th>Vs Opponent</th><th>Opponent Defense</th></tr></thead><tbody>'+table+'</tbody></table></div>'
-    +'<div class="nfl-td-method">Qualification requires a genuine Anytime TD price, at least five recent home/away games, and model confidence at least five percentage points above sportsbook break-even. Passing touchdowns do not count; only rushing or receiving touchdowns settle this market. Click any player for the full game log.</div>';
+    +'<div class="nfl-td-method">TD Confidence is calibrated against walk-forward results from multiple completed seasons: every backtest prediction uses only games played earlier than that matchup. Workload uses carries, targets, target share, team scoring environment, and red-zone/end-zone/snap inputs only when nflverse publishes them. Players need five prior games; reliability bins are shrunk until 100 outcomes. Qualification also requires a genuine Anytime TD price and at least a five-point edge over sportsbook break-even. Passing touchdowns never count—only rushing or receiving touchdowns settle this market. Click any player for the full game log.</div>';
 }
 function renderResults(d){
   var res=document.getElementById('results');
