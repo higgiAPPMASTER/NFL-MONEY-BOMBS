@@ -169,7 +169,7 @@ _NFL_WEEK_JOB_TIMEOUT = 1200
 # ── File cache ─────────────────────────────────────────────────────────────────
 _CACHE_DIR = pathlib.Path("/tmp/mpa_cache")
 _CACHE_DIR.mkdir(parents=True, exist_ok=True)
-_CACHE_TTL = 6 * 3600
+_CACHE_TTL = 15 * 60
 _NFL_LINE_MOVEMENT_APP = "nfl_line_movement"
 _NFL_LINE_OPEN_CATEGORY = "__wednesday_open__"
 
@@ -185,7 +185,7 @@ def _is_past_date(date_key) -> bool:
 def _cache_get(date_key):
     # v2 invalidates pre-blend Game Predictor results without invalidating the
     # separate raw-odds cache (so recalculation does not re-buy sportsbook data).
-    p = _CACHE_DIR / f"nfl_v2_{date_key}.json"
+    p = _CACHE_DIR / f"nfl_v3_{date_key}.json"
     try:
         if p.exists() and (_is_past_date(date_key)
                            or (time.time() - p.stat().st_mtime) < _CACHE_TTL):
@@ -195,7 +195,7 @@ def _cache_get(date_key):
 
 def _cache_set(date_key, result):
     try:
-        (_CACHE_DIR / f"nfl_v2_{date_key}.json").write_text(
+        (_CACHE_DIR / f"nfl_v3_{date_key}.json").write_text(
             json.dumps(result, ensure_ascii=False), encoding="utf-8")
     except: pass
 
@@ -204,12 +204,16 @@ def _cache_set(date_key, result):
 # pulled instead of hitting the Odds API again. Shorter TTL than the result
 # cache so lines still refresh over the day. Cleared by /api/clear-cache (which
 # globs nfl_*.json), so a true fresh run still re-pulls.
-_ODDS_TTL = 6 * 3600  # match the 6h result cache — both expire together
+_ODDS_TTL = 15 * 60
 
 def _odds_cache_get(date_key):
     """Returns (props_list, game_lines_by_id) or (None, None) on miss.
     Handles the old list-only format for backward compat."""
-    p = _CACHE_DIR / f"nfl_odds_{date_key}.json"
+    # Historical replays keep the original permanent filename so paid archived
+    # Odds API data remains reusable. Live slates use v2 for quote timestamps.
+    p = _CACHE_DIR / (
+        f"nfl_odds_{date_key}.json" if _is_past_date(date_key)
+        else f"nfl_odds_v2_{date_key}.json")
     try:
         if p.exists() and (_is_past_date(date_key)
                            or (time.time() - p.stat().st_mtime) < _ODDS_TTL):
@@ -224,18 +228,21 @@ def _odds_cache_get(date_key):
 
 def _odds_cache_set(date_key, props, game_lines):
     try:
-        (_CACHE_DIR / f"nfl_odds_{date_key}.json").write_text(
+        p = _CACHE_DIR / (
+            f"nfl_odds_{date_key}.json" if _is_past_date(date_key)
+            else f"nfl_odds_v2_{date_key}.json")
+        p.write_text(
             json.dumps({"props": props, "game_lines": game_lines}, ensure_ascii=False),
             encoding="utf-8")
         print(f"[OddsCache] SET nfl/{date_key} ({len(props)} props, {len(game_lines)} games)")
     except Exception as e:
         print(f"[OddsCache] write error: {e}")
 
-_ALT_COACH_TTL = 2 * 3600
+_ALT_COACH_TTL = 15 * 60
 _ALT_COACH_INFLIGHT: Dict[str, asyncio.Task] = {}
 
 def _alt_coach_cache_get(date_key):
-    p = _CACHE_DIR / f"nfl_alt_coach_v2_{date_key}.json"
+    p = _CACHE_DIR / f"nfl_alt_coach_v3_{date_key}.json"
     try:
         if p.exists() and (time.time() - p.stat().st_mtime) < _ALT_COACH_TTL:
             return json.loads(p.read_text(encoding="utf-8"))
@@ -245,7 +252,7 @@ def _alt_coach_cache_get(date_key):
 
 def _alt_coach_cache_set(date_key, result):
     try:
-        (_CACHE_DIR / f"nfl_alt_coach_v2_{date_key}.json").write_text(
+        (_CACHE_DIR / f"nfl_alt_coach_v3_{date_key}.json").write_text(
             json.dumps(result, ensure_ascii=False), encoding="utf-8")
     except Exception as e:
         print(f"[AltCoachCache] write error: {e}")
@@ -1208,7 +1215,81 @@ async def nfl_game_history(home: str = "", away: str = "", before: str = ""):
 # remain the expected-game lineup; this map assigns those players to the right
 # team and excludes explicit inactive/practice-squad listings.
 _NFL_ROSTER_CACHE: dict = {}
-_NFL_ROSTER_TTL = 6 * 3600
+_NFL_ROSTER_TTL = 15 * 60
+
+def _nfl_injury_status(athlete: dict) -> tuple:
+    """Return normalized status, note, and participation probability."""
+    status = athlete.get("status") or {}
+    parts = [status.get("type"), status.get("name"), status.get("description")]
+    for injury in athlete.get("injuries") or []:
+        parts.extend([
+            injury.get("status"), injury.get("type"), injury.get("details"),
+            injury.get("shortComment"), injury.get("longComment"),
+        ])
+    text = " ".join(str(x or "") for x in parts).strip()
+    low = text.lower().replace("_", " ")
+    token = re.sub(r"[^a-z0-9]+", "", low)
+    if any(x in token for x in ("injuredreserve", "suspended",
+                                "practicesquad")):
+        return "OUT", text or "Unavailable", 0.0
+    if "out" in low or "inactive" in low:
+        return "OUT", text or "Out", 0.0
+    if "doubtful" in low:
+        return "DOUBTFUL", text or "Doubtful", 0.25
+    if "questionable" in low or "game time" in low or "day-to-day" in low:
+        return "QUESTIONABLE", text or "Questionable", 0.65
+    if "probable" in low or "limited" in low:
+        return "LIMITED", text or "Limited/Probable", 0.9
+    return "ACTIVE", text or "Active", 1.0
+
+def _nfl_position_group(value: str) -> str:
+    pos = str(value or "").upper()
+    return "RB" if pos in ("RB", "HB", "FB") else pos
+
+def _apply_nfl_injury_context(lines: list, roster_map: dict) -> None:
+    """Stamp availability and conservative same-position opportunity changes."""
+    by_group = {}
+    for info in (roster_map or {}).values():
+        key = (info.get("team", ""), _nfl_position_group(info.get("position")))
+        if all(key):
+            by_group.setdefault(key, []).append(info)
+    market_ok = {
+        "player_rush_yds", "player_rush_attempts", "player_anytime_td",
+        "player_reception_yds", "player_receptions",
+    }
+    base_share = {"RB": 0.10, "WR": 0.05, "TE": 0.06}
+    status_weight = {"OUT": 1.0, "DOUBTFUL": 0.75,
+                     "QUESTIONABLE": 0.35, "LIMITED": 0.10}
+    caps = {"RB": 0.15, "WR": 0.10, "TE": 0.10}
+    for line in lines:
+        info = roster_map.get(_norm(line.get("name", ""))) if roster_map else None
+        line["availability_verified"] = bool(info)
+        line["coach_eligible"] = bool(info and info.get("eligible", True))
+        line["injury_status"] = (info or {}).get("injury_status", "UNVERIFIED")
+        line["injury_note"] = (info or {}).get("injury_note",
+                                                "Player not verified on current ESPN roster")
+        line["injury_updated_at"] = (info or {}).get("injury_updated_at")
+        line["participation_probability"] = (info or {}).get(
+            "participation_probability")
+        position = _nfl_position_group((info or {}).get("position"))
+        factor, reasons = 1.0, []
+        if info and line.get("market") in market_ok and position in base_share:
+            for mate in by_group.get((info.get("team", ""), position), []):
+                if mate.get("name_norm") == _norm(line.get("name", "")):
+                    continue
+                status = mate.get("injury_status", "ACTIVE")
+                weight = status_weight.get(status, 0)
+                if weight <= 0:
+                    continue
+                bump = base_share[position] * weight
+                factor += bump
+                reasons.append({
+                    "player": mate.get("name", "Teammate"), "status": status,
+                    "position": position, "bump_pct": round(bump * 100, 1),
+                })
+            factor = min(factor, 1.0 + caps[position])
+        line["injury_opportunity_factor"] = round(factor, 4)
+        line["injury_opportunity_reasons"] = reasons
 
 async def get_espn_roster_map(espn_games: List[Dict], date_str: str) -> dict:
     """Return normalized player name -> current roster metadata for slate teams.
@@ -1243,13 +1324,22 @@ async def get_espn_roster_map(espn_games: List[Dict], date_str: str) -> dict:
                         status = athlete.get("status") or {}
                         pos = athlete.get("position") or {}
                         status_type = str(status.get("type") or "").lower()
+                        injury_status, injury_note, participation = (
+                            _nfl_injury_status(athlete))
                         eligible = (bucket in ("offense", "defense", "specialTeam")
                                     and status_type not in
-                                    ("injuredreserve", "out", "suspended", "practicesquad"))
+                                    ("injuredreserve", "out", "suspended", "practicesquad")
+                                    and injury_status != "OUT")
                         players[_norm(name)] = {
                             "team": team, "eligible": eligible,
                             "bucket": bucket,
                             "position": str(pos.get("abbreviation") or ""),
+                            "name": name, "name_norm": _norm(name),
+                            "injury_status": injury_status,
+                            "injury_note": injury_note,
+                            "participation_probability": participation,
+                            "injury_updated_at": datetime.now(
+                                timezone.utc).isoformat(),
                         }
         except Exception as e:
             print(f"[Roster] {team} failed: {e}")
@@ -1384,6 +1474,8 @@ async def get_prop_lines(event_id: str, date_str: str,
             for l in out:
                 l["over_book"]  = _book_label(l["over_book"])  if l.get("over_book")  else ""
                 l["under_book"] = _book_label(l["under_book"]) if l.get("under_book") else ""
+                l["quote_fetched_at"] = datetime.now(timezone.utc).isoformat()
+                l["quote_status"] = "ARCHIVED" if is_past else "LIVE"
             _NFL_PROP_FETCH_STATUS[fetch_key] = "success"
             return out
     except Exception as e:
@@ -1970,7 +2062,12 @@ def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str) -> Optional[Dict
         if _fr:
             def_factor, def_rank = _fr
     def_rank_factor = 1.0 + max(-0.05, min(0.05, (def_factor - 1) * 0.5))
-    adj_avg = ref_avg
+    base_proj_avg = ref_avg
+    injury_factor = float(pl.get("injury_opportunity_factor") or 1.0)
+    adj_avg = (round(ref_avg * injury_factor, 1)
+               if ref_avg is not None else None)
+    injury_adj = (round(adj_avg - ref_avg, 1)
+                  if ref_avg is not None and adj_avg is not None else 0.0)
     def_adj = round((def_rank_factor - 1) * 100)
 
     gap     = round(adj_avg - line, 1) if adj_avg is not None else None
@@ -1998,6 +2095,7 @@ def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str) -> Optional[Dict
 
     rates = [r for r in [rate_a, rate_b] if r is not None]
     score = round(sum(rates)/len(rates), 1) if rates else 0
+    player_injury_status = str(pl.get("injury_status") or "UNVERIFIED")
     if market != "player_anytime_td" and pick:
         side_factor = def_rank_factor if pick == "OVER" else (2.0 - def_rank_factor)
         score = round(max(0.0, min(100.0, score * side_factor)), 1)
@@ -2009,6 +2107,15 @@ def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str) -> Optional[Dict
         score, td_raw_score, td_opportunity, td_calibration_n, td_calibration_report = (
             _td_calibrated_probability(pdf, df, game_team, opp_abbr, def_factor)
         )
+    # Apply teammate opportunity and player-status uncertainty to the final
+    # probability, including the separately calibrated anytime-TD probability.
+    if pick and injury_factor != 1.0:
+        side_factor = injury_factor if pick == "OVER" else (2.0 - injury_factor)
+        score = round(max(0.0, min(100.0, score * side_factor)), 1)
+    if player_injury_status == "QUESTIONABLE":
+        score = round(50.0 + (score - 50.0) * 0.80, 1)
+    elif player_injury_status == "LIMITED":
+        score = round(50.0 + (score - 50.0) * 0.92, 1)
     tag     = _book_tag_nfl(pick, score, gap, under_rate)
     # Anytime TD is a binary, price-sensitive market. A raw historical hit
     # rate is not enough: a 44% TD rate loses at +100 and only starts to clear
@@ -2083,6 +2190,8 @@ def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str) -> Optional[Dict
         "over_book": pl.get("over_book", ""), "under_book": pl.get("under_book", ""),
         "isAlternate": bool(pl.get("is_alternate")),
         "sourceMarket": pl.get("source_market", market),
+        "quoteFetchedAt": pl.get("quote_fetched_at"),
+        "quoteStatus": pl.get("quote_status", "UNVERIFIED"),
         # averages
         "avg": avg_b if avg_b is not None else (avg_a if avg_a is not None else 0),
         "avgA": avg_a if avg_a is not None else 0,
@@ -2097,6 +2206,15 @@ def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str) -> Optional[Dict
         # opponent-defense ranking factor
         "defAdj": def_adj, "defRank": def_rank, "defLbl": def_lbl,
         "projAvg": adj_avg,
+        "baseProjAvg": base_proj_avg, "injuryAdj": injury_adj,
+        "injuryOpportunityFactor": injury_factor,
+        "injuryOpportunityReasons": pl.get("injury_opportunity_reasons") or [],
+        "injuryStatus": player_injury_status,
+        "injuryNote": pl.get("injury_note", ""),
+        "injuryUpdatedAt": pl.get("injury_updated_at"),
+        "participationProbability": pl.get("participation_probability"),
+        "availabilityVerified": bool(pl.get("availability_verified")),
+        "coachEligible": bool(pl.get("coach_eligible", True)),
         # score / pick
         "score": score, "dispScore": score, "gap": gap, "pick": pick, "tag": tag,
         "betQualified": bet_qualified, "valueEdge": value_edge, "valueReason": value_reason,
@@ -2650,6 +2768,8 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False,
                 continue
         roster_filtered.append(line)
     all_lines = roster_filtered
+    if not simulate:
+        _apply_nfl_injury_context(all_lines, roster_map)
     # Keep the complete sportsbook set for later game-line cache updates.
     # _trim_prop_lines intentionally reduces analysis volume, but that reduced
     # list must never overwrite the raw odds cache.
@@ -2937,6 +3057,7 @@ async def _build_alt_coach(date_str: str) -> dict:
                 "roster_position": (info or {}).get("position", ""),
             })
             lines.append(line)
+    _apply_nfl_injury_context(lines, roster_map)
     df = await get_nfl_stats()
     if df is None:
         raise RuntimeError("NFL stats are unavailable.")
@@ -2950,7 +3071,8 @@ async def _build_alt_coach(date_str: str) -> dict:
                 result.get("realOdds") if result.get("pick") == "OVER"
                 else result.get("realUnderOdds")
             )
-        if result and selected_odds is not None and selected_odds >= -500:
+        if (result and result.get("coachEligible", True)
+                and selected_odds is not None and selected_odds >= -500):
             picks.append(result)
     payload = {"date": date_str, "picks": picks, "lines": len(lines)}
     _alt_coach_cache_set(date_str, payload)
@@ -6477,6 +6599,11 @@ function _nflCoachSigned(v){var n=Number(v||0);return (n>=0?'+':'')+n.toFixed(2)
 function _nflCoachProps(){
   var d=(window._nflState||{}).d||{},seen={},out=[];
   (d.coach_candidates||d.picks||[]).forEach(function(p){
+    if(p.coachEligible===false || p.availabilityVerified===false)return;
+    var quoteTs=p.quoteFetchedAt?Date.parse(p.quoteFetchedAt):NaN;
+    var injuryTs=p.injuryUpdatedAt?Date.parse(p.injuryUpdatedAt):NaN;
+    if(p.quoteStatus==='LIVE' && (!isFinite(quoteTs)||Date.now()-quoteTs>20*60*1000))return;
+    if(p.quoteStatus!=='ARCHIVED' && (!isFinite(injuryTs)||Date.now()-injuryTs>20*60*1000))return;
     var side=String(p.pick||'OVER').toUpperCase();
     var odds=_nflSideOdds(p,side),implied=_nflCoachImplied(odds);
     var line=p.realLine!=null?p.realLine:p.dispLine;
@@ -6617,16 +6744,27 @@ function _nflCoachAccordions(p){
   var def=(s.defRank!=null?('#'+s.defRank+' '+_esc(s.defLbl||'defense')):'N/A');
   var defAdj=s.defAdj!=null?((Number(s.defAdj)>=0?'+':'')+Number(s.defAdj).toFixed(1)+'%'):'N/A';
   var gameTime=s.game_start?new Date(s.game_start).toLocaleString():'N/A';
+  var injuryStatus=_esc(s.injuryStatus||'UNVERIFIED');
+  var injuryColor=s.injuryStatus==='ACTIVE'?'#4ade80':(s.injuryStatus==='OUT'||s.injuryStatus==='DOUBTFUL'?'#f87171':'#fbbf24');
+  var baseProjection=s.baseProjAvg!=null&&isFinite(Number(s.baseProjAvg))?Number(s.baseProjAvg).toFixed(2):projection;
+  var injuryAdj=s.injuryAdj!=null&&isFinite(Number(s.injuryAdj))?((Number(s.injuryAdj)>=0?'+':'')+Number(s.injuryAdj).toFixed(2)):'0.00';
+  var injuryReasons=(s.injuryOpportunityReasons||[]);
+  var injuryText=injuryReasons.length?injuryReasons.map(function(r){return _esc(r.player)+' ('+_esc(r.status)+') '+(Number(r.bump_pct)>=0?'+':'')+Number(r.bump_pct).toFixed(1)+'% opportunity';}).join('<br>'):'No same-position teammate adjustment.';
+  var injuryUpdated=s.injuryUpdatedAt?new Date(s.injuryUpdatedAt).toLocaleString():'N/A';
+  var quoteUpdated=s.quoteFetchedAt?new Date(s.quoteFetchedAt).toLocaleString():'N/A';
   return '<div class="nfl-coach-accord">'
     +'<details><summary>Odds Comparison</summary><div class="nfl-coach-accord-body"><div class="nfl-coach-stats">'
     +'<div class="nfl-coach-stat"><div class="k">Selected side</div><div class="v">'+p.side+' '+_nflCoachOdds(p.odds)+' · '+p.implied.toFixed(1)+'% implied</div></div>'
     +'<div class="nfl-coach-stat"><div class="k">Other side</div><div class="v">'+(opp!=null?other+' '+_nflCoachOdds(opp)+' · '+oppImp.toFixed(1)+'% implied':'N/A')+'</div></div>'
     +'<div class="nfl-coach-stat"><div class="k">Source</div><div class="v">'+_esc(p.book||'Sportsbook line')+'</div></div>'
-    +'</div><div style="margin-top:7px">Only genuine prices carried by the loaded NFL prop are shown. This is not a full multi-book screen unless the source provides those books.</div></div></details>'
+    +'<div class="nfl-coach-stat"><div class="k">Quote checked</div><div class="v">'+_esc(quoteUpdated)+'</div></div>'
+    +'</div><div style="margin-top:7px">Only genuine prices from a sportsbook response refreshed within 15 minutes are eligible for live Coach rankings.</div></div></details>'
     +'<details open><summary>Hit Rate Chart</summary><div class="nfl-coach-accord-body">'+_nflCoachRateTiles(p)+_nflCoachGameTiles(p)+'</div></details>'
     +'<details><summary>Line Movement</summary><div class="nfl-coach-accord-body">'+_nflCoachLineMovement(p)+'</div></details>'
     +'<details><summary>Key Stats</summary><div class="nfl-coach-accord-body"><div class="nfl-coach-stats">'
     +'<div class="nfl-coach-stat"><div class="k">Projection</div><div class="v">'+projection+'</div></div>'
+    +'<div class="nfl-coach-stat"><div class="k">Base projection</div><div class="v">'+baseProjection+'</div></div>'
+    +'<div class="nfl-coach-stat"><div class="k">Injury adjustment</div><div class="v">'+injuryAdj+'</div></div>'
     +'<div class="nfl-coach-stat"><div class="k">Recent average</div><div class="v">'+avg+'</div></div>'
     +'<div class="nfl-coach-stat"><div class="k">Projection gap</div><div class="v">'+(gap!=null?_nflCoachSigned(gap):'N/A')+'</div></div>'
     +'<div class="nfl-coach-stat"><div class="k">App probability</div><div class="v">'+p.appProb.toFixed(1)+'%</div></div>'
@@ -6640,7 +6778,11 @@ function _nflCoachAccordions(p){
     +'<div class="nfl-coach-stat"><div class="k">Defense ranking factor</div><div class="v">'+defAdj+'</div></div>'
     +'<div class="nfl-coach-stat"><div class="k">Recent games</div><div class="v">'+(s.glog||[]).length+'</div></div>'
     +'<div class="nfl-coach-stat"><div class="k">Game time</div><div class="v">'+_esc(gameTime)+'</div></div>'
-    +'</div></div></details></div>';
+    +'<div class="nfl-coach-stat"><div class="k">Player injury status</div><div class="v" style="color:'+injuryColor+'">'+injuryStatus+'</div></div>'
+    +'<div class="nfl-coach-stat"><div class="k">Status checked</div><div class="v">'+_esc(injuryUpdated)+'</div></div>'
+    +'</div><div style="margin-top:9px;color:#cbd5e1">'+injuryText+'</div>'
+    +(s.injuryNote?'<div style="margin-top:7px;color:#94a3b8">'+_esc(s.injuryNote)+'</div>':'')
+    +'</div></details></div>';
 }
 function _nflCoachRender(question,rows,total,mode){
   var el=document.getElementById('nflCoachAnswer');if(!el)return;
@@ -6654,11 +6796,13 @@ function _nflCoachRender(question,rows,total,mode){
   var cards=rows.map(function(p,i){
     var s=p.source||{},head=_esc(s.head||''),logo='https://a.espncdn.com/i/teamlogos/nfl/500/'+_logoAbbr(p.team)+'.png';
     var venue=s.homeRoad==='H'?'HOME':(s.homeRoad==='R'?'AWAY':'');
+    var status=String(s.injuryStatus||'UNVERIFIED'),statusColor=status==='ACTIVE'?'#4ade80':'#fbbf24';
     return '<details class="nfl-coach-play" open><summary><span class="nfl-coach-ident"><span class="nfl-coach-avatar">'+_esc(_initials(p.player))
       +(head?'<img src="'+head+'" alt="" onerror="this.style.display=\\'none\\'"/>':'')
       +'<img class="team-logo" src="'+_esc(logo)+'" alt="" onerror="this.style.display=\\'none\\'"/></span>'
       +'<span><span class="nfl-coach-name">'+(i+1)+'. '+_esc(p.player)+'</span><span class="nfl-coach-meta">'
       +(p.position?'<span class="nfl-coach-pos">'+_esc(p.position)+'</span>':'')
+      +'<span style="color:'+statusColor+';font-weight:800">'+_esc(status)+'</span>'
       +'<span>'+_esc(p.team)+' vs '+_esc(p.opponent)+'</span>'+(venue?'<span>· '+venue+'</span>':'')+(p.slate_date?'<span>· '+_esc(p.slate_date)+'</span>':'')+'</span></span></span>'
       +'<span class="nfl-coach-pickmeta">'+_esc(p.market)+(p.isAlternate?' · <b style="color:#fbbf24">ALT LINE</b>':'')+'<br><b style="color:'+(p.side==='OVER'?'#4ade80':'#f87171')+'">'+p.side+' '+p.line+' · '+_nflCoachOdds(p.odds)+'</b></span></summary>'
       +'<div class="nfl-coach-copy">'+(mode==='safe'?'<b style="color:#fbbf24">Safety rank: '+p.implied.toFixed(1)+'% sportsbook-implied.</b> ':'')
