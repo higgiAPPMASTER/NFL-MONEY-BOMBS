@@ -228,7 +228,7 @@ _ALT_COACH_TTL = 2 * 3600
 _ALT_COACH_INFLIGHT: Dict[str, asyncio.Task] = {}
 
 def _alt_coach_cache_get(date_key):
-    p = _CACHE_DIR / f"nfl_alt_coach_v1_{date_key}.json"
+    p = _CACHE_DIR / f"nfl_alt_coach_v2_{date_key}.json"
     try:
         if p.exists() and (time.time() - p.stat().st_mtime) < _ALT_COACH_TTL:
             return json.loads(p.read_text(encoding="utf-8"))
@@ -238,7 +238,7 @@ def _alt_coach_cache_get(date_key):
 
 def _alt_coach_cache_set(date_key, result):
     try:
-        (_CACHE_DIR / f"nfl_alt_coach_v1_{date_key}.json").write_text(
+        (_CACHE_DIR / f"nfl_alt_coach_v2_{date_key}.json").write_text(
             json.dumps(result, ensure_ascii=False), encoding="utf-8")
     except Exception as e:
         print(f"[AltCoachCache] write error: {e}")
@@ -2799,8 +2799,13 @@ async def _build_alt_coach(date_str: str) -> dict:
     for line in lines:
         result = _analyze_prop(
             line, df, line.get("home_abbr", ""), line.get("away_abbr", ""))
-        if result and (result.get("realOdds") is not None
-                       or result.get("realUnderOdds") is not None):
+        selected_odds = None
+        if result:
+            selected_odds = (
+                result.get("realOdds") if result.get("pick") == "OVER"
+                else result.get("realUnderOdds")
+            )
+        if result and selected_odds is not None and selected_odds >= -500:
             picks.append(result)
     payload = {"date": date_str, "picks": picks, "lines": len(lines)}
     _alt_coach_cache_set(date_str, payload)
@@ -4915,7 +4920,7 @@ function _nflCoachParlayCandidates(){
     td_scorers:select(positive.filter(function(p){return _nflCoachFamily(p.market)==='td'&&p.side==='OVER';}),byEdge,5),
     best_unders:select(positive.filter(function(p){return p.side==='UNDER';}),byEdge,5),
     alt_line_edge:(window.__NFL_ALT_PARLAY_CANDIDATES__||[]).filter(function(p){
-      return p&&p.edge>0&&p.appProb>=85&&p.implied>=70;
+      return p&&p.odds!=null&&p.odds>=-500&&p.edge>0&&p.appProb>=85&&p.implied>=70;
     }).slice(0,10)
   },merged={};
   Object.keys(pools).forEach(function(cat){
@@ -5830,7 +5835,7 @@ function _nflCoachRender(question,rows,total,mode){
   var summary=mode==='safe'
     ?'I checked both sides of '+total+' priced NFL candidates and ranked these by sportsbook-implied win probability. Safer favorites can require substantially more risk for a smaller return.'
     :(window.__NFL_COACH_ALT_ACTIVE__
-      ?'I checked '+total+' genuine alternate-line candidates for the safer-value sweet spot. Every result has at least 85% app probability, at least 70% sportsbook-implied probability, and positive Coach Edge; each player keeps the qualifying line with the largest edge, with a maximum of 10 plays.'
+      ?'I checked '+total+' genuine alternate-line candidates for the safer-value sweet spot. Every result is priced -500 or better, has at least 85% app probability, at least 70% sportsbook-implied probability, and positive Coach Edge; each player keeps the qualifying line with the largest edge, with a maximum of 10 plays.'
       :'I checked '+total+' priced NFL board plays and ranked the matching positive Coach Edge results. Coach Edge is probability edge, not guaranteed monetary profit.');
   if(!rows.length){el.innerHTML='<div class="nfl-coach-question">'+_esc(question)+'</div><div class="nfl-coach-summary">No loaded priced NFL prop matched that request.</div>';return;}
   var cards=rows.map(function(p,i){
@@ -5884,7 +5889,7 @@ async function askNflAltCoach(){
     window.__NFL_COACH_LIMIT_OVERRIDE__=10;
     window.__NFL_COACH_ALT_ACTIVE__=true;
     var input=document.getElementById('nflCoachInput');
-    if(input)input.value='Show the top 10 safe-value alternate-line plays at 85% model probability and 70% book probability or better';
+    if(input)input.value='Show the top 10 safe-value alternate-line plays priced -500 or better, at 85% model probability and 70% book probability or better';
     var shown=askNflCoach();
     window.__NFL_ALT_PARLAY_CANDIDATES__=shown.slice();
     _nflCoachCapture('alt_line_edge',shown);
@@ -5912,6 +5917,7 @@ function askNflCoach(){
     if(f.mode!=='safe'&&p.edge<=0)return false;
     if(window.__NFL_COACH_ALT_ACTIVE__&&p.appProb<85)return false;
     if(window.__NFL_COACH_ALT_ACTIVE__&&p.implied<70)return false;
+    if(window.__NFL_COACH_ALT_ACTIVE__&&(p.odds==null||p.odds<-500))return false;
     if(f.side&&p.side!==f.side)return false;
     if(f.marketExact&&String(p.market)!==f.marketExact)return false;
     if(f.market&&_nflCoachFamily(p.market)!==f.market)return false;
@@ -6150,7 +6156,16 @@ function _nflPaint(q){
   }).sort(function(a,b){
     return Number(b.score||b.dispScore||0)-Number(a.score||a.dispScore||0)
       ||_edge(b)-_edge(a);
-  });
+  }).filter(function(p){
+    // ROI Focus is a concentrated board: keep only the highest-ranked
+    // qualifying market for each player. Their other markets remain on the
+    // normal boards below.
+    var key=String(p.name||p.player||'').trim().toLowerCase();
+    if(!key)return false;
+    if(this[key])return false;
+    this[key]=true;
+    return true;
+  },{});
   if(roiFocus.length){
     var focusTop=roiFocus.slice(0,10),focusMore=roiFocus.slice(10);
     var focusBody=nflCardGrid(focusTop,1);
