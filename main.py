@@ -1901,14 +1901,17 @@ def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str) -> Optional[Dict
     # use L10 home/away only when no opponent history exists.
     ref_avg = avg_a if avg_a is not None else avg_b
 
-    # Opponent-defense adjustment: project vs THIS defense, not a neutral one.
+    # Opponent defense is a secondary ranking/confidence nudge only. It must
+    # never move the projection across the book line or overturn the side chosen
+    # by opponent history (or the L10 H/A fallback).
     def_factor = 1.0; def_rank = None; def_lbl = _OPP_ADJ_COLS.get(stat_col, "")
     if opp_abbr and stat_col in _OPP_ADJ_COLS:
         _fr = _def_factor_map(df, stat_col).get(opp_abbr)
         if _fr:
             def_factor, def_rank = _fr
-    adj_avg = round(ref_avg * def_factor, 1) if ref_avg is not None else None
-    def_adj = round((def_factor - 1) * 100)
+    def_rank_factor = 1.0 + max(-0.05, min(0.05, (def_factor - 1) * 0.5))
+    adj_avg = ref_avg
+    def_adj = round((def_rank_factor - 1) * 100)
 
     gap     = round(adj_avg - line, 1) if adj_avg is not None else None
     # EVERY player with any history gets a pick — a 0.0 average is a real
@@ -1935,6 +1938,9 @@ def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str) -> Optional[Dict
 
     rates = [r for r in [rate_a, rate_b] if r is not None]
     score = round(sum(rates)/len(rates), 1) if rates else 0
+    if market != "player_anytime_td" and pick:
+        side_factor = def_rank_factor if pick == "OVER" else (2.0 - def_rank_factor)
+        score = round(max(0.0, min(100.0, score * side_factor)), 1)
     td_raw_score = None
     td_opportunity = {}
     td_calibration_n = 0
@@ -2028,7 +2034,7 @@ def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str) -> Optional[Dict
         "vsLineHits": vsl_hits, "vsLineTotal": vsl_tot, "vsLineRate": vsl_rate or 0,
         # under track
         "underHits": under_hits, "underTotal": tot_b, "underRate": under_rate or 0, "underLine": line,
-        # opponent-defense adjustment
+        # opponent-defense ranking factor
         "defAdj": def_adj, "defRank": def_rank, "defLbl": def_lbl,
         "projAvg": adj_avg,
         # score / pick
@@ -5254,7 +5260,7 @@ function nflCard(p,i){
   var defChip='';
   if(p.defRank&&p.defAdj){
     var dcol=p.defAdj>0?'#4ade80':'#f87171';
-    defChip='<div style="font-size:.62rem;font-weight:800;color:'+dcol+';margin-top:2px">vs #'+p.defRank+' '+(p.defLbl||'D')+' · '+(p.defAdj>0?'+':'')+p.defAdj+'% proj</div>';
+    defChip='<div style="font-size:.62rem;font-weight:800;color:'+dcol+';margin-top:2px">vs #'+p.defRank+' '+(p.defLbl||'D')+' · '+(p.defAdj>0?'+':'')+p.defAdj+'% rank</div>';
   }
   return `
    <div class="pick-card ${_accFor(p.mkt)}">
@@ -5386,7 +5392,7 @@ function openNflLadder(key){
       ${vslRow}
       <div class="lad-stat"><span class="k">Under Line L10</span><span class="v ${rateClass(p.underRate)}">${p.underHits}/${p.underTotal} (${p.underRate}%)</span></div>
       <div class="lad-stat"><span class="k">Average</span><span class="v gold">${p.avg}</span></div>
-      ${(p.defRank!=null&&p.defAdj!=null)?`<div class="lad-stat"><span class="k">Opp Def Adj (#${p.defRank} ${p.defLbl||'D'})</span><span class="v" style="color:${p.defAdj>0?'#4ade80':(p.defAdj<0?'#f87171':'#9ca3af')}">${p.defAdj>0?'+':''}${p.defAdj}% → ${p.projAvg!=null?p.projAvg:p.avg}</span></div>`:''}
+      ${(p.defRank!=null&&p.defAdj!=null)?`<div class="lad-stat"><span class="k">Opp Def Rank Factor (#${p.defRank} ${p.defLbl||'D'})</span><span class="v" style="color:${p.defAdj>0?'#4ade80':(p.defAdj<0?'#f87171':'#9ca3af')}">${p.defAdj>0?'+':''}${p.defAdj}% confidence</span></div>`:''}
       <div class="lad-stat"><span class="k">Score</span><span class="v" style="color:#f59e0b">${p.dispScore}</span></div>
     </div>`;
   var ov=document.createElement('div');
@@ -5813,7 +5819,7 @@ function _nflCoachAccordions(p){
     +'<div class="nfl-coach-stat"><div class="k">Matchup</div><div class="v">'+_esc(p.team)+' vs '+_esc(p.opponent)+'</div></div>'
     +'<div class="nfl-coach-stat"><div class="k">Venue</div><div class="v">'+venue+'</div></div>'
     +'<div class="nfl-coach-stat"><div class="k">Opponent defense</div><div class="v">'+def+'</div></div>'
-    +'<div class="nfl-coach-stat"><div class="k">Defense adjustment</div><div class="v">'+defAdj+'</div></div>'
+    +'<div class="nfl-coach-stat"><div class="k">Defense ranking factor</div><div class="v">'+defAdj+'</div></div>'
     +'<div class="nfl-coach-stat"><div class="k">Recent games</div><div class="v">'+(s.glog||[]).length+'</div></div>'
     +'<div class="nfl-coach-stat"><div class="k">Game time</div><div class="v">'+_esc(gameTime)+'</div></div>'
     +'</div></div></details></div>';
