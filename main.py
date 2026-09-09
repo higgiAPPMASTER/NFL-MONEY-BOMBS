@@ -7146,8 +7146,7 @@ function _nflCoachTrackCategoryHtml(rows,stake){
          ?'<span style="color:#fbbf24">Alt picks: '+alts.length+' · '+aw+'W · '+al+'L · '+ar+' · '+(an>=0?'+$':'-$')+Math.abs(an).toFixed(0)+(aroi==null?'':' · '+(aroi>=0?'+':'')+aroi.toFixed(1)+'% ROI')+'</span>'
          :'<span style="color:#94a3b8">No saved alt picks</span>')
        +'<span class="nfl-trk-group-toggle" aria-hidden="true"></span></div></summary>'
-       +_nflCoachTrackRowsTable(list,stake,false)
-       +_nflCoachAltRowsTable(list,stake)+'</details>';
+        +_nflCoachTrackRowsTable(list,stake,false)+'</details>';
   }).join('');
 }
 function _nflCoachTrackRowsTable(rows,stake,showCategory){
@@ -7155,48 +7154,30 @@ function _nflCoachTrackRowsTable(rows,stake,showCategory){
   var sorted=rows.slice().sort(function(a,b){return String(b.record_date).localeCompare(String(a.record_date))||Object.keys(_NFL_COACH_TRACK_LABELS).indexOf(a.category)-Object.keys(_NFL_COACH_TRACK_LABELS).indexOf(b.category)||String(a.player).localeCompare(String(b.player));});
   var body=sorted.map(function(r){
     var result=(r.result||'PENDING').toUpperCase(),profit=_nflCoachTrackProfit(r,stake),edge=Number(r.coach_edge);
-    var metrics='<small style="display:block;color:#94a3b8;margin-top:4px">Model '+Number(r.model_probability||0).toFixed(1)+'% · Implied '+Number(r.implied_probability||0).toFixed(1)+'% · <b style="color:'+(edge>=0?'#4ade80':'#f87171')+'">'+(edge>=0?'+':'')+edge.toFixed(2)+' pts</b></small>';
+     var metrics='<small style="display:block;color:#94a3b8;margin-top:4px">Model '+Number(r.model_probability||0).toFixed(1)+'% · Implied '+Number(r.implied_probability||0).toFixed(1)+'% · <b style="color:'+(edge>=0?'#4ade80':'#f87171')+'">'+(edge>=0?'+':'')+edge.toFixed(2)+' pts</b></small>';
     var a=r.paired_alternate;
     if(a&&a.available){
       var ar=(a.result||'PENDING').toUpperCase();
       var aprofit=(ar==='WIN'||ar==='LOSS')?_nflTrkProfit(a,stake):null;
-      metrics+='<small style="display:block;color:#fbbf24;margin-top:5px"><b>Recommended Alt:</b> '+_esc(ar+' '+a.side+' '+a.line+' '+_nflCoachOdds(a.odds))+' · Model '+Number(a.model_probability||0).toFixed(1)+'% · Implied '+Number(a.implied_probability||0).toFixed(1)+'% · '+_esc(a.book||'')+' · Actual '+(a.actual==null?'—':_esc(String(a.actual)))+' · P/L '+(aprofit==null?'—':(aprofit>=0?'+$':'-$')+Math.abs(aprofit).toFixed(2))+'</small>';
+       metrics+='<div style="margin-top:8px;padding-top:7px;border-top:1px solid #475569;color:#fbbf24"><b style="font-size:.72rem;letter-spacing:.04em">RECOMMENDED SAFER ALT</b><br>'
+         +'<span style="color:#f8fafc">'+_esc((a.market_label||r.market_label||r.market||'')+' '+a.side+' '+a.line)+'</span>'
+         +'<small style="display:block;color:#94a3b8;margin-top:3px">Model '+Number(a.model_probability||0).toFixed(1)+'% · Implied '+Number(a.implied_probability||0).toFixed(1)+'% · Edge '+(Number(a.edge||0)>=0?'+':'')+Number(a.edge||0).toFixed(2)+' pts</small></div>';
     }else if(a){
-      metrics+='<small style="display:block;color:#94a3b8;margin-top:5px"><b>Recommended Alt:</b> unavailable — '+_esc(a.reason||'No genuine alternate published')+'</small>';
+       metrics+='<div style="margin-top:8px;padding-top:7px;border-top:1px solid #334155;color:#94a3b8"><b style="font-size:.72rem;letter-spacing:.04em">RECOMMENDED SAFER ALT</b><br>Unavailable — '+_esc(a.reason||'No genuine alternate published')+'</div>';
     }
+     var altOdds=a&&a.available?'<div style="margin-top:7px;padding-top:6px;border-top:1px solid #475569;color:#fbbf24"><b style="font-size:.7rem">ALT</b> '+_nflCoachOdds(a.odds)+'<br><small style="color:#94a3b8">'+_esc(a.book||'')+'</small></div>':'';
+     var altActual=a&&a.available?'<div style="margin-top:7px;padding-top:6px;border-top:1px solid #475569;color:#fbbf24"><b style="font-size:.7rem">ALT</b> '+(a.actual==null?'—':_esc(String(a.actual)))+'</div>':'';
+     var altResult=a&&a.available?'<div style="margin-top:7px;padding-top:6px;border-top:1px solid #475569"><b style="font-size:.7rem;color:#fbbf24">ALT</b> <span class="nfl-trk-result '+ar.toLowerCase()+'">'+_esc(ar)+'</span><br><small style="font-family:monospace;font-weight:900;color:'+(aprofit==null?'#94a3b8':aprofit>=0?'#4ade80':'#f87171')+'">'+(aprofit==null?'—':(aprofit>=0?'+$':'-$')+Math.abs(aprofit).toFixed(2))+'</small></div>':'';
     return '<tr><td class="trk-date" data-label="Date" style="color:#94a3b8;font-family:monospace">'+_esc(r.record_date||'')+'</td>'
       +(showCategory?'<td class="trk-category" data-label="Category" style="color:#7dd3fc;font-weight:900">'+_esc(r.category_label)+'</td>':'')
       +'<td class="trk-player" data-label="Player" style="color:#fff;font-weight:900">'+_esc(r.player||'')+'<br><small style="color:#94a3b8">'+_esc(r.team||'')+' vs '+_esc(r.opponent||'')+'</small></td>'
       +'<td class="trk-play" data-label="Play" style="color:#e2e8f0;font-weight:800">'+_esc(r.market_label||r.market||'')+'<br>'+_esc((r.side||'')+' '+r.line)+metrics+'</td>'
-      +'<td class="trk-odds" data-label="Odds / Book" style="font-family:monospace">'+_nflCoachOdds(r.odds)+'<br><small style="color:#94a3b8">'+_esc(r.book||'')+'</small></td>'
-      +'<td class="trk-actual" data-label="Actual" style="color:#cbd5e1">'+(r.actual==null?'—':_esc(String(r.actual)))+'</td>'
-      +'<td class="trk-result" data-label="Result / P&L"><span class="nfl-trk-result '+result.toLowerCase()+'">'+_esc(result)+'</span><br><small style="font-family:monospace;font-weight:900;color:'+(profit==null?'#94a3b8':profit>=0?'#4ade80':'#f87171')+'">'+(profit==null?'—':(profit>=0?'+$':'-$')+Math.abs(profit).toFixed(2))+'</small></td></tr>';
+       +'<td class="trk-odds" data-label="Odds / Book" style="font-family:monospace">'+_nflCoachOdds(r.odds)+'<br><small style="color:#94a3b8">'+_esc(r.book||'')+'</small>'+altOdds+'</td>'
+       +'<td class="trk-actual" data-label="Actual" style="color:#cbd5e1">'+(r.actual==null?'—':_esc(String(r.actual)))+altActual+'</td>'
+       +'<td class="trk-result" data-label="Result / P&L"><span class="nfl-trk-result '+result.toLowerCase()+'">'+_esc(result)+'</span><br><small style="font-family:monospace;font-weight:900;color:'+(profit==null?'#94a3b8':profit>=0?'#4ade80':'#f87171')+'">'+(profit==null?'—':(profit>=0?'+$':'-$')+Math.abs(profit).toFixed(2))+'</small>'+altResult+'</td></tr>';
   }).join('');
   return '<div class="nfl-trk-table-scroll"><table class="nfl-trk-tbl nfl-trk-compact"><thead><tr><th class="trk-date">Date</th>'
     +(showCategory?'<th class="trk-category">Coach Category</th>':'')+'<th class="trk-player">Player</th><th class="trk-play">Play / Probabilities</th><th class="trk-odds">Odds / Book</th><th class="trk-actual">Actual</th><th class="trk-result">Result / P&L</th></tr></thead><tbody>'+body+'</tbody></table></div>';
-}
-function _nflCoachAltRowsTable(rows,stake){
-  var altRows=rows.filter(function(r){return r.paired_alternate&&r.paired_alternate.available;});
-  if(!altRows.length){
-    return '<div style="margin:12px 14px 16px;padding:12px 14px;border:1px solid #334155;border-radius:10px;color:#94a3b8;font-size:.82rem"><b style="color:#cbd5e1">Recommended Safer Alt Lines:</b> No genuine alternate recommendations were saved for this category.</div>';
-  }
-  var sorted=altRows.slice().sort(function(a,b){return String(b.record_date).localeCompare(String(a.record_date))||String(a.player).localeCompare(String(b.player));});
-  var body=sorted.map(function(r){
-    var a=r.paired_alternate,result=(a.result||'PENDING').toUpperCase();
-    var profit=(result==='WIN'||result==='LOSS')?_nflTrkProfit(a,stake):null;
-    return '<tr>'
-      +'<td class="trk-date" data-label="Date" style="color:#94a3b8;font-family:monospace">'+_esc(r.record_date||'')+'</td>'
-      +'<td class="trk-player" data-label="Player" style="color:#fff;font-weight:900">'+_esc(r.player||'')+'<br><small style="color:#94a3b8">'+_esc(r.team||'')+' vs '+_esc(r.opponent||'')+'</small></td>'
-      +'<td class="trk-play" data-label="Original Pick" style="color:#cbd5e1;font-weight:800">'+_esc((r.market_label||r.market||'')+' '+(r.side||'')+' '+r.line)+'</td>'
-      +'<td class="trk-play" data-label="Recommended Safer Alt" style="color:#fbbf24;font-weight:900">'+_esc((a.market_label||r.market_label||r.market||'')+' '+(a.side||'')+' '+a.line)
-      +'<small style="display:block;color:#94a3b8;margin-top:4px">Model '+Number(a.model_probability||0).toFixed(1)+'% · Implied '+Number(a.implied_probability||0).toFixed(1)+'%</small></td>'
-      +'<td class="trk-odds" data-label="Alt Odds / Book" style="font-family:monospace">'+_nflCoachOdds(a.odds)+'<br><small style="color:#94a3b8">'+_esc(a.book||'')+'</small></td>'
-      +'<td class="trk-actual" data-label="Actual" style="color:#cbd5e1">'+(a.actual==null?'—':_esc(String(a.actual)))+'</td>'
-      +'<td class="trk-result" data-label="Alt Result / P&L"><span class="nfl-trk-result '+result.toLowerCase()+'">'+_esc(result)+'</span><br><small style="font-family:monospace;font-weight:900;color:'+(profit==null?'#94a3b8':profit>=0?'#4ade80':'#f87171')+'">'+(profit==null?'—':(profit>=0?'+$':'-$')+Math.abs(profit).toFixed(2))+'</small></td>'
-      +'</tr>';
-  }).join('');
-  return '<div style="margin:18px 14px 8px;color:#fbbf24;font-size:.82rem;font-weight:900;letter-spacing:.08em;text-transform:uppercase">Recommended Safer Alt Lines ('+altRows.length+')</div>'
-    +'<div class="nfl-trk-table-scroll" style="margin-bottom:16px"><table class="nfl-trk-tbl nfl-trk-compact"><thead><tr><th class="trk-date">Date</th><th class="trk-player">Player</th><th class="trk-play">Original Pick</th><th class="trk-play">Recommended Safer Alt</th><th class="trk-odds">Alt Odds / Book</th><th class="trk-actual">Actual</th><th class="trk-result">Alt Result / P&L</th></tr></thead><tbody>'+body+'</tbody></table></div>';
 }
 function _nflCoachTrackListHtml(rows,stake){
   return _nflCoachTrackCategoryHtml(rows,stake);
