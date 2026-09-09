@@ -138,6 +138,8 @@ _BOOK_PRIORITY = {b: i for i, b in enumerate(_PRIORITY_BOOKS)}
 # bookmaker. These books cover the user's main US/Canadian options while
 # reducing the response size and Odds API point usage substantially.
 ODDS_BOOKMAKERS = "draftkings,fanduel,betmgm,caesars,bet365,bet99,thescore"
+_NFL_PROP_FETCH_CONCURRENCY = 3
+_NFL_ALT_FETCH_CONCURRENCY = 1
 _BOOK_LABEL = {"bet99":"Bet99","thescore":"theScore","bet365":"Bet365","draftkings":"DK",
                "fanduel":"FanDuel","betmgm":"BetMGM","caesars":"Caesars",
                "williamhill_us":"Caesars","betrivers":"BetRivers","ballybet":"Bally Bet",
@@ -2472,24 +2474,52 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False,
                     ),
                 }
 
-        # 3. Fetch prop lines per game
+        # 3. Fetch prop lines with bounded concurrency. A 13-game Sunday slate
+        # must not run 13 independent 20-second requests serially, but keeping
+        # the cap low avoids a burst that can trigger provider rate limits.
         all_lines = []
-        for gi, ev in enumerate(espn_games):
+        fetch_limit = min(_NFL_PROP_FETCH_CONCURRENCY, len(espn_games))
+        fetch_sem = asyncio.Semaphore(max(1, fetch_limit))
+        _p(f"Fetching prop lines for {len(espn_games)} games — "
+           f"up to {fetch_limit} at once…")
+
+        async def _fetch_game_props(gi, ev):
             ev_id = ev.get("id", "")
-            _p(f"Fetching prop lines — game {gi+1}/{len(espn_games)}: {ev.get('game','')}…")
-            lines = await get_prop_lines(ev_id, date_str) if ev_id else []
-            # A live Odds API response can occasionally be successful but contain
-            # no bookmaker markets. Do not erase a slate on that one transient
-            # response; retry briefly before reporting that lines are unavailable.
-            if ev_id and not simulate and not lines:
-                for retry in range(2):
-                    wait_s = 1.5 * (retry + 1)
-                    print(f"[OddsAPI props] empty for {ev_id}; retry {retry + 1}/2 in {wait_s:.1f}s")
-                    await asyncio.sleep(wait_s)
-                    lines = await get_prop_lines(ev_id, date_str)
-                    if lines:
-                        print(f"[OddsAPI props] retry recovered {len(lines)} lines for {ev_id}")
-                        break
+            async with fetch_sem:
+                print(f"[OddsAPI props] start game {gi+1}/{len(espn_games)}: "
+                      f"{ev.get('game','')}")
+                lines = await get_prop_lines(ev_id, date_str) if ev_id else []
+                # A live response can occasionally succeed with no markets.
+                # Retry that exact game without adding any new API calls when
+                # the first response is complete.
+                if ev_id and not simulate and not lines:
+                    for retry in range(2):
+                        wait_s = 1.5 * (retry + 1)
+                        print(f"[OddsAPI props] empty for {ev_id}; "
+                              f"retry {retry + 1}/2 in {wait_s:.1f}s")
+                        await asyncio.sleep(wait_s)
+                        lines = await get_prop_lines(ev_id, date_str)
+                        if lines:
+                            print(f"[OddsAPI props] retry recovered "
+                                  f"{len(lines)} lines for {ev_id}")
+                            break
+                return gi, ev, lines
+
+        tasks = [
+            asyncio.create_task(_fetch_game_props(gi, ev))
+            for gi, ev in enumerate(espn_games)
+        ]
+        fetched_games = [None] * len(tasks)
+        completed = 0
+        for task in asyncio.as_completed(tasks):
+            gi, ev, lines = await task
+            fetched_games[gi] = (ev, lines)
+            completed += 1
+            _p(f"Prop lines complete — {completed}/{len(espn_games)}: "
+               f"{ev.get('game','')} ({len(lines)} lines)")
+
+        # Preserve schedule order so downstream ranking remains deterministic.
+        for ev, lines in fetched_games:
             home_abbr = ev.get("home_abbr", "") or _name_to_abbr(ev.get("home_team",""))
             away_abbr = ev.get("away_abbr", "") or _name_to_abbr(ev.get("away_team",""))
             for l in lines:
@@ -2781,11 +2811,14 @@ async def _build_alt_coach(date_str: str) -> dict:
         return {"date": date_str, "picks": [], "error": "No NFL games found for this date."}
     games = await get_odds_events(date_str, games)
     roster_map = await get_espn_roster_map(games, date_str)
-    requests = [
-        get_prop_lines(game.get("id", ""), date_str, alternate_only=True)
-        if game.get("id") else asyncio.sleep(0, result=[])
-        for game in games
-    ]
+    alt_sem = asyncio.Semaphore(_NFL_ALT_FETCH_CONCURRENCY)
+    async def _one_alt(game):
+        if not game.get("id"):
+            return []
+        async with alt_sem:
+            return await get_prop_lines(
+                game.get("id", ""), date_str, alternate_only=True)
+    requests = [_one_alt(game) for game in games]
     batches = await asyncio.gather(*requests)
     lines = []
     for game, batch in zip(games, batches):
