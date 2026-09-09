@@ -1896,7 +1896,10 @@ def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str) -> Optional[Dict
     vsl_tot    = len(la_vals)
     vsl_rate   = round(vsl_hits/vsl_tot*100, 1) if vsl_tot >= 1 else None
 
-    ref_avg = avg_b if avg_b is not None else avg_a
+    # Matchup history takes precedence over generic venue form. If this player
+    # has faced today's opponent, project from that opponent-specific sample;
+    # use L10 home/away only when no opponent history exists.
+    ref_avg = avg_a if avg_a is not None else avg_b
 
     # Opponent-defense adjustment: project vs THIS defense, not a neutral one.
     def_factor = 1.0; def_rank = None; def_lbl = _OPP_ADJ_COLS.get(stat_col, "")
