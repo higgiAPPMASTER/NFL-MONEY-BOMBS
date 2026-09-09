@@ -165,6 +165,8 @@ SEASON_JOBS: Dict[str, Dict] = {}
 _CACHE_DIR = pathlib.Path("/tmp/mpa_cache")
 _CACHE_DIR.mkdir(parents=True, exist_ok=True)
 _CACHE_TTL = 6 * 3600
+_NFL_LINE_MOVEMENT_APP = "nfl_line_movement"
+_NFL_LINE_OPEN_CATEGORY = "__wednesday_open__"
 
 def _is_past_date(date_key) -> bool:
     """Past dates are FINAL — historical odds/results never change, so their
@@ -2408,7 +2410,9 @@ async def _build_nfl_game_predictions(espn_games: list, df, date_str: str,
     return predictions, fetched
 
 # ── Pipeline ───────────────────────────────────────────────────────────────────
-async def run_pipeline(date_str: str, progress=None, simulate: bool = False) -> Dict:
+async def run_pipeline(date_str: str, progress=None, simulate: bool = False,
+                       force_refresh: bool = False,
+                       capture_official: bool = True) -> Dict:
     def _p(msg):
         print(f"[Pipeline] {msg}")
         if progress:
@@ -2429,7 +2433,7 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False) -> 
     # replays/past dates must retain their historical Odds API request behavior.
     if not simulate:
         _schedule_alt_coach_warm(date_str)
-    cached = None if simulate else _cache_get(date_str)
+    cached = None if (simulate or force_refresh) else _cache_get(date_str)
     if cached:
         return cached
 
@@ -2450,7 +2454,8 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False) -> 
     # 2+3. Odds layer — ONE call per game fetches props + h2h + totals together.
     #      All games are fetched concurrently (asyncio.gather) then cached for 6h.
     #      On a cache hit the result cache (6h) fires first so no API calls happen.
-    all_lines, game_lines_by_id = _odds_cache_get(date_str)
+    all_lines, game_lines_by_id = (
+        (None, None) if force_refresh else _odds_cache_get(date_str))
     if all_lines is None:
         # 2. Match Odds API event IDs
         _p(f"Matching {len(espn_games)} games with sportsbook events…")
@@ -2705,15 +2710,22 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False) -> 
             "enter the official NFL Track Record."
         )
         return result
-    _cache_set(date_str, result)
-    official_capture = _nfl_official_capture_allowed(date_str, result)
+    _nfl_attach_line_movement(date_str, result)
+    official_capture = (
+        capture_official and _nfl_official_capture_allowed(date_str, result))
     result["official_tracking"] = official_capture
+    if not capture_official:
+        result["tracking_reason"] = (
+            "Weekly opening-line snapshot only; official picks remain available "
+            "for the first eligible game-day run.")
     if official_capture:
         _nfl_save_picks_snapshot(date_str, result)
         _nfl_save_gp_snapshot(date_str, result)
     else:
         print(f"[nfl_track] official snapshot skipped for {date_str}: "
-              "capture was not before every kickoff")
+              + ("weekly opening-line mode"
+                 if not capture_official else "capture was not before every kickoff"))
+    _cache_set(date_str, result)
     try:
         from replit_push import push_picks_to_replit
         push_picks_to_replit("nfl", result)
@@ -2896,20 +2908,57 @@ async def api_run(request: Request):
     if not _verify_hub_token(tok):
         raise HTTPException(status_code=401, detail="Subscription required — please log in via moneypicksarena.com")
     date_str = body.get("date", datetime.now(timezone.utc).strftime("%Y-%m-%d"))
+    scope = str(body.get("scope") or "day").lower()
+    if scope not in ("day", "week"):
+        raise HTTPException(status_code=400, detail="Run scope must be day or week")
     job_id   = str(uuid.uuid4())[:8]
     JOBS[job_id] = {"status":"running","result":None,"error":None,"progress":"Starting…"}
     async def _run():
         try:
             # Job-level watchdog: no matter what hangs inside, the job always
-            # resolves to done/error within 5 minutes so the UI never spins forever.
+            # resolves to done/error. Weekly runs get extra time because they
+            # preserve seven independent daily caches/snapshots.
+            async def _work():
+                if scope == "week":
+                    dates = _nfl_week_dates(date_str)
+                    results = []
+                    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                    for index, ds in enumerate(dates, 1):
+                        JOBS.get(job_id, {}).update({
+                            "progress": f"Week {index}/7 · {ds}: checking slate…"})
+                        if ds < today:
+                            saved = _cache_get(ds)
+                            results.append(saved or {
+                                "date": ds, "picks": [], "all": [], "games": [],
+                                "game_predictions": [], "td_picks": [],
+                                "error": "Past day has no saved pre-game board; skipped without buying historical odds.",
+                            })
+                            continue
+                        result = await run_pipeline(
+                            ds,
+                            force_refresh=True,
+                            capture_official=False,
+                            progress=lambda m, i=index, d=ds: JOBS.get(
+                                job_id, {}).update(
+                                    {"progress": f"Week {i}/7 · {d}: {m}"}))
+                        _nfl_capture_opening_lines(ds, result)
+                        _nfl_attach_line_movement(ds, result)
+                        results.append(result)
+                    return _nfl_merge_week_results(date_str, results)
+                result = await run_pipeline(
+                    date_str,
+                    force_refresh=True,
+                    progress=lambda m: JOBS.get(job_id, {}).update({"progress": m}))
+                _nfl_attach_line_movement(date_str, result)
+                return result
             result = await asyncio.wait_for(
-                run_pipeline(date_str,
-                    progress=lambda m: JOBS.get(job_id, {}).update({"progress": m})),
-                timeout=300)
+                _work(), timeout=900 if scope == "week" else 300)
             JOBS[job_id].update({"status":"done","result":result})
         except asyncio.TimeoutError:
             JOBS[job_id].update({"status":"error",
-                "error":"Run timed out after 5 minutes — the data sources may be slow right now. Please try again."})
+                "error":("Weekly run timed out after 15 minutes"
+                         if scope == "week" else "Run timed out after 5 minutes")
+                        + " — the data sources may be slow right now. Please try again."})
         except Exception as e:
             JOBS[job_id].update({"status":"error","error":str(e)})
     asyncio.create_task(_run())
@@ -2920,6 +2969,78 @@ async def api_poll(job_id: str):
     job = JOBS.get(job_id)
     if not job: raise HTTPException(404, "Job not found")
     return job
+
+
+def _nfl_week_dates(anchor_date: str) -> list:
+    """Return the NFL display week containing anchor_date: Wednesday–Tuesday."""
+    try:
+        anchor = datetime.strptime(anchor_date, "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="A valid NFL date is required")
+    start = anchor - timedelta(days=(anchor.weekday() - 2) % 7)
+    return [(start + timedelta(days=offset)).isoformat() for offset in range(7)]
+
+
+def _nfl_merge_week_results(anchor_date: str, daily_results: list) -> dict:
+    """Merge daily boards for display without merging their tracking identity."""
+    dates = _nfl_week_dates(anchor_date)
+    merged = {
+        "date": f"{dates[0]} through {dates[-1]}",
+        "anchor_date": anchor_date,
+        "week_mode": True,
+        "week_start": dates[0],
+        "week_end": dates[-1],
+        "week_dates": dates,
+        "picks": [], "all": [], "td_picks": [], "games": [],
+        "game_predictions": [], "qualified": 0,
+        "daily_status": [],
+    }
+    notes, warnings, successful = [], [], []
+    for ds, result in zip(dates, daily_results):
+        result = result or {}
+        error = str(result.get("error") or "")
+        merged["daily_status"].append({
+            "date": ds, "error": error,
+            "games": len(result.get("games") or []),
+            "picks": len(result.get("picks") or []),
+        })
+        if error:
+            notes.append(f"{ds}: {error}")
+        else:
+            successful.append(result)
+        for key in ("all", "picks", "td_picks"):
+            for row in result.get(key) or []:
+                copy = dict(row)
+                copy["slate_date"] = ds
+                merged[key].append(copy)
+        for game in result.get("games") or []:
+            copy = dict(game)
+            copy["slate_date"] = ds
+            merged["games"].append(copy)
+        for game in result.get("game_predictions") or []:
+            copy = dict(game)
+            copy["slate_date"] = ds
+            merged["game_predictions"].append(copy)
+        if result.get("data_warning") and result["data_warning"] not in warnings:
+            warnings.append(result["data_warning"])
+        if result.get("data_note") and result["data_note"] not in warnings:
+            warnings.append(result["data_note"])
+    merged["qualified"] = len(merged["picks"])
+    merged["data_warning"] = " · ".join(
+        w for w in warnings if str(w).startswith("⚠"))
+    merged["data_note"] = " · ".join(
+        w for w in warnings if not str(w).startswith("⚠"))
+    merged["week_notice"] = (
+        f"Full NFL week: {dates[0]} through {dates[-1]} (Wednesday–Tuesday). "
+        f"{len(merged['games'])} games loaded. Opening lines are stored by game "
+        "date; this weekly run does not lock the official pick tracker."
+        + (f" {len(notes)} date(s) had no usable saved/live board." if notes else "")
+    )
+    merged["official_tracking"] = bool(successful) and all(
+        result.get("official_tracking") is True for result in successful)
+    if not successful and not merged["all"]:
+        merged["error"] = "No saved or live NFL boards were available for this week."
+    return merged
 
 async def _nfl_season_game_dates(season: int) -> list:
     """Return every regular-season and playoff game date for one NFL season."""
@@ -3042,15 +3163,32 @@ async def api_historical_season_poll(request: Request, job_id: str,
     return job
 
 @app.get("/api/cached")
-async def api_cached(request: Request, target_date: str = "", token: str = ""):
+async def api_cached(request: Request, target_date: str = "", token: str = "",
+                     scope: str = "day"):
     # Read-only: serve picks already saved on file. Never runs the pipeline, so any
     # logged-in member can pull the latest saved picks without triggering a fresh run.
     tok = token or request.headers.get("Authorization", "").replace("Bearer ", "").strip()
     if not _verify_hub_token(tok):
         raise HTTPException(status_code=401, detail="Subscription required — please log in via moneypicksarena.com")
     date_str = target_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if str(scope).lower() == "week":
+        daily = []
+        for ds in _nfl_week_dates(date_str):
+            cached_day = _cache_get(ds)
+            if cached_day:
+                _nfl_attach_line_movement(ds, cached_day)
+            daily.append(cached_day or {
+                "date": ds, "picks": [], "all": [], "games": [],
+                "game_predictions": [], "td_picks": [],
+                "error": "No saved board for this date.",
+            })
+        result = _nfl_merge_week_results(date_str, daily)
+        if result.get("all") or result.get("games"):
+            return result
+        raise HTTPException(status_code=404, detail="No saved picks for this NFL week.")
     cached = _cache_get(date_str)
     if cached:
+        _nfl_attach_line_movement(date_str, cached)
         return cached
     raise HTTPException(status_code=404, detail="No saved picks for this date.")
 
@@ -3069,6 +3207,8 @@ async def api_picks(request: Request, target_date: str = "", token: str = "",
         if replay_date >= datetime.now(timezone.utc).date():
             raise HTTPException(status_code=400, detail="Historical replays are available only for completed dates")
     result = await run_pipeline(date_str, simulate=simulate)
+    if not simulate:
+        _nfl_attach_line_movement(date_str, result)
     return JSONResponse(result)
 
 @app.get("/api/whoami")
@@ -3387,6 +3527,113 @@ def _nfl_sb_insert_ignore(table, rows, on_conflict):
     except Exception as e:
         print(f"[nfl_sb_insert_ignore] {e}")
         return None
+
+
+def _nfl_line_identity(row: dict) -> str:
+    return "|".join((
+        _norm(str(row.get("name") or row.get("player") or "")),
+        str(row.get("market") or "").strip().lower(),
+    ))
+
+
+def _nfl_opening_lines(date_str: str) -> dict:
+    """Read the write-once weekly opening line snapshot for one game date."""
+    rows = _nfl_sb_get("mpa_track_ledger", {
+        "app": f"eq.{_NFL_LINE_MOVEMENT_APP}",
+        "date": f"eq.{date_str}",
+        "category": f"eq.{_NFL_LINE_OPEN_CATEGORY}",
+        "side": "eq.ALL",
+        "select": "detail",
+        "limit": "1",
+    })
+    detail = (rows[0] or {}).get("detail") if rows else None
+    if isinstance(detail, str):
+        try:
+            detail = json.loads(detail)
+        except Exception:
+            detail = None
+    if not isinstance(detail, dict):
+        return {}
+    captured_at = detail.get("captured_at")
+    out = {}
+    for line in detail.get("lines") or []:
+        if not isinstance(line, dict):
+            continue
+        key = _nfl_line_identity(line)
+        if key and key != "|":
+            copy = dict(line)
+            copy["captured_at"] = captured_at
+            out[key] = copy
+    return out
+
+
+def _nfl_capture_opening_lines(date_str: str, result: dict) -> bool:
+    """Write the first weekly line snapshot once; later runs never replace it."""
+    lines, seen = [], set()
+    for row in result.get("all") or []:
+        key = _nfl_line_identity(row)
+        line = row.get("realLine")
+        if not key or key == "|" or key in seen or line is None:
+            continue
+        seen.add(key)
+        lines.append({
+            "name": row.get("name", ""),
+            "team": row.get("team", ""),
+            "opponent": row.get("opponent", ""),
+            "market": row.get("market", ""),
+            "market_label": row.get("mkt") or row.get("label") or "",
+            "line": line,
+            "over_odds": row.get("realOdds"),
+            "under_odds": row.get("realUnderOdds"),
+            "over_book": row.get("over_book", ""),
+            "under_book": row.get("under_book", ""),
+            "game_start": row.get("game_start", ""),
+        })
+    if not lines:
+        return False
+    inserted = _nfl_sb_insert_ignore("mpa_track_ledger", [{
+        "app": _NFL_LINE_MOVEMENT_APP,
+        "date": date_str,
+        "category": _NFL_LINE_OPEN_CATEGORY,
+        "side": "ALL",
+        "wins": 0, "losses": 0, "locked": True,
+        "detail": {
+            "captured_at": datetime.now(timezone.utc).isoformat(),
+            "source": "full_week_run",
+            "lines": lines,
+        },
+    }], "app,date,category,side")
+    return inserted is not None
+
+
+def _nfl_attach_line_movement(date_str: str, result: dict) -> dict:
+    """Annotate current plays from the durable weekly opening snapshot."""
+    opening = _nfl_opening_lines(date_str)
+    if not opening:
+        return result
+    for collection in ("all", "picks", "td_picks"):
+        for row in result.get(collection) or []:
+            saved = opening.get(_nfl_line_identity(row))
+            if not saved or saved.get("line") is None or row.get("realLine") is None:
+                continue
+            try:
+                move = round(float(row["realLine"]) - float(saved["line"]), 2)
+            except (TypeError, ValueError):
+                continue
+            side = str(row.get("pick") or "OVER").upper()
+            row["openingLine"] = saved.get("line")
+            row["currentLine"] = row.get("realLine")
+            row["lineMove"] = move
+            row["openingOdds"] = (
+                saved.get("under_odds") if side == "UNDER"
+                else saved.get("over_odds"))
+            row["openingBook"] = (
+                saved.get("under_book") if side == "UNDER"
+                else saved.get("over_book"))
+            row["lineOpenCapturedAt"] = saved.get("captured_at")
+            row["lineMovementAvailable"] = True
+    result["line_movement_dates"] = [date_str]
+    return result
 
 # ── Pick snapshot ─────────────────────────────────────────────────────────────
 _NFL_TRK_APP   = "nfl"
@@ -4677,14 +4924,19 @@ tr:last-child td{border-bottom:none}
 <main>
   <div class="hero">
     <h1>NFL <span>Money Bombs</span></h1>
-    <p>NFL Daily Picks</p>
+    <p>NFL Daily &amp; Weekly Picks</p>
   </div>
   <div class="card run-card">
-    <h2>Run Today&#39;s Picks</h2>
+    <h2>Run NFL Picks</h2>
     <div class="date-row">
       <label>Date</label>
       <input type="date" id="datePicker" class="date-input" value="__TODAY__" >
+      <select id="runScope" class="date-input" onchange="_nflRunScopeChanged()" style="min-width:190px">
+        <option value="day">Selected day only</option>
+        <option value="week">Full week · Wed–Tue</option>
+      </select>
     </div>
+    <div id="runScopeHint" style="color:#6b7280;font-size:.72rem;margin:-5px 0 14px">Runs only the selected calendar date.</div>
     <button class="btn" id="getBtn" onclick="getPicks()">🎯 Get Picks</button>
     <button class="btn" id="lastSeasonBtn" onclick="openNflLastSeason()" style="margin-left:10px;background:#6d28d9;color:#fff">📚 View Last Season</button>
     <button class="btn admin-only" id="runBtn" onclick="runPicks()" style="margin-left:10px">Run Picks</button>
@@ -4692,7 +4944,7 @@ tr:last-child td{border-bottom:none}
   </div>
   <div class="card" id="parlayCard" style="text-align:center;max-width:600px;margin:0 auto 16px">
     <h2 style="font-family:'Playfair Display',serif;font-size:1.3rem;font-weight:700;color:#fff;margin-bottom:6px">🎰 Auto Parlay Builder <span style="font-size:.7rem;color:#777;font-family:sans-serif">admin only</span></h2>
-    <p style="font-size:.74rem;color:#888;margin-bottom:14px">Best available legs from today&#39;s board — priced odds combined</p>
+    <p style="font-size:.74rem;color:#888;margin-bottom:14px">Best available legs from the loaded board — priced odds combined</p>
     <div style="display:flex;gap:10px;justify-content:center;align-items:center;flex-wrap:wrap">
       <label style="color:#9ca3af;font-size:.85rem;font-weight:600">Legs
         <select id="parlayLegs" style="background:#1a1a1a;color:#fff;border:1px solid #333;border-radius:8px;padding:8px 12px;font-size:.9rem;font-weight:700;margin-left:6px">
@@ -5034,17 +5286,31 @@ function _renderParlay(randomize){
 
 var jobId=null, pollTimer=null;
 
+function _nflRunScope(){
+  var el=document.getElementById('runScope');
+  return el&&el.value==='week'?'week':'day';
+}
+function _nflRunScopeChanged(){
+  var hint=document.getElementById('runScopeHint'),week=_nflRunScope()==='week';
+  if(hint)hint.textContent=week
+    ?'Runs the NFL week containing this date: Wednesday through Tuesday, including Monday Night Football.'
+    :'Runs only the selected calendar date.';
+}
+
 async function runPicks(){
   var date=document.getElementById('datePicker').value;
+  var scope=_nflRunScope();
   if(!date){alert('Please select a date');return;}
   var btn=document.getElementById('runBtn');
   var status=document.getElementById('statusMsg');
   btn.disabled=true;
   btn.innerHTML='<span class="spinner"></span>Running...';
-  status.innerHTML='<span class="spinner"></span>Fetching prop lines and loading NFL stats...';
+  status.innerHTML='<span class="spinner"></span>'+(scope==='week'
+    ?'Running the full Wednesday–Tuesday NFL week...'
+    :'Fetching prop lines and loading NFL stats...');
   document.getElementById('results').innerHTML='';
   try{
-    const r=await fetch('/api/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({date:date,token:_nflTok})});
+    const r=await fetch('/api/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({date:date,scope:scope,token:_nflTok})});
     const d=await r.json();
     jobId=d.job_id;
     pollTimer=setInterval(pollJob,2500);
@@ -5088,6 +5354,9 @@ async function pollJob(){
       document.getElementById('runBtn').disabled=false;
       document.getElementById('runBtn').textContent='Run Picks';
       document.getElementById('statusMsg').textContent=
+        d.result&&d.result.week_mode
+          ?'Full NFL week loaded and opening lines saved by game date. Official pick tracking remains open for the first eligible game-day run.'
+          :
         d.result&&d.result.historicalTrackRecord
           ?'HISTORICAL REPLAY — this run excludes the selected date from model inputs and is excluded from the official Track Record.'
           :d.result&&d.result.official_tracking===false
@@ -5117,21 +5386,24 @@ async function pollJob(){
 // Get Picks loads today's saved board, or builds a view-only replay for a past date.
 async function getPicks(){
   var date=document.getElementById('datePicker').value;
+  var scope=_nflRunScope();
   if(!date){alert('Please select a date');return;}
   var btn=document.getElementById('getBtn');
   var status=document.getElementById('statusMsg');
   var orig=btn.textContent;
-  var isHistorical=date<new Date().toISOString().slice(0,10);
+  var isHistorical=scope==='day'&&date<new Date().toISOString().slice(0,10);
   btn.disabled=true;
   btn.innerHTML='<span class="spinner"></span>'+(isHistorical?'Replaying...':'Loading...');
-  status.innerHTML='<span class="spinner"></span>'+(isHistorical
+  status.innerHTML='<span class="spinner"></span>'+(scope==='week'
+    ?'Loading saved Wednesday–Tuesday boards...'
+    :isHistorical
     ?'Building point-in-time picks and grading the historical results...'
     :'Loading saved picks...');
   document.getElementById('results').innerHTML='';
   try{
     var url=isHistorical
       ?'/api/picks?target_date='+encodeURIComponent(date)+'&simulate=true&token='+encodeURIComponent(_nflTok)
-      :'/api/cached?target_date='+encodeURIComponent(date)+'&token='+encodeURIComponent(_nflTok);
+      :'/api/cached?target_date='+encodeURIComponent(date)+'&scope='+encodeURIComponent(scope)+'&token='+encodeURIComponent(_nflTok);
     var r=await fetch(url);
     if(r.status===404){ status.textContent=''; alert("Today's picks aren't ready yet -- check back a little later."); return; }
     if(!r.ok){
@@ -5171,6 +5443,10 @@ var _MLBL={'Pass Yds':'Pass','Pass TDs':'Pass TD','Completions':'Comp','Pass Att
 function _nflGameDone(p){
   var s=p&&p.game_start; if(!s) return false;
   var t=new Date(s).getTime(); if(!t||isNaN(t)) return false;
+  // A merged weekly board is still a live betting view, so remove every game
+  // once its normal four-hour completion window has elapsed.
+  if(window._nflState&&window._nflState.d&&window._nflState.d.week_mode)
+    return Date.now() > (t + 4*3600*1000);
   // Only auto-hide finished games on TODAY'S live slate. When browsing a
   // past date every game is long over — show ALL picks (historical review).
   var d=new Date(t), now=new Date();
@@ -5277,7 +5553,7 @@ function nflCard(p,i){
        </div>
        <div class="pc-id">
          <div class="pc-name">${p.name}</div>
-         <div class="pc-meta">${p.team} vs ${p.opponent} ${haBadge}</div>
+          <div class="pc-meta">${p.team} vs ${p.opponent} ${haBadge}${p.slate_date?' · '+p.slate_date:''}</div>
          <div class="pc-mkt">${p.mkt||''} · ${p.pick||''}</div>
          ${defChip}
        </div>
@@ -5441,7 +5717,7 @@ function buildNormTable(picks, startNum){
 function _nflGpConfClr(c){return({STRONG:'#7c3aed',MODERATE:'#2563eb',LEAN:'#64748b'})[c]||'#64748b';}
 function _nflGpFix(v){return(v==null||v==='')?'&#8212;':(Math.round(Number(v)*10)/10).toFixed(1);}
 function _nflGpBetPanel(g,idx){
-  var _gd=window.__NFL_DATE__||'';
+  var _gd=g.slate_date||window.__NFL_DATE__||'';
   var _ha=g.home_abbr||'',_aa=g.away_abbr||'';
   window.__NFL_GP_BET__=window.__NFL_GP_BET__||{};
   var n=0;
@@ -5517,7 +5793,7 @@ function _nflGpCard(g,i){
   }
   return '<div onclick="_openNflGamePred('+i+')" style="background:#0a1120;border:1px solid '+bdr+';border-radius:14px;padding:13px 15px;cursor:pointer" onmouseover="this.style.borderColor=&#39;#3b2c63&#39;" onmouseout="this.style.borderColor=&#39;'+bdr+'&#39;">'
     +'<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:7px">'
-    +'<div style="font-weight:800;color:#94a3b8;font-size:.72rem;letter-spacing:.04em">'+_esc(g.away_abbr)+' @ '+_esc(g.home_abbr)+'</div>'
+    +'<div style="font-weight:800;color:#94a3b8;font-size:.72rem;letter-spacing:.04em">'+_esc(g.away_abbr)+' @ '+_esc(g.home_abbr)+(g.slate_date?' · '+_esc(g.slate_date):'')+'</div>'
     +'<div style="display:flex;gap:6px;align-items:center">'+vb
     +'<span style="background:'+cc+';color:#fff;font-weight:900;font-size:.62rem;border-radius:6px;padding:2px 7px;letter-spacing:.04em">'+_esc(g.conf)+'</span>'
     +'<span style="background:rgba(167,139,250,.15);color:#c4b5fd;font-weight:900;font-size:.68rem;border-radius:6px;padding:2px 8px">PICK '+_esc(g.pick_abbr)+'</span>'
@@ -5654,7 +5930,7 @@ function _nflGpSaveBet(){
   var stake=parseFloat(document.getElementById('nfl-gp-bet-stake').value);
   var msg=document.getElementById('nfl-gp-bet-msg');
   if(isNaN(odds)||isNaN(stake)||stake<=0){if(msg)msg.textContent='Enter valid odds and stake.';return;}
-  var payload=Object.assign({},src,{odds:odds,stake:stake,date_placed:window.__NFL_DATE__||''});
+  var payload=Object.assign({},src,{odds:odds,stake:stake,date_placed:src.date||window.__NFL_DATE__||''});
   fetch('/api/nfl/bet',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)})
     .then(function(r){return r.json();})
     .then(function(r){
@@ -5704,7 +5980,8 @@ function _nflCoachProps(){
       recentRate:Number(p.vsLineRate||p.rateB||0),recentHits:Number(p.vsLineHits||p.hitsB||0),
       recentTotal:Number(p.vsLineTotal||p.totB||0),oppRate:Number(p.rateA||0),
       oppHits:Number(p.hitsA||0),oppTotal:Number(p.totA||0),book:side==='UNDER'?(p.under_book||''):(p.over_book||''),
-       isAlternate:!!p.isAlternate,game_start:p.game_start||'',source:p
+        isAlternate:!!p.isAlternate,game_start:p.game_start||'',
+        slate_date:p.slate_date||'',source:p
     });
   });
   out.forEach(function(p){p.edge=p.appProb-p.implied;});
@@ -5795,6 +6072,29 @@ function _nflCoachGameTiles(p){
     return '<div class="nfl-coach-game '+cls+'"><div class="d">'+_esc(g.d)+(g.o?' · '+_esc(g.o):'')+'</div><div class="v">'+Number(g.v).toFixed(1)+'</div></div>';
   }).join('')+'</div>';
 }
+function _nflCoachLineMovement(p){
+  var s=p.source||{};
+  if(!s.lineMovementAvailable||s.openingLine==null||s.currentLine==null){
+    return '<div>No Wednesday weekly opening line is stored for this exact player and market yet. Run Full Week on Wednesday, then use Run Picks on game day to fetch and compare fresh lines.</div>';
+  }
+  var open=Number(s.openingLine),current=Number(s.currentLine),move=Number(s.lineMove||0);
+  var direction=move>0?'UP':(move<0?'DOWN':'UNCHANGED');
+  var color=move===0?'#9ca3af':'#fbbf24';
+  var impact=move===0
+    ?'The book line has not moved.'
+    :(move>0
+      ?(p.side==='OVER'?'The higher line makes this Over harder to clear.':'The higher line gives this Under more room.')
+      :(p.side==='OVER'?'The lower line makes this Over easier to clear.':'The lower line gives this Under less room.'));
+  var openOdds=s.openingOdds!=null?_nflCoachOdds(s.openingOdds):'N/A';
+  var captured=s.lineOpenCapturedAt?new Date(s.lineOpenCapturedAt).toLocaleString():'Wednesday weekly run';
+  return '<div class="nfl-coach-stats">'
+    +'<div class="nfl-coach-stat"><div class="k">Weekly opening line</div><div class="v">'+open+'</div></div>'
+    +'<div class="nfl-coach-stat"><div class="k">Current game-day line</div><div class="v">'+current+'</div></div>'
+    +'<div class="nfl-coach-stat"><div class="k">Line move</div><div class="v" style="color:'+color+'">'+direction+' '+_nflCoachSigned(move)+' pts</div></div>'
+    +'<div class="nfl-coach-stat"><div class="k">Selected-side odds</div><div class="v">'+openOdds+' → '+_nflCoachOdds(p.odds)+'</div></div>'
+    +'</div><div style="margin-top:9px;color:#cbd5e1">'+impact+'</div>'
+    +'<div style="margin-top:7px;color:#6b7280;font-size:.68rem">Opening snapshot: '+_esc(captured)+'. Line movement can reflect betting pressure, injuries, limits, or sportsbook adjustment; it does not by itself prove whether public or sharp bettors caused the move.</div>';
+}
 function _nflCoachAccordions(p){
   var s=p.source||{},opp=_nflCoachNum(p.oppositeOdds),oppImp=opp!=null?_nflCoachImplied(opp):null;
   var other=p.side==='OVER'?'UNDER':'OVER',projection=p.projection!=null&&isFinite(p.projection)?p.projection.toFixed(2):'N/A';
@@ -5811,7 +6111,7 @@ function _nflCoachAccordions(p){
     +'<div class="nfl-coach-stat"><div class="k">Source</div><div class="v">'+_esc(p.book||'Sportsbook line')+'</div></div>'
     +'</div><div style="margin-top:7px">Only genuine prices carried by the loaded NFL prop are shown. This is not a full multi-book screen unless the source provides those books.</div></div></details>'
     +'<details open><summary>Hit Rate Chart</summary><div class="nfl-coach-accord-body">'+_nflCoachRateTiles(p)+_nflCoachGameTiles(p)+'</div></details>'
-    +'<details><summary>Line Movement</summary><div class="nfl-coach-accord-body">Line movement is unavailable because the NFL app does not store timestamped opening and closing prices. No movement or sharp-money claim is generated.</div></details>'
+    +'<details><summary>Line Movement</summary><div class="nfl-coach-accord-body">'+_nflCoachLineMovement(p)+'</div></details>'
     +'<details><summary>Key Stats</summary><div class="nfl-coach-accord-body"><div class="nfl-coach-stats">'
     +'<div class="nfl-coach-stat"><div class="k">Projection</div><div class="v">'+projection+'</div></div>'
     +'<div class="nfl-coach-stat"><div class="k">Recent average</div><div class="v">'+avg+'</div></div>'
@@ -5846,7 +6146,7 @@ function _nflCoachRender(question,rows,total,mode){
       +'<img class="team-logo" src="'+_esc(logo)+'" alt="" onerror="this.style.display=\\'none\\'"/></span>'
       +'<span><span class="nfl-coach-name">'+(i+1)+'. '+_esc(p.player)+'</span><span class="nfl-coach-meta">'
       +(p.position?'<span class="nfl-coach-pos">'+_esc(p.position)+'</span>':'')
-      +'<span>'+_esc(p.team)+' vs '+_esc(p.opponent)+'</span>'+(venue?'<span>· '+venue+'</span>':'')+'</span></span></span>'
+      +'<span>'+_esc(p.team)+' vs '+_esc(p.opponent)+'</span>'+(venue?'<span>· '+venue+'</span>':'')+(p.slate_date?'<span>· '+_esc(p.slate_date)+'</span>':'')+'</span></span></span>'
       +'<span class="nfl-coach-pickmeta">'+_esc(p.market)+(p.isAlternate?' · <b style="color:#fbbf24">ALT LINE</b>':'')+'<br><b style="color:'+(p.side==='OVER'?'#4ade80':'#f87171')+'">'+p.side+' '+p.line+' · '+_nflCoachOdds(p.odds)+'</b></span></summary>'
       +'<div class="nfl-coach-copy">'+(mode==='safe'?'<b style="color:#fbbf24">Safety rank: '+p.implied.toFixed(1)+'% sportsbook-implied.</b> ':'')
       +'App probability '+p.appProb.toFixed(1)+'% vs '+p.implied.toFixed(1)+'% implied = <b style="color:'+(p.edge>=0?'#4ade80':'#f87171')+'">'+_nflCoachSigned(p.edge)+' Coach Edge points</b>.</div>'
@@ -5857,9 +6157,18 @@ function _nflCoachRender(question,rows,total,mode){
 function _nflCoachCapture(category,rows){
   var status=document.getElementById('nflCoachCaptureStatus'),dp=document.getElementById('datePicker'),token=localStorage.getItem('__mpa_token')||'';
   if(!rows||!rows.length){if(status)status.textContent='Nothing saved: no qualifying displayed plays.';return;}
-  var payload={category:category,date:(dp&&dp.value)||window.__NFL_DATE__||'',rows:rows.map(function(p){return {player:p.player,team:p.team,opponent:p.opponent,game_start:p.game_start,market:p.market,side:p.side,line:p.line,odds:p.odds,book:p.book,model_probability:p.appProb,implied_probability:p.implied,coach_edge:p.edge,projection:p.projection,alternate:p.isAlternate};})};
-  if(status)status.textContent='Saving displayed snapshot…';
-  fetch('/api/nfl/coach-track/capture?token='+encodeURIComponent(token),{method:'POST',headers:{'Content-Type':'application/json','Authorization':token?'Bearer '+token:''},body:JSON.stringify(payload)}).then(function(r){return r.json().then(function(x){if(!r.ok)throw new Error(x.detail||'Save failed');return x;});}).then(function(x){if(status){status.style.color=x.status==='saved'?'#86efac':'#fbbf24';status.textContent=x.message;}}).catch(function(e){if(status){status.style.color='#f87171';status.textContent='Not saved: '+e.message;}});
+  var fallback=(dp&&dp.value)||window.__NFL_DATE__||'',groups={};
+  rows.forEach(function(p){
+    var ds=p.slate_date||fallback;
+    if(!groups[ds])groups[ds]=[];
+    groups[ds].push({player:p.player,team:p.team,opponent:p.opponent,game_start:p.game_start,market:p.market,side:p.side,line:p.line,odds:p.odds,book:p.book,model_probability:p.appProb,implied_probability:p.implied,coach_edge:p.edge,projection:p.projection,alternate:p.isAlternate});
+  });
+  if(status)status.textContent='Saving displayed snapshot by game date…';
+  var requests=Object.keys(groups).map(function(ds){
+    var payload={category:category,date:ds,rows:groups[ds]};
+    return fetch('/api/nfl/coach-track/capture?token='+encodeURIComponent(token),{method:'POST',headers:{'Content-Type':'application/json','Authorization':token?'Bearer '+token:''},body:JSON.stringify(payload)}).then(function(r){return r.json().then(function(x){if(!r.ok)throw new Error(x.detail||'Save failed');return x;});});
+  });
+  Promise.all(requests).then(function(results){if(status){status.style.color='#86efac';status.textContent='Saved '+results.length+' game-date snapshot'+(results.length===1?'':'s')+'.';}}).catch(function(e){if(status){status.style.color='#f87171';status.textContent='Not saved: '+e.message;}});
 }
 function askNflCoachPreset(q,category){var input=document.getElementById('nflCoachInput');if(input)input.value=q;_nflCoachCapture(category,askNflCoach());}
 async function askNflAltCoach(){
@@ -6086,7 +6395,7 @@ function _renderNflTdPredictor(d){
     var versus=p.totA?Number(p.hitsA||0)+'/'+Number(p.totA||0)+' ('+Number(p.rateA||0).toFixed(0)+'%)':'—';
     var defense=p.defRank!=null?'#'+p.defRank+' '+_esc(p.defLbl||'defense'):(p.defLbl?_esc(p.defLbl):'—');
     return '<tr><td><span class="nfl-td-rank">'+(i+1)+'</span></td>'
-      +'<td><button type="button" class="nfl-td-player" onclick="openNflLadder(\\''+key+'\\')">'+_esc(p.name)+'</button><br><small style="color:#6b7280">'+_esc(p.team||'')+' vs '+_esc(p.opponent||'')+'</small></td>'
+      +'<td><button type="button" class="nfl-td-player" onclick="openNflLadder(\\''+key+'\\')">'+_esc(p.name)+'</button><br><small style="color:#6b7280">'+_esc(p.team||'')+' vs '+_esc(p.opponent||'')+(p.slate_date?' · '+_esc(p.slate_date):'')+'</small></td>'
       +'<td style="font-weight:900;color:#fde68a">OVER 0.5 TD</td>'
       +'<td style="font-family:monospace;color:#fbbf24;font-weight:900">'+(_fmtOdds(odds)||'—')+'<br><small style="color:#6b7280">'+_esc(p.over_book||'')+'</small></td>'
       +'<td>'+(implied==null?'—':implied.toFixed(1)+'%')+'</td>'
@@ -6106,8 +6415,9 @@ function renderResults(d){
   }
   window._nflState={d:d, all:(d.all||[])};
   window.__NFL_PLAYS__=d.all||[];
-  window.__NFL_DATE__=d.date||'';
+  window.__NFL_DATE__=d.anchor_date||d.date||'';
   _renderNflParlayFilters();
+  var weekNotice=d.week_notice?('<div style="margin-bottom:10px;padding:11px 14px;border:1px solid #6d28d9;background:rgba(109,40,217,.12);border-radius:10px;color:#ddd6fe;font-size:.82rem">'+d.week_notice+'</div>'):'';
   var note=d.data_note?('<div style="margin-bottom:10px;padding:11px 14px;border:1px solid #24506b;background:#0b2230;border-radius:10px;color:#9bd5f5;font-size:.82rem">'+d.data_note+'</div>'):'';
   var warn=d.data_warning?('<div class="err-box" style="margin-bottom:10px">'+d.data_warning+'</div>'):'';
   var tdAll=(d.all||[]).filter(function(p){return p.market==='player_anytime_td'&&p.pick==='OVER';});
@@ -6117,7 +6427,7 @@ function renderResults(d){
       +'<strong>Anytime TD value gate:</strong> '+tdQualified+' of '+tdAll.length
       +' signals clear the book break-even probability by at least 5 points with 5+ recent games. The rest remain review-only.</div>'
     :'';
-  res.innerHTML=note+warn+tdNote+'<div class="nfl-toolbar"><input id="nflSearch" type="text" placeholder="Search player…" oninput="_nflPaint(this.value)"/></div><div id="nflBody"></div>';
+  res.innerHTML=weekNotice+note+warn+tdNote+'<div class="nfl-toolbar"><input id="nflSearch" type="text" placeholder="Search player…" oninput="_nflPaint(this.value)"/></div><div id="nflBody"></div>';
   _renderNflGamePredictor(d);
   _renderNflTdPredictor(d);
   _nflPaint('');
@@ -6180,7 +6490,7 @@ function _nflPaint(q){
       +'<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap">'
       +'<div><div style="font-weight:900;font-size:1rem;color:#6ee7b7">ROI Focus</div>'
       +'<div style="font-size:.72rem;color:#a7f3d0;margin-top:3px">UNDER picks priced -150 or better — the positive-ROI slice in the saved 2025 replay. Past results do not guarantee future profit.</div></div>'
-      +'<div style="background:rgba(52,211,153,.14);border:1px solid rgba(52,211,153,.35);border-radius:20px;padding:4px 12px;color:#6ee7b7;font-size:.75rem;font-weight:900">'+roiFocus.length+' today</div>'
+      +'<div style="background:rgba(52,211,153,.14);border:1px solid rgba(52,211,153,.35);border-radius:20px;padding:4px 12px;color:#6ee7b7;font-size:.75rem;font-weight:900">'+roiFocus.length+(d.week_mode?' this week':' today')+'</div>'
       +'</div></div>'+focusBody+'</div>';
   }
 
@@ -6226,7 +6536,8 @@ function _nflPaint(q){
     h+='<div class="sec">- Games -- '+(d.date||'')+'</div><div class="games">';
     d.games.forEach(function(g,gi){
       var mu=(g.away_abbr||g.away_team||'?')+' @ '+(g.home_abbr||g.home_team||'?');
-      h+='<div class="gcard" onclick="_gameModal('+gi+')"><div class="mu">'+mu+'</div><div class="gc-hint">tap for plays</div></div>';
+      var day=g.slate_date?'<div style="color:#a78bfa;font-size:.64rem;font-weight:900;margin-bottom:3px">'+g.slate_date+'</div>':'';
+      h+='<div class="gcard" onclick="_gameModal('+gi+')">'+day+'<div class="mu">'+mu+'</div><div class="gc-hint">tap for plays</div></div>';
     });
     h+='</div>';
   }
@@ -6307,7 +6618,7 @@ function _nflBetBtn(p,forceSide){
   window.__NFL_BET_SRC__[k]={
     name:p.name,pid:(p.pid!=null?String(p.pid):''),team:(p.team||''),opp:(p.opponent||''),
     category:(p.mkt||p.label||''),side:side,market:p.market,stat_label:(p.mkt||p.label||''),
-    line:p.realLine,odds:(odds!=null?odds:null),date:(window.__NFL_DATE__||'')
+    line:p.realLine,odds:(odds!=null?odds:null),date:(p.slate_date||window.__NFL_DATE__||'')
   };
   return '<button data-betkey="'+k+'" class="admin-only" onclick="event.stopPropagation();_nflBetForm(this.dataset.betkey)" style="background:#0e7490;color:#fff;border:none;border-radius:8px;padding:6px 10px;font-size:.7rem;font-weight:800;cursor:pointer">Track Bet</button>';
 }
