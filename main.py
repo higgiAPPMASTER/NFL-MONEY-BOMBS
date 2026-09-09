@@ -5743,6 +5743,14 @@ function _renderParlay(randomize){
   if(randomize){var avoid=null;if(window._lastParlay&&window._lastParlay.length){avoid={};window._lastParlay.forEach(function(pl){avoid[pl]=1;});}legs=_pick(_shuffle(cands.slice()),avoid).sort(function(a,b){return _legScore(b)-_legScore(a);});}
   else{legs=_pick(cands.slice(),null);}
   window._lastParlay=legs.map(function(l){return l.player;});
+  window._nflParlayLegs=legs;
+  window._nflParlayMode=randomize?'RANDOM MIX':'TOP PLAYS';
+  _paintNflParlay();
+}
+function _paintNflParlay(){
+  var out=document.getElementById('parlayResult');
+  if(!out)return;
+  var legs=window._nflParlayLegs||[],n=legs.length;
   var dec=1,priced=0,missing=0;
   legs.forEach(function(l){if(l.dec){dec*=l.dec;priced++;}else{missing++;}});
   var am=priced?_decToAm(dec):null;var payout=priced?(100*dec):null;
@@ -5752,18 +5760,41 @@ function _renderParlay(randomize){
     +'<div style="font-weight:800;color:#fff;font-size:.85rem">'+(i+1)+'. '+l.player+' <span style="color:#777;font-size:.7rem">'+l.team+(l.opp?(' vs '+l.opp):'')+'</span><span class="nfl-parlay-source '+(l.source==='coach'?'coach':'normal')+'">'+(l.source==='coach'?'COACH EDGE':'NORMAL')+'</span></div>'
     +'<div style="color:#999;font-size:.72rem;margin-top:2px">'+l.market+(l.line!=null?(' · line '+l.line):'')+(l.rate?(' · '+l.rate+'% hit'):'')+'</div>'
     +'</div>'
-    +'<div style="text-align:right;white-space:nowrap">'
+    +'<div style="display:flex;align-items:center;gap:8px;white-space:nowrap">'
+    +'<div style="text-align:right">'
     +'<div style="color:'+dirColor(l.dir)+';font-weight:900;font-size:.8rem">'+l.dir+'</div>'
     +'<div style="color:#f59e0b;font-size:.72rem;font-weight:800">'+(fo||'odds N/A')+'</div>'
+    +'</div>'
+    +'<button id="nflrep'+i+'" onclick="event.stopPropagation();_replaceNflParlayLeg('+i+')" title="Swap this leg for another play" style="background:#1e3a8a;color:#bfdbfe;border:1px solid #1d4ed8;border-radius:7px;padding:4px 9px;font-size:.85rem;cursor:pointer;font-weight:800;line-height:1;flex-shrink:0">&#8635;</button>'
     +'</div></div>';}).join('');
   var header='<div style="display:flex;justify-content:space-between;align-items:center;padding:8px 12px;border-bottom:1px solid #262626;background:#121212">'
-    +'<span style="font-weight:800;color:#ccc;font-size:.74rem">'+(randomize?'RANDOM MIX':'TOP PLAYS')+'</span>'
+    +'<span style="font-weight:800;color:#ccc;font-size:.74rem">'+(window._nflParlayMode||'TOP PLAYS')+'</span>'
     +'<span onclick="closeParlay()" title="Close" style="cursor:pointer;color:#888;font-weight:900;font-size:1.15rem;line-height:1;padding:0 6px">×</span></div>';
   var summary='<div style="display:flex;justify-content:space-between;align-items:center;padding:12px;background:linear-gradient(135deg,rgba(245,158,11,.12),rgba(245,158,11,.02));border-top:1px solid #262626">'
     +'<div style="font-weight:900;color:#f59e0b">'+n+'-LEG PARLAY</div>'
     +'<div style="text-align:right">'+(am?('<div style="font-weight:900;color:#4ade80;font-size:1.05rem">'+am+'</div><div style="color:#999;font-size:.7rem">$100 → $'+payout.toFixed(2)+(missing?(' · '+priced+'/'+n+' legs priced'):'')+'</div>'):('<div style="color:#888;font-size:.78rem">No book odds available for these legs</div>'))+'</div>'
     +'</div>';
   out.innerHTML='<div style="background:#0e0e0e;border:1px solid #262626;border-radius:12px;overflow:hidden">'+header+rows+summary+'</div>';
+}
+function _replaceNflParlayLeg(idx){
+  var legs=window._nflParlayLegs;
+  if(!legs||!legs[idx])return;
+  var current=legs[idx],used={};
+  legs.forEach(function(l,i){if(i!==idx)used[l.player]=1;});
+  var pool=_parlayPool().filter(function(c){
+    return c.player!==current.player&&!used[c.player];
+  });
+  if(!pool.length){_flashNoNflSwap(idx);return;}
+  legs[idx]=pool[Math.floor(Math.random()*pool.length)];
+  window._lastParlay=legs.map(function(l){return l.player;});
+  _paintNflParlay();
+}
+function _flashNoNflSwap(idx){
+  var b=document.getElementById('nflrep'+idx);
+  if(!b)return;
+  var old=b.innerHTML;
+  b.innerHTML='none';b.style.background='#374151';b.style.color='#9ca3af';
+  setTimeout(function(){b.innerHTML=old;b.style.background='#1e3a8a';b.style.color='#bfdbfe';},1000);
 }
 
 var jobId=null, pollTimer=null;
