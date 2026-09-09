@@ -162,6 +162,9 @@ def _take_odds(entry, price_field, book_field, price, book_key):
 app  = FastAPI(title="NFL Money Bombs", docs_url=None, redoc_url=None)
 JOBS: Dict[str, Dict] = {}
 SEASON_JOBS: Dict[str, Dict] = {}
+_NFL_WEEK_DATE_CONCURRENCY = 2
+_NFL_WEEK_DAY_TIMEOUT = 480
+_NFL_WEEK_JOB_TIMEOUT = 1200
 
 # ── File cache ─────────────────────────────────────────────────────────────────
 _CACHE_DIR = pathlib.Path("/tmp/mpa_cache")
@@ -2485,17 +2488,6 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False,
             pass
     cached = None if (simulate or force_refresh) else _cache_get(date_str)
     if cached:
-        # Old/live cached boards may predate paired alternates. Enrich them once
-        # from the shared alternate cache (or its single coalesced fetch), save
-        # the enriched board, and preserve every existing list's order.
-        if not _nfl_result_has_pair_metadata(cached):
-            try:
-                alt_payload = await _warm_alt_coach(date_str)
-                _nfl_attach_result_paired_alternates(
-                    cached, (alt_payload or {}).get("picks") or [])
-                _cache_set(date_str, cached)
-            except Exception as exc:
-                print(f"[Coach pairs] cached board enrichment failed: {exc}")
         return cached
     # Alternate markets have their own Coach-only cache and must never leak into
     # the standard props, picks, or tracking path. Warm only after ruling out a
@@ -2803,18 +2795,6 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False,
                    "bins": td_calibration,
                },
                "game_predictions": game_predictions}
-    # The dedicated alternate cache is shared with the Coach endpoint.  Attach
-    # pairs before any official capture (never lazily after kickoff); this does
-    # not add an Odds call when the cache/in-flight scan already exists.
-    if not simulate:
-        try:
-            alt_payload = await _warm_alt_coach(date_str)
-            _nfl_attach_result_paired_alternates(
-                result, (alt_payload or {}).get("picks") or [])
-        except Exception as exc:
-            # Leave metadata absent so the cached primary board remains
-            # retryable instead of freezing a transport failure as unavailable.
-            print(f"[Coach pairs] live alternate cache unavailable: {exc}")
     if simulate:
         result["simulation"] = True
         replay_box = _nfl_box_from_stats_rows(target_rows)
@@ -2972,9 +2952,6 @@ async def _build_alt_coach(date_str: str) -> dict:
             )
         if result and selected_odds is not None and selected_odds >= -500:
             picks.append(result)
-    # Best Alt-Line cards are themselves primary recommendations: retain the
-    # next genuinely safer rung as nested metadata, never as another card.
-    _nfl_attach_paired_alternates(picks, picks)
     payload = {"date": date_str, "picks": picks, "lines": len(lines)}
     _alt_coach_cache_set(date_str, payload)
     return payload
@@ -3077,29 +3054,66 @@ async def api_run(request: Request):
             async def _work():
                 if scope == "week":
                     dates = _nfl_week_dates(date_str)
-                    results = []
+                    results = [None] * len(dates)
                     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-                    for index, ds in enumerate(dates, 1):
-                        JOBS.get(job_id, {}).update({
-                            "progress": f"Week {index}/7 · {ds}: checking slate…"})
+                    week_sem = asyncio.Semaphore(_NFL_WEEK_DATE_CONCURRENCY)
+                    completed = 0
+
+                    async def _run_week_date(index, ds):
+                        nonlocal completed
                         if ds < today:
                             saved = _cache_get(ds)
-                            results.append(saved or {
+                            results[index] = saved or {
                                 "date": ds, "picks": [], "all": [], "games": [],
                                 "game_predictions": [], "td_picks": [],
                                 "error": "Past day has no saved pre-game board; skipped without buying historical odds.",
-                            })
-                            continue
-                        result = await run_pipeline(
-                            ds,
-                            force_refresh=True,
-                            capture_official=False,
-                            progress=lambda m, i=index, d=ds: JOBS.get(
-                                job_id, {}).update(
-                                    {"progress": f"Week {i}/7 · {d}: {m}"}))
-                        _nfl_capture_opening_lines(ds, result)
-                        _nfl_attach_line_movement(ds, result)
-                        results.append(result)
+                            }
+                        else:
+                            async with week_sem:
+                                JOBS.get(job_id, {}).update({
+                                    "progress": (
+                                        f"Full week: {completed}/7 complete · "
+                                        f"{ds}: checking slate…")})
+                                try:
+                                    result = await asyncio.wait_for(
+                                        run_pipeline(
+                                            ds,
+                                            force_refresh=True,
+                                            capture_official=False,
+                                            progress=lambda m, d=ds: JOBS.get(
+                                                job_id, {}).update({
+                                                    "progress": (
+                                                        f"Full week: {completed}/7 complete · "
+                                                        f"{d}: {m}")})),
+                                        timeout=_NFL_WEEK_DAY_TIMEOUT)
+                                    _nfl_capture_opening_lines(ds, result)
+                                    _nfl_attach_line_movement(ds, result)
+                                    results[index] = result
+                                except asyncio.TimeoutError:
+                                    results[index] = {
+                                        "date": ds, "picks": [], "all": [],
+                                        "games": [], "game_predictions": [],
+                                        "td_picks": [],
+                                        "error": (
+                                            "This date exceeded the 8-minute "
+                                            "data-source deadline. Run Full Week "
+                                            "again to retry this date."),
+                                    }
+                                except Exception as exc:
+                                    results[index] = {
+                                        "date": ds, "picks": [], "all": [],
+                                        "games": [], "game_predictions": [],
+                                        "td_picks": [],
+                                        "error": f"This date failed: {exc}",
+                                    }
+                        completed += 1
+                        JOBS.get(job_id, {}).update({
+                            "progress": f"Full week: {completed}/7 complete"})
+
+                    await asyncio.gather(*[
+                        _run_week_date(index, ds)
+                        for index, ds in enumerate(dates)
+                    ])
                     return _nfl_merge_week_results(date_str, results)
                 result = await run_pipeline(
                     date_str,
@@ -3108,11 +3122,11 @@ async def api_run(request: Request):
                 _nfl_attach_line_movement(date_str, result)
                 return result
             result = await asyncio.wait_for(
-                _work(), timeout=900 if scope == "week" else 300)
+                _work(), timeout=_NFL_WEEK_JOB_TIMEOUT if scope == "week" else 300)
             JOBS[job_id].update({"status":"done","result":result})
         except asyncio.TimeoutError:
             JOBS[job_id].update({"status":"error",
-                "error":("Weekly run timed out after 15 minutes"
+                "error":("Weekly run timed out after 20 minutes"
                          if scope == "week" else "Run timed out after 5 minutes")
                         + " — the data sources may be slow right now. Please try again."})
         except Exception as e:
@@ -3807,172 +3821,6 @@ _NFL_COACH_HIST_APP = "nfl_coach_historical"
 _NFL_COACH_CATS = ("safest_bets", "coach_edge", "alt_line_edge", "passing",
                    "rushing", "receiving", "td_scorers", "best_unders")
 
-# Alternate lines are deliberately paired metadata, never an additional pick.
-# Keep this logic pure so archived rows and the live cache use exactly the same
-# matching/ordering rules.
-_NFL_NO_ALT_MARKETS = {"player_anytime_td", "player_tackles_assists",
-                       "player_defensive_interceptions"}
-
-def _nfl_alt_pair_identity(row):
-    return "|".join(str(row.get(k) or "").strip().lower() for k in
-                    ("game", "player", "market", "side", "line"))
-
-def _nfl_best_paired_alternate(primary, alternates):
-    """Return the closest genuine safer line, or explicit unavailable metadata."""
-    base = primary.get("market") or primary.get("sourceMarket") or ""
-    side = str(primary.get("pick") or primary.get("side") or "").upper()
-    try:
-        line = float(primary.get("realLine", primary.get("line")))
-    except (TypeError, ValueError):
-        line = None
-    unavailable = {"available": False, "reason": "No genuine alternate line published",
-                   "market": base, "source_market": base,
-                   "pair_identity": _nfl_alt_pair_identity({
-                       "game": primary.get("game"), "player": primary.get("name", primary.get("player")),
-                       "market": base, "side": side, "line": line})}
-    if line is None or side not in ("OVER", "UNDER") or base in _NFL_NO_ALT_MARKETS:
-        unavailable["reason"] = ("Alternate market not configured" if base in _NFL_NO_ALT_MARKETS
-                                 else "Primary line is not pairable")
-        return unavailable
-    name = _norm(str(primary.get("name", primary.get("player", ""))))
-    game = str(primary.get("game") or "")
-    choices = []
-    for alt in alternates or []:
-        if _norm(str(alt.get("name", alt.get("player", "")))) != name:
-            continue
-        am = alt.get("market") or alt.get("sourceMarket") or alt.get("source_market")
-        if am != base or game and alt.get("game") and alt.get("game") != game:
-            continue
-        try:
-            al = float(alt.get("realLine", alt.get("line")))
-        except (TypeError, ValueError):
-            continue
-        if (side == "OVER" and not al < line) or (side == "UNDER" and not al > line):
-            continue
-        alt_side = str(alt.get("pick") or alt.get("side") or "").upper()
-        # Live alternate analyses carry one model-selected pick but retain both
-        # prices. Historical candidates are expanded into both sides.
-        if alt_side and alt_side not in ("OVER", "UNDER"):
-            continue
-        odds = (alt.get("realOdds") if side == "OVER" else alt.get("realUnderOdds"))
-        # Live analyzed ladders retain both side prices, so either Coach side
-        # can use the same genuine alternate rung. Historical candidates are
-        # expanded into one row per side and only carry that row's `odds`;
-        # never borrow the opposite historical side's price.
-        if odds is None and alt_side == side:
-            odds = alt.get("odds")
-        if odds is None:
-            continue
-        # Distance first (nearest safer), then stronger selected-side price,
-        # then stable source/book tie breakers.
-        try: price = float(odds)
-        except (TypeError, ValueError): continue
-        choices.append((abs(line - al), -price, str(alt.get("book") or ""),
-                        al, alt, price))
-    if not choices:
-        return unavailable
-    _, _, _, al, alt, price = sorted(choices, key=lambda x: x[:3])[0]
-    alt_side = str(alt.get("pick") or alt.get("side") or "").upper()
-    raw_model = alt.get("score", alt.get("dispScore", alt.get("model_probability")))
-    model = raw_model if alt_side in ("", side) else (100.0 - float(raw_model) if raw_model is not None else None)
-    implied = _nfl_coach_hist_implied(price)
-    pair = {
-        "available": True, "line": al, "side": side, "odds": int(price) if price.is_integer() else price,
-        "book": (alt.get("over_book") if side == "OVER" else alt.get("under_book")) or alt.get("book") or "",
-        "model_probability": float(model) if model is not None else None,
-        "implied_probability": implied,
-        "coach_edge": (float(model) - implied) if model is not None and implied is not None else None,
-        "market": base, "source_market": alt.get("sourceMarket") or alt.get("source_market") or base,
-        "result": "PENDING", "actual": None,
-        "pair_identity": _nfl_alt_pair_identity({"game": game, "player": primary.get("name", primary.get("player")),
-                                                  "market": base, "side": side, "line": al}),
-    }
-    return pair
-
-def _nfl_attach_paired_alternates(rows, alternates):
-    for row in rows or []:
-        if row.get("pick") or row.get("side"):
-            side = str(row.get("pick") or row.get("side") or "").upper()
-            row["paired_alternate"] = _nfl_best_paired_alternate(row, alternates)
-            # Coach can also inspect the opposite side of a two-sided primary.
-            # Preserve both pairings without turning either into a second play.
-            if side in ("OVER", "UNDER"):
-                opposite = dict(row)
-                opposite["pick"] = "UNDER" if side == "OVER" else "OVER"
-                row["paired_alternates"] = {
-                    side: row["paired_alternate"],
-                    opposite["pick"]: _nfl_best_paired_alternate(opposite, alternates),
-                }
-    return rows
-
-def _nfl_attach_result_paired_alternates(result, alternates):
-    """Attach pair metadata without rebuilding or reordering primary lists."""
-    for key in ("all", "picks", "td_picks", "coach_candidates"):
-        rows = result.get(key)
-        if isinstance(rows, list):
-            _nfl_attach_paired_alternates(rows, alternates)
-    return result
-
-def _nfl_result_has_pair_metadata(result):
-    rows = result.get("picks") or result.get("all") or []
-    return bool(rows) and all(
-        isinstance(row, dict) and "paired_alternate" in row for row in rows)
-
-def _nfl_paired_alternate_self_test():
-    """Network-free focused fixtures for the paired-line contract."""
-    primary = {"name": "A Player", "game": "A at B", "market": "player_rush_yds",
-               "pick": "OVER", "realLine": 60.5}
-    alts = [{"name": "A Player", "game": "A at B", "market": "player_rush_yds",
-             "pick": "OVER", "realLine": 55.5, "realOdds": -115,
-             "over_book": "DK", "score": 82},
-            # Same line is never a pair; farther line loses to nearest safe rung.
-            {"name": "A Player", "game": "A at B", "market": "player_rush_yds",
-             "pick": "OVER", "realLine": 50.5, "realOdds": -105, "score": 90}]
-    got = _nfl_best_paired_alternate(primary, alts)
-    assert got["available"] and got["line"] == 55.5
-    assert not _nfl_best_paired_alternate(
-        {**primary, "market": "player_anytime_td", "realLine": .5}, alts)["available"]
-    under_alts = [{**a, "pick": "UNDER", "realLine": 65.5,
-                   "realUnderOdds": -110, "under_book": "DK"} for a in alts]
-    under = {**primary, "pick": "UNDER", "realLine": 60.5}
-    assert _nfl_best_paired_alternate(under, under_alts)["available"]
-    live_opposite = _nfl_best_paired_alternate(
-        under, [{**alts[0], "realLine": 65.5,
-                 "realUnderOdds": -135, "under_book": "FD"}])
-    assert live_opposite["available"] and live_opposite["odds"] == -135
-    assert live_opposite["model_probability"] == 18
-    historical_wrong_side = {
-        "player": "A Player", "game": "A at B", "market": "player_rush_yds",
-        "side": "OVER", "line": 65.5, "odds": -400,
-        "model_probability": 90, "source_market": "player_rush_yds_alternate"}
-    assert not _nfl_best_paired_alternate(
-        under, [historical_wrong_side])["available"]
-    assert not _nfl_best_paired_alternate(
-        primary, [{**alts[0], "game": "wrong"}])["available"]
-    assert not _nfl_best_paired_alternate(
-        primary, [{**alts[0], "name": "Other"}])["available"]
-    assert not _nfl_best_paired_alternate(
-        primary, [{**alts[0], "market": "player_receptions"}])["available"]
-    assert not _nfl_best_paired_alternate(
-        primary, [{**alts[0], "realLine": 60.5}])["available"]
-    assert not _nfl_best_paired_alternate(
-        {**primary, "market": "player_anytime_td"}, alts)["available"]
-    # Primary and pair settle independently, including a retry where primary
-    # is already terminal and the nested pair is still pending.
-    paired = _nfl_best_paired_alternate(primary, alts)
-    paired["source_market"] = "player_rush_yds_alternate"
-    detail = [{**primary, "player": "A Player", "team": "A", "opponent": "B",
-               "side": "OVER", "line": 60.5, "odds": -110,
-               "market": "player_rush_yds", "result": "WIN",
-               "paired_alternate": paired}]
-    box = {"a player": {"final": True, "player_rush_yds": 60.5}}
-    graded = _nfl_coach_grade_snapshot("2099-01-01", detail, box=box)
-    assert graded[0]["result"] == "WIN" and graded[0]["paired_alternate"]["result"] == "WIN"
-    graded[0]["paired_alternate"]["result"] = "PENDING"
-    retried = _nfl_coach_grade_snapshot("2099-01-01", graded, box=box)
-    assert retried[0]["result"] == "WIN" and retried[0]["paired_alternate"]["result"] == "WIN"
-    return {"ok": True, "fixtures": 13}
-
 def _nfl_coach_hist_implied(odds):
     try:
         odds = float(odds)
@@ -4160,14 +4008,8 @@ async def _nfl_build_historical_coach(date_str, picks, games, df, roster_map,
             if analyzed:
                 alt_results.append(analyzed)
     alt_candidates = _nfl_coach_hist_candidates(alt_results)
-    # Pair every standard Coach recommendation with one genuine safer ladder
-    # rung.  The alternate is nested metadata, so category counts/limits and
-    # parlay candidates remain unchanged.
-    for category, rows in output.items():
-        _nfl_attach_paired_alternates(rows, alt_candidates)
     output["alt_line_edge"] = _nfl_coach_hist_select(
         alt_candidates, "alt_line_edge", alternate=True)
-    _nfl_attach_paired_alternates(output["alt_line_edge"], alt_candidates)
     for category, rows in output.items():
         for row in rows:
             row.update({
@@ -4251,29 +4093,8 @@ def _nfl_coach_grade_snapshot(date_str, detail, box=None):
                 row.setdefault("result", "PENDING")
         else:
             row["result"] = "PENDING"
-        # A pair is settled independently against the same final stat.  Older
-        # snapshots simply have no nested object and remain fully compatible.
-        pair = row.get("paired_alternate")
-        if isinstance(pair, dict) and pair.get("available"):
-            pstat = stat
-            pactual = pstat.get(row.get("market")) if pstat else None
-            if pstat and pstat.get("final") and pactual is not None:
-                try:
-                    pline = float(pair["line"]); pactual = float(pactual)
-                    pside = str(pair.get("side") or row.get("side")).upper()
-                    pres = ("PUSH" if pactual == pline else
-                            ("WIN" if pactual > pline else "LOSS") if pside == "OVER"
-                            else ("WIN" if pactual < pline else "LOSS"))
-                    pair.update(result=pres, actual=pactual,
-                                units=round(_nfl_american_profit(
-                                    pair.get("odds"), _NFL_TRK_STAKE, pres)
-                                    / _NFL_TRK_STAKE, 4),
-                                settled_at=datetime.now(timezone.utc).isoformat())
-                except (TypeError, ValueError, KeyError):
-                    pair["result"] = "PENDING"
-            elif complete and not stat:
-                pair.update(result="VOID", actual=None, units=0.0,
-                            settled_at=datetime.now(timezone.utc).isoformat())
+        row.pop("paired_alternate", None)
+        row.pop("paired_alternates", None)
         out.append(row)
     return out
 
@@ -4296,22 +4117,6 @@ def _nfl_coach_summary(rows):
     totals["roi"] = round(totals["units"] / denom * 100, 1) if denom else None
     totals["rate"] = round(totals["wins"] / denom * 100, 1) if denom else None
     totals["units"] = round(totals["units"], 2)
-    alt = [r.get("paired_alternate") for r in rows
-           if isinstance(r.get("paired_alternate"), dict)
-           and r["paired_alternate"].get("available")]
-    aw = sum(a.get("result") == "WIN" for a in alt)
-    al = sum(a.get("result") == "LOSS" for a in alt)
-    totals["alternate"] = {
-        "wins": aw, "losses": al,
-        "pushes": sum(a.get("result") == "PUSH" for a in alt),
-        "voids": sum(a.get("result") == "VOID" for a in alt),
-        "pending": max(0, len(alt) - aw - al -
-                       sum(a.get("result") in ("PUSH", "VOID") for a in alt)),
-        "rate": round(aw / (aw + al) * 100, 1) if aw + al else None,
-        "units": round(sum(float(a.get("units") or 0) for a in alt), 2),
-    }
-    ad = aw + al
-    totals["alternate"]["roi"] = round(totals["alternate"]["units"] / ad * 100, 1) if ad else None
     return totals
 
 def _nfl_official_capture_allowed(date_str: str, result: dict) -> bool:
@@ -5175,14 +4980,7 @@ def _nfl_coach_trusted_capture_source(date_str, raw):
             and row_market == target_market
             and same_numbers
         ):
-            side_pairs = row.get("paired_alternates")
-            pair = (
-                side_pairs.get(target_side)
-                if isinstance(side_pairs, dict) else None)
-            if not isinstance(pair, dict) and row_side == target_side:
-                pair = row.get("paired_alternate")
-            if isinstance(pair, dict):
-                return {"primary": dict(row), "pair": dict(pair)}
+            return {"primary": dict(row)}
     return None
 
 def _nfl_grade_coach_ledger():
@@ -5193,12 +4991,6 @@ def _nfl_grade_coach_ledger():
             graded = _nfl_coach_grade_snapshot(saved["date"], saved["detail"])
             terminal = bool(graded) and all(
                 r.get("result") in ("WIN","LOSS","PUSH","VOID")
-                and (
-                    not isinstance(r.get("paired_alternate"), dict)
-                    or not r["paired_alternate"].get("available")
-                    or r["paired_alternate"].get("result")
-                    in ("WIN","LOSS","PUSH","VOID")
-                )
                 for r in graded)
             _nfl_sb_upsert("mpa_track_ledger", [{"app": _NFL_COACH_TRK_APP,
                 "date": saved["date"], "category": saved["category"], "side": "ALL",
@@ -5228,15 +5020,11 @@ async def nfl_coach_track_capture(request: Request, token: str = ""):
         if not market or any(raw.get(k) in (None,"") for k in required) or str(raw["side"]).upper() not in ("OVER","UNDER"):
             raise HTTPException(400, "Coach capture rejected: each displayed row needs complete data.")
         try:
-            pair = raw.get("paired_alternate")
-            if pair is not None and not isinstance(pair, dict):
-                raise ValueError("invalid paired alternate")
             trusted_source = _nfl_coach_trusted_capture_source(date_str, raw)
             if not isinstance(trusted_source, dict):
                 raise ValueError(
                     "displayed recommendation is not present in server cache")
             trusted_primary = trusted_source["primary"]
-            trusted_pair = trusted_source["pair"]
             kickoff = _nfl_coach_kickoff(trusted_primary.get("game_start"))
             trusted_date = (
                 kickoff.astimezone(ZoneInfo("America/New_York"))
@@ -5244,89 +5032,6 @@ async def nfl_coach_track_capture(request: Request, token: str = ""):
             if not kickoff or kickoff <= now or trusted_date != date_str:
                 raise ValueError(
                     "server-cached recommendation is not pre-kickoff for this date")
-            frozen_pair = {
-                "available": False,
-                "reason": str(
-                    trusted_pair.get("reason")
-                    or "No genuine safer alternate line published"),
-                "market": market,
-                "source_market": market,
-            }
-            if isinstance(pair, dict) and pair.get("available"):
-                if not trusted_pair.get("available"):
-                    raise ValueError("server cache has no paired alternate")
-                pside = str(pair.get("side") or "").upper()
-                pline, primary_line = float(pair["line"]), float(raw["line"])
-                pmarket = str(pair.get("market") or "")
-                source_market = str(pair.get("source_market") or "")
-                if pmarket != market or ALT_PROP_MARKET_TO_BASE.get(source_market) != market:
-                    raise ValueError("paired alternate market/source is invalid")
-                if pside != str(raw["side"]).upper() or (
-                    pside == "OVER" and not pline < primary_line) or (
-                    pside == "UNDER" and not pline > primary_line):
-                    raise ValueError("paired alternate is not safer")
-                expected_pair_identity = _nfl_alt_pair_identity({
-                    "game": str(raw.get("game") or ""),
-                    "player": str(raw.get("player") or ""),
-                    "market": market,
-                    "side": pside,
-                    "line": pline,
-                })
-                if (pair.get("odds") in (None, "")
-                        or str(pair.get("pair_identity") or "")
-                        != expected_pair_identity):
-                    raise ValueError("paired alternate is incomplete")
-                trusted_identity = str(
-                    trusted_pair.get("pair_identity") or "")
-                if (
-                    str(trusted_pair.get("side") or "").upper() != pside
-                    or _nfl_coach_market_key(trusted_pair.get("market")) != market
-                    or str(trusted_pair.get("source_market") or "") != source_market
-                    or abs(float(trusted_pair.get("line")) - pline) > 1e-9
-                    or int(float(trusted_pair.get("odds")))
-                    != int(float(pair.get("odds")))
-                    or trusted_identity != expected_pair_identity
-                ):
-                    raise ValueError(
-                        "paired alternate does not match server sportsbook cache")
-                pair_odds = int(float(trusted_pair["odds"]))
-                pair_model = float(
-                    trusted_pair.get("model_probability") or 0)
-                pair_implied = round(
-                    float(_nfl_coach_hist_implied(pair_odds)), 1)
-                frozen_pair = {
-                    "available": True,
-                    "market": market,
-                    "market_label": str(
-                        trusted_pair.get("market_label")
-                        or PROP_LABELS.get(market, market)),
-                    "source_market": source_market,
-                    "side": pside,
-                    "line": pline,
-                    "odds": pair_odds,
-                    "book": str(trusted_pair.get("book") or "OddsAPI"),
-                    "model_probability": pair_model,
-                    "implied_probability": pair_implied,
-                    "coach_edge": round(pair_model - pair_implied, 1),
-                    "projection": (
-                        float(trusted_pair["projection"])
-                        if trusted_pair.get("projection")
-                        not in (None, "") else None),
-                    "h5_hits": int(trusted_pair.get("h5_hits") or 0),
-                    "h5_total": int(trusted_pair.get("h5_total") or 0),
-                    "h10_hits": int(trusted_pair.get("h10_hits") or 0),
-                    "h10_total": int(trusted_pair.get("h10_total") or 0),
-                    "pair_identity": expected_pair_identity,
-                    "result": "PENDING",
-                    "actual": None,
-                    "units": None,
-                }
-            elif trusted_pair.get("available"):
-                raise ValueError(
-                    "displayed recommendation omitted its server paired alternate")
-            elif isinstance(pair, dict):
-                if pair.get("market") not in (None, "", market):
-                    raise ValueError("unavailable alternate market is invalid")
             frozen.append({"player":str(raw["player"]),"team":str(raw["team"]),"opponent":str(raw["opponent"]),
                 "game":str(raw["game"]),"game_start":kickoff.isoformat(),"market":market,"market_label":str(raw["market"]),"side":str(raw["side"]).upper(),
                 "line":float(raw["line"]),"odds":int(float(raw["odds"])),
@@ -5336,7 +5041,6 @@ async def nfl_coach_track_capture(request: Request, token: str = ""):
                 "projection":(float(raw["projection"])
                               if raw.get("projection") not in (None, "") else None),
                 "alternate":bool(raw.get("alternate")),
-                "paired_alternate":frozen_pair,
                 "captured_at":now.isoformat(),"result":"PENDING","actual":None,"units":None})
         except (TypeError, ValueError): raise HTTPException(400, "Coach capture rejected: invalid displayed play values.")
     inserted = _nfl_sb_insert_ignore("mpa_track_ledger", [{"app":_NFL_COACH_TRK_APP,"date":date_str,"category":category,"side":"ALL","wins":0,"losses":0,"locked":False,"detail":frozen}], "app,date,category,side")
@@ -5360,10 +5064,17 @@ async def nfl_coach_track(request: Request, token: str = "", grade: bool = False
             if not start <= str(saved.get("date") or "") < end:
                 continue
         if saved.get("category") in grouped:
-            grouped[saved["category"]].extend([
-                {**row, "date": saved.get("date"), "category": saved.get("category")}
-                for row in (saved.get("detail") or []) if isinstance(row, dict)
-            ])
+            for row in (saved.get("detail") or []):
+                if not isinstance(row, dict):
+                    continue
+                clean = {
+                    **row,
+                    "date": saved.get("date"),
+                    "category": saved.get("category"),
+                }
+                clean.pop("paired_alternate", None)
+                clean.pop("paired_alternates", None)
+                grouped[saved["category"]].append(clean)
     return {"stake":_NFL_TRK_STAKE,"source":"historical" if historical else "official",
             "season":season or None,
             "categories":[{"category":c,"summary":_nfl_coach_summary(grouped[c]),"rows":grouped[c]} for c in _NFL_COACH_CATS]}
@@ -6751,7 +6462,7 @@ function _nflCoachProps(){
       recentRate:Number(p.vsLineRate||p.rateB||0),recentHits:Number(p.vsLineHits||p.hitsB||0),
       recentTotal:Number(p.vsLineTotal||p.totB||0),oppRate:Number(p.rateA||0),
       oppHits:Number(p.hitsA||0),oppTotal:Number(p.totA||0),book:side==='UNDER'?(p.under_book||''):(p.over_book||''),
-         isAlternate:!!p.isAlternate,paired_alternate:(p.paired_alternates&&p.paired_alternates[side])||p.paired_alternate||null,game_start:p.game_start||'',
+      isAlternate:!!p.isAlternate,game_start:p.game_start||'',
         slate_date:p.slate_date||'',source:p
     });
   });
@@ -6772,8 +6483,7 @@ function _nflCoachSafest(props){
       recentHits:p.recentTotal?Math.max(0,p.recentTotal-p.recentHits):0,
       oppRate:p.oppTotal?Math.max(0,100-p.oppRate):0,
       oppHits:p.oppTotal?Math.max(0,p.oppTotal-p.oppHits):0,
-       book:side==='UNDER'?(p.source.under_book||''):(p.source.over_book||''),
-       paired_alternate:(p.source.paired_alternates&&p.source.paired_alternates[side])||p.source.paired_alternate||null});
+      book:side==='UNDER'?(p.source.under_book||''):(p.source.over_book||'')});
     q.edge=q.appProb-q.implied;out.push(q);
   });
   return out;
@@ -6867,19 +6577,6 @@ function _nflCoachLineMovement(p){
     +'</div><div style="margin-top:9px;color:#cbd5e1">'+impact+'</div>'
     +'<div style="margin-top:7px;color:#6b7280;font-size:.68rem">Opening snapshot: '+_esc(captured)+'. Line movement can reflect betting pressure, injuries, limits, or sportsbook adjustment; it does not by itself prove whether public or sharp bettors caused the move.</div>';
 }
-function _nflCoachPairedAlt(p){
-  var a=p.paired_alternate;
-  if(!a||!a.available)return '<div class="nfl-coach-alt unavailable"><b>Recommended Alt:</b> unavailable — '+_esc(a&&a.reason||'No genuine alternate line published')+'</div>';
-  var log=(p.source&&p.source.glog)||[],hits5=0,total5=0,hits10=0,total10=0;
-  log.slice(0,5).forEach(function(g){var h=_nflCoachHit(a.side,g.v,a.line);if(h!=null){total5++;if(h)hits5++;}});
-  log.slice(0,10).forEach(function(g){var h=_nflCoachHit(a.side,g.v,a.line);if(h!=null){total10++;if(h)hits10++;}});
-  var rate=function(h,t){return t?(h+'/'+t+' · '+(h/t*100).toFixed(1)+'%'):'N/A';};
-  return '<div class="nfl-coach-alt" style="margin:10px 0;padding:11px;border:1px solid #7c5a16;border-radius:9px;background:rgba(120,80,10,.13)">'
-    +'<b style="color:#fbbf24">Recommended Alt:</b> '+a.side+' '+a.line+' · '+_nflCoachOdds(a.odds)+' · '+_esc(a.book||'')
-    +'<br><small>Model '+Number(a.model_probability||0).toFixed(1)+'% · Implied '+Number(a.implied_probability||0).toFixed(1)+'% · Edge '+(Number(a.coach_edge||0)>=0?'+':'')+Number(a.coach_edge||0).toFixed(2)+' pts'
-    +' · L5 '+rate(hits5,total5)+' · L10 '+rate(hits10,total10)
-    +' · Result '+_esc(a.result||'PENDING')+' · Actual '+(a.actual==null?'—':_esc(String(a.actual)))+'</small></div>';
-}
 function _nflCoachAccordions(p){
   var s=p.source||{},opp=_nflCoachNum(p.oppositeOdds),oppImp=opp!=null?_nflCoachImplied(opp):null;
   var other=p.side==='OVER'?'UNDER':'OVER',projection=p.projection!=null&&isFinite(p.projection)?p.projection.toFixed(2):'N/A';
@@ -6935,7 +6632,7 @@ function _nflCoachRender(question,rows,total,mode){
       +'<span class="nfl-coach-pickmeta">'+_esc(p.market)+(p.isAlternate?' · <b style="color:#fbbf24">ALT LINE</b>':'')+'<br><b style="color:'+(p.side==='OVER'?'#4ade80':'#f87171')+'">'+p.side+' '+p.line+' · '+_nflCoachOdds(p.odds)+'</b></span></summary>'
       +'<div class="nfl-coach-copy">'+(mode==='safe'?'<b style="color:#fbbf24">Safety rank: '+p.implied.toFixed(1)+'% sportsbook-implied.</b> ':'')
       +'App probability '+p.appProb.toFixed(1)+'% vs '+p.implied.toFixed(1)+'% implied = <b style="color:'+(p.edge>=0?'#4ade80':'#f87171')+'">'+_nflCoachSigned(p.edge)+' Coach Edge points</b>.</div>'
-     +_nflCoachPairedAlt(p)+_nflCoachAccordions(p)+'</details>';
+     +_nflCoachAccordions(p)+'</details>';
   }).join('');
   el.innerHTML='<div class="nfl-coach-question">'+_esc(question)+'</div><div class="nfl-coach-summary">'+summary+'</div>'+cards;
 }
@@ -6946,7 +6643,7 @@ function _nflCoachCapture(category,rows){
   rows.forEach(function(p){
     var ds=p.slate_date||fallback;
     if(!groups[ds])groups[ds]=[];
-            groups[ds].push({player:p.player,team:p.team,opponent:p.opponent,game:(p.source&&p.source.game)||'',game_start:p.game_start,market:p.market,side:p.side,line:p.line,odds:p.odds,book:p.book,model_probability:p.appProb,implied_probability:p.implied,coach_edge:p.edge,projection:p.projection,alternate:p.isAlternate,paired_alternate:p.paired_alternate});
+    groups[ds].push({player:p.player,team:p.team,opponent:p.opponent,game:(p.source&&p.source.game)||'',game_start:p.game_start,market:p.market,side:p.side,line:p.line,odds:p.odds,book:p.book,model_probability:p.appProb,implied_probability:p.implied,coach_edge:p.edge,projection:p.projection,alternate:p.isAlternate});
   });
   if(status)status.textContent='Saving displayed snapshot by game date…';
   var requests=Object.keys(groups).map(function(ds){
@@ -7102,10 +6799,6 @@ function _nflCoachTrackSummary(rows,stake,label){
   var graded=wins+losses,priced=rows.filter(function(r){return (r.result==='WIN'||r.result==='LOSS')&&r.odds!=null;});
   var net=priced.reduce(function(v,r){return v+(_nflCoachTrackProfit(r,stake)||0);},0);
   var roi=priced.length?net/(priced.length*stake)*100:null,rate=graded?wins/graded*100:null;
-  var ap=rows.map(function(r){return r.paired_alternate;}).filter(function(a){return a&&a.available;});
-  var aw=ap.filter(function(a){return a.result==='WIN';}).length,al=ap.filter(function(a){return a.result==='LOSS';}).length;
-  var an=ap.reduce(function(v,a){return v+((a.result==='WIN'||a.result==='LOSS')?_nflTrkProfit(a,stake):0);},0);
-  var aroi=(aw+al)?an/((aw+al)*stake)*100:null;
   var color=net>=0?'#4ade80':'#f87171';
   if(!rows.length){sum.innerHTML='<p style="color:#9ca3af;padding:12px;text-align:center">No AI Coach recommendations for '+_esc(label)+'.</p>';return;}
   sum.innerHTML='<div class="nfl-trk-sum">'
@@ -7117,8 +6810,6 @@ function _nflCoachTrackSummary(rows,stake,label){
     +(pending?'<span style="color:#fbbf24;font-weight:800">'+pending+' pending</span>':'')
      +'<span style="font-family:monospace;font-weight:800;color:'+color+'">Primary Net '+(net>=0?'+$':'-$')+Math.abs(net).toFixed(0)+'</span>'
     +(roi!=null?'<span style="font-family:monospace;font-weight:700;color:'+color+'">ROI '+(roi>=0?'+':'')+roi.toFixed(1)+'%</span>':'')
-     +'<span style="font-family:monospace;font-weight:800;color:#fbbf24">Alt Net '+(an>=0?'+$':'-$')+Math.abs(an).toFixed(0)+'</span>'
-     +(aroi!=null?'<span style="font-family:monospace;font-weight:700;color:#fbbf24">Alt ROI '+(aroi>=0?'+':'')+aroi.toFixed(1)+'%</span>':'')
     +'<span style="color:#6b7280;font-size:.8rem">$'+stake+'/play · ROI uses WIN/LOSS priced plays only</span></div>';
 }
 function _nflCoachTrackCategoryHtml(rows,stake){
@@ -7130,11 +6821,6 @@ function _nflCoachTrackCategoryHtml(rows,stake){
     var graded=w+l,rate=graded?w/graded*100:null,priced=list.filter(function(r){return (r.result==='WIN'||r.result==='LOSS')&&r.odds!=null;});
     var net=priced.reduce(function(total,r){return total+(_nflCoachTrackProfit(r,stake)||0);},0);
     var roi=priced.length?net/(priced.length*stake)*100:null,color=net>=0?'#4ade80':'#f87171';
-    var alts=list.map(function(r){return r.paired_alternate;}).filter(function(a){return a&&a.available;});
-    var aw=alts.filter(function(a){return a.result==='WIN';}).length,al=alts.filter(function(a){return a.result==='LOSS';}).length;
-    var ar=aw+al?(aw/(aw+al)*100).toFixed(1)+'%':'—';
-     var an=alts.reduce(function(total,a){return total+((a.result==='WIN'||a.result==='LOSS')?_nflTrkProfit(a,stake):0);},0);
-     var aroi=aw+al?an/((aw+al)*stake)*100:null;
     var meta=w+'W · '+l+'L'+(p?' · '+p+'P':'')+(v?' · '+v+'V':'')+(pending?' · '+pending+' pending':'');
     return '<details class="nfl-trk-group" style="--trk-accent:#22d3ee">'
       +'<summary class="nfl-trk-group-head"><div class="nfl-trk-group-title">'
@@ -7142,9 +6828,6 @@ function _nflCoachTrackCategoryHtml(rows,stake){
       +'<div class="nfl-trk-group-summary"><span>'+meta+'</span><span class="nfl-trk-group-rate">'+(rate==null?'—':rate.toFixed(1)+'%')+'</span>'
       +'<span class="nfl-trk-group-pl" style="color:'+color+'">'+(net>=0?'+$':'-$')+Math.abs(net).toFixed(0)+'</span>'
        +'<span style="color:'+color+'">'+(roi==null?'—':(roi>=0?'+':'')+roi.toFixed(1)+'% ROI')+'</span>'
-       +(alts.length
-         ?'<span style="color:#fbbf24">Alt picks: '+alts.length+' · '+aw+'W · '+al+'L · '+ar+' · '+(an>=0?'+$':'-$')+Math.abs(an).toFixed(0)+(aroi==null?'':' · '+(aroi>=0?'+':'')+aroi.toFixed(1)+'% ROI')+'</span>'
-         :'<span style="color:#94a3b8">No saved alt picks</span>')
        +'<span class="nfl-trk-group-toggle" aria-hidden="true"></span></div></summary>'
         +_nflCoachTrackRowsTable(list,stake,false)+'</details>';
   }).join('');
@@ -7155,26 +6838,13 @@ function _nflCoachTrackRowsTable(rows,stake,showCategory){
   var body=sorted.map(function(r){
     var result=(r.result||'PENDING').toUpperCase(),profit=_nflCoachTrackProfit(r,stake),edge=Number(r.coach_edge);
      var metrics='<small style="display:block;color:#94a3b8;margin-top:4px">Model '+Number(r.model_probability||0).toFixed(1)+'% · Implied '+Number(r.implied_probability||0).toFixed(1)+'% · <b style="color:'+(edge>=0?'#4ade80':'#f87171')+'">'+(edge>=0?'+':'')+edge.toFixed(2)+' pts</b></small>';
-    var a=r.paired_alternate;
-    if(a&&a.available){
-      var ar=(a.result||'PENDING').toUpperCase();
-      var aprofit=(ar==='WIN'||ar==='LOSS')?_nflTrkProfit(a,stake):null;
-       metrics+='<div style="margin-top:8px;padding-top:7px;border-top:1px solid #475569;color:#fbbf24"><b style="font-size:.72rem;letter-spacing:.04em">RECOMMENDED SAFER ALT</b><br>'
-         +'<span style="color:#f8fafc">'+_esc((a.market_label||r.market_label||r.market||'')+' '+a.side+' '+a.line)+'</span>'
-         +'<small style="display:block;color:#94a3b8;margin-top:3px">Model '+Number(a.model_probability||0).toFixed(1)+'% · Implied '+Number(a.implied_probability||0).toFixed(1)+'% · Edge '+(Number(a.edge||0)>=0?'+':'')+Number(a.edge||0).toFixed(2)+' pts</small></div>';
-    }else if(a){
-       metrics+='<div style="margin-top:8px;padding-top:7px;border-top:1px solid #334155;color:#94a3b8"><b style="font-size:.72rem;letter-spacing:.04em">RECOMMENDED SAFER ALT</b><br>Unavailable — '+_esc(a.reason||'No genuine alternate published')+'</div>';
-    }
-     var altOdds=a&&a.available?'<div style="margin-top:7px;padding-top:6px;border-top:1px solid #475569;color:#fbbf24"><b style="font-size:.7rem">ALT</b> '+_nflCoachOdds(a.odds)+'<br><small style="color:#94a3b8">'+_esc(a.book||'')+'</small></div>':'';
-     var altActual=a&&a.available?'<div style="margin-top:7px;padding-top:6px;border-top:1px solid #475569;color:#fbbf24"><b style="font-size:.7rem">ALT</b> '+(a.actual==null?'—':_esc(String(a.actual)))+'</div>':'';
-     var altResult=a&&a.available?'<div style="margin-top:7px;padding-top:6px;border-top:1px solid #475569"><b style="font-size:.7rem;color:#fbbf24">ALT</b> <span class="nfl-trk-result '+ar.toLowerCase()+'">'+_esc(ar)+'</span><br><small style="font-family:monospace;font-weight:900;color:'+(aprofit==null?'#94a3b8':aprofit>=0?'#4ade80':'#f87171')+'">'+(aprofit==null?'—':(aprofit>=0?'+$':'-$')+Math.abs(aprofit).toFixed(2))+'</small></div>':'';
     return '<tr><td class="trk-date" data-label="Date" style="color:#94a3b8;font-family:monospace">'+_esc(r.record_date||'')+'</td>'
       +(showCategory?'<td class="trk-category" data-label="Category" style="color:#7dd3fc;font-weight:900">'+_esc(r.category_label)+'</td>':'')
       +'<td class="trk-player" data-label="Player" style="color:#fff;font-weight:900">'+_esc(r.player||'')+'<br><small style="color:#94a3b8">'+_esc(r.team||'')+' vs '+_esc(r.opponent||'')+'</small></td>'
       +'<td class="trk-play" data-label="Play" style="color:#e2e8f0;font-weight:800">'+_esc(r.market_label||r.market||'')+'<br>'+_esc((r.side||'')+' '+r.line)+metrics+'</td>'
-       +'<td class="trk-odds" data-label="Odds / Book" style="font-family:monospace">'+_nflCoachOdds(r.odds)+'<br><small style="color:#94a3b8">'+_esc(r.book||'')+'</small>'+altOdds+'</td>'
-       +'<td class="trk-actual" data-label="Actual" style="color:#cbd5e1">'+(r.actual==null?'—':_esc(String(r.actual)))+altActual+'</td>'
-       +'<td class="trk-result" data-label="Result / P&L"><span class="nfl-trk-result '+result.toLowerCase()+'">'+_esc(result)+'</span><br><small style="font-family:monospace;font-weight:900;color:'+(profit==null?'#94a3b8':profit>=0?'#4ade80':'#f87171')+'">'+(profit==null?'—':(profit>=0?'+$':'-$')+Math.abs(profit).toFixed(2))+'</small>'+altResult+'</td></tr>';
+       +'<td class="trk-odds" data-label="Odds / Book" style="font-family:monospace">'+_nflCoachOdds(r.odds)+'<br><small style="color:#94a3b8">'+_esc(r.book||'')+'</small></td>'
+       +'<td class="trk-actual" data-label="Actual" style="color:#cbd5e1">'+(r.actual==null?'—':_esc(String(r.actual)))+'</td>'
+       +'<td class="trk-result" data-label="Result / P&L"><span class="nfl-trk-result '+result.toLowerCase()+'">'+_esc(result)+'</span><br><small style="font-family:monospace;font-weight:900;color:'+(profit==null?'#94a3b8':profit>=0?'#4ade80':'#f87171')+'">'+(profit==null?'—':(profit>=0?'+$':'-$')+Math.abs(profit).toFixed(2))+'</small></td></tr>';
   }).join('');
   return '<div class="nfl-trk-table-scroll"><table class="nfl-trk-tbl nfl-trk-compact"><thead><tr><th class="trk-date">Date</th>'
     +(showCategory?'<th class="trk-category">Coach Category</th>':'')+'<th class="trk-player">Player</th><th class="trk-play">Play / Probabilities</th><th class="trk-odds">Odds / Book</th><th class="trk-actual">Actual</th><th class="trk-result">Result / P&L</th></tr></thead><tbody>'+body+'</tbody></table></div>';
