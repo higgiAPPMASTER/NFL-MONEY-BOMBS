@@ -1257,10 +1257,12 @@ def _apply_nfl_injury_context(lines: list, roster_map: dict) -> None:
         "player_rush_yds", "player_rush_attempts", "player_anytime_td",
         "player_reception_yds", "player_receptions",
     }
-    base_share = {"RB": 0.10, "WR": 0.05, "TE": 0.06}
+    # Conservative scenario scale for a same-position teammate absence.
+    # Multiple unavailable teammates still cannot exceed the 10% total cap.
+    base_share = {"RB": 0.10, "WR": 0.10, "TE": 0.10}
     status_weight = {"OUT": 1.0, "DOUBTFUL": 0.75,
-                     "QUESTIONABLE": 0.35, "LIMITED": 0.10}
-    caps = {"RB": 0.15, "WR": 0.10, "TE": 0.10}
+                     "QUESTIONABLE": 0.40, "LIMITED": 0.20}
+    caps = {"RB": 0.10, "WR": 0.10, "TE": 0.10}
     for line in lines:
         info = roster_map.get(_norm(line.get("name", ""))) if roster_map else None
         line["availability_verified"] = bool(info)
