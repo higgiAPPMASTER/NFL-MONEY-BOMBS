@@ -5184,6 +5184,15 @@ tr:last-child td{border-bottom:none}
  .nfl-trk-tbl td{padding:12px 14px;border-bottom:1px solid rgba(51,65,85,.55);white-space:nowrap;vertical-align:middle}
 .nfl-trk-tbl tr:last-child td{border-bottom:none}
  .nfl-trk-tbl tr:hover td{background:rgba(56,189,248,.06)}
+ .nfl-trk-compact{width:100%;table-layout:fixed}
+ .nfl-trk-compact th,.nfl-trk-compact td{white-space:normal;overflow-wrap:anywhere;padding:10px 9px}
+ .nfl-trk-compact .trk-date{width:11%}
+ .nfl-trk-compact .trk-category{width:15%}
+ .nfl-trk-compact .trk-player{width:18%}
+ .nfl-trk-compact .trk-play{width:25%}
+ .nfl-trk-compact .trk-odds{width:10%}
+ .nfl-trk-compact .trk-actual{width:8%}
+ .nfl-trk-compact .trk-result{width:13%}
  .nfl-trk-bar-wrap{width:96px;background:#1f2937;border-radius:999px;height:10px;overflow:hidden;display:inline-block;vertical-align:middle}
 .nfl-trk-bar{height:100%;border-radius:4px}
  .nfl-trk-group{margin:0 0 18px;border:1px solid #263449;border-left:5px solid var(--trk-accent,#22d3ee);border-radius:16px;overflow:hidden;background:linear-gradient(145deg,rgba(15,23,42,.98),rgba(10,15,26,.98));box-shadow:0 8px 22px rgba(0,0,0,.18)}
@@ -5238,7 +5247,14 @@ tr:last-child td{border-bottom:none}
  .nfl-td-edge{color:#4ade80;font-weight:950;font-family:monospace}
  .nfl-td-method{margin-top:10px;color:#6b7280;font-size:.64rem;line-height:1.45}
  @media(max-width:620px){.nfl-parlay-filters{grid-template-columns:1fr}}
- @media(max-width:680px){.nfl-trk-group-head{padding:14px}.nfl-trk-group-name{font-size:1.02rem}.nfl-trk-tbl{font-size:.88rem}.nfl-trk-tbl th{font-size:.68rem;padding:11px}.nfl-trk-tbl td{padding:11px 12px}}
+ @media(max-width:680px){
+   .nfl-trk-group-head{padding:14px}.nfl-trk-group-name{font-size:1.02rem}.nfl-trk-tbl{font-size:.88rem}.nfl-trk-tbl th{font-size:.68rem;padding:11px}.nfl-trk-tbl td{padding:11px 12px}
+   .nfl-trk-compact,.nfl-trk-compact tbody,.nfl-trk-compact tr,.nfl-trk-compact td{display:block;width:100%}
+   .nfl-trk-compact thead{display:none}
+   .nfl-trk-compact tr{padding:9px 11px;border-bottom:1px solid rgba(51,65,85,.65)}
+   .nfl-trk-compact td{display:grid;grid-template-columns:92px minmax(0,1fr);gap:9px;border:0;padding:5px 0!important}
+   .nfl-trk-compact td:before{content:attr(data-label);color:#64748b;font-size:.66rem;font-weight:900;text-transform:uppercase;letter-spacing:.08em}
+ }
 </style>
 <div id="nfl-mybets-card" style="display:none;max-width:960px;margin:18px auto 0;padding:0 16px">
   <div class="card" style="padding:20px 22px">
@@ -6661,40 +6677,42 @@ function _nflCoachTrackSummary(rows,stake,label){
 }
 function _nflCoachTrackCategoryHtml(rows,stake){
   var categories=Object.keys(_NFL_COACH_TRACK_LABELS);
-  var body=categories.map(function(category){
+  return categories.map(function(category){
     var list=rows.filter(function(r){return r.category===category;}),w=list.filter(function(r){return r.result==='WIN';}).length;
     var l=list.filter(function(r){return r.result==='LOSS';}).length,p=list.filter(function(r){return r.result==='PUSH';}).length;
     var v=list.filter(function(r){return r.result==='VOID';}).length,pending=list.length-w-l-p-v;
     var graded=w+l,rate=graded?w/graded*100:null,priced=list.filter(function(r){return (r.result==='WIN'||r.result==='LOSS')&&r.odds!=null;});
     var net=priced.reduce(function(total,r){return total+(_nflCoachTrackProfit(r,stake)||0);},0);
     var roi=priced.length?net/(priced.length*stake)*100:null,color=net>=0?'#4ade80':'#f87171';
-    var bar=rate==null?0:Math.min(100,rate),barColor=rate>=70?'#4ade80':rate>=55?'#facc15':'#f87171';
-    return '<tr><td style="color:#fff;font-weight:800">'+_esc(_nflCoachTrackLabel(category))+'</td>'
-      +'<td style="font-family:monospace;color:#fff">'+w+'-'+l+(p?' · '+p+'P':'')+(v?' · '+v+'V':'')+(pending?' · '+pending+' pending':'')+'</td>'
-      +'<td><div style="display:flex;align-items:center;gap:8px"><div class="nfl-trk-bar-wrap"><div class="nfl-trk-bar" style="width:'+bar+'%;background:'+barColor+'"></div></div><span style="color:'+barColor+';font-weight:700">'+(rate==null?'—':rate.toFixed(0)+'%')+'</span></div></td>'
-      +'<td style="font-family:monospace;font-weight:800;color:'+color+'">'+(net>=0?'+$':'-$')+Math.abs(net).toFixed(0)+'</td>'
-      +'<td style="font-family:monospace;font-weight:700;color:'+color+'">'+(roi==null?'—':(roi>=0?'+':'')+roi.toFixed(1)+'%')+'</td></tr>';
+    var meta=w+'W · '+l+'L'+(p?' · '+p+'P':'')+(v?' · '+v+'V':'')+(pending?' · '+pending+' pending':'');
+    return '<details class="nfl-trk-group" style="--trk-accent:#22d3ee">'
+      +'<summary class="nfl-trk-group-head"><div class="nfl-trk-group-title">'
+      +'<span class="nfl-trk-group-kicker">Coach Category</span><span class="nfl-trk-group-name">'+_esc(_nflCoachTrackLabel(category))+'</span></div>'
+      +'<div class="nfl-trk-group-summary"><span>'+meta+'</span><span class="nfl-trk-group-rate">'+(rate==null?'—':rate.toFixed(1)+'%')+'</span>'
+      +'<span class="nfl-trk-group-pl" style="color:'+color+'">'+(net>=0?'+$':'-$')+Math.abs(net).toFixed(0)+'</span>'
+      +'<span style="color:'+color+'">'+(roi==null?'—':(roi>=0?'+':'')+roi.toFixed(1)+'% ROI')+'</span><span class="nfl-trk-group-toggle" aria-hidden="true"></span></div></summary>'
+      +_nflCoachTrackRowsTable(list,stake,false)+'</details>';
   }).join('');
-  return '<div class="tbl-wrap"><table class="nfl-trk-tbl"><thead><tr><th>Category</th><th>Record</th><th>Hit Rate</th><th>Net P/L</th><th>ROI</th></tr></thead><tbody>'+body+'</tbody></table></div>';
 }
-function _nflCoachTrackListHtml(rows,stake){
+function _nflCoachTrackRowsTable(rows,stake,showCategory){
   if(!rows.length)return '';
   var sorted=rows.slice().sort(function(a,b){return String(b.record_date).localeCompare(String(a.record_date))||Object.keys(_NFL_COACH_TRACK_LABELS).indexOf(a.category)-Object.keys(_NFL_COACH_TRACK_LABELS).indexOf(b.category)||String(a.player).localeCompare(String(b.player));});
   var body=sorted.map(function(r){
     var result=(r.result||'PENDING').toUpperCase(),profit=_nflCoachTrackProfit(r,stake),edge=Number(r.coach_edge);
-    return '<tr><td style="color:#94a3b8;font-family:monospace">'+_esc(r.record_date||'')+'</td>'
-      +'<td style="color:#7dd3fc;font-weight:900">'+_esc(r.category_label)+'</td>'
-      +'<td style="color:#fff;font-weight:900">'+_esc(r.player||'')+'<br><small style="color:#94a3b8">'+_esc(r.team||'')+' vs '+_esc(r.opponent||'')+'</small></td>'
-      +'<td style="color:#e2e8f0;font-weight:800">'+_esc(r.market_label||r.market||'')+'<br>'+_esc((r.side||'')+' '+r.line)+'</td>'
-      +'<td style="font-family:monospace">'+_nflCoachOdds(r.odds)+'<br><small style="color:#94a3b8">'+_esc(r.book||'')+'</small></td>'
-      +'<td style="color:#cbd5e1">'+Number(r.model_probability||0).toFixed(1)+'%</td>'
-      +'<td style="color:#cbd5e1">'+Number(r.implied_probability||0).toFixed(1)+'%</td>'
-      +'<td style="font-weight:900;color:'+(edge>=0?'#4ade80':'#f87171')+'">'+(edge>=0?'+':'')+edge.toFixed(2)+' pts</td>'
-      +'<td style="color:#cbd5e1">'+(r.actual==null?'—':_esc(String(r.actual)))+'</td>'
-      +'<td><span class="nfl-trk-result '+result.toLowerCase()+'">'+_esc(result)+'</span></td>'
-      +'<td style="font-family:monospace;font-weight:900;color:'+(profit==null?'#94a3b8':profit>=0?'#4ade80':'#f87171')+'">'+(profit==null?'—':(profit>=0?'+$':'-$')+Math.abs(profit).toFixed(2))+'</td></tr>';
+    var metrics='<small style="display:block;color:#94a3b8;margin-top:4px">Model '+Number(r.model_probability||0).toFixed(1)+'% · Implied '+Number(r.implied_probability||0).toFixed(1)+'% · <b style="color:'+(edge>=0?'#4ade80':'#f87171')+'">'+(edge>=0?'+':'')+edge.toFixed(2)+' pts</b></small>';
+    return '<tr><td class="trk-date" data-label="Date" style="color:#94a3b8;font-family:monospace">'+_esc(r.record_date||'')+'</td>'
+      +(showCategory?'<td class="trk-category" data-label="Category" style="color:#7dd3fc;font-weight:900">'+_esc(r.category_label)+'</td>':'')
+      +'<td class="trk-player" data-label="Player" style="color:#fff;font-weight:900">'+_esc(r.player||'')+'<br><small style="color:#94a3b8">'+_esc(r.team||'')+' vs '+_esc(r.opponent||'')+'</small></td>'
+      +'<td class="trk-play" data-label="Play" style="color:#e2e8f0;font-weight:800">'+_esc(r.market_label||r.market||'')+'<br>'+_esc((r.side||'')+' '+r.line)+metrics+'</td>'
+      +'<td class="trk-odds" data-label="Odds / Book" style="font-family:monospace">'+_nflCoachOdds(r.odds)+'<br><small style="color:#94a3b8">'+_esc(r.book||'')+'</small></td>'
+      +'<td class="trk-actual" data-label="Actual" style="color:#cbd5e1">'+(r.actual==null?'—':_esc(String(r.actual)))+'</td>'
+      +'<td class="trk-result" data-label="Result / P&L"><span class="nfl-trk-result '+result.toLowerCase()+'">'+_esc(result)+'</span><br><small style="font-family:monospace;font-weight:900;color:'+(profit==null?'#94a3b8':profit>=0?'#4ade80':'#f87171')+'">'+(profit==null?'—':(profit>=0?'+$':'-$')+Math.abs(profit).toFixed(2))+'</small></td></tr>';
   }).join('');
-  return '<div class="tbl-wrap"><table class="nfl-trk-tbl"><thead><tr><th>Date</th><th>Coach Category</th><th>Player</th><th>Play</th><th>Odds / Book</th><th>Model</th><th>Implied</th><th>Coach Edge</th><th>Actual</th><th>Result</th><th>P/L</th></tr></thead><tbody>'+body+'</tbody></table></div>';
+  return '<div class="nfl-trk-table-scroll"><table class="nfl-trk-tbl nfl-trk-compact"><thead><tr><th class="trk-date">Date</th>'
+    +(showCategory?'<th class="trk-category">Coach Category</th>':'')+'<th class="trk-player">Player</th><th class="trk-play">Play / Probabilities</th><th class="trk-odds">Odds / Book</th><th class="trk-actual">Actual</th><th class="trk-result">Result / P&L</th></tr></thead><tbody>'+body+'</tbody></table></div>';
+}
+function _nflCoachTrackListHtml(rows,stake){
+  return _nflCoachTrackCategoryHtml(rows,stake);
 }
 function renderNflCoachTrack(){
   var out=document.getElementById('nflCoachTrackBody');if(!out||!_nflCoachTrackData)return;
@@ -7286,21 +7304,28 @@ function renderNflGpRecord(){
     var color=result==='WIN'?'#4ade80':result==='LOSS'?'#f87171':'#fbbf24';
     return '<span style="color:'+color+';font-weight:900">'+result+'</span>';
   }
-  var rows=shown.map(function(g){
-    var actual=(g.actual_away!=null&&g.actual_home!=null)
-      ?_esc(g.away_abbr)+' '+g.actual_away+' — '+_esc(g.home_abbr)+' '+g.actual_home:'—';
-    var totalPick=g.total_pick?(g.total_pick+' '+g.total_line):'—';
-    return '<tr><td style="color:#94a3b8">'+_esc(g.record_date||'')+'</td>'
-      +'<td style="color:#fff;font-weight:800">'+_esc(g.away_abbr)+' @ '+_esc(g.home_abbr)+'</td>'
-      +'<td style="color:#c4b5fd;font-weight:800">'+_esc(g.pick_abbr||'—')+'</td>'
-      +'<td style="color:#cbd5e1">'+actual+'</td><td>'+badge(g.winner_result)+'</td>'
-      +'<td style="color:#7dd3fc;font-weight:800">'+_esc(totalPick)+'</td>'
-      +'<td style="color:#cbd5e1">'+(g.actual_total!=null?g.actual_total:'—')+'</td>'
-      +'<td>'+badge(g.total_result)+'</td></tr>';
-  }).join('');
   var label=sel?'Results for '+sel:'All recorded games';
+  function gpGroup(title,key,pickKey,actualKey,accent,record){
+    var rows=shown.map(function(g){
+      var actual=key==='winner_result'
+        ?((g.actual_away!=null&&g.actual_home!=null)?_esc(g.away_abbr)+' '+g.actual_away+' — '+_esc(g.home_abbr)+' '+g.actual_home:'—')
+        :(g.actual_total!=null?_esc(String(g.actual_total)):'—');
+      var pick=key==='winner_result'?(g.pick_abbr||'—'):(g.total_pick?(g.total_pick+' '+g.total_line):'—');
+      return '<tr><td class="trk-date" data-label="Date" style="color:#94a3b8">'+_esc(g.record_date||'')+'</td>'
+        +'<td data-label="Matchup" style="color:#fff;font-weight:800">'+_esc(g.away_abbr)+' @ '+_esc(g.home_abbr)+'</td>'
+        +'<td data-label="Pick" style="color:'+accent+';font-weight:900">'+_esc(pick)+'</td>'
+        +'<td data-label="Actual" style="color:#cbd5e1">'+actual+'</td>'
+        +'<td data-label="Result">'+badge(g[key])+'</td></tr>';
+    }).join('');
+    return '<details class="nfl-trk-group" style="--trk-accent:'+accent+'"><summary class="nfl-trk-group-head">'
+      +'<div class="nfl-trk-group-title"><span class="nfl-trk-group-kicker">Game Predictor</span><span class="nfl-trk-group-name">'+title+'</span></div>'
+      +'<div class="nfl-trk-group-summary"><span>'+record.w+'W · '+record.l+'L'+(record.p?' · '+record.p+'P':'')+'</span>'
+      +'<span class="nfl-trk-group-rate">'+(record.rate==null?'—':record.rate.toFixed(1)+'%')+'</span><span class="nfl-trk-group-toggle" aria-hidden="true"></span></div></summary>'
+      +'<div class="nfl-trk-table-scroll"><table class="nfl-trk-tbl nfl-trk-compact"><thead><tr><th>Date</th><th>Matchup</th><th>Pick</th><th>Actual</th><th>Result</th></tr></thead><tbody>'+rows+'</tbody></table></div></details>';
+  }
   bodyEl.innerHTML='<div style="color:#94a3b8;font-size:.72rem;font-weight:900;text-transform:uppercase;letter-spacing:.08em;margin:2px 0 8px">'+label+'</div>'
-    +'<div class="tbl-wrap"><table class="nfl-trk-tbl"><thead><tr><th>Date</th><th>Matchup</th><th>Winner Pick</th><th>Final</th><th>Result</th><th>Total Pick</th><th>Actual Total</th><th>Result</th></tr></thead><tbody>'+rows+'</tbody></table></div>';
+    +gpGroup('Game Winners','winner_result','pick_abbr','final','#a78bfa',wr)
+    +gpGroup('Point Totals','total_result','total_pick','actual_total','#38bdf8',tr);
 }
 function renderNflTrackDay(){
   if(!_nflTrkData) return;
@@ -7398,26 +7423,33 @@ function _nflTrkCatHtml(decided,stake){
   var entries=Object.entries(cats).sort(function(a,b){
     return ((b[1].pl/b[1].staked)||0)-((a[1].pl/a[1].staked)||0);
   });
-  var rows=entries.map(function(e){
+  return entries.map(function(e){
     var cat=e[0],c=e[1],total=c.w+c.l;
     var rate=total?(c.w/total*100):0;
     var roi=c.staked?(c.pl/c.staked*100):null;
     var plColor=c.pl>=0?'#4ade80':'#f87171';
     var barColor=rate>=70?'#4ade80':rate>=55?'#facc15':'#f87171';
-    var barW=Math.min(100,Math.round(rate));
-    return '<tr>'
-      +'<td style="color:#fff;font-weight:700">'+cat+'</td>'
-      +'<td style="font-family:monospace;color:#fff">'+c.w+'-'+c.l+'</td>'
-      +'<td><div style="display:flex;align-items:center;gap:8px">'
-      +'<div class="nfl-trk-bar-wrap"><div class="nfl-trk-bar" style="width:'+barW+'%;background:'+barColor+'"></div></div>'
-      +'<span style="color:'+barColor+';font-weight:700;font-size:.82rem">'+rate.toFixed(0)+'%</span></div></td>'
-      +'<td style="font-family:monospace;font-weight:800;color:'+plColor+'">'+(c.pl>=0?'+$':'-$')+Math.abs(c.pl).toFixed(0)+'</td>'
-      +'<td style="font-family:monospace;font-weight:700;color:'+plColor+'">'+(roi!=null?(roi>=0?'+':'')+roi.toFixed(1)+'%':'—')+'</td>'
-      +'</tr>';
+    var list=decided.filter(function(r){return r.category===cat;}).slice().sort(function(a,b){
+      return String(b.record_date||'').localeCompare(String(a.record_date||''))||Number(a.rank||999)-Number(b.rank||999)||String(a.name||'').localeCompare(String(b.name||''));
+    });
+    var detail=list.map(function(r){
+      var result=(r.result||'PENDING').toUpperCase(),profit=_nflTrkProfit(r,stake);
+      var odds=r.odds!=null?(Number(r.odds)>0?'+':'')+r.odds:'—';
+      return '<tr><td class="trk-date" data-label="Date" style="color:#94a3b8;font-family:monospace">'+_nflEsc(r.record_date||'')+'</td>'
+        +'<td class="trk-player" data-label="Player" style="color:#fff;font-weight:900">'+_nflEsc(r.name||'')+'</td>'
+        +'<td data-label="Team" style="color:#c4b5fd;font-weight:800">'+_nflEsc(r.team||'')+'</td>'
+        +'<td class="trk-play" data-label="Pick" style="color:#e2e8f0;font-weight:800">'+_nflEsc((r.side||'')+(r.line!=null?' '+r.line:''))+'</td>'
+        +'<td class="trk-odds" data-label="Odds" style="font-family:monospace">'+odds+'</td>'
+        +'<td class="trk-actual" data-label="Actual">'+(r.actual!=null?_nflEsc(String(r.actual)):'—')+'</td>'
+        +'<td class="trk-result" data-label="Result / P&L"><span class="nfl-trk-result '+result.toLowerCase()+'">'+_nflEsc(result)+'</span><br><small style="font-family:monospace;color:'+(profit!=null&&profit>=0?'#4ade80':'#f87171')+'">'+(profit==null?'—':(profit>=0?'+$':'-$')+Math.abs(profit).toFixed(2))+'</small></td></tr>';
+    }).join('');
+    return '<details class="nfl-trk-group" style="--trk-accent:'+barColor+'"><summary class="nfl-trk-group-head">'
+      +'<div class="nfl-trk-group-title"><span class="nfl-trk-group-kicker">Category</span><span class="nfl-trk-group-name">'+_nflEsc(cat)+'</span></div>'
+      +'<div class="nfl-trk-group-summary"><span>'+c.w+'W · '+c.l+'L</span><span class="nfl-trk-group-rate">'+rate.toFixed(1)+'%</span>'
+      +'<span class="nfl-trk-group-pl" style="color:'+plColor+'">'+(c.pl>=0?'+$':'-$')+Math.abs(c.pl).toFixed(0)+'</span>'
+      +'<span style="color:'+plColor+'">'+(roi!=null?(roi>=0?'+':'')+roi.toFixed(1)+'% ROI':'—')+'</span><span class="nfl-trk-group-toggle" aria-hidden="true"></span></div></summary>'
+      +'<div class="nfl-trk-table-scroll"><table class="nfl-trk-tbl nfl-trk-compact"><thead><tr><th>Date</th><th>Player</th><th>Team</th><th>Pick</th><th>Odds</th><th>Actual</th><th>Result / P&L</th></tr></thead><tbody>'+detail+'</tbody></table></div></details>';
   }).join('');
-  return '<div class="tbl-wrap"><table class="nfl-trk-tbl">'
-    +'<thead><tr><th>Category</th><th>Record</th><th>Hit Rate</th><th>Net P/L</th><th>ROI</th></tr></thead>'
-    +'<tbody>'+rows+'</tbody></table></div>';
 }
 function _nflTrkListHtml(decided,stake){
   if(!decided.length) return '<p style="color:#6b7280;padding:20px;text-align:center">No graded picks yet.</p>';
@@ -7482,7 +7514,7 @@ function _nflTrkListHtml(decided,stake){
       +'<summary class="nfl-trk-group-head"><div class="nfl-trk-group-title">'
       +'<span class="nfl-trk-group-kicker">Category</span><span class="nfl-trk-group-name">'+_nflEsc(cat)+'</span><span class="nfl-trk-group-side">'+_nflEsc(side)+'</span></div>'
       +'<div class="nfl-trk-group-summary"><span>'+meta+'</span><span class="nfl-trk-group-rate">'+(rate!=null?rate.toFixed(1)+'%':'—')+'</span><span class="nfl-trk-group-pl" style="color:'+(pl>=0?'#4ade80':'#f87171')+'">'+money(pl)+'</span><span class="nfl-trk-group-toggle" aria-hidden="true"></span></div></summary>'
-      +'<div class="nfl-trk-table-scroll"><table class="nfl-trk-tbl"><thead><tr>'
+      +'<div class="nfl-trk-table-scroll"><table class="nfl-trk-tbl nfl-trk-compact"><thead><tr>'
       +'<th>Date</th><th>Player</th><th>Team</th><th>Pick</th><th>Odds</th><th>Actual</th><th>Result</th><th>P/L</th>'
       +'</tr></thead><tbody>'+rows+'</tbody></table></div></details>';
   }
