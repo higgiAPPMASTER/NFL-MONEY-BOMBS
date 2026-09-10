@@ -7162,7 +7162,11 @@ function _nflCoachParse(question,props){
     if(def.terms.some(function(term){return q.indexOf(term)>=0;})){f.marketExact=def.label;return true;}
     return false;
   });
-  var markets=[['passing','pass'],['pass ','pass'],['rushing','rush'],['rush ','rush'],['receiving','rec'],['reception','rec'],['touchdown','td'],[' td','td'],['tackle','def'],['sack','def'],['defense','def'],['kicking','kick'],['field goal','kick']];
+  var markets=[['passing','pass'],['pass ','pass'],['quarterback','pass'],[' qb ','pass'],
+    ['rushing','rush'],['rush ','rush'],['running back','rush'],[' rb ','rush'],
+    ['receiving','rec'],['reception','rec'],['receiver','rec'],[' wr ','rec'],[' tight end','rec'],[' te ','rec'],
+    ['touchdown','td'],[' td','td'],['tackle','def'],['sack','def'],['defensive','def'],['defense','def'],
+    ['kicker','kick'],['kicking','kick'],['field goal','kick']];
   markets.some(function(x){if(q.indexOf(x[0])>=0){f.market=x[1];return true;}return false;});
   var neg=q.match(/-[0-9]{2,4}/g)||[];if(neg.length>=2){var ns=neg.slice(0,2).map(Number);f.minOdds=Math.min.apply(null,ns);f.maxOdds=Math.max.apply(null,ns);}
   props.forEach(function(p){
