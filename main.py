@@ -6074,7 +6074,7 @@ tr:last-child td{border-bottom:none}
     </div>
     <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:14px">
       <label style="color:#9ca3af;font-size:.78rem;font-weight:700;text-transform:uppercase;letter-spacing:.1em">Record</label>
-      <select id="nflCoachTrkSource" class="date-input" onchange="loadNflCoachTrack()">
+      <select id="nflCoachTrkSource" class="date-input" onchange="_nflCoachTrackAwaitingSelection()">
         <option value="official">Official Coach</option>
         <option value="historical">Historical Edge Coach</option>
       </select>
@@ -6087,7 +6087,7 @@ tr:last-child td{border-bottom:none}
         <option value="all">All Time</option>
       </select>
       <label style="color:#9ca3af;font-size:.78rem;font-weight:700;text-transform:uppercase;letter-spacing:.1em">Date</label>
-      <input type="date" id="nflCoachTrkDate" class="date-input" value="__TODAY__" style="width:auto" onchange="_nflCoachTrkDayName();if((document.getElementById('nflCoachTrkSource')||{}).value==='historical')loadNflCoachTrack();else renderNflCoachTrack()">
+      <input type="date" id="nflCoachTrkDate" class="date-input" value="__TODAY__" style="width:auto" onchange="_nflCoachTrkDayName();_nflCoachTrackAwaitingSelection()">
       <span id="nflCoachTrkDayName" style="color:#34d399;font-weight:700;font-size:.9rem"></span>
       <label style="color:#9ca3af;font-size:.78rem;font-weight:700;text-transform:uppercase;letter-spacing:.1em">Bet $</label>
       <input type="number" id="nflCoachTrkStake" class="date-input" value="20" min="0.01" step="0.01" style="width:105px" oninput="renderNflCoachTrack()">
@@ -7600,7 +7600,18 @@ function nflCoachTrkSetTab(tab){
   if(bl)bl.style.background=_nflCoachTrackTabMode==='list'?'#065f46':'#1f2937';
   renderNflCoachTrack();
 }
-function openNflCoachTrack(){var e=document.getElementById('nfl-coach-track-section');if(e){e.style.display='block';e.scrollIntoView({behavior:'smooth',block:'center'});}_nflCoachTrkDayName();loadNflCoachTrack();}
+function _nflCoachTrackAwaitingSelection(){
+  _nflCoachTrackData=null;
+  var sum=document.getElementById('nflCoachTrackSummary'),out=document.getElementById('nflCoachTrackBody');
+  if(sum)sum.innerHTML='';
+  if(out)out.innerHTML='<p style="color:#94a3b8">Select the record, period, and date, then click Get Results.</p>';
+}
+function openNflCoachTrack(){
+  var e=document.getElementById('nfl-coach-track-section');
+  if(e){e.style.display='block';e.scrollIntoView({behavior:'smooth',block:'center'});}
+  _nflCoachTrkDayName();
+  _nflCoachTrackAwaitingSelection();
+}
 function loadNflCoachTrack(){
   var out=document.getElementById('nflCoachTrackBody'),token=localStorage.getItem('__mpa_token')||'';if(out)out.innerHTML='<p style="color:#94a3b8">Loading Coach record…</p>';
   var source=(document.getElementById('nflCoachTrkSource')||{}).value||'official';
