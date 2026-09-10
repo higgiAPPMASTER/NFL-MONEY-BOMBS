@@ -1550,6 +1550,9 @@ async def get_nfl_game_lines(event_id: str, date_str: str) -> dict:
 # history analysis. The final starter filter below still chooses one player, but
 # there is no value in analyzing every backup and deep-roster prop first.
 _MAX_PROP_CANDIDATES_PER_TEAM_MARKET = 3
+_DEFENSIVE_PROP_MARKETS = {
+    "player_tackles_assists", "player_sacks", "player_defensive_interceptions",
+}
 
 def _trim_prop_lines(lines: list, df) -> list:
     if not lines or df is None or len(lines) <= _MAX_PROP_CANDIDATES_PER_TEAM_MARKET:
@@ -1597,7 +1600,12 @@ def _trim_prop_lines(lines: list, df) -> list:
             stat_col = line.get("stat_col") or ""
             score = volume_maps.get(stat_col, {}).get(name, 0) or 0
             limit = _MAX_PROP_CANDIDATES_PER_TEAM_MARKET
-            if market == "player_anytime_td":
+            if market in _DEFENSIVE_PROP_MARKETS:
+                # Defensive boards need depth across the active unit rather
+                # than one volume leader. Five per team allows up to ten
+                # genuine candidates from each matchup before side ranking.
+                limit = 5
+            elif market == "player_anytime_td":
                 position = str(line.get("roster_position") or "").upper().strip()
                 if position == "RB":
                     position_group = "RB"
@@ -2848,36 +2856,22 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False,
             print(f"[nfl_sim] point-in-time filter failed closed: {exc}")
             analysis_df = df.iloc[0:0]
 
-    # 5. Analyze props synchronously (pandas is fast, no I/O)
-    raw_line_count = len(all_lines)
-    all_lines = _trim_prop_lines(all_lines, analysis_df)
-    _p(f"Analyzing {len(all_lines)} player prop histories"
-       + (f" (reduced from {raw_line_count})" if len(all_lines) < raw_line_count else "")
-       + "…")
+    # 5. Analyze every sportsbook-listed active player. Do not pre-trim offense
+    # or defense by career volume: every listed starter/role player must get the
+    # same qualification pass, and the market boards apply their own Top-10 caps.
+    _p(f"Analyzing all {len(all_lines)} sportsbook-listed player prop histories…")
     all_results = []
     for pl in all_lines:
         result = _analyze_prop(pl, analysis_df, pl.get("home_abbr",""), pl.get("away_abbr",""))
         if result:
             all_results.append(result)
 
-    # 6. Starter filter — normally keep one primary player per team/market.
-    # Anytime TD is intentionally different: retain at most one RB plus one
-    # combined WR/TE candidate per team, selected by model-versus-book edge.
-    # This keeps useful TD depth without opening the board to every longshot.
-    def _starter_score(r):
-        try:
-            nm  = r["name"].lower()
-            col = PROP_TO_COL.get(r.get("market",""), "")
-            if not col or col not in df.columns:
-                return 0
-            mask = analysis_df["player_display_name"].str.lower() == nm
-            return float(analysis_df[mask][col].fillna(0).sum())
-        except Exception:
-            return 0
-
-    def _selection_group(r):
+    # 6. Preserve every qualified offense, defense, and kicking result. Anytime
+    # TD keeps its separate one-RB plus one-WR/TE-per-team rule, selected by
+    # model-versus-book edge, as required by the dedicated TD board.
+    def _td_selection_group(r):
         if r.get("market") != "player_anytime_td":
-            return (r.get("team", ""), r.get("mkt", ""), "PRIMARY")
+            return None
         position = str(r.get("position") or "").upper().strip()
         if position == "RB":
             return (r.get("team", ""), r.get("mkt", ""), "RB")
@@ -2885,20 +2879,19 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False,
             return (r.get("team", ""), r.get("mkt", ""), "WR_TE")
         return None
 
-    def _selection_score(r):
-        if r.get("market") == "player_anytime_td":
-            edge = r.get("valueEdge")
-            return float(edge) if edge is not None else float("-inf")
-        return _starter_score(r)
-
-    _scored = [(r, _selection_score(r)) for r in all_results
-               if _selection_group(r) is not None]
-    _team_mkt_best: dict = {}
-    for r, score in _scored:
-        key = _selection_group(r)
-        if key not in _team_mkt_best or score > _team_mkt_best[key][1]:
-            _team_mkt_best[key] = (r, score)
-    all_results = [v[0] for v in _team_mkt_best.values()]
+    _non_td_results = [
+        r for r in all_results if r.get("market") != "player_anytime_td"
+    ]
+    _td_best: dict = {}
+    for r in all_results:
+        key = _td_selection_group(r)
+        if key is None:
+            continue
+        edge = r.get("valueEdge")
+        score = float(edge) if edge is not None else float("-inf")
+        if key not in _td_best or score > _td_best[key][1]:
+            _td_best[key] = (r, score)
+    all_results = _non_td_results + [v[0] for v in _td_best.values()]
 
     picks   = sorted([r for r in all_results
                       if r.get("pick") and r.get("betQualified", True)],
@@ -4707,7 +4700,7 @@ def _nfl_grade_date(date_str: str, snap: list, box_override: dict = None) -> dic
     for key in by_group:
         by_group[key].sort(key=lambda x: float(x.get("score") or 0), reverse=True)
 
-    main_rows, ovf_rows, lock_rows = [], [], []
+    main_rows, ovf_rows, lock_best = [], [], {}
     for (mk, direction), ps in by_group.items():
         label = PROP_LABELS[mk]
         dir_word = "Over" if direction == "OVER" else "Under"
@@ -4746,9 +4739,21 @@ def _nfl_grade_date(date_str: str, snap: list, box_override: dict = None) -> dic
             else:
                 ovf_rows.append({**row, "pool": "NFL Overflow"})
             # Cross-market 80-100% Locks category
-            if float(p.get("score") or p.get("dispScore") or 0) >= 80:
-                lock_rows.append({**row, "category": "80-100% Locks"})
+            lock_score = float(p.get("score") or p.get("dispScore") or 0)
+            if lock_score >= 80:
+                # Locks is a cross-market shortlist, not a duplicate copy of
+                # every qualifying market. Keep one strongest option per player.
+                lock_key = _norm(p.get("name") or "")
+                lock_rank = (lock_score, abs(float(p.get("gap") or 0)), -rank)
+                prior = lock_best.get(lock_key)
+                if lock_key and (prior is None or lock_rank > prior[0]):
+                    lock_best[lock_key] = (
+                        lock_rank, {**row, "category": "80-100% Locks"})
 
+    lock_rows = [
+        rec[1] for rec in sorted(
+            lock_best.values(), key=lambda rec: rec[0], reverse=True)
+    ]
     return {"any_game": any_game, "all_final": all_final,
             "main": main_rows, "overflow": ovf_rows, "locks": lock_rows}
 
@@ -5793,8 +5798,8 @@ tr:last-child td{border-bottom:none}
  .nfl-gp-filters{display:grid;grid-template-columns:minmax(130px,160px) minmax(110px,140px) minmax(0,1fr);gap:10px;align-items:end;margin-bottom:14px}
  .nfl-gp-filter{display:flex;flex-direction:column;gap:6px;min-width:0;color:#9ca3af;font-size:.72rem;font-weight:800;text-transform:uppercase;letter-spacing:.09em}
  .nfl-gp-filter .date-input{display:block;width:100%;max-width:100%;min-width:0;box-sizing:border-box}
-  .nfl-gp-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,460px));justify-content:center;gap:14px}
-  .nfl-gp-game{position:relative;overflow:hidden;background:linear-gradient(145deg,#111a2d 0%,#090f1c 72%);border:1px solid #334155;border-radius:18px;cursor:pointer;box-shadow:0 14px 30px rgba(0,0,0,.28);transition:transform .18s ease,border-color .18s ease,box-shadow .18s ease}
+   .nfl-gp-grid{display:flex;align-items:stretch;justify-content:flex-start;gap:14px;overflow-x:auto;overscroll-behavior-x:contain;scroll-snap-type:x proximity;padding:2px 2px 14px;scrollbar-color:#475569 #0b1220}
+   .nfl-gp-game{position:relative;overflow:hidden;background:linear-gradient(145deg,#111a2d 0%,#090f1c 72%);border:1px solid #334155;border-radius:18px;cursor:pointer;box-shadow:0 14px 30px rgba(0,0,0,.28);transition:transform .18s ease,border-color .18s ease,box-shadow .18s ease;width:460px;max-width:calc(100vw - 54px);flex:0 0 460px;scroll-snap-align:start}
   .nfl-gp-game:hover{transform:translateY(-2px);border-color:#8b5cf6;box-shadow:0 18px 38px rgba(76,29,149,.26)}
   .nfl-gp-game:focus-visible{outline:3px solid rgba(167,139,250,.55);outline-offset:3px}
   .nfl-gp-head{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:14px 16px 11px;border-bottom:1px solid rgba(148,163,184,.14)}
@@ -5847,7 +5852,7 @@ tr:last-child td{border-bottom:none}
   .nfl-game-group-body{border-top:1px solid #263244;padding:5px 12px 10px}
  @media(max-width:620px){.nfl-parlay-filters{grid-template-columns:1fr}}
  @media(max-width:680px){
-    .nfl-gp-grid{grid-template-columns:minmax(0,1fr)}.nfl-gp-game{border-radius:14px}.nfl-gp-head{align-items:flex-start}.nfl-gp-team{grid-template-columns:34px 38px minmax(0,1fr) 46px 46px;gap:6px}.nfl-gp-logo{width:32px;height:32px}.nfl-gp-callouts{grid-template-columns:1fr}.nfl-game-group summary{align-items:flex-start}.nfl-game-group-meta{flex-direction:column;align-items:flex-end}
+    .nfl-gp-game{width:calc(100vw - 54px);max-width:calc(100vw - 54px);flex-basis:calc(100vw - 54px);border-radius:14px}.nfl-gp-head{align-items:flex-start}.nfl-gp-team{grid-template-columns:34px 38px minmax(0,1fr) 46px 46px;gap:6px}.nfl-gp-logo{width:32px;height:32px}.nfl-gp-callouts{grid-template-columns:1fr}.nfl-game-group summary{align-items:flex-start}.nfl-game-group-meta{flex-direction:column;align-items:flex-end}
    .nfl-gp-filters{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}
    .nfl-gp-filter-date{grid-column:1/-1}
    .nfl-trk-group-head{padding:14px}.nfl-trk-group-name{font-size:1.02rem}.nfl-trk-tbl{font-size:.88rem}.nfl-trk-tbl th{font-size:.68rem;padding:11px}.nfl-trk-tbl td{padding:11px 12px}
@@ -5984,7 +5989,7 @@ tr:last-child td{border-bottom:none}
     <div id="nflCoachTrackSummary"></div>
     <div id="nflCoachTrackBody"></div>
   </div>
-  <div id="nfl-gp-card" style="display:none;max-width:960px;margin:18px auto 0;padding:0 16px">
+  <div id="nfl-gp-card" style="display:none;max-width:1500px;margin:18px auto 0;padding:0 16px">
     <div style="font-size:1rem;font-weight:900;color:#a78bfa;margin-bottom:6px">&#128302; Game Predictor &#8212; Today&#39;s Winners</div>
     <div style="font-size:.72rem;color:#64748b;margin-bottom:14px">Model blends recent L5 form, last completed season offense/defense, home-field advantage, and venue-aware results from the last five head-to-head meetings. Tap a game for the full breakdown.</div>
     <div id="nfl-gp-body"></div>
@@ -6725,36 +6730,6 @@ function _nflJumpToGames(){
   el.setAttribute('data-highlight','1');
   el.style.boxShadow='0 0 0 3px rgba(245,158,11,.28),0 18px 45px rgba(0,0,0,.32)';
   setTimeout(function(){el.style.boxShadow='';el.removeAttribute('data-highlight');},1400);
-}
-function _nflByGameHtml(d){
-  var games=(d&&d.games)||[],all=(d&&d.all)||[];
-  if(!games.length)return '';
-  var groups=games.map(function(g){return {game:g,plays:[]};});
-  all.forEach(function(p){
-    var idx=games.findIndex(function(g){
-      if(p.game&&g.game)return String(p.game)===String(g.game);
-      var pa=String(p.team||''),po=String(p.opponent||p.opp||'');
-      var ga=String(g.away_abbr||g.away_team||''),gh=String(g.home_abbr||g.home_team||'');
-      return (pa===ga&&po===gh)||(pa===gh&&po===ga);
-    });
-    if(idx>=0)groups[idx].plays.push(p);
-  });
-  var total=groups.reduce(function(n,x){return n+x.plays.length;},0);
-  var body=groups.map(function(group,gi){
-    var g=group.game,mu=(g.away_abbr||g.away_team||'?')+' @ '+(g.home_abbr||g.home_team||'?');
-    var plays=group.plays.slice().sort(function(a,b){
-      var ai=_MORDER.indexOf(a.mkt||a.label),bi=_MORDER.indexOf(b.mkt||b.label);
-      return ai-bi||_edge(b)-_edge(a)||(a.name||'').localeCompare(b.name||'');
-    });
-    var rows='';
-    _MORDER.forEach(function(m){
-      var mp=plays.filter(function(p){return (p.mkt||p.label)===m;});
-      if(mp.length)rows+='<div class="mk-hdr">'+_mIcon(m)+' '+_esc(m)+'</div>'+mp.map(_playRow).join('');
-    });
-    if(!rows)rows='<div style="padding:13px;color:#64748b;font-size:.72rem">No analyzed picks for this matchup.</div>';
-    return '<details class="nfl-game-group" id="nfl-game-group-'+gi+'"><summary><span>'+_esc(mu)+'</span><span class="nfl-game-group-meta"><span>'+_esc(g.slate_date||d.date||'')+'</span><span class="nfl-game-pick-count">'+plays.length+' pick'+(plays.length===1?'':'s')+'</span></span></summary><div class="nfl-game-group-body">'+rows+'</div></details>';
-  }).join('');
-  return '<section id="nfl-by-game-section" class="nfl-by-game"><div class="nfl-by-game-head"><div><div class="nfl-by-game-title">All Picks by Game</div><div class="nfl-by-game-sub">Open any matchup to see every analyzed player prop for that game. Tap a player for the complete game log.</div></div><div class="nfl-by-game-count">'+games.length+' games · '+total+' picks</div></div><div class="nfl-by-game-list">'+body+'</div></section>';
 }
 function _underBox(picks){
   // Sort best rate first, then keep only 1 play per player (their best)
@@ -7734,8 +7709,16 @@ function _nflPaint(q){
   lockPicks.sort(function(a,b){
     var sa=Number(b.score||b.dispScore||0),sb=Number(a.score||a.dispScore||0);
     if(sa!==sb) return sa-sb;
+    var ga=Math.abs(Number(a.gap||0)),gb=Math.abs(Number(b.gap||0));
+    if(ga!==gb) return gb-ga;
     var ai=_MORDER.indexOf(a.mkt||a.label),bi=_MORDER.indexOf(b.mkt||b.label);
     return ai-bi||(a.name||'').localeCompare(b.name||'');
+  });
+  var lockSeen={};
+  lockPicks=lockPicks.filter(function(p){
+    var key=String(p.name||'').trim().toLowerCase().replace(/[^a-z0-9]+/g,'');
+    if(!key||lockSeen[key])return false;
+    lockSeen[key]=1;return true;
   });
   if(lockPicks.length){
      var lockTop=lockPicks.slice(0,20), lockMore=lockPicks.slice(20);
@@ -7762,17 +7745,6 @@ function _nflPaint(q){
       +'</div>';
   }
 
-  // Games (tappable -> all plays for that game)
-  if((d.games||[]).length){
-    h+='<div class="sec">- Games -- '+(d.date||'')+'</div><div class="games">';
-    d.games.forEach(function(g,gi){
-      var mu=(g.away_abbr||g.away_team||'?')+' @ '+(g.home_abbr||g.home_team||'?');
-      var day=g.slate_date?'<div style="color:#a78bfa;font-size:.64rem;font-weight:900;margin-bottom:3px">'+g.slate_date+'</div>':'';
-      h+='<div class="gcard" onclick="_gameModal('+gi+')">'+day+'<div class="mu">'+mu+'</div><div class="gc-hint">tap for plays</div></div>';
-    });
-    h+='</div>';
-  }
-
   // Card grids per market — separate OVER and UNDER boards, each top 10 + overflow.
   // Finished games (kickoff + 4h elapsed) drop off the board.
   var hasCards=false;
@@ -7797,7 +7769,17 @@ function _nflPaint(q){
     h+='<div class="no-picks">No qualifying picks'+(q?' for "'+q+'"':' for '+(d.date||'today'))+'.</div>';
   }
 
-  h+=_nflByGameHtml(d);
+  // Existing matchup tiles belong after the market boards. Each tile opens
+  // the complete game-picks modal, so no second by-game accordion is needed.
+  if((d.games||[]).length){
+    h+='<div id="nfl-by-game-section"><div class="sec">- Games -- '+(d.date||'')+'</div><div class="games">';
+    d.games.forEach(function(g,gi){
+      var mu=(g.away_abbr||g.away_team||'?')+' @ '+(g.home_abbr||g.home_team||'?');
+      var day=g.slate_date?'<div style="color:#a78bfa;font-size:.64rem;font-weight:900;margin-bottom:3px">'+g.slate_date+'</div>':'';
+      h+='<div class="gcard" onclick="_gameModal('+gi+')">'+day+'<div class="mu">'+mu+'</div><div class="gc-hint">tap for plays</div></div>';
+    });
+    h+='</div></div>';
+  }
 
   document.getElementById('nflBody').innerHTML=h;
 }
