@@ -5725,8 +5725,13 @@ tr:last-child td{border-bottom:none}
  .nfl-td-prob{color:#86efac;font-weight:950;font-family:monospace}
  .nfl-td-edge{color:#4ade80;font-weight:950;font-family:monospace}
  .nfl-td-method{margin-top:10px;color:#6b7280;font-size:.64rem;line-height:1.45}
+ .nfl-gp-filters{display:grid;grid-template-columns:minmax(130px,160px) minmax(110px,140px) minmax(0,1fr);gap:10px;align-items:end;margin-bottom:14px}
+ .nfl-gp-filter{display:flex;flex-direction:column;gap:6px;min-width:0;color:#9ca3af;font-size:.72rem;font-weight:800;text-transform:uppercase;letter-spacing:.09em}
+ .nfl-gp-filter .date-input{display:block;width:100%;max-width:100%;min-width:0;box-sizing:border-box}
  @media(max-width:620px){.nfl-parlay-filters{grid-template-columns:1fr}}
  @media(max-width:680px){
+   .nfl-gp-filters{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}
+   .nfl-gp-filter-date{grid-column:1/-1}
    .nfl-trk-group-head{padding:14px}.nfl-trk-group-name{font-size:1.02rem}.nfl-trk-tbl{font-size:.88rem}.nfl-trk-tbl th{font-size:.68rem;padding:11px}.nfl-trk-tbl td{padding:11px 12px}
    .nfl-trk-compact,.nfl-trk-compact tbody,.nfl-trk-compact tr,.nfl-trk-compact td{display:block;width:100%}
    .nfl-trk-compact thead{display:none}
@@ -5874,13 +5879,16 @@ tr:last-child td{border-bottom:none}
       </div>
       <button onclick="loadNflGpRecord()" style="background:#6d28d9;color:#fff;border:none;border-radius:8px;padding:8px 14px;font-weight:700;cursor:pointer;font-size:.82rem">&#8635; Get Results</button>
     </div>
-    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:14px">
-      <label style="color:#9ca3af;font-size:.72rem;font-weight:800;text-transform:uppercase;letter-spacing:.09em">Season</label>
-      <select id="nflGpSeason" class="date-input" onchange="_nflGpControlChanged('season')"></select>
-      <label style="color:#9ca3af;font-size:.72rem;font-weight:800;text-transform:uppercase;letter-spacing:.09em">Week</label>
-      <select id="nflGpWeek" class="date-input" onchange="_nflGpControlChanged('week')"></select>
-      <label style="color:#9ca3af;font-size:.72rem;font-weight:800;text-transform:uppercase;letter-spacing:.09em">Game Date</label>
-      <select id="nflGpDate" class="date-input" onchange="renderNflGpRecord()"></select>
+    <div class="nfl-gp-filters">
+      <label class="nfl-gp-filter">Season
+        <select id="nflGpSeason" class="date-input" onchange="_nflGpControlChanged('season')"></select>
+      </label>
+      <label class="nfl-gp-filter">Week
+        <select id="nflGpWeek" class="date-input" onchange="_nflGpControlChanged('week')"></select>
+      </label>
+      <label class="nfl-gp-filter nfl-gp-filter-date">Game Date
+        <select id="nflGpDate" class="date-input" onchange="renderNflGpRecord()"></select>
+      </label>
     </div>
     <div id="nflGpTrkSummary"></div>
     <div id="nflGpTrkBody"></div>
