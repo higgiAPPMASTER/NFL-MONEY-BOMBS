@@ -1554,8 +1554,56 @@ _DEFENSIVE_PROP_MARKETS = {
     "player_tackles_assists", "player_sacks", "player_defensive_interceptions",
 }
 
+def _limit_prop_candidates(lines: list, volume_maps: dict,
+                           latest_team: dict) -> list:
+    """Apply per-team candidate limits after dataframe stats are summarized."""
+    groups = {}
+    for idx, line in enumerate(lines):
+        name = str(line.get("name") or "").strip().lower()
+        market = line.get("market") or ""
+        home = line.get("home_abbr") or ""
+        away = line.get("away_abbr") or ""
+        team = line.get("roster_team") or (latest_team.get(name) or ((0, ""), ""))[1]
+        if team not in (home, away):
+            # Match the analyzer's conservative traded-player fallback.
+            team = home or away or ""
+        stat_col = line.get("stat_col") or ""
+        score = volume_maps.get(stat_col, {}).get(name, 0) or 0
+        limit = _MAX_PROP_CANDIDATES_PER_TEAM_MARKET
+        if market in _DEFENSIVE_PROP_MARKETS:
+            # Defensive boards need depth across the active unit rather
+            # than one volume leader. Five per team allows up to ten
+            # genuine candidates from each matchup before side ranking.
+            limit = 5
+            position_group = "PRIMARY"
+        elif market == "player_anytime_td":
+            position = str(line.get("roster_position") or "").upper().strip()
+            if position == "RB":
+                position_group = "RB"
+                limit = 1
+            elif position == "WR":
+                position_group = "WR"
+                limit = 3
+            elif position == "TE":
+                position_group = "TE"
+                limit = 1
+            else:
+                continue
+        else:
+            position_group = "PRIMARY"
+        group_key = (home, away, market, team, position_group)
+        groups.setdefault(group_key, {"limit": limit, "rows": []})["rows"].append(
+            (float(score), idx))
+
+    keep = set()
+    for group in groups.values():
+        candidates = group["rows"]
+        candidates.sort(key=lambda item: (-item[0], item[1]))
+        keep.update(idx for _, idx in candidates[:group["limit"]])
+    return [line for idx, line in enumerate(lines) if idx in keep]
+
 def _trim_prop_lines(lines: list, df) -> list:
-    if not lines or df is None or len(lines) <= _MAX_PROP_CANDIDATES_PER_TEAM_MARKET:
+    if not lines or df is None:
         return lines
     try:
         cols = {"player_display_name", "recent_team", "season", "week"}
@@ -1587,52 +1635,20 @@ def _trim_prop_lines(lines: list, df) -> list:
             totals = df.assign(_n=name_series).groupby("_n")[stat_col].sum()
             volume_maps[stat_col] = totals.to_dict()
 
-        groups = {}
-        for idx, line in enumerate(lines):
-            name = str(line.get("name") or "").strip().lower()
-            market = line.get("market") or ""
-            home = line.get("home_abbr") or ""
-            away = line.get("away_abbr") or ""
-            team = line.get("roster_team") or (latest_team.get(name) or ((0, ""), ""))[1]
-            if team not in (home, away):
-                # Match the analyzer's conservative traded-player fallback.
-                team = home or away or ""
-            stat_col = line.get("stat_col") or ""
-            score = volume_maps.get(stat_col, {}).get(name, 0) or 0
-            limit = _MAX_PROP_CANDIDATES_PER_TEAM_MARKET
-            if market in _DEFENSIVE_PROP_MARKETS:
-                # Defensive boards need depth across the active unit rather
-                # than one volume leader. Five per team allows up to ten
-                # genuine candidates from each matchup before side ranking.
-                limit = 5
-            elif market == "player_anytime_td":
-                position = str(line.get("roster_position") or "").upper().strip()
-                if position == "RB":
-                    position_group = "RB"
-                    limit = 1
-                elif position == "WR":
-                    position_group = "WR"
-                    limit = 3
-                elif position == "TE":
-                    position_group = "TE"
-                    limit = 1
-                else:
-                    continue
-                group_key = (home, away, market, team, position_group)
-            else:
-                group_key = (home, away, market, team, "PRIMARY")
-            groups.setdefault(group_key, {"limit": limit, "rows": []})["rows"].append(
-                (float(score), idx))
-
-        keep = set()
-        for group in groups.values():
-            candidates = group["rows"]
-            candidates.sort(key=lambda item: (-item[0], item[1]))
-            keep.update(idx for _, idx in candidates[:group["limit"]])
-        return [line for idx, line in enumerate(lines) if idx in keep]
+        return _limit_prop_candidates(lines, volume_maps, latest_team)
     except Exception as e:
         print(f"[PropTrim] skipped: {e}")
         return lines
+
+def _analysis_prop_lines(lines: list, df) -> list:
+    """Preserve every standard prop; prefilter only the Anytime TD pool."""
+    standard_lines = [
+        line for line in lines if line.get("market") != "player_anytime_td"
+    ]
+    td_lines = [
+        line for line in lines if line.get("market") == "player_anytime_td"
+    ]
+    return standard_lines + _trim_prop_lines(td_lines, df)
 
 # ── Analysis using nfl_data_py ─────────────────────────────────────────────────
 def _espn_ha_week(season_type, week):
@@ -2866,11 +2882,10 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False,
     standard_lines = [
         pl for pl in all_lines if pl.get("market") != "player_anytime_td"
     ]
-    td_lines = [
+    all_lines = _analysis_prop_lines(all_lines, analysis_df)
+    td_starter_lines = [
         pl for pl in all_lines if pl.get("market") == "player_anytime_td"
     ]
-    td_starter_lines = _trim_prop_lines(td_lines, analysis_df)
-    all_lines = standard_lines + td_starter_lines
     _p(
         f"Analyzing all {len(standard_lines)} standard player props plus "
         f"{len(td_starter_lines)} starter-level Anytime TD candidates…")
@@ -5608,6 +5623,7 @@ tr:last-child td{border-bottom:none}
 .pc-id{flex:1;min-width:0}
 .pc-name{font-weight:800;color:#fff;font-size:1.02rem;line-height:1.15;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .pc-meta{font-size:.74rem;color:#9ca3af;margin-top:4px;display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.pc-pos{display:inline-flex;align-items:center;justify-content:center;min-width:26px;padding:2px 6px;border:1px solid rgba(245,158,11,.48);border-radius:5px;background:rgba(245,158,11,.1);color:#fbbf24;font-size:.62rem;font-weight:900;letter-spacing:.04em}
 .pc-mkt{display:inline-block;font-size:.6rem;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:#6b7280;margin-top:4px}
 .pc-tagrow{min-height:1px;margin-bottom:8px}
 .pc-line-row{display:flex;align-items:center;justify-content:space-between;background:#0e0e0e;border:1px solid #242424;border-radius:10px;padding:8px 12px;margin-bottom:10px}
@@ -6625,6 +6641,8 @@ function nflCard(p,i){
     ? `<div class="pc-stat"><div class="k">vs Book L10</div><div class="v ${rateClass(p.vsLineRate)}">${p.vsLineHits}/${p.vsLineTotal} (${p.vsLineRate}%)</div></div>`
     : `<div class="pc-stat"><div class="k">Under L10</div><div class="v ${rateClass(p.underRate)}">${p.underHits}/${p.underTotal} (${p.underRate}%)</div></div>`;
   var haBadge=hasHA?`<span class="${ha?'home':'away'}">${ha?'HOME':'AWAY'}</span>`:'';
+  var pos=String(p.position||p.roster_position||'').toUpperCase().trim();
+  var posBadge=pos?`<span class="pc-pos">${_esc(pos)}</span>`:'';
   var defChip='';
   if(p.defRank&&p.defAdj){
     var dcol=p.defAdj>0?'#4ade80':'#f87171';
@@ -6640,7 +6658,7 @@ function nflCard(p,i){
        </div>
        <div class="pc-id">
          <div class="pc-name">${p.name}</div>
-          <div class="pc-meta">${p.team} vs ${p.opponent} ${haBadge}${p.slate_date?' · '+p.slate_date:''}</div>
+           <div class="pc-meta">${posBadge}${p.team} vs ${p.opponent} ${haBadge}${p.slate_date?' · '+p.slate_date:''}</div>
          <div class="pc-mkt">${p.mkt||''} · ${p.pick||''}</div>
          ${defChip}
        </div>
