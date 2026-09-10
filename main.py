@@ -32,7 +32,8 @@ PROP_MARKETS = [
     "player_pass_yds", "player_pass_tds", "player_pass_completions",
     "player_pass_attempts", "player_pass_interceptions",
     # rushing
-    "player_rush_yds", "player_rush_attempts", "player_anytime_td",
+    "player_rush_yds", "player_rush_reception_yds",
+    "player_rush_attempts", "player_anytime_td",
     # receiving
     "player_reception_yds", "player_receptions",
     # defense
@@ -60,6 +61,7 @@ PROP_LABELS = {
     "player_pass_completions":"Completions", "player_pass_attempts":"Pass Att",
     "player_pass_interceptions":"INT Thrown",
     "player_rush_yds":"Rush Yds", "player_rush_attempts":"Rush Att",
+    "player_rush_reception_yds":"RB Total Yds",
     "player_anytime_td":"Anytime TD",
     "player_reception_yds":"Rec Yds", "player_receptions":"Receptions",
     "player_tackles_assists":"Tackles+Ast", "player_sacks":"Sacks",
@@ -75,6 +77,7 @@ PROP_TO_COL = {
     "player_pass_attempts":          "attempts",
     "player_pass_interceptions":     "interceptions",
     "player_rush_yds":               "rushing_yards",
+    "player_rush_reception_yds":     "rush_rec_yards",
     "player_rush_attempts":          "carries",
     "player_anytime_td":             "anytime_td",       # computed
     "player_reception_yds":          "receiving_yards",
@@ -393,7 +396,7 @@ _NFL_KICK_URL = "https://github.com/nflverse/nflverse-data/releases/download/pla
 # live in ONE combined weekly file (offense + defense + kicking per player-week).
 _NFL_NEW_URL       = "https://github.com/nflverse/nflverse-data/releases/download/stats_player/stats_player_week_{year}.csv"
 _NFL_NEW_FMT_START = 2025
-_KEEP_COLS   = ["player_display_name","player_id","headshot_url","recent_team","opponent_team",
+_KEEP_COLS   = ["player_display_name","player_id","headshot_url","position","recent_team","opponent_team",
                 "season","week","season_type","rushing_yards","receiving_yards","passing_yards",
                 "receptions","targets","passing_tds","rushing_tds","receiving_tds",
                 "completions","attempts","interceptions","carries",
@@ -440,6 +443,11 @@ def _load_nfl_stats_sync():
         if _NFL_PKL.exists() and (time.time() - _NFL_PKL.stat().st_mtime) < _NFL_PKL_TTL:
             import pickle
             _nfl_df = pickle.loads(_NFL_PKL.read_bytes())
+            if ("rush_rec_yards" not in _nfl_df.columns
+                    and {"rushing_yards", "receiving_yards"}.issubset(_nfl_df.columns)):
+                _nfl_df["rush_rec_yards"] = (
+                    _nfl_df["rushing_yards"].fillna(0)
+                    + _nfl_df["receiving_yards"].fillna(0))
             print(f"[NFL Data] Loaded from disk cache: {len(_nfl_df):,} rows")
             return _nfl_df
     except Exception as e:
@@ -480,10 +488,11 @@ def _load_nfl_stats_sync():
             def col(name):
                 return d[name].fillna(0) if name in d.columns else 0
             d["anytime_td"]      = col("rushing_tds") + col("receiving_tds")  # scorer only — no passing TDs
+            d["rush_rec_yards"]  = col("rushing_yards") + col("receiving_yards")
             d["tackles_assists"] = col("def_tackles_solo") + col("def_tackle_assists")
             d["def_ints"]        = col("def_interceptions")
             d["kicking_points"]  = col("fg_made") * 3 + col("pat_made")
-            extra = ["anytime_td","tackles_assists","def_sacks","def_ints",
+            extra = ["anytime_td","rush_rec_yards","tackles_assists","def_sacks","def_ints",
                      "fg_made","kicking_points"]
             keep  = [c for c in _KEEP_COLS + extra if c in d.columns]
             return d[keep]
@@ -506,6 +515,10 @@ def _load_nfl_stats_sync():
             print("[NFL Data] No offense data downloaded — aborting")
             return None
         off = pd.concat(off_frames, ignore_index=True)
+        if {"rushing_yards", "receiving_yards"}.issubset(off.columns):
+            off["rush_rec_yards"] = (
+                off["rushing_yards"].fillna(0)
+                + off["receiving_yards"].fillna(0))
 
         # Compute anytime TD (offense only). Anytime-TD props pay when the player
         # SCORES — rushing or receiving TDs only. Passing TDs don't count (and
@@ -1309,7 +1322,8 @@ def _apply_nfl_injury_context(lines: list, roster_map: dict) -> None:
         if all(key):
             by_group.setdefault(key, []).append(info)
     market_ok = {
-        "player_rush_yds", "player_rush_attempts", "player_anytime_td",
+        "player_rush_yds", "player_rush_reception_yds",
+        "player_rush_attempts", "player_anytime_td",
         "player_reception_yds", "player_receptions",
     }
     # Conservative scenario scale for a same-position teammate absence.
@@ -2094,6 +2108,13 @@ def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str) -> Optional[Dict
     # Use MOST RECENT team (not historical mode) so traded players show correct team
     pdf_sorted = pdf.sort_values(["season", "week"], ascending=False) if not pdf.empty else pdf
     recent_team = pdf_sorted["recent_team"].iloc[0] if not pdf_sorted.empty else ""
+    historical_position = (
+        _first_str(pdf_sorted["position"])
+        if "position" in pdf_sorted.columns else "")
+    effective_position = _nfl_position_group(
+        pl.get("roster_position") or historical_position)
+    if market == "player_rush_reception_yds" and effective_position != "RB":
+        return None
     current_team = pl.get("roster_team") or recent_team
 
     # Determine home/away using current game teams first, fall back to historical
@@ -2282,7 +2303,7 @@ def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str) -> Optional[Dict
 
     return {
         # identity
-        "name": name, "pid": pid, "position": pl.get("roster_position", ""),
+        "name": name, "pid": pid, "position": effective_position,
         "team": game_team, "opponent": opp_abbr or "--",
         "homeRoad": home_road, "side": side, "head": head, "game": pl.get("game",""),
         "game_start": pl.get("game_start",""),
@@ -2882,6 +2903,9 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False,
             line["roster_team"] = ri.get("team", "")
             line["roster_position"] = ri.get("position", "")
             if not ri.get("eligible", True):
+                continue
+            if (line.get("market") == "player_rush_reception_yds"
+                    and _nfl_position_group(ri.get("position")) != "RB"):
                 continue
         roster_filtered.append(line)
     all_lines = roster_filtered
@@ -3748,6 +3772,12 @@ def _nfl_market_from_groups(groups: dict, market: str):
     if market == "player_pass_attempts":       return _nfl_made(g("passing", "C/ATT"))[1]
     if market == "player_pass_interceptions":  return _nfl_num(g("passing", "INT"))
     if market == "player_rush_yds":            return _nfl_num(g("rushing", "YDS"))
+    if market == "player_rush_reception_yds":
+        rushing = _nfl_num(g("rushing", "YDS"))
+        receiving = _nfl_num(g("receiving", "YDS"))
+        if rushing is None and receiving is None:
+            return None
+        return (rushing or 0) + (receiving or 0)
     if market == "player_rush_attempts":       return _nfl_num(g("rushing", "CAR"))
     if market == "player_anytime_td":
         rt = _nfl_num(g("rushing", "TD"))
@@ -4216,6 +4246,8 @@ def _nfl_coach_hist_implied(odds):
 
 def _nfl_coach_hist_family(label):
     value = str(label or "").lower()
+    if "rb total yds" in value:
+        return "rush"
     if "pass" in value or "completion" in value or "int thrown" in value:
         return "pass"
     if "rush" in value:
@@ -6699,8 +6731,8 @@ async function getPicks(){
 
 // ===== NBA-style cards (NFL) =====
 window.__NFLLAD__ = window.__NFLLAD__ || {};
-var _MORDER=['Pass Yds','Pass TDs','Completions','Pass Att','INT Thrown','Rush Yds','Rush Att','Rec Yds','Receptions','Anytime TD','Tackles+Ast','Sacks','Def INT','Kick Pts','FG Made'];
-var _MLBL={'Pass Yds':'Pass','Pass TDs':'Pass TD','Completions':'Comp','Pass Att':'Att','INT Thrown':'INT','Rush Yds':'Rush','Rush Att':'Carries','Rec Yds':'Rec','Receptions':'Recept','Anytime TD':'TD','Tackles+Ast':'Tkl','Sacks':'Sacks','Def INT':'D INT','Kick Pts':'K Pts','FG Made':'FG'};
+var _MORDER=['Pass Yds','Pass TDs','Completions','Pass Att','INT Thrown','Rush Yds','RB Total Yds','Rush Att','Rec Yds','Receptions','Anytime TD','Tackles+Ast','Sacks','Def INT','Kick Pts','FG Made'];
+var _MLBL={'Pass Yds':'Pass','Pass TDs':'Pass TD','Completions':'Comp','Pass Att':'Att','INT Thrown':'INT','Rush Yds':'Rush','RB Total Yds':'Total Yds','Rush Att':'Carries','Rec Yds':'Rec','Receptions':'Recept','Anytime TD':'TD','Tackles+Ast':'Tkl','Sacks':'Sacks','Def INT':'D INT','Kick Pts':'K Pts','FG Made':'FG'};
 
 function _nflGameDone(p){
   var s=p&&p.game_start; if(!s) return false;
@@ -6723,7 +6755,7 @@ function _initials(name){
   return (parts[0][0]+parts[parts.length-1][0]).toUpperCase();
 }
 function _accFor(mkt){
-  if(mkt==='Rush Yds'||mkt==='Rush Att') return 'acc-rush';
+  if(mkt==='Rush Yds'||mkt==='RB Total Yds'||mkt==='Rush Att') return 'acc-rush';
   if(mkt==='Rec Yds') return 'acc-rec';
   if(mkt==='Pass Yds'||mkt==='Completions'||mkt==='Pass Att'||mkt==='INT Thrown') return 'acc-pass';
   if(mkt==='Receptions') return 'acc-recpt';
@@ -6735,6 +6767,7 @@ function _accFor(mkt){
 }
 function _mIcon(mkt){
   if(mkt==='Rush Yds') return '🏈';
+  if(mkt==='RB Total Yds') return '🏈';
   if(mkt==='Rush Att') return '🏃';
   if(mkt==='Rec Yds') return '🙌';
   if(mkt==='Pass Yds') return '🎯';
@@ -7294,6 +7327,7 @@ function _nflCoachParse(question,props){
   var top=words.match(/ top +([0-9]{1,2}) /);if(top)f.limit=Math.max(1,Math.min(5,Number(top[1])));
   if(words.indexOf(' under ')>=0)f.side='UNDER';else if(words.indexOf(' over ')>=0)f.side='OVER';
   var exactMarkets=[
+    {label:'RB Total Yds',terms:['rushing and receiving yards','rushing plus receiving yards','rush and receiving yards','rush plus receiving yards','rush receiving yards','rush rec yards','combined yards','total yards']},
     {label:'Completions',terms:['qb completions','qb completion','quarterback completions','quarterback completion','pass completions','pass completion','passing completions','passing completion','completions']},
     {label:'Pass Att',terms:['qb attempts','qb attempt','quarterback attempts','quarterback attempt','pass attempts','pass attempt','passing attempts','passing attempt']},
     {label:'Pass Yds',terms:['passing yards','passing yard','passing yds','passing yd','pass yards','pass yard','pass yds','pass yd']},
@@ -7329,6 +7363,7 @@ function _nflCoachParse(question,props){
 }
 function _nflCoachFamily(m){
   m=String(m||'').toLowerCase();
+  if(m.indexOf('rb total yds')>=0)return 'rush';
   if(m.indexOf('pass')>=0||m.indexOf('completion')>=0||m.indexOf('int thrown')>=0)return 'pass';
   if(m.indexOf('rush')>=0)return 'rush';
   if(m.indexOf('rec')>=0)return 'rec';
@@ -8677,10 +8712,11 @@ function _nflTrkCatHtml(decided,stake){
 function _nflTrkListHtml(decided,stake){
   if(!decided.length) return '<p style="color:#6b7280;padding:20px;text-align:center">No graded picks yet.</p>';
   var catOrder=['Pass Yds','Pass TDs','Completions','Pass Att','INT Thrown',
-    'Rush Yds','Rush Att','Rec Yds','Receptions','Anytime TD','Tackles+Ast',
+    'Rush Yds','RB Total Yds','Rush Att','Rec Yds','Receptions','Anytime TD','Tackles+Ast',
     'Sacks','Def INT','Kick Pts','FG Made','80-100% Locks'];
   var catColors={'Pass Yds':'#38bdf8','Pass TDs':'#818cf8','Completions':'#60a5fa',
     'Pass Att':'#22d3ee','INT Thrown':'#f87171','Rush Yds':'#34d399',
+    'RB Total Yds':'#10b981',
     'Rush Att':'#2dd4bf','Rec Yds':'#a78bfa','Receptions':'#c084fc',
     'Anytime TD':'#fbbf24','Tackles+Ast':'#fb923c','Sacks':'#f97316',
     'Def INT':'#f43f5e','Kick Pts':'#facc15','FG Made':'#fde047',
