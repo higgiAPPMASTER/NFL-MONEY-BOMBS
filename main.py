@@ -4103,7 +4103,8 @@ _NFL_TRK_TOP   = 10   # picks per market+direction that count in main record
 _NFL_COACH_TRK_APP = "nfl_coach_track"
 _NFL_COACH_HIST_APP = "nfl_coach_historical"
 _NFL_COACH_CATS = ("safest_bets", "coach_edge", "alt_line_edge", "passing",
-                   "rushing", "receiving", "td_scorers", "best_unders")
+                   "rushing", "receiving", "defense", "kicking",
+                   "td_scorers", "best_unders")
 _NFL_COACH_CAPTURE_GUARD_SECONDS = 120
 
 def _nfl_coach_hist_implied(odds):
@@ -4189,7 +4190,7 @@ def _nfl_coach_hist_candidates(picks):
 def _nfl_coach_hist_select(candidates, category, alternate=False):
     family = {
         "passing": "pass", "rushing": "rush", "receiving": "rec",
-        "td_scorers": "td",
+        "defense": "def", "kicking": "kick", "td_scorers": "td",
     }.get(category)
     rows = []
     for row in candidates:
@@ -5754,6 +5755,13 @@ tr:last-child td{border-bottom:none}
  .nfl-trk-result.pending{color:#cbd5e1;background:rgba(100,116,139,.15);border:1px solid rgba(148,163,184,.25)}
  .nfl-parlay-filters{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:14px;text-align:left}
  .nfl-parlay-filter-group{background:#101010;border:1px solid #292929;border-radius:11px;padding:11px}
+.nfl-game-filter-dropdown>summary{display:flex;align-items:center;justify-content:space-between;gap:10px;list-style:none;cursor:pointer;color:#93c5fd;font-size:.68rem;font-weight:900;text-transform:uppercase;letter-spacing:.06em}
+.nfl-game-filter-dropdown>summary::-webkit-details-marker{display:none}
+.nfl-game-filter-dropdown>summary:after{content:"▼";color:#60a5fa;font-size:.62rem;transition:transform .15s ease}
+.nfl-game-filter-dropdown[open]>summary:after{transform:rotate(180deg)}
+.nfl-game-filter-summary{margin-left:auto;color:#9ca3af;font-size:.62rem;font-weight:800;letter-spacing:0;text-transform:none}
+.nfl-game-filter-panel{padding-top:11px;margin-top:9px;border-top:1px solid #252525}
+.nfl-game-filter-panel .nfl-parlay-filter-actions{display:flex;justify-content:flex-end;margin-bottom:9px}
  .nfl-parlay-filter-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px}
  .nfl-parlay-filter-title{color:#e5e7eb;font-size:.72rem;font-weight:950;letter-spacing:.05em;text-transform:uppercase}
  .nfl-parlay-filter-actions{display:flex;gap:5px}
@@ -5897,10 +5905,13 @@ tr:last-child td{border-bottom:none}
       <button class="btn" onclick="generateParlay()" style="background:#1f2937;color:#fff">🎲 Generate New</button>
     </div>
     <div class="nfl-parlay-filters">
-      <div class="nfl-parlay-filter-group" style="grid-column:1/-1;border-color:rgba(59,130,246,.35)">
-        <div class="nfl-parlay-filter-head"><div class="nfl-parlay-filter-title" style="color:#93c5fd">Choose Games</div><div class="nfl-parlay-filter-actions"><button type="button" onclick="_nflGameSetAll('parlay',true)">All</button><button type="button" onclick="_nflGameSetAll('parlay',false)">None</button></div></div>
-        <div id="nflParlayGames" class="nfl-game-filter-list"><div class="nfl-parlay-cat-empty">Run today&#39;s picks to load games.</div></div>
-      </div>
+      <details class="nfl-parlay-filter-group nfl-game-filter-dropdown" style="grid-column:1/-1;border-color:rgba(59,130,246,.35)">
+        <summary><span>Choose Games</span><span id="nflParlayGamesSummary" class="nfl-game-filter-summary">Run picks to load games</span></summary>
+        <div class="nfl-game-filter-panel">
+          <div class="nfl-parlay-filter-actions"><button type="button" onclick="_nflGameSetAll('parlay',true)">All</button><button type="button" onclick="_nflGameSetAll('parlay',false)">None</button></div>
+          <div id="nflParlayGames" class="nfl-game-filter-list"><div class="nfl-parlay-cat-empty">Run today&#39;s picks to load games.</div></div>
+        </div>
+      </details>
       <div class="nfl-parlay-filter-group">
         <div class="nfl-parlay-filter-head"><div class="nfl-parlay-filter-title">Normal Plays</div><div class="nfl-parlay-filter-actions"><button type="button" onclick="_nflParlaySetAll('normal',true)">All</button><button type="button" onclick="_nflParlaySetAll('normal',false)">None</button></div></div>
         <div id="nflParlayNormalCats" class="nfl-parlay-cat-list"><div class="nfl-parlay-cat-empty">Run today&#39;s picks to load categories.</div></div>
@@ -5926,13 +5937,18 @@ tr:last-child td{border-bottom:none}
       <button class="nfl-coach-preset" onclick="askNflCoachPreset('Show the best passing plays','passing')">Passing</button>
       <button class="nfl-coach-preset" onclick="askNflCoachPreset('Show the best rushing plays','rushing')">Rushing</button>
       <button class="nfl-coach-preset" onclick="askNflCoachPreset('Show the best receiving plays','receiving')">Receiving</button>
+      <button class="nfl-coach-preset" onclick="askNflCoachPreset('Show the best defensive player prop plays','defense')">Best Defense Plays</button>
+      <button class="nfl-coach-preset" onclick="askNflCoachPreset('Show the best kicker prop plays','kicking')">Best Kicker Plays</button>
       <button class="nfl-coach-preset" onclick="askNflTdCoach()" style="border-color:#eab308;color:#fde68a">TD Scorers · Top 10 / Game Top 5</button>
       <button class="nfl-coach-preset" onclick="askNflCoachPreset('Show the best under plays','best_unders')">Best unders</button>
     </div>
-    <div class="nfl-parlay-filter-group" style="margin:10px 0 12px;border-color:rgba(56,189,248,.35)">
-      <div class="nfl-parlay-filter-head"><div class="nfl-parlay-filter-title" style="color:#7dd3fc">Choose Games for Coach</div><div class="nfl-parlay-filter-actions"><button type="button" onclick="_nflGameSetAll('coach',true)">All</button><button type="button" onclick="_nflGameSetAll('coach',false)">None</button></div></div>
-      <div id="nflCoachGames" class="nfl-game-filter-list"><div class="nfl-parlay-cat-empty">Run today&#39;s picks to load games.</div></div>
-    </div>
+    <details class="nfl-parlay-filter-group nfl-game-filter-dropdown" style="margin:10px 0 12px;border-color:rgba(56,189,248,.35)">
+      <summary><span style="color:#7dd3fc">Choose Games for Coach</span><span id="nflCoachGamesSummary" class="nfl-game-filter-summary">Run picks to load games</span></summary>
+      <div class="nfl-game-filter-panel">
+        <div class="nfl-parlay-filter-actions"><button type="button" onclick="_nflGameSetAll('coach',true)">All</button><button type="button" onclick="_nflGameSetAll('coach',false)">None</button></div>
+        <div id="nflCoachGames" class="nfl-game-filter-list"><div class="nfl-parlay-cat-empty">Run today&#39;s picks to load games.</div></div>
+      </div>
+    </details>
     <div class="nfl-coach-row">
       <input id="nflCoachInput" class="nfl-coach-input" placeholder="Example: Safest rushing unders from -300 to -150" onkeydown="if(event.key==='Enter')askNflCoach()"/>
       <button class="nfl-coach-send" onclick="askNflCoach()">Analyze</button>
@@ -6127,6 +6143,7 @@ function _nflGameSync(scope){
   document.querySelectorAll('.nfl-game-choice[data-scope="'+scope+'"]').forEach(function(cb){
     group[decodeURIComponent(cb.getAttribute('data-key')||'')]=!!cb.checked;
   });
+  _nflGameFilterSummary(scope);
 }
 function _nflGameSetAll(scope,on){
   document.querySelectorAll('.nfl-game-choice[data-scope="'+scope+'"]').forEach(function(cb){cb.checked=!!on;});
@@ -6135,6 +6152,17 @@ function _nflGameSetAll(scope,on){
 function _nflGameFilterActive(scope){
   var games=_nflLoadedGames();
   return games.some(function(g){return !_nflGameFilterOn(scope,g.key.split('|')[0],g.key.split('|')[1]);});
+}
+function _nflGameFilterSummary(scope){
+  var games=_nflLoadedGames(),selected=games.filter(function(g){
+    return _nflGameFilterOn(scope,g.key.split('|')[0],g.key.split('|')[1]);
+  }).length;
+  var id=scope==='coach'?'nflCoachGamesSummary':'nflParlayGamesSummary';
+  var el=document.getElementById(id);if(!el)return;
+  if(!games.length)el.textContent='Run picks to load games';
+  else if(selected===games.length)el.textContent='All '+games.length+' selected';
+  else if(selected===0)el.textContent='None selected';
+  else el.textContent=selected+' of '+games.length+' selected';
 }
 function _nflGameFilterHtml(scope){
   var games=_nflLoadedGames(),group=(window.__NFL_GAME_FILTERS__||{})[scope]||{};
@@ -6148,6 +6176,8 @@ function _renderNflGameFilters(){
   var parlay=document.getElementById('nflParlayGames'),coach=document.getElementById('nflCoachGames');
   if(parlay)parlay.innerHTML=_nflGameFilterHtml('parlay');
   if(coach)coach.innerHTML=_nflGameFilterHtml('coach');
+  _nflGameFilterSummary('parlay');
+  _nflGameFilterSummary('coach');
 }
 function _nflNormalParlayCandidates(){
   var plays=window.__NFL_PLAYS__||[],out=[];
@@ -6187,6 +6217,8 @@ function _nflCoachParlayCandidates(){
     passing:select(positive.filter(function(p){return _nflCoachFamily(p.market)==='pass';}),byEdge,5),
     rushing:select(positive.filter(function(p){return _nflCoachFamily(p.market)==='rush';}),byEdge,5),
     receiving:select(positive.filter(function(p){return _nflCoachFamily(p.market)==='rec';}),byEdge,5),
+    defense:select(positive.filter(function(p){return _nflCoachFamily(p.market)==='def';}),byEdge,5),
+    kicking:select(positive.filter(function(p){return _nflCoachFamily(p.market)==='kick';}),byEdge,5),
     td_scorers:select(positive.filter(function(p){return _nflCoachFamily(p.market)==='td'&&p.side==='OVER';}),byEdge,5),
     best_unders:select(positive.filter(function(p){return p.side==='UNDER';}),byEdge,5),
     alt_line_edge:(window.__NFL_ALT_PARLAY_CANDIDATES__||[]).filter(function(p){
@@ -6211,6 +6243,8 @@ var _NFL_PARLAY_COACH_CATS=[
   {key:'passing',label:'Passing'},
   {key:'rushing',label:'Rushing'},
   {key:'receiving',label:'Receiving'},
+  {key:'defense',label:'Best Defense Plays'},
+  {key:'kicking',label:'Best Kicker Plays'},
   {key:'td_scorers',label:'TD Scorers'},
   {key:'best_unders',label:'Best Unders'}
 ];
@@ -7406,7 +7440,8 @@ var _nflCoachTrackData=null,_nflCoachTrackTabMode='cat';
 var _NFL_COACH_TRACK_LABELS={
   safest_bets:'Safest Bets',coach_edge:'Coach Edge',
   alt_line_edge:'Best Alt-Line Edge Plays',passing:'Passing',
-  rushing:'Rushing',receiving:'Receiving',td_scorers:'TD Scorers',best_unders:'Best Unders'
+  rushing:'Rushing',receiving:'Receiving',defense:'Best Defense Plays',
+  kicking:'Best Kicker Plays',td_scorers:'TD Scorers',best_unders:'Best Unders'
 };
 function _nflCoachTrackLabel(category){return _NFL_COACH_TRACK_LABELS[category]||String(category||'Coach').replace(/_/g,' ');}
 function _nflCoachTrkStake(){
