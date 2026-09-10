@@ -1538,6 +1538,10 @@ async def get_nfl_game_lines(event_id: str, date_str: str) -> dict:
                                     _take_odds(res, "total_over_odds", "_tot_over_book", price, bkey)
                                 elif side == "Under":
                                     _take_odds(res, "total_under_odds", "_tot_under_book", price, bkey)
+            res["away_ml_book"] = _book_label(res["away_ml_book"]) if res.get("away_ml_book") else ""
+            res["home_ml_book"] = _book_label(res["home_ml_book"]) if res.get("home_ml_book") else ""
+            res["total_over_book"] = _book_label(res.pop("_tot_over_book")) if res.get("_tot_over_book") else ""
+            res["total_under_book"] = _book_label(res.pop("_tot_under_book")) if res.get("_tot_under_book") else ""
             return res
     except Exception as e:
         print(f"[GP GameLines] {e}"); return {}
@@ -2576,8 +2580,12 @@ async def _build_nfl_game_predictions(espn_games: list, df, date_str: str,
             "win_away": win_away, "win_home": win_home,
             "pick_home": pick_home, "pick_abbr": pick_abbr, "conf": conf,
             "away_ml_odds": away_ml, "home_ml_odds": home_ml,
+            "away_ml_book": gl.get("away_ml_book", ""),
+            "home_ml_book": gl.get("home_ml_book", ""),
             "total_line": total_line, "total_pick": total_pick, "total_edge": total_edge,
             "total_over_odds": total_over_odds, "total_under_odds": total_under_odds,
+            "total_over_book": gl.get("total_over_book", ""),
+            "total_under_book": gl.get("total_under_book", ""),
             "mkt_home_pct": mkt_home_pct, "mkt_away_pct": mkt_away_pct,
             "mkt_edge": mkt_edge, "value_flag": value_flag,
             "drivers": drivers, "game_start": g.get("start", ""),
@@ -4487,8 +4495,12 @@ def _nfl_save_gp_snapshot(date_str: str, result: dict):
             "proj_total": p.get("proj_total"),
             "total_line": p.get("total_line"), "total_pick": p.get("total_pick"),
             "home_ml_odds": p.get("home_ml_odds"), "away_ml_odds": p.get("away_ml_odds"),
+            "home_ml_book": p.get("home_ml_book", ""),
+            "away_ml_book": p.get("away_ml_book", ""),
             "total_over_odds": p.get("total_over_odds"),
             "total_under_odds": p.get("total_under_odds"),
+            "total_over_book": p.get("total_over_book", ""),
+            "total_under_book": p.get("total_under_book", ""),
             "game_start": p.get("game_start", ""),
         })
     ok = _nfl_sb_insert_ignore("mpa_track_ledger", [{
@@ -4794,6 +4806,7 @@ def _nfl_historical_replay_payload(result: dict, espn_games: list = None,
             gp.get("away_abbr") if aws > hs else "TIE")
         win_result = "PUSH" if winner == "TIE" else ("WIN" if picked == winner else "LOSS")
         ml_odds = gp.get("home_ml_odds") if pick_home else gp.get("away_ml_odds")
+        ml_book = gp.get("home_ml_book") if pick_home else gp.get("away_ml_book")
         total_result = None
         actual_total = hs + aws
         total_odds = None
@@ -4801,7 +4814,8 @@ def _nfl_historical_replay_payload(result: dict, espn_games: list = None,
             "name": f"{gp.get('away_abbr','')} @ {gp.get('home_abbr','')}",
             "team": picked, "category": "Game Predictor (Winner)",
             "side": "WIN", "market": "gp_winner", "line": None,
-            "odds": ml_odds, "rank": len(gp_rows) + 1,
+            "odds": ml_odds, "book": ml_book or "",
+            "rank": len(gp_rows) + 1,
             "result": win_result, "actual": winner,
             "profit": round(_nfl_american_profit(
                 ml_odds, _NFL_TRK_STAKE, win_result), 2
@@ -4820,11 +4834,16 @@ def _nfl_historical_replay_payload(result: dict, espn_games: list = None,
                 gp.get("total_over_odds") if total_side == "OVER"
                 else gp.get("total_under_odds")
             )
+            total_book = (
+                gp.get("total_over_book") if total_side == "OVER"
+                else gp.get("total_under_book")
+            )
             gp_rows.append({
                 "name": f"{gp.get('away_abbr','')} @ {gp.get('home_abbr','')}",
                 "team": "", "category": "Game Predictor (Total)",
                 "side": total_side, "market": "gp_total",
                 "line": total_line, "odds": total_odds,
+                "book": total_book or "",
                 "rank": len(gp_rows) + 1, "result": total_result,
                 "actual": actual_total,
                 "profit": round(_nfl_american_profit(
@@ -4839,8 +4858,12 @@ def _nfl_historical_replay_payload(result: dict, espn_games: list = None,
             "proj_total": gp.get("proj_total"), "total_line": total_line,
             "total_pick": total_side, "home_ml_odds": gp.get("home_ml_odds"),
             "away_ml_odds": gp.get("away_ml_odds"),
+            "home_ml_book": gp.get("home_ml_book", ""),
+            "away_ml_book": gp.get("away_ml_book", ""),
             "total_over_odds": gp.get("total_over_odds"),
             "total_under_odds": gp.get("total_under_odds"),
+            "total_over_book": gp.get("total_over_book", ""),
+            "total_under_book": gp.get("total_under_book", ""),
             "game_start": gp.get("game_start", ""),
             "actual_home": int(hs) if hs.is_integer() else hs,
             "actual_away": int(aws) if aws.is_integer() else aws,
@@ -6121,7 +6144,7 @@ function _paintNflParlay(){
     +'<div style="display:flex;align-items:center;gap:8px;white-space:nowrap">'
     +'<div style="text-align:right">'
     +'<div style="color:'+dirColor(l.dir)+';font-weight:900;font-size:.8rem">'+l.dir+'</div>'
-    +'<div style="color:#f59e0b;font-size:.72rem;font-weight:800">'+(fo||'odds N/A')+'</div>'
+    +'<div style="color:#f59e0b;font-size:.72rem;font-weight:800">'+(fo||'odds N/A')+' · '+_esc(l.book||'Book unavailable')+'</div>'
     +'</div>'
     +'<button id="nflrep'+i+'" onclick="event.stopPropagation();_replaceNflParlayLeg('+i+')" title="Swap this leg for another play" style="background:#1e3a8a;color:#bfdbfe;border:1px solid #1d4ed8;border-radius:7px;padding:4px 9px;font-size:.85rem;cursor:pointer;font-weight:800;line-height:1;flex-shrink:0">&#8635;</button>'
     +'</div></div>';}).join('');
@@ -6391,6 +6414,10 @@ function _nflSideOdds(p,side){
   if(side==='UNDER') return p&&p.realUnderOdds!=null?p.realUnderOdds:null;
   return p&&p.realOdds!=null?p.realOdds:null;
 }
+function _nflSideBook(p,side){
+  side=side||(p&&p.pick)||'OVER';
+  return String((side==='UNDER'?(p&&p.under_book):(p&&p.over_book))||'Book unavailable');
+}
 function _nflIsRoiFocusPick(p){
   var odds=_nflSideOdds(p,'UNDER');
   return !!p&&p.pick==='UNDER'&&odds!=null&&Number(odds)>=-150;
@@ -6406,8 +6433,9 @@ function nflCard(p,i){
   var head=p.head||'';
   var logo='https://a.espncdn.com/i/teamlogos/nfl/500/'+_logoAbbr(p.team)+'.png';
   var shownOdds=_nflSideOdds(p);
+  var shownBook=_nflSideBook(p);
   var lineHtml=(p.realLine!=null)
-    ? `<span class="ln">${p.dispLine}</span> <span class="od">${shownOdds!=null?shownOdds:''}</span>`
+    ? `<span class="ln">${p.dispLine}</span> <span class="od">${shownOdds!=null?shownOdds:''} · ${_esc(shownBook)}</span>`
     : `<span class="est">~${p.dispLine}</span>`;
   var lastStat=(p.realLine!=null&&p.vsLineTotal)
     ? `<div class="pc-stat"><div class="k">vs Book L10</div><div class="v ${rateClass(p.vsLineRate)}">${p.vsLineHits}/${p.vsLineTotal} (${p.vsLineRate}%)</div></div>`
@@ -6434,7 +6462,7 @@ function nflCard(p,i){
        </div>
      </div>
      <div class="pc-tagrow">${fmtTag(p.tag)}</div>
-     <div class="pc-line-row"><span>${lineHtml}</span><span class="od">Line</span></div>
+      <div class="pc-line-row"><span>${lineHtml}</span><span class="od">Odds / Book</span></div>
      <div class="pc-stats">
        <div class="pc-stat"><div class="k">Career vs ${p.opponent}</div><div class="v">${_rateHtml(p.rateA,p.hitsA,p.totA)}</div></div>
        <div class="pc-stat"><div class="k">L10 ${hasHA?(ha?'Home':'Away'):'H/A'}</div><div class="v">${_rateHtml(p.rateB,p.hitsB,p.totB)}</div></div>
@@ -6453,7 +6481,7 @@ function nflCardGrid(picks,startRank){
 function _spRow(p){
   var key=_ladKey(p); window.__NFLLAD__[key]=p;
   var best=Math.max(p.rateA||0,p.rateB||0);
-  return `<div class="sp-row" onclick="openNflLadder('${key}')"><div><div class="nm">${p.name}</div><div class="mt">${p.team} vs ${p.opponent} · ${p.dispLine} ${p.pick||''}</div></div><div class="${rateClass(best)}" style="font-weight:800">${best}%</div></div>`;
+  return `<div class="sp-row" onclick="openNflLadder('${key}')"><div><div class="nm">${p.name}</div><div class="mt">${p.team} vs ${p.opponent} · ${p.dispLine} ${p.pick||''} · ${_esc(_nflSideBook(p))}</div></div><div class="${rateClass(best)}" style="font-weight:800">${best}%</div></div>`;
 }
 function _edge(p){ var g=(p.gap==null?0:p.gap); return (p.pick==='UNDER')?(-g):g; }
 function _collapseSec(id,title,inner,open){
@@ -6470,7 +6498,7 @@ function _secToggle(id){
 function _playRow(p){
   var key=_ladKey(p); window.__NFLLAD__[key]=p;
   var best=Math.max(p.rateA||0,p.rateB||0);
-  var sub=p.team+' vs '+p.opponent+' · '+(p.mkt||p.label)+' · '+p.dispLine+' '+(p.pick||'');
+  var sub=p.team+' vs '+p.opponent+' · '+(p.mkt||p.label)+' · '+p.dispLine+' '+(p.pick||'')+' · '+_nflSideBook(p);
   return '<div class="pl-row" onclick="openNflLadder(&#39;'+key+'&#39;)">'+
          '<div><div class="nm">'+p.name+'</div><div class="mt">'+sub+'</div></div>'+
          '<div class="'+rateClass(best)+'" style="font-weight:800">'+best+'%</div></div>';
@@ -6512,7 +6540,7 @@ function _underBox(picks){
   if(!u.length) return '';
   var rows=u.map(function(p){
     var key=_ladKey(p); window.__NFLLAD__[key]=p;
-    return `<div class="uprow" onclick="openNflLadder('${key}')"><div><div class="nm">${p.name}</div><div class="mt">${p.team} vs ${p.opponent} · ${p.mkt} · under ${p.underLine}</div></div><div class="${rateClass(p.underRate)}" style="font-weight:800">${p.underHits}/${p.underTotal} (${p.underRate}%)</div></div>`;
+    return `<div class="uprow" onclick="openNflLadder('${key}')"><div><div class="nm">${p.name}</div><div class="mt">${p.team} vs ${p.opponent} · ${p.mkt} · under ${p.underLine} · ${_esc(_nflSideBook(p,'UNDER'))}</div></div><div class="${rateClass(p.underRate)}" style="font-weight:800">${p.underHits}/${p.underTotal} (${p.underRate}%)</div></div>`;
   }).join('');
   return '<div class="uplays">'+rows+'</div>';
 }
@@ -6539,7 +6567,7 @@ function openNflLadder(key){
     <div class="lad-modal" onclick="event.stopPropagation()">
       <button class="lad-close" onclick="closeNflLadder()">✕</button>
       <h3>${p.name}</h3>
-      <div class="lad-sub">${p.mkt} · ${p.team} vs ${p.opponent} · Line ${p.dispLine} · ${p.pick||''}</div>
+      <div class="lad-sub">${p.mkt} · ${p.team} vs ${p.opponent} · Line ${p.dispLine} · ${p.pick||''} · ${_esc(_nflSideBook(p))}</div>
       <div style="font-size:.7rem;color:#6b7280;text-transform:uppercase;letter-spacing:.08em;font-weight:700;margin-bottom:4px">Recent Games (green = over line)</div>
       <div class="lad-glog">${chips}</div>
       ${voHtml}
@@ -6573,7 +6601,7 @@ function buildNormTable(picks, startNum){
       '<td><span class="tbadge">' + p.team + '</span></td>' +
       '<td><span class="tbadge">' + p.opponent + '</span></td>' +
       '<td>' + (hasHA ? '<span class="' + (ha ? 'home' : 'away') + '">' + (ha ? 'HOME' : 'AWAY') + '</span>' : '<span class="gray">—</span>') + '</td>' +
-      '<td>' + (p.realLine!=null ? '<span class="real-line">' + p.dispLine + '</span> <span class="odds-txt">' + (_nflSideOdds(p)!=null?_nflSideOdds(p):'') + '</span>' : '<span class="est">~' + p.dispLine + '</span>') + '</td>' +
+      '<td>' + (p.realLine!=null ? '<span class="real-line">' + p.dispLine + '</span> <span class="odds-txt">' + (_nflSideOdds(p)!=null?_nflSideOdds(p):'') + '</span><br><small class="gray">' + _esc(_nflSideBook(p)) + '</small>' : '<span class="est">~' + p.dispLine + '</span>') + '</td>' +
       '<td><span class="gold">' + p.avgA + '</span></td>' +
       '<td><span class="gold">' + p.avg + '</span></td>' +
       '<td>' + fmtVsLine(p) + '</td>' +
@@ -6597,33 +6625,33 @@ function _nflGpBetPanel(g,idx){
   window.__NFL_GP_BET__=window.__NFL_GP_BET__||{};
   var n=0;
   function _od(v){return v!=null?(v>0?'+'+v:''+v):'&#8212;';}
-  function _regML(abbr,side,odds,sfx){
+  function _regML(abbr,side,odds,book,sfx){
     var k='nfgpml'+idx+sfx; window.__NFL_GP_BET__[k]={
       name:_aa+' @ '+_ha+' \u2014 '+abbr+' to Win',team:abbr,opp:(side==='HOME'?_aa:_ha),
       category:'Game Predictor',side:side,stat_key:'gp_winner',stat_label:'to Win',
-      line:null,odds:odds,home_abbr:_ha,away_abbr:_aa,date:_gd}; return k;
+      line:null,odds:odds,book:book||'',home_abbr:_ha,away_abbr:_aa,date:_gd}; return k;
   }
-  function _regTot(dir,odds,sfx){
+  function _regTot(dir,odds,book,sfx){
     var k='nfgptl'+idx+sfx; window.__NFL_GP_BET__[k]={
       name:_aa+' @ '+_ha+' '+dir+' '+g.total_line,team:_aa+'@'+_ha,opp:'',
       category:'Game Predictor',side:dir,stat_key:'gp_total',stat_label:'Point Total',
-      line:g.total_line,odds:odds,home_abbr:_ha,away_abbr:_aa,date:_gd}; return k;
+      line:g.total_line,odds:odds,book:book||'',home_abbr:_ha,away_abbr:_aa,date:_gd}; return k;
   }
-  function _row(label,od,k,isPick){
+  function _row(label,od,book,k,isPick){
     if(od==null||!k) return '';
     var star=isPick?'&#9733; ':''; var lc=isPick?'#e9d5ff':'#94a3b8';
     return '<div style="display:flex;align-items:center;gap:6px;padding:5px 12px;border-top:1px solid #111c2e">'
       +'<div style="flex:1;font-size:.7rem;font-weight:800;color:'+lc+'">'+star+label+'</div>'
-      +'<div style="font-family:monospace;font-size:.7rem;font-weight:700;color:#fbbf24;min-width:36px;text-align:right">'+_od(od)+'</div>'
+      +'<div style="font-family:monospace;font-size:.7rem;font-weight:700;color:#fbbf24;min-width:36px;text-align:right">'+_od(od)+'<br><small style="color:#64748b">'+_esc(book||'Book unavailable')+'</small></div>'
       +'<button onclick="event.stopPropagation();_nflGpBetForm(&#39;'+k+'&#39;)" style="background:#1a1740;color:#a5b4fc;border:none;border-radius:5px 0 0 5px;padding:4px 9px;font-size:.65rem;font-weight:800;cursor:pointer;white-space:nowrap">Track</button>'
       +'</div>';
   }
   var rows='';
-  if(g.away_ml_odds!=null) rows+=_row(_aa+' ML',g.away_ml_odds,_regML(_aa,'AWAY',g.away_ml_odds,'a'),!g.pick_home);
-  if(g.home_ml_odds!=null) rows+=_row(_ha+' ML',g.home_ml_odds,_regML(_ha,'HOME',g.home_ml_odds,'h'),g.pick_home);
+  if(g.away_ml_odds!=null) rows+=_row(_aa+' ML',g.away_ml_odds,g.away_ml_book,_regML(_aa,'AWAY',g.away_ml_odds,g.away_ml_book,'a'),!g.pick_home);
+  if(g.home_ml_odds!=null) rows+=_row(_ha+' ML',g.home_ml_odds,g.home_ml_book,_regML(_ha,'HOME',g.home_ml_odds,g.home_ml_book,'h'),g.pick_home);
   if(g.total_line!=null){
-    if(g.total_over_odds!=null) rows+=_row('OVER '+g.total_line,g.total_over_odds,_regTot('OVER',g.total_over_odds,'o'),g.total_pick==='OVER');
-    if(g.total_under_odds!=null) rows+=_row('UNDER '+g.total_line,g.total_under_odds,_regTot('UNDER',g.total_under_odds,'u'),g.total_pick==='UNDER');
+    if(g.total_over_odds!=null) rows+=_row('OVER '+g.total_line,g.total_over_odds,g.total_over_book,_regTot('OVER',g.total_over_odds,g.total_over_book,'o'),g.total_pick==='OVER');
+    if(g.total_under_odds!=null) rows+=_row('UNDER '+g.total_line,g.total_under_odds,g.total_under_book,_regTot('UNDER',g.total_under_odds,g.total_under_book,'u'),g.total_pick==='UNDER');
   }
   if(!rows) return '';
   return '<div style="margin-top:8px;margin-left:-15px;margin-right:-15px;margin-bottom:-13px;border-top:1px solid #1e293b;border-radius:0 0 14px 14px;overflow:hidden;background:#070d1a">'
@@ -6632,12 +6660,12 @@ function _nflGpBetPanel(g,idx){
 }
 function _nflGpCard(g,i){
   var cc=_nflGpConfClr(g.conf);
-  function teamRow(abbr,sp,proj,win,isPick){
+  function teamRow(abbr,sp,proj,win,isPick,book){
     var barClr=isPick?'#a78bfa':'#334155';
     return '<div style="display:flex;align-items:center;gap:8px;padding:5px 0">'
       +'<div style="width:44px;font-weight:900;color:'+(isPick?'#e9d5ff':'#cbd5e1')+';font-size:.9rem">'+_esc(abbr)+'</div>'
       +'<div style="flex:1;min-width:0"><div style="height:8px;background:#0f172a;border-radius:5px;overflow:hidden"><div style="height:100%;width:'+win+'%;background:'+barClr+'"></div></div>'
-      +'<div style="font-size:.6rem;color:#64748b;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">'+_esc(sp||'TBD')+'</div></div>'
+      +'<div style="font-size:.6rem;color:#64748b;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">'+_esc(sp||'TBD')+' · '+_esc(book||'Book unavailable')+'</div></div>'
       +'<div style="width:32px;text-align:right;font-weight:800;color:#e2e8f0;font-size:.82rem">'+_nflGpFix(proj)+'</div>'
       +'<div style="width:42px;text-align:right;font-weight:900;color:'+(isPick?'#4ade80':'#94a3b8')+';font-size:.82rem">'+win+'%</div>'
       +'</div>';
@@ -6651,9 +6679,10 @@ function _nflGpCard(g,i){
     totRow='<div style="margin-top:8px;padding-top:7px;border-top:1px solid #111c2e;font-size:.66rem;color:#64748b">POINT TOTAL <span style="color:#cbd5e1;font-weight:800">'+_nflGpFix(g.proj_total)+'</span> proj &#183; no line posted</div>';
   } else {
     var ov=g.total_pick==='OVER'; var ec=(g.total_edge>0?'+':'')+_nflGpFix(g.total_edge);
+    var totalBook=ov?g.total_over_book:g.total_under_book;
     totRow='<div style="margin-top:8px;padding-top:7px;border-top:1px solid #111c2e;display:flex;align-items:center;justify-content:space-between">'
       +'<span style="font-size:.66rem;color:#64748b;font-weight:700">POINT TOTAL <span style="color:#cbd5e1">'+_nflGpFix(g.proj_total)+'</span> vs line '+_nflGpFix(g.total_line)+'</span>'
-      +'<span style="background:'+(ov?'#166534':'#7f1d1d')+';color:#fff;font-weight:900;font-size:.62rem;border-radius:6px;padding:2px 8px">'+g.total_pick+' '+ec+'</span>'
+      +'<span style="background:'+(ov?'#166534':'#7f1d1d')+';color:#fff;font-weight:900;font-size:.62rem;border-radius:6px;padding:2px 8px">'+g.total_pick+' '+ec+' · '+_esc(totalBook||'Book unavailable')+'</span>'
       +'</div>';
   }
   // Market edge row
@@ -6673,8 +6702,8 @@ function _nflGpCard(g,i){
     +'<span style="background:'+cc+';color:#fff;font-weight:900;font-size:.62rem;border-radius:6px;padding:2px 7px;letter-spacing:.04em">'+_esc(g.conf)+'</span>'
     +'<span style="background:rgba(167,139,250,.15);color:#c4b5fd;font-weight:900;font-size:.68rem;border-radius:6px;padding:2px 8px">PICK '+_esc(g.pick_abbr)+'</span>'
     +'</div></div>'
-    +teamRow(g.away_abbr,g.away_sp,g.proj_away,g.win_away,!g.pick_home)
-    +teamRow(g.home_abbr,g.home_sp,g.proj_home,g.win_home,g.pick_home)
+    +teamRow(g.away_abbr,g.away_sp,g.proj_away,g.win_away,!g.pick_home,g.away_ml_book)
+    +teamRow(g.home_abbr,g.home_sp,g.proj_home,g.win_home,g.pick_home,g.home_ml_book)
     +totRow+mktRow
     +'<div style="margin-top:6px;font-size:.66rem;color:#94a3b8;line-height:1.5"><span style="color:#7c3aed;font-weight:800">Why:</span> '+drivers+'</div>'
     +_nflGpBetPanel(g,i)
@@ -7044,7 +7073,7 @@ function _nflCoachRender(question,rows,total,mode){
       +(p.position?'<span class="nfl-coach-pos">'+_esc(p.position)+'</span>':'')
       +'<span style="color:'+statusColor+';font-weight:800">'+_esc(status)+'</span>'
       +'<span>'+_esc(p.team)+' vs '+_esc(p.opponent)+'</span>'+(venue?'<span>· '+venue+'</span>':'')+(p.slate_date?'<span>· '+_esc(p.slate_date)+'</span>':'')+'</span></span></span>'
-      +'<span class="nfl-coach-pickmeta">'+_esc(p.market)+(p.isAlternate?' · <b style="color:#fbbf24">ALT LINE</b>':'')+'<br><b style="color:'+(p.side==='OVER'?'#4ade80':'#f87171')+'">'+p.side+' '+p.line+' · '+_nflCoachOdds(p.odds)+'</b></span></summary>'
+      +'<span class="nfl-coach-pickmeta">'+_esc(p.market)+(p.isAlternate?' · <b style="color:#fbbf24">ALT LINE</b>':'')+'<br><b style="color:'+(p.side==='OVER'?'#4ade80':'#f87171')+'">'+p.side+' '+p.line+' · '+_nflCoachOdds(p.odds)+'</b><br><small style="color:#94a3b8">'+_esc(p.book||'Book unavailable')+'</small></span></summary>'
       +'<div class="nfl-coach-copy">'+(mode==='safe'?'<b style="color:#fbbf24">Safety rank: '+p.implied.toFixed(1)+'% sportsbook-implied.</b> ':'')
       +'App probability '+p.appProb.toFixed(1)+'% vs '+p.implied.toFixed(1)+'% implied = <b style="color:'+(p.edge>=0?'#4ade80':'#f87171')+'">'+_nflCoachSigned(p.edge)+' Coach Edge points</b>.</div>'
      +_nflCoachAccordions(p)+'</details>';
@@ -7953,9 +7982,12 @@ function renderNflGpRecord(){
         ?((g.actual_away!=null&&g.actual_home!=null)?_esc(g.away_abbr)+' '+g.actual_away+' — '+_esc(g.home_abbr)+' '+g.actual_home:'—')
         :(g.actual_total!=null?_esc(String(g.actual_total)):'—');
       var pick=key==='winner_result'?(g.pick_abbr||'—'):(g.total_pick?(g.total_pick+' '+g.total_line):'—');
+      var book=key==='winner_result'
+        ?(g.pick_home?g.home_ml_book:g.away_ml_book)
+        :(g.total_pick==='OVER'?g.total_over_book:g.total_under_book);
       return '<tr><td class="trk-date" data-label="Date" style="color:#94a3b8">'+_esc(g.record_date||'')+'</td>'
         +'<td data-label="Matchup" style="color:#fff;font-weight:800">'+_esc(g.away_abbr)+' @ '+_esc(g.home_abbr)+'</td>'
-        +'<td data-label="Pick" style="color:'+accent+';font-weight:900">'+_esc(pick)+'</td>'
+        +'<td data-label="Pick" style="color:'+accent+';font-weight:900">'+_esc(pick)+'<br><small style="color:#94a3b8">'+_esc(book||'Book unavailable')+'</small></td>'
         +'<td data-label="Actual" style="color:#cbd5e1">'+actual+'</td>'
         +'<td data-label="Result">'+badge(g[key])+'</td></tr>';
     }).join('');
@@ -8077,11 +8109,12 @@ function _nflTrkCatHtml(decided,stake){
     var detail=list.map(function(r){
       var result=(r.result||'PENDING').toUpperCase(),profit=_nflTrkProfit(r,stake);
       var odds=r.odds!=null?(Number(r.odds)>0?'+':'')+r.odds:'—';
+      var book=r.book||(String(r.side||'').toUpperCase()==='UNDER'?r.under_book:r.over_book)||'Book unavailable';
       return '<tr><td class="trk-date" data-label="Date" style="color:#94a3b8;font-family:monospace">'+_nflEsc(r.record_date||'')+'</td>'
         +'<td class="trk-player" data-label="Player" style="color:#fff;font-weight:900">'+_nflEsc(r.name||'')+'</td>'
         +'<td data-label="Team" style="color:#c4b5fd;font-weight:800">'+_nflEsc(r.team||'')+'</td>'
         +'<td class="trk-play" data-label="Pick" style="color:#e2e8f0;font-weight:800">'+_nflEsc((r.side||'')+(r.line!=null?' '+r.line:''))+'</td>'
-        +'<td class="trk-odds" data-label="Odds" style="font-family:monospace">'+odds+'</td>'
+        +'<td class="trk-odds" data-label="Odds / Book" style="font-family:monospace">'+odds+'<br><small style="color:#64748b">'+_nflEsc(book)+'</small></td>'
         +'<td class="trk-actual" data-label="Actual">'+(r.actual!=null?_nflEsc(String(r.actual)):'—')+'</td>'
         +'<td class="trk-result" data-label="Result / P&L"><span class="nfl-trk-result '+result.toLowerCase()+'">'+_nflEsc(result)+'</span><br><small style="font-family:monospace;color:'+(profit!=null&&profit>=0?'#4ade80':'#f87171')+'">'+(profit==null?'—':(profit>=0?'+$':'-$')+Math.abs(profit).toFixed(2))+'</small></td></tr>';
     }).join('');
@@ -8090,7 +8123,7 @@ function _nflTrkCatHtml(decided,stake){
       +'<div class="nfl-trk-group-summary"><span>'+c.w+'W · '+c.l+'L</span><span class="nfl-trk-group-rate">'+rate.toFixed(1)+'%</span>'
       +'<span class="nfl-trk-group-pl" style="color:'+plColor+'">'+(c.pl>=0?'+$':'-$')+Math.abs(c.pl).toFixed(0)+'</span>'
       +'<span style="color:'+plColor+'">'+(roi!=null?(roi>=0?'+':'')+roi.toFixed(1)+'% ROI':'—')+'</span><span class="nfl-trk-group-toggle" aria-hidden="true"></span></div></summary>'
-      +'<div class="nfl-trk-table-scroll"><table class="nfl-trk-tbl nfl-trk-compact"><thead><tr><th>Date</th><th>Player</th><th>Team</th><th>Pick</th><th>Odds</th><th>Actual</th><th>Result / P&L</th></tr></thead><tbody>'+detail+'</tbody></table></div></details>';
+      +'<div class="nfl-trk-table-scroll"><table class="nfl-trk-tbl nfl-trk-compact"><thead><tr><th>Date</th><th>Player</th><th>Team</th><th>Pick</th><th>Odds / Book</th><th>Actual</th><th>Result / P&L</th></tr></thead><tbody>'+detail+'</tbody></table></div></details>';
   }).join('');
 }
 function _nflTrkListHtml(decided,stake){
@@ -8140,13 +8173,14 @@ function _nflTrkListHtml(decided,stake){
       var resultClass=result.toLowerCase();
       var profit=_nflTrkProfit(r,stake);
       var odds=r.odds!=null?(Number(r.odds)>0?'+':'')+r.odds:'—';
+      var book=r.book||(String(r.side||'').toUpperCase()==='UNDER'?r.under_book:r.over_book)||'Book unavailable';
       var plColor=result==='WIN'?'#4ade80':(result==='LOSS'?'#f87171':'#facc15');
       return '<tr>'
         +'<td style="color:#94a3b8;font-family:monospace;font-size:.82rem">'+_nflEsc(r.record_date||'')+'</td>'
         +'<td style="color:#f8fafc;font-weight:900;font-size:.98rem">'+_nflEsc(r.name||'')+'</td>'
         +'<td style="color:#c4b5fd;font-weight:900">'+_nflEsc(r.team||'')+'</td>'
         +'<td style="color:#e2e8f0;font-weight:800">'+_nflEsc((r.side||'')+(r.line!=null?' '+r.line:''))+'</td>'
-        +'<td style="font-family:monospace;color:#cbd5e1;font-weight:800">'+odds+'</td>'
+        +'<td style="font-family:monospace;color:#cbd5e1;font-weight:800">'+odds+'<br><small style="color:#64748b">'+_nflEsc(book)+'</small></td>'
         +'<td style="color:#cbd5e1;font-weight:800">'+(r.actual!=null?_nflEsc(String(r.actual)):'—')+'</td>'
         +'<td><span class="nfl-trk-result '+resultClass+'">'+_nflEsc(result)+'</span></td>'
         +'<td style="font-family:monospace;font-weight:950;color:'+plColor+'">'+money(profit)+'</td>'
@@ -8157,7 +8191,7 @@ function _nflTrkListHtml(decided,stake){
       +'<span class="nfl-trk-group-kicker">Category</span><span class="nfl-trk-group-name">'+_nflEsc(cat)+'</span><span class="nfl-trk-group-side">'+_nflEsc(side)+'</span></div>'
       +'<div class="nfl-trk-group-summary"><span>'+meta+'</span><span class="nfl-trk-group-rate">'+(rate!=null?rate.toFixed(1)+'%':'—')+'</span><span class="nfl-trk-group-pl" style="color:'+(pl>=0?'#4ade80':'#f87171')+'">'+money(pl)+'</span><span class="nfl-trk-group-toggle" aria-hidden="true"></span></div></summary>'
       +'<div class="nfl-trk-table-scroll"><table class="nfl-trk-tbl nfl-trk-compact"><thead><tr>'
-      +'<th>Date</th><th>Player</th><th>Team</th><th>Pick</th><th>Odds</th><th>Actual</th><th>Result</th><th>P/L</th>'
+      +'<th>Date</th><th>Player</th><th>Team</th><th>Pick</th><th>Odds / Book</th><th>Actual</th><th>Result</th><th>P/L</th>'
       +'</tr></thead><tbody>'+rows+'</tbody></table></div></details>';
   }
   return order.map(groupBlock).join('');
