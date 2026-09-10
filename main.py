@@ -2891,6 +2891,17 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False,
     # _trim_prop_lines intentionally reduces analysis volume, but that reduced
     # list must never overwrite the raw odds cache.
     raw_cached_lines = list(all_lines)
+    expected_prop_games = {
+        (str(g.get("away_abbr") or _name_to_abbr(g.get("away_team", ""))),
+         str(g.get("home_abbr") or _name_to_abbr(g.get("home_team", ""))))
+        for g in espn_games
+    }
+    covered_prop_games = {
+        (str(line.get("away_abbr") or ""), str(line.get("home_abbr") or ""))
+        for line in raw_cached_lines
+    }
+    prop_coverage_complete = bool(expected_prop_games) and expected_prop_games.issubset(
+        covered_prop_games)
 
     # 4. Load NFL stats (nfl_data_py — downloads once, cached in memory)
     _p(f"Loading player stats ({len(all_lines)} props to analyze) — first run after deploy downloads ~20s…")
@@ -3010,6 +3021,7 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False,
                            if r.get("tdCalibrationReport")), [])
     result  = {"picks":picks, "all":all_results, "td_picks":td_picks, "date":date_str,
                "games":games_out, "qualified":len(picks),
+               "prop_coverage_complete": prop_coverage_complete,
                "data_warning": data_warning,
                "data_note": data_note,
                "td_calibration": {
@@ -4502,6 +4514,11 @@ def _nfl_official_capture_allowed(date_str: str, result: dict) -> bool:
         return False
     if slate_date < today:
         return False
+    # Never bank a partial player-prop board. Every scheduled game must have at
+    # least one matched sportsbook prop before a run can replace the official
+    # pre-kickoff snapshot.
+    if result.get("prop_coverage_complete") is not True:
+        return False
     now = datetime.now(timezone.utc)
     predictions = result.get("game_predictions") or []
     if not predictions:
@@ -4544,27 +4561,49 @@ def _nfl_save_historical_replay(date_str: str, replay: dict):
     print(f"[nfl_track] historical replay {'saved' if ok else 'FAILED'}: {date_str}")
     return ok
 
+_NFL_PICKS_SNAPSHOT_LOCK = _bt_th.Lock()
+
 def _nfl_save_picks_snapshot(date_str: str, result: dict):
-    """Persist today's qualified picks to Supabase so they survive redeploys
-    and can be graded once game box scores are final."""
-    picks = result.get("picks") or []
+    """Persist the latest complete pre-kickoff board for later grading.
+
+    A complete later run replaces an earlier pre-kickoff run. Once any game in
+    the saved slate has started, the snapshot is immutable."""
+    captured_at = datetime.now(timezone.utc)
+    picks = [
+        {**pick, "snapshot_captured_at": captured_at.isoformat()}
+        for pick in (result.get("picks") or [])
+    ]
     if not picks:
         return
-    existing = _nfl_sb_get("mpa_track_ledger", {
-        "app": f"eq.{_NFL_TRK_APP}", "category": f"eq.{_NFL_PICKS_CAT}",
-        "side": "eq.ALL", "date": f"eq.{date_str}",
-        "select": "detail", "limit": "1",
-    })
-    if existing and isinstance(existing[0].get("detail"), list) and existing[0]["detail"]:
-        return
-    row = {
-        "app": _NFL_TRK_APP, "date": date_str,
-        "category": _NFL_PICKS_CAT, "side": "ALL",
-        "wins": 0, "losses": 0, "locked": False,
-        "detail": picks,
-    }
-    ok = _nfl_sb_upsert("mpa_track_ledger", [row], on_conflict="app,date,category,side")
-    print(f"[nfl_track] snapshot {'saved' if ok else 'FAILED'}: {len(picks)} picks -> {date_str}")
+    with _NFL_PICKS_SNAPSHOT_LOCK:
+        existing = _nfl_sb_get("mpa_track_ledger", {
+            "app": f"eq.{_NFL_TRK_APP}", "category": f"eq.{_NFL_PICKS_CAT}",
+            "side": "eq.ALL", "date": f"eq.{date_str}",
+            "select": "detail,locked", "limit": "1",
+        })
+        if existing and existing[0].get("locked"):
+            print(f"[nfl_track] snapshot kept: official record already locked -> {date_str}")
+            return
+        if existing:
+            starts = [
+                _nfl_coach_kickoff(pick.get("game_start"))
+                for pick in (existing[0].get("detail") or [])
+            ]
+            known_starts = [start for start in starts if start]
+            if known_starts and captured_at >= min(known_starts):
+                print(f"[nfl_track] snapshot kept: saved slate already started -> {date_str}")
+                return
+        row = {
+            "app": _NFL_TRK_APP, "date": date_str,
+            "category": _NFL_PICKS_CAT, "side": "ALL",
+            "wins": 0, "losses": 0, "locked": False,
+            "detail": picks,
+        }
+        ok = _nfl_sb_upsert(
+            "mpa_track_ledger", [row], on_conflict="app,date,category,side")
+        action = "updated" if existing else "saved"
+        print(f"[nfl_track] snapshot {action if ok else 'FAILED'}: "
+              f"{len(picks)} picks -> {date_str}")
 
 def _nfl_load_picks_snapshot(date_str: str) -> list:
     rows = _nfl_sb_get("mpa_track_ledger", {
@@ -6177,8 +6216,31 @@ tr:last-child td{border-bottom:none}
       <h2 style="font-family:'Playfair Display',serif;font-size:1.4rem;font-weight:700;color:#fff">&#128200; NFL Overflow Track Record</h2>
       <div style="color:#9a7b63;font-size:.76rem;margin-top:4px">Ranks 11+ tracked separately from each category&#39;s Top 10 picks.</div>
     </div>
+    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:14px">
+      <label style="color:#9ca3af;font-size:.78rem;font-weight:700;text-transform:uppercase;letter-spacing:.1em">Record</label>
+      <select id="nflOvfSource" class="date-input" onchange="renderNflOverflowDay()">
+        <option value="official">Official</option>
+        <option value="historical">Historical Analysis</option>
+      </select>
+      <label style="color:#9ca3af;font-size:.78rem;font-weight:700;text-transform:uppercase;letter-spacing:.1em">Period</label>
+      <select id="nflOvfPeriod" class="date-input" onchange="renderNflOverflowDay()">
+        <option value="day">Day</option>
+        <option value="week">Week</option>
+        <option value="month">Month</option>
+        <option value="season">Season</option>
+        <option value="all">All Time</option>
+      </select>
+      <label style="color:#9ca3af;font-size:.78rem;font-weight:700;text-transform:uppercase;letter-spacing:.1em">Date</label>
+      <input type="date" id="nflOvfDate" class="date-input" style="width:auto" onchange="_nflOvfDayName();renderNflOverflowDay()">
+      <span id="nflOvfDayName" style="color:#f59e0b;font-weight:700;font-size:.9rem"></span>
+      <label style="color:#9ca3af;font-size:.78rem;font-weight:700;text-transform:uppercase;letter-spacing:.1em">Bet $</label>
+      <input type="number" id="nflOvfStake" class="date-input" value="20" min="0.01" step="0.01" style="width:105px" oninput="renderNflOverflowDay()">
+      <button onclick="loadNflOverflowRecord()" style="background:#92400e;color:#fff;border:none;border-radius:8px;padding:8px 14px;font-weight:700;cursor:pointer;font-size:.82rem">&#8635; Get Results</button>
+      <button id="nflOvfBtnCat" onclick="nflOvfSetTab('cat')" style="background:#92400e;color:#fff;border:none;border-radius:8px;padding:8px 14px;font-weight:700;cursor:pointer;font-size:.82rem">By Category</button>
+      <button id="nflOvfBtnList" onclick="nflOvfSetTab('list')" style="background:#1f2937;color:#fff;border:none;border-radius:8px;padding:8px 14px;font-weight:700;cursor:pointer;font-size:.82rem">Full List</button>
+    </div>
     <div id="nflOvfSummary"></div>
-    <div id="nflOvfBody"></div>
+    <div id="nflOvfBody"><p style="color:#94a3b8">Select the record, period, and date, then click Get Results.</p></div>
   </div>
 </div>
 <script>
@@ -7223,8 +7285,12 @@ function _nflCoachSafest(props){
 }
 function _nflCoachParse(question,props){
   var q=String(question||'').toLowerCase(),words=' '+q.replace(/[^a-z0-9]+/g,' ').replace(/ +/g,' ').trim()+' ';
-  var f={mode:'edge',limit:5,side:'',market:'',marketExact:'',players:[],teams:[],minOdds:null,maxOdds:null};
+  var f={mode:'edge',limit:5,side:'',market:'',marketExact:'',players:[],teams:[],minOdds:null,maxOdds:null,onePerCategory:false};
   if(q.indexOf('safe')>=0||q.indexOf('most likely')>=0||q.indexOf('highest probability')>=0)f.mode='safe';
+  if(/(?:each|every|all)\\s+(?:available\\s+)?(?:market\\s+)?categor/.test(q)
+      ||/(?:each|every|all)\\s+(?:available\\s+)?market/.test(q)){
+    f.onePerCategory=true;
+  }
   var top=words.match(/ top +([0-9]{1,2}) /);if(top)f.limit=Math.max(1,Math.min(5,Number(top[1])));
   if(words.indexOf(' under ')>=0)f.side='UNDER';else if(words.indexOf(' over ')>=0)f.side='OVER';
   var exactMarkets=[
@@ -7567,6 +7633,17 @@ function askNflCoach(){
     :(f.mode==='safe'
       ?function(a,b){return b.implied-a.implied||b.appProb-a.appProb;}
       :function(a,b){return b.edge-a.edge||b.appProb-a.appProb;}));
+  if(f.onePerCategory){
+    var seenCategories={},categoryRows=[];
+    rows.forEach(function(p){
+      var category=String(p.market||'NFL Prop');
+      if(seenCategories[category])return;
+      seenCategories[category]=1;
+      categoryRows.push(p);
+    });
+    _nflCoachRender(question,categoryRows,candidates.length,f.mode);
+    return categoryRows;
+  }
   var seenPlayers={};
   rows=rows.filter(function(p){
     var key=String(p.player||'').trim().toLowerCase();
@@ -8117,6 +8194,7 @@ async function _nflDeleteBet(id){
 }
 // ── NFL Track Record ──────────────────────────────────────────────────────────
 var _nflTrkData=null,_nflTrkTabMode='cat',_nflTrkReplayDate='',_nflTrkLoadSeq=0;
+var _nflOvfData=null,_nflOvfTabMode='cat',_nflOvfLoadSeq=0;
 function _nflTrkStake(){
   var el=document.getElementById('nflTrkStake'),n=parseFloat(el&&el.value);
   return isFinite(n)&&n>0?n:20;
@@ -8127,6 +8205,62 @@ function _nflTrkProfit(r,stake){
   var o=parseFloat(r.odds);
   if(!isFinite(o)||o===0) return null;
   return o>0?stake*(o/100):stake*(100/Math.abs(o));
+}
+function _nflOvfStake(){
+  var el=document.getElementById('nflOvfStake'),n=parseFloat(el&&el.value);
+  return isFinite(n)&&n>0?n:20;
+}
+function _nflOvfSource(){
+  var el=document.getElementById('nflOvfSource');
+  return el&&el.value==='historical'?'historical':'official';
+}
+function _nflOvfPeriod(){
+  var el=document.getElementById('nflOvfPeriod');
+  return el?el.value:'day';
+}
+function _nflOvfDayName(){
+  var dp=document.getElementById('nflOvfDate'),dn=document.getElementById('nflOvfDayName');
+  if(!dp||!dn)return;
+  try{var days=['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
+    dn.textContent=days[new Date(dp.value+'T12:00:00').getDay()];}catch(e){dn.textContent='';}
+}
+function nflOvfSetTab(tab){
+  _nflOvfTabMode=tab==='list'?'list':'cat';
+  var bc=document.getElementById('nflOvfBtnCat'),bl=document.getElementById('nflOvfBtnList');
+  if(bc)bc.style.background=_nflOvfTabMode==='cat'?'#92400e':'#1f2937';
+  if(bl)bl.style.background=_nflOvfTabMode==='list'?'#92400e':'#1f2937';
+  renderNflOverflowDay();
+}
+async function loadNflOverflowRecord(){
+  var body=document.getElementById('nflOvfBody'),dp=document.getElementById('nflOvfDate');
+  var loadSeq=++_nflOvfLoadSeq;
+  if(body)body.innerHTML='<p style="color:#9ca3af;padding:24px">Loading Overflow record\u2026</p>';
+  try{
+    var r=await fetch('/api/track-record?grade=true&date_str='+encodeURIComponent(dp?dp.value:''));
+    if(!r.ok)throw new Error(await r.text());
+    var data=await r.json();
+    if(loadSeq!==_nflOvfLoadSeq)return;
+    _nflOvfData=data;
+    renderNflOverflowDay();
+  }catch(e){
+    if(body)body.innerHTML='<p style="color:#f87171;padding:16px">'+_esc(e.message||'Error loading Overflow record')+'</p>';
+  }
+}
+function renderNflOverflowDay(){
+  if(!_nflOvfData)return;
+  var dp=document.getElementById('nflOvfDate'),selDate=dp?dp.value:'';
+  var source=_nflOvfSource(),period=_nflOvfPeriod(),stake=_nflOvfStake();
+  var dates=source==='historical'
+    ?(_nflOvfData.historical_overflow_dates||_nflOvfData.overflow_dates||[])
+    :(_nflOvfData.overflow_dates||[]);
+  var selected=_nflTrkFilterDates(dates,selDate,period),rows=[];
+  selected.forEach(function(d){(d.detail||[]).forEach(function(r){
+    if(r.result==='WIN'||r.result==='LOSS')rows.push(Object.assign({record_date:d.date},r));
+  });});
+  _nflRenderRecordBook(
+    rows,stake,_nflTrkPeriodLabel(selDate,period),
+    document.getElementById('nflOvfSummary'),document.getElementById('nflOvfBody'),
+    true,source,_nflOvfTabMode);
 }
 function _nflSeasonKey(ds){
   var y=parseInt(String(ds||'').slice(0,4),10),m=parseInt(String(ds||'').slice(5,7),10);
@@ -8431,11 +8565,7 @@ function renderNflTrackDay(){
   var mainDates=source==='historical'
     ?(_nflTrkData.historical_dates||_nflTrkData.dates||[])
     :(_nflTrkData.dates||[]);
-  var overflowDates=source==='historical'
-    ?(_nflTrkData.historical_overflow_dates||_nflTrkData.overflow_dates||[])
-    :(_nflTrkData.overflow_dates||[]);
   var selectedMain=_nflTrkFilterDates(mainDates,selDate,period);
-  var selectedOverflow=_nflTrkFilterDates(overflowDates,selDate,period);
   function flatten(days){
     var out=[];
     days.forEach(function(d){(d.detail||[]).forEach(function(r){
@@ -8447,11 +8577,7 @@ function renderNflTrackDay(){
   _nflRenderRecordBook(
     flatten(selectedMain),stake,label,
     document.getElementById('nflTrkSummary'),document.getElementById('nflTrkBody'),
-    false,source);
-  _nflRenderRecordBook(
-    flatten(selectedOverflow),stake,label,
-    document.getElementById('nflOvfSummary'),document.getElementById('nflOvfBody'),
-    true,source);
+    false,source,_nflTrkTabMode);
 }
 function _nflRoiFocusSummary(decided,stake){
   var focus=decided.filter(function(r){
@@ -8475,7 +8601,7 @@ function _nflRoiFocusSummary(decided,stake){
     +'</div></div>'
     +'<div style="color:#6b7280;font-size:.68rem;margin-top:7px">A positive historical filter is not a guarantee of future profit.</div></div>';
 }
-function _nflRenderRecordBook(decided,stake,label,sumEl,bodyEl,isOverflow,source){
+function _nflRenderRecordBook(decided,stake,label,sumEl,bodyEl,isOverflow,source,tabMode){
   if(!sumEl||!bodyEl) return;
   if(!decided.length){
     sumEl.innerHTML='<p style="color:#9ca3af;padding:12px;text-align:center">No '
@@ -8505,7 +8631,7 @@ function _nflRenderRecordBook(decided,stake,label,sumEl,bodyEl,isOverflow,source
     +(roi!=null?'<span style="font-family:monospace;font-weight:700;color:'+plColor+'">ROI '+(roi>=0?'+':'')+roi.toFixed(1)+'%</span>':'')
     +'<span style="color:#6b7280;font-size:.8rem">$'+stake+'/play \u00b7 ROI uses priced plays only</span>'
     +'</div>';
-  bodyEl.innerHTML=_nflTrkTabMode==='cat'
+  bodyEl.innerHTML=(tabMode||'cat')==='cat'
     ?_nflTrkCatHtml(decided,stake):_nflTrkListHtml(decided,stake);
 }
 function _nflTrkCatHtml(decided,stake){
@@ -8640,6 +8766,9 @@ document.addEventListener('DOMContentLoaded',function(){
   if(dp){dp.value=_nflTodayLocal();
     dp.addEventListener('change',function(){_nflTrkDayName();renderNflTrackDay();renderNflGpRecord();});}
   _nflTrkDayName();
+  var ovfDp=document.getElementById('nflOvfDate');
+  if(ovfDp)ovfDp.value=_nflTodayLocal();
+  _nflOvfDayName();
   loadNflTrackRecord(false);
   var top=document.getElementById('nfl-btn-top'),bot=document.getElementById('nfl-btn-bot');
   function _sc(){var y=window.pageYOffset||document.documentElement.scrollTop;
