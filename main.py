@@ -173,12 +173,19 @@ _CACHE_TTL = 15 * 60
 _NFL_LINE_MOVEMENT_APP = "nfl_line_movement"
 _NFL_LINE_OPEN_CATEGORY = "__wednesday_open__"
 
+def _nfl_today_date():
+    """NFL calendar day in the league's Eastern reporting timezone."""
+    return datetime.now(ZoneInfo("America/New_York")).date()
+
+def _nfl_today() -> str:
+    return _nfl_today_date().isoformat()
+
 def _is_past_date(date_key) -> bool:
     """Past dates are FINAL — historical odds/results never change, so their
     caches never expire. (Historical Odds API calls cost 10x live ones, so
     re-buying the same finished lines burns credits for nothing.)"""
     try:
-        return str(date_key) < datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        return str(date_key) < _nfl_today()
     except Exception:
         return False
 
@@ -276,7 +283,7 @@ def _hist_alt_raw_cache_set(date_key, result):
 
 async def _warm_alt_coach(date_str: str) -> dict:
     """Share one live alternate-line scan between normal runs and Coach requests."""
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    today = _nfl_today()
     if date_str < today:
         return {}
     cached = _alt_coach_cache_get(date_str)
@@ -295,7 +302,7 @@ async def _warm_alt_coach(date_str: str) -> dict:
 def _schedule_alt_coach_warm(date_str: str) -> None:
     """Start the dedicated alternate cache without delaying standard boards."""
     try:
-        if date_str >= datetime.now(timezone.utc).strftime("%Y-%m-%d"):
+        if date_str >= _nfl_today():
             asyncio.create_task(_warm_alt_coach(date_str))
     except Exception as e:
         print(f"[AltCoachCache] warm schedule error: {e}")
@@ -743,7 +750,7 @@ async def _nfl_season_schedule(season: int) -> dict:
                     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_key):
                         continue
                     # Never queue a future date as a historical replay.
-                    if date_key >= datetime.now(timezone.utc).strftime("%Y-%m-%d"):
+                    if date_key >= _nfl_today():
                         continue
                     event_id = str(event.get("id") or "")
                     if event_id and event_id in seen_events:
@@ -1297,7 +1304,7 @@ async def get_espn_roster_map(espn_games: List[Dict], date_str: str) -> dict:
     """Return normalized player name -> current roster metadata for slate teams.
     Used only for current/future games in the active season; historical runs keep
     their date-appropriate nfl-verse team history."""
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    today = _nfl_today()
     try:
         if date_str < today or int(date_str[:4]) != _cur_season:
             return {}
@@ -1358,7 +1365,7 @@ async def get_espn_roster_map(espn_games: List[Dict], date_str: str) -> dict:
 # ── Odds API ───────────────────────────────────────────────────────────────────
 async def get_odds_events(date_str: str, espn_games: List[Dict]) -> List[Dict]:
     if not ODDS_API_KEY: return []
-    today    = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    today    = _nfl_today()
     tomorrow = (datetime.fromisoformat(date_str) + timedelta(days=1)).strftime("%Y-%m-%d")
     def _match_events(odds_evs):
         matched = 0
@@ -1411,7 +1418,7 @@ async def get_prop_lines(event_id: str, date_str: str,
     fetch_key = (str(event_id), str(date_str), bool(alternate_only))
     _NFL_PROP_FETCH_STATUS[fetch_key] = "error"
     if not event_id or not ODDS_API_KEY: return []
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    today = _nfl_today()
     is_past = date_str < today
     try:
         async with httpx.AsyncClient(timeout=20) as c:
@@ -1487,7 +1494,7 @@ async def get_nfl_game_lines(event_id: str, date_str: str) -> dict:
     """Fetch moneyline (h2h) + totals for one NFL game — separate call so it
     never competes with the player-prop market quota."""
     if not event_id or not ODDS_API_KEY: return {}
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    today = _nfl_today()
     is_past = date_str < today
     try:
         async with httpx.AsyncClient(timeout=15) as c:
@@ -2602,7 +2609,7 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False,
     # a completed date with stats from that date or later.
     if not simulate:
         try:
-            if date_str < datetime.now(timezone.utc).strftime("%Y-%m-%d"):
+            if date_str < _nfl_today():
                 simulate = True
         except Exception:
             pass
@@ -2675,7 +2682,7 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False,
                 # A live response can occasionally succeed with no markets.
                 # Retry that exact game without adding any new API calls when
                 # the first response is complete.
-                today_date = datetime.now(timezone.utc).date()
+                today_date = _nfl_today_date()
                 try:
                     slate_date = datetime.strptime(date_str, "%Y-%m-%d").date()
                 except (TypeError, ValueError):
@@ -2729,7 +2736,7 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False,
             _odds_cache_set(date_str, all_lines, {})
 
     if not all_lines:
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        today = _nfl_today()
         if date_str < today:
             msg = f"No prop data found for {date_str} — the Odds API may not have archived lines for these games."
         else:
@@ -2985,7 +2992,7 @@ async def health(): return {"status":"ok"}
 
 @app.get("/api/warm")
 async def api_warm():
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    today = _nfl_today()
     cached = _cache_get(today)
     if cached:
         return {"ok":True,"source":"cache","date":today,"picks":len(cached.get("picks",[]))}
@@ -3088,8 +3095,8 @@ async def api_nfl_coach_alternates(request: Request, date_str: str = "",
         raise HTTPException(
             status_code=401,
             detail="Subscription required — please log in via moneypicksarena.com")
-    ds = date_str or datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    if ds < datetime.now(timezone.utc).strftime("%Y-%m-%d"):
+    ds = date_str or _nfl_today()
+    if ds < _nfl_today():
         raise HTTPException(
             status_code=400,
             detail="Alternate-line Coach scans are available for current and upcoming slates.")
@@ -3147,7 +3154,7 @@ async def cron_run_nfl(request: Request, date_str: str = ""):
     tok = request.headers.get("X-Internal-Token", "") or request.headers.get("Authorization", "").replace("Bearer ", "").strip()
     if not secret or not hmac.compare_digest(tok or "", secret):
         raise HTTPException(status_code=401, detail="Invalid cron token")
-    ds = date_str or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    ds = date_str or _nfl_today()
     if _CRON_BUSY_NFL:
         return {"ran": False, "cached": bool(_cache_get(ds)), "date": ds, "reason": "already running"}
     _CRON_BUSY_NFL = True
@@ -3164,7 +3171,7 @@ async def api_run(request: Request):
     tok = body.get("token","") or request.headers.get("Authorization","").replace("Bearer ","").strip()
     if not _verify_hub_token(tok):
         raise HTTPException(status_code=401, detail="Subscription required — please log in via moneypicksarena.com")
-    date_str = body.get("date", datetime.now(timezone.utc).strftime("%Y-%m-%d"))
+    date_str = body.get("date", _nfl_today())
     scope = str(body.get("scope") or "day").lower()
     if scope not in ("day", "week"):
         raise HTTPException(status_code=400, detail="Run scope must be day or week")
@@ -3179,7 +3186,7 @@ async def api_run(request: Request):
                 if scope == "week":
                     dates = _nfl_week_dates(date_str)
                     results = [None] * len(dates)
-                    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                    today = _nfl_today()
                     week_sem = asyncio.Semaphore(_NFL_WEEK_DATE_CONCURRENCY)
                     completed = 0
 
@@ -3212,6 +3219,11 @@ async def api_run(request: Request):
                                         timeout=_NFL_WEEK_DAY_TIMEOUT)
                                     _nfl_capture_opening_lines(ds, result)
                                     _nfl_attach_line_movement(ds, result)
+                                    # A full-week run is a valid pre-kickoff
+                                    # Game Predictor forecast for each slate.
+                                    # Keep player-prop official capture in its
+                                    # existing game-day-only path.
+                                    _nfl_save_gp_snapshot(ds, result)
                                     results[index] = result
                                 except asyncio.TimeoutError:
                                     results[index] = {
@@ -3464,7 +3476,7 @@ async def api_cached(request: Request, target_date: str = "", token: str = "",
     tok = token or request.headers.get("Authorization", "").replace("Bearer ", "").strip()
     if not _verify_hub_token(tok):
         raise HTTPException(status_code=401, detail="Subscription required — please log in via moneypicksarena.com")
-    date_str = target_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    date_str = target_date or _nfl_today()
     if str(scope).lower() == "week":
         daily = []
         for ds in _nfl_week_dates(date_str):
@@ -3493,13 +3505,13 @@ async def api_picks(request: Request, target_date: str = "", token: str = "",
     if not _verify_hub_token(tok) and not (
             simulate and _nfl_batch_admin_ok(request, tok, admin)):
         raise HTTPException(status_code=401, detail="Subscription required — please log in via moneypicksarena.com")
-    date_str = target_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    date_str = target_date or _nfl_today()
     if simulate:
         try:
             replay_date = datetime.strptime(date_str, "%Y-%m-%d").date()
         except (TypeError, ValueError):
             raise HTTPException(status_code=400, detail="A valid completed NFL date is required")
-        if replay_date >= datetime.now(timezone.utc).date():
+        if replay_date >= _nfl_today_date():
             raise HTTPException(status_code=400, detail="Historical replays are available only for completed dates")
     result = await run_pipeline(date_str, simulate=simulate)
     if not simulate:
@@ -3718,7 +3730,7 @@ def _nfl_settle_cached(bet: dict, name_stats: dict) -> bool:
     bet["result"] = res
     bet["actual"] = actual
     bet["profit"] = round(_nfl_american_profit(bet.get("odds"), bet.get("stake"), res), 2)
-    bet["settled_at"] = _bt_date.today().isoformat()
+    bet["settled_at"] = _nfl_today()
     return True
 
 
@@ -3726,7 +3738,7 @@ def _nfl_settle_bet(bet: dict) -> bool:
     if bet.get("result") in ("WIN", "LOSS", "PUSH"):
         return False
     bdate = bet.get("date")
-    if not bdate or bdate >= _bt_date.today().isoformat():
+    if not bdate or bdate >= _nfl_today():
         return False
     try:
         ns = _nfl_box_lookup(bdate)
@@ -3737,7 +3749,7 @@ def _nfl_settle_bet(bet: dict) -> bool:
 
 
 def _nfl_settle_batch(bets: list) -> bool:
-    today = _bt_date.today().isoformat()
+    today = _nfl_today()
     dates_needed: set = set()
     for b in bets:
         if b.get("result") in ("WIN", "LOSS", "PUSH"):
@@ -3822,6 +3834,113 @@ def _nfl_sb_insert_ignore(table, rows, on_conflict):
     except Exception as e:
         print(f"[nfl_sb_insert_ignore] {e}")
         return None
+
+def _nfl_sb_save_latest_unlocked(table, row, captured_at):
+    """Atomically insert or replace only an older, still-unlocked snapshot."""
+    inserted = _nfl_sb_insert_ignore(
+        table, [row], "app,date,category,side")
+    if inserted is None:
+        return "error"
+    if inserted:
+        return "saved"
+    try:
+        params = {
+            "app": f"eq.{row['app']}", "date": f"eq.{row['date']}",
+            "category": f"eq.{row['category']}", "side": f"eq.{row['side']}",
+            "locked": "eq.false",
+            # While unlocked, locked_at stores the earliest kickoff deadline.
+            # PostgreSQL parses `now` at statement time.
+            "locked_at": "gt.now",
+            "detail->0->>captured_at": f"lt.{captured_at}",
+        }
+        response = httpx.patch(
+            f"{_SB_URL}/rest/v1/{table}", params=params,
+            headers={
+                "apikey": _SB_KEY, "Authorization": f"Bearer {_SB_KEY}",
+                "Content-Type": "application/json",
+                "Prefer": "return=representation",
+            },
+            # Preserve result/lock state while atomically moving the unlocked
+            # deadline to the incoming snapshot's earliest kickoff.
+            json={
+                "detail": row["detail"],
+                "locked_at": row["locked_at"],
+            }, timeout=20)
+        if response.status_code not in (200, 204):
+            print(f"[nfl_sb_latest] HTTP {response.status_code}: {response.text[:200]}")
+            return "error"
+        changed = response.json() if response.content else []
+        return "updated" if changed else "refused"
+    except Exception as exc:
+        print(f"[nfl_sb_latest] {exc}")
+        return "error"
+
+def _nfl_sb_backfill_coach_deadline(saved, deadline):
+    """Add a kickoff deadline to a legacy unlocked Coach snapshot."""
+    detail = saved.get("detail") or []
+    version = str((detail[0] if detail else {}).get("captured_at") or "")
+    if not version:
+        return False
+    try:
+        response = httpx.patch(
+            f"{_SB_URL}/rest/v1/mpa_track_ledger",
+            params={
+                "app": f"eq.{_NFL_COACH_TRK_APP}",
+                "date": f"eq.{saved['date']}",
+                "category": f"eq.{saved['category']}",
+                "side": "eq.ALL", "locked": "eq.false",
+                "locked_at": "is.null",
+                "detail->0->>captured_at": f"eq.{version}",
+            },
+            headers={
+                "apikey": _SB_KEY, "Authorization": f"Bearer {_SB_KEY}",
+                "Content-Type": "application/json",
+                "Prefer": "return=representation",
+            },
+            json={"locked_at": deadline}, timeout=20)
+        return (
+            response.status_code in (200, 204)
+            and bool(response.json() if response.content else []))
+    except Exception as exc:
+        print(f"[nfl_coach_deadline] {exc}")
+        return False
+
+def _nfl_sb_lock_coach_cas(saved, graded, summary):
+    """Lock only the exact Coach capture version that was graded."""
+    detail = saved.get("detail") or []
+    version = str((detail[0] if detail else {}).get("captured_at") or "")
+    if not version:
+        return False
+    try:
+        response = httpx.patch(
+            f"{_SB_URL}/rest/v1/mpa_track_ledger",
+            params={
+                "app": f"eq.{_NFL_COACH_TRK_APP}",
+                "date": f"eq.{saved['date']}",
+                "category": f"eq.{saved['category']}",
+                "side": "eq.ALL", "locked": "eq.false",
+                "detail->0->>captured_at": f"eq.{version}",
+            },
+            headers={
+                "apikey": _SB_KEY, "Authorization": f"Bearer {_SB_KEY}",
+                "Content-Type": "application/json",
+                "Prefer": "return=representation",
+            },
+            json={
+                "wins": summary["wins"], "losses": summary["losses"],
+                "locked": True,
+                "locked_at": datetime.now(timezone.utc).isoformat(),
+                "detail": graded,
+            },
+            timeout=20)
+        if response.status_code not in (200, 204):
+            print(f"[nfl_coach_cas] HTTP {response.status_code}: {response.text[:200]}")
+            return False
+        changed = response.json() if response.content else []
+        return bool(changed)
+    except Exception as exc:
+        print(f"[nfl_coach_cas] {exc}")
+        return False
 
 
 def _nfl_line_identity(row: dict) -> str:
@@ -3944,6 +4063,7 @@ _NFL_COACH_TRK_APP = "nfl_coach_track"
 _NFL_COACH_HIST_APP = "nfl_coach_historical"
 _NFL_COACH_CATS = ("safest_bets", "coach_edge", "alt_line_edge", "passing",
                    "rushing", "receiving", "td_scorers", "best_unders")
+_NFL_COACH_CAPTURE_GUARD_SECONDS = 120
 
 def _nfl_coach_hist_implied(odds):
     try:
@@ -4246,7 +4366,7 @@ def _nfl_coach_summary(rows):
 def _nfl_official_capture_allowed(date_str: str, result: dict) -> bool:
     """Official records require a slate captured before every kickoff.
     Historical/manual after-the-fact runs remain view-only simulations."""
-    today = datetime.now(timezone.utc).date()
+    today = _nfl_today_date()
     try:
         slate_date = datetime.strptime(date_str, "%Y-%m-%d").date()
     except (TypeError, ValueError):
@@ -4350,19 +4470,11 @@ def _nfl_gp_is_pre_game(prediction: dict) -> bool:
 
 def _nfl_save_gp_snapshot(date_str: str, result: dict):
     """Freeze Game Predictor winner/total calls separately from player props."""
-    predictions = [
-        p for p in (result.get("game_predictions") or [])
-        if _nfl_gp_is_pre_game(p)
-    ]
-    if not predictions:
-        print(f"[nfl_track] GP snapshot skipped: no pre-game calls for {date_str}")
-        return
-    existing = _nfl_sb_get("mpa_track_ledger", {
-        "app": f"eq.{_NFL_TRK_APP}", "category": f"eq.{_NFL_GP_CAT}",
-        "side": "eq.ALL", "date": f"eq.{date_str}",
-        "select": "detail", "limit": "1",
-    })
-    if existing and isinstance(existing[0].get("detail"), list) and existing[0]["detail"]:
+    predictions = result.get("game_predictions") or []
+    # Never freeze a partial date. If any game has started (or lacks a reliable
+    # kickoff), wait rather than permanently saving only the remaining games.
+    if not predictions or not all(_nfl_gp_is_pre_game(p) for p in predictions):
+        print(f"[nfl_track] GP snapshot skipped: incomplete pre-game slate for {date_str}")
         return
     detail = []
     for p in predictions:
@@ -4379,11 +4491,11 @@ def _nfl_save_gp_snapshot(date_str: str, result: dict):
             "total_under_odds": p.get("total_under_odds"),
             "game_start": p.get("game_start", ""),
         })
-    ok = _nfl_sb_upsert("mpa_track_ledger", [{
+    ok = _nfl_sb_insert_ignore("mpa_track_ledger", [{
         "app": _NFL_TRK_APP, "date": date_str, "category": _NFL_GP_CAT,
         "side": "ALL", "wins": 0, "losses": 0, "locked": False,
         "detail": detail,
-    }], on_conflict="app,date,category,side")
+    }], "app,date,category,side")
     print(f"[nfl_track] GP snapshot {'saved' if ok else 'FAILED'}: "
           f"{len(detail)} games -> {date_str}")
 
@@ -4502,7 +4614,7 @@ def _nfl_gp_record_payload() -> dict:
 
 def _nfl_update_gp_ledger(include_date: str = ""):
     """Grade unlocked official GP snapshots; historical replay never calls this."""
-    today = _bt_date.today().isoformat()
+    today = _nfl_today()
     for saved in _nfl_load_gp_snapshots():
         d = saved.get("date")
         if not d or d > today or (d == today and d != include_date) or saved.get("locked"):
@@ -4763,7 +4875,7 @@ def _nfl_update_track_ledger(include_date: str = ""):
     """Grade all saved pick snapshots for past dates not yet locked.
     Safe to call repeatedly — locked dates are skipped."""
     from datetime import date as _d
-    today = _d.today().isoformat()
+    today = _nfl_today()
     with _NFL_TRK_LOCK:
         locked_rows = _nfl_sb_get("mpa_track_ledger", {
             "app": f"eq.{_NFL_TRK_APP}", "category": f"eq.{_NFL_LEDGER_CAT}",
@@ -4909,7 +5021,7 @@ async def nfl_add_bet(request: Request, token: str = "", admin: str = ""):
     side = (body.get("side") or "OVER").strip().upper()
     if not name or market not in _NFL_BET_STAT_KEYS or side not in ("OVER", "UNDER"):
         raise HTTPException(status_code=400, detail="Invalid bet")
-    bdate = (body.get("date") or _bt_date.today().isoformat()).strip()
+    bdate = (body.get("date") or _nfl_today()).strip()
     bet = {"id": _bt_uuid.uuid4().hex[:12], "date": bdate,
            "name": name, "pid": str(body.get("pid") or ""),
            "team": (body.get("team") or "").strip(),
@@ -4918,7 +5030,7 @@ async def nfl_add_bet(request: Request, token: str = "", admin: str = ""):
            "side": side, "market": market,
            "stat_label": (body.get("stat_label") or _NFL_STAT_LABEL.get(market, "")).strip(),
            "line": line, "odds": odds, "stake": stake,
-           "placed_at": (body.get("placed_at") or _bt_date.today().isoformat()),
+           "placed_at": (body.get("placed_at") or _nfl_today()),
            "result": "pending", "actual": None, "profit": None, "settled_at": None}
     try:
         _nfl_settle_bet(bet)
@@ -5107,21 +5219,68 @@ def _nfl_coach_trusted_capture_source(date_str, raw):
             return {"primary": dict(row)}
     return None
 
+def _nfl_coach_capture_identity(row):
+    try:
+        return (
+            _norm(str(row.get("player") or row.get("name") or "")),
+            _nfl_coach_market_key(
+                row.get("market") or row.get("market_label")),
+            str(row.get("side") or row.get("pick") or "").upper(),
+            round(float(row.get("line", row.get("realLine"))), 6),
+            int(float(row.get("odds"))),
+        )
+    except (TypeError, ValueError):
+        return None
+
+def _nfl_coach_canonical_capture(date_str, category):
+    """Rebuild the complete current preset from server-owned cached picks."""
+    if category == "alt_line_edge":
+        source = _alt_coach_cache_get(date_str)
+        picks = source.get("picks") if isinstance(source, dict) else []
+        return _nfl_coach_hist_select(
+            _nfl_coach_hist_candidates(picks), category, alternate=True)
+    source = _cache_get(date_str)
+    picks = ((source.get("coach_candidates") or source.get("picks") or [])
+             if isinstance(source, dict) else [])
+    return _nfl_coach_hist_select(
+        _nfl_coach_hist_candidates(picks), category)
+
 def _nfl_grade_coach_ledger():
     for saved in _nfl_coach_ledger_rows():
         if saved.get("locked") or not isinstance(saved.get("detail"), list):
             continue
         try:
-            graded = _nfl_coach_grade_snapshot(saved["date"], saved["detail"])
-            terminal = bool(graded) and all(
-                r.get("result") in ("WIN","LOSS","PUSH","VOID")
-                for r in graded)
-            _nfl_sb_upsert("mpa_track_ledger", [{"app": _NFL_COACH_TRK_APP,
-                "date": saved["date"], "category": saved["category"], "side": "ALL",
-                "wins": sum(r.get("result") == "WIN" for r in graded),
-                "losses": sum(r.get("result") == "LOSS" for r in graded), "locked": terminal,
-                "locked_at": datetime.now(timezone.utc).isoformat() if terminal else None,
-                "detail": graded}], "app,date,category,side")
+            current = saved
+            for attempt in range(2):
+                graded = _nfl_coach_grade_snapshot(
+                    current["date"], current["detail"])
+                terminal = bool(graded) and all(
+                    r.get("result") in ("WIN","LOSS","PUSH","VOID")
+                    for r in graded)
+                # Pending rows remain untouched so grading cannot overwrite a
+                # newer pre-kickoff capture with stale PENDING detail.
+                if not terminal:
+                    break
+                summary = {
+                    "wins": sum(r.get("result") == "WIN" for r in graded),
+                    "losses": sum(r.get("result") == "LOSS" for r in graded),
+                }
+                if _nfl_sb_lock_coach_cas(current, graded, summary):
+                    break
+                if attempt:
+                    print("[nfl_coach_track] CAS retry lost for "
+                          f"{current['date']} {current['category']}")
+                    break
+                latest = _nfl_sb_get("mpa_track_ledger", {
+                    "app": f"eq.{_NFL_COACH_TRK_APP}",
+                    "date": f"eq.{current['date']}",
+                    "category": f"eq.{current['category']}",
+                    "side": "eq.ALL",
+                    "select": "date,category,detail,locked", "limit": "1",
+                })
+                if not latest or latest[0].get("locked"):
+                    break
+                current = latest[0]
         except Exception as exc: print(f"[nfl_coach_track] grade failed: {exc}")
 
 @app.post("/api/nfl/coach-track/capture")
@@ -5132,9 +5291,25 @@ async def nfl_coach_track_capture(request: Request, token: str = ""):
     body = await request.json(); category = str(body.get("category") or ""); date_str = str(body.get("date") or ""); rows = body.get("rows")
     if category not in _NFL_COACH_CATS or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_str) or not isinstance(rows, list) or not rows:
         raise HTTPException(400, "Invalid preset capture; no snapshot was saved.")
-    exists = _nfl_sb_get("mpa_track_ledger", {"app":f"eq.{_NFL_COACH_TRK_APP}","date":f"eq.{date_str}","category":f"eq.{category}","side":"eq.ALL","select":"date","limit":"1"})
-    if exists: return {"ok":True,"status":"already_saved","message":"This preset is already saved for this date/category."}
+    canonical = _nfl_coach_canonical_capture(date_str, category)
+    submitted_ids = [_nfl_coach_capture_identity(row) for row in rows]
+    canonical_ids = [_nfl_coach_capture_identity(row) for row in canonical]
+    if (not canonical_ids or any(item is None for item in submitted_ids)
+            or submitted_ids != canonical_ids):
+        raise HTTPException(
+            409,
+            "Coach capture rejected: the displayed list is not the complete "
+            "latest server-ranked preset. Run that Coach preset again.")
+    existing = _nfl_sb_get("mpa_track_ledger", {"app":f"eq.{_NFL_COACH_TRK_APP}","date":f"eq.{date_str}","category":f"eq.{category}","side":"eq.ALL","select":"date,locked,locked_at,detail","limit":"1"})
+    if existing and existing[0].get("locked"):
+        return {"ok":True,"status":"locked",
+                "message":"Results are locked; the final pregame snapshot cannot be changed."}
     now, frozen = datetime.now(timezone.utc), []
+    if existing and any(
+            (_nfl_coach_kickoff(row.get("game_start")) or now) <= now
+            for row in (existing[0].get("detail") or [])):
+        return {"ok":True,"status":"locked",
+                "message":"This Coach category is frozen because one of its games has started."}
     for raw in rows:
         if not isinstance(raw, dict):
             raise HTTPException(400, "Coach capture rejected: invalid displayed row.")
@@ -5167,9 +5342,52 @@ async def nfl_coach_track_capture(request: Request, token: str = ""):
                 "alternate":bool(raw.get("alternate")),
                 "captured_at":now.isoformat(),"result":"PENDING","actual":None,"units":None})
         except (TypeError, ValueError): raise HTTPException(400, "Coach capture rejected: invalid displayed play values.")
-    inserted = _nfl_sb_insert_ignore("mpa_track_ledger", [{"app":_NFL_COACH_TRK_APP,"date":date_str,"category":category,"side":"ALL","wins":0,"losses":0,"locked":False,"detail":frozen}], "app,date,category,side")
-    if inserted is None: raise HTTPException(503, "AI Coach Track Record could not be persisted; nothing was saved.")
-    return {"ok":True,"status":"saved" if inserted else "already_saved","message":"Coach snapshot saved." if inserted else "This preset is already saved for this date/category."}
+    # Recheck immediately before writing so a slow request cannot replace the
+    # banked list after kickoff. Until then, each run replaces the prior run;
+    # therefore the final run before kickoff is the official Coach snapshot.
+    write_time = datetime.now(timezone.utc)
+    kickoffs = [
+        _nfl_coach_kickoff(row.get("game_start")) for row in frozen]
+    safe_write_cutoff = write_time + timedelta(
+        seconds=_NFL_COACH_CAPTURE_GUARD_SECONDS)
+    if any(not kickoff or kickoff <= safe_write_cutoff for kickoff in kickoffs):
+        raise HTTPException(
+            400, "Coach capture rejected: kickoff is less than two minutes away "
+                 "or passed before the snapshot was saved.")
+    snapshot_deadline = min(kickoffs).isoformat()
+    for row in frozen:
+        row["snapshot_deadline"] = snapshot_deadline
+    if existing and not existing[0].get("locked_at"):
+        legacy_kickoffs = [
+            _nfl_coach_kickoff(row.get("game_start"))
+            for row in (existing[0].get("detail") or [])]
+        legacy_deadline = min(
+            (kickoff for kickoff in legacy_kickoffs if kickoff),
+            default=min(kickoffs)).isoformat()
+        _nfl_sb_backfill_coach_deadline(
+            existing[0], legacy_deadline)
+    save_state = _nfl_sb_save_latest_unlocked("mpa_track_ledger", {
+        "app":_NFL_COACH_TRK_APP,"date":date_str,"category":category,
+        "side":"ALL","wins":0,"losses":0,"locked":False,
+        # While unlocked this is the database-filterable kickoff deadline.
+        # Terminal grading replaces it with the actual lock timestamp.
+        "locked_at":snapshot_deadline,"detail":frozen,
+    }, now.isoformat())
+    if save_state == "error":
+        raise HTTPException(
+            503, "AI Coach Track Record could not be persisted; nothing was saved.")
+    if save_state == "refused":
+        return {
+            "ok":True, "status":"no_update",
+            "message":(
+                "No change: a newer pregame run is already banked or this "
+                "category locked while the request was being saved."),
+        }
+    return {
+        "ok":True, "status":save_state,
+        "message":("Latest pregame Coach snapshot replaced the earlier run."
+                   if save_state == "updated" else "Coach snapshot saved."),
+    }
 
 @app.get("/api/nfl/coach-track")
 async def nfl_coach_track(request: Request, token: str = "", grade: bool = False,
@@ -5214,7 +5432,7 @@ async def nfl_coach_track_grade(request: Request, token: str = ""):
 
 @app.get("/", response_class=HTMLResponse)
 async def index(admin: str = "", token: str = ""):
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    today = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
     is_admin = (bool(admin) and admin == os.environ.get("INTERNAL_API_TOKEN", "__none__")) or _is_admin_token(token)
     js_flag = "true" if is_admin else "false"
     html = (
@@ -5654,7 +5872,15 @@ tr:last-child td{border-bottom:none}
         <h2 style="font-family:'Playfair Display',serif;font-size:1.4rem;font-weight:700;color:#fff">&#128302; NFL Game Predictor Record</h2>
         <div style="color:#7c8aa0;font-size:.76rem;margin-top:4px">Official pre-game forecasts tracked separately for game winners and point totals.</div>
       </div>
-      <button onclick="loadNflTrackRecord()" style="background:#6d28d9;color:#fff;border:none;border-radius:8px;padding:8px 14px;font-weight:700;cursor:pointer;font-size:.82rem">&#8635; Get Results</button>
+      <button onclick="loadNflGpRecord()" style="background:#6d28d9;color:#fff;border:none;border-radius:8px;padding:8px 14px;font-weight:700;cursor:pointer;font-size:.82rem">&#8635; Get Results</button>
+    </div>
+    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:14px">
+      <label style="color:#9ca3af;font-size:.72rem;font-weight:800;text-transform:uppercase;letter-spacing:.09em">Season</label>
+      <select id="nflGpSeason" class="date-input" onchange="_nflGpControlChanged('season')"></select>
+      <label style="color:#9ca3af;font-size:.72rem;font-weight:800;text-transform:uppercase;letter-spacing:.09em">Week</label>
+      <select id="nflGpWeek" class="date-input" onchange="_nflGpControlChanged('week')"></select>
+      <label style="color:#9ca3af;font-size:.72rem;font-weight:800;text-transform:uppercase;letter-spacing:.09em">Game Date</label>
+      <select id="nflGpDate" class="date-input" onchange="renderNflGpRecord()"></select>
     </div>
     <div id="nflGpTrkSummary"></div>
     <div id="nflGpTrkBody"></div>
@@ -5927,6 +6153,10 @@ function _nflRunScope(){
   var el=document.getElementById('runScope');
   return el&&el.value==='week'?'week':'day';
 }
+function _nflTodayLocal(){
+  var d=new Date(),y=d.getFullYear(),m=String(d.getMonth()+1).padStart(2,'0'),day=String(d.getDate()).padStart(2,'0');
+  return y+'-'+m+'-'+day;
+}
 function _nflRunScopeChanged(){
   var hint=document.getElementById('runScopeHint'),week=_nflRunScope()==='week';
   if(hint)hint.textContent=week
@@ -6028,7 +6258,7 @@ async function getPicks(){
   var btn=document.getElementById('getBtn');
   var status=document.getElementById('statusMsg');
   var orig=btn.textContent;
-  var isHistorical=scope==='day'&&date<new Date().toISOString().slice(0,10);
+  var isHistorical=scope==='day'&&date<_nflTodayLocal();
   btn.disabled=true;
   btn.innerHTML='<span class="spinner"></span>'+(isHistorical?'Replaying...':'Loading...');
   status.innerHTML='<span class="spinner"></span>'+(scope==='week'
@@ -6827,7 +7057,7 @@ function _nflCoachCapture(category,rows){
     var payload={category:category,date:ds,rows:groups[ds]};
     return fetch('/api/nfl/coach-track/capture?token='+encodeURIComponent(token),{method:'POST',headers:{'Content-Type':'application/json','Authorization':token?'Bearer '+token:''},body:JSON.stringify(payload)}).then(function(r){return r.json().then(function(x){if(!r.ok)throw new Error(x.detail||'Save failed');return x;});});
   });
-  Promise.all(requests).then(function(results){if(status){status.style.color='#86efac';status.textContent='Saved '+results.length+' game-date snapshot'+(results.length===1?'':'s')+'.';}}).catch(function(e){if(status){status.style.color='#f87171';status.textContent='Not saved: '+e.message;}});
+  Promise.all(requests).then(function(results){if(status){var changed=results.filter(function(x){return x.status==='saved'||x.status==='updated';}).length,refused=results.length-changed,updated=results.some(function(x){return x.status==='updated';});status.style.color=refused?'#fbbf24':'#86efac';status.textContent=changed?((updated?'Updated latest pregame':'Saved')+' '+changed+' game-date snapshot'+(changed===1?'':'s')+'. The final run before kickoff is banked.'+(refused?' '+refused+' date was already frozen or newer.':'')):('No snapshot changed: '+results.map(function(x){return x.message||x.status;}).join(' '));}}).catch(function(e){if(status){status.style.color='#f87171';status.textContent='Not saved: '+e.message;}});
 }
 function askNflCoachPreset(q,category){var input=document.getElementById('nflCoachInput');if(input)input.value=q;_nflCoachCapture(category,askNflCoach());}
 async function askNflAltCoach(){
@@ -7457,6 +7687,8 @@ function _nflTrkSource(){
   return el&&el.value==='historical'?'historical':'official';
 }
 function nflTrkSourceChanged(){
+  var gpDate=document.getElementById('nflGpDate');
+  if(gpDate){gpDate.dataset.ready='';gpDate.value='';}
   if(_nflTrkSource()==='historical'&&_nflTrkData){
     var dates=_nflTrkData.historical_dates||[];
     if(dates.length){
@@ -7567,6 +7799,22 @@ async function loadNflTrackRecord(forceOfficial){
     if(body) body.innerHTML='<p style="color:#f87171;padding:16px">'+(e.message||'Error loading track record')+'</p>';
   }
 }
+async function loadNflGpRecord(){
+  var body=document.getElementById('nflGpTrkBody'),dateEl=document.getElementById('nflGpDate');
+  if(_nflTrkSource()==='historical'){renderNflGpRecord();return;}
+  if(body) body.innerHTML='<p style="color:#9ca3af;padding:18px 0">Loading Game Predictor results\u2026</p>';
+  try{
+    var selected=dateEl&&dateEl.value&&dateEl.value!=='all'?dateEl.value:'';
+    var r=await fetch('/api/gp-record?grade=true&date_str='+encodeURIComponent(selected));
+    if(!r.ok) throw new Error(await r.text());
+    var gp=await r.json();
+    _nflTrkData=_nflTrkData||{};
+    _nflTrkData.game_predictor=gp;
+    renderNflGpRecord();
+  }catch(e){
+    if(body) body.innerHTML='<p style="color:#f87171;padding:16px">'+_esc(e.message||'Could not load Game Predictor results')+'</p>';
+  }
+}
 function nflTrkSetTab(tab){
   _nflTrkTabMode=tab;
   var bc=document.getElementById('nflTrkBtnCat'),bl=document.getElementById('nflTrkBtnList');
@@ -7574,19 +7822,79 @@ function nflTrkSetTab(tab){
   if(bl) bl.style.background=tab==='list'?'#065f46':'#1f2937';
   renderNflTrackDay();
 }
+function _nflGpWeekNumber(ds){
+  var season=_nflSeasonKey(ds);
+  if(season==null)return null;
+  var sep1=new Date(Date.UTC(season,8,1)),firstMonday=1+((8-sep1.getUTCDay())%7);
+  var weekOneTuesday=new Date(Date.UTC(season,8,firstMonday+1));
+  var wkDate=new Date(_nflWeekKey(ds)+'T12:00:00Z');
+  return Math.min(22,Math.max(1,Math.floor((wkDate-weekOneTuesday)/(7*86400000))+1));
+}
+function _nflGpPopulateControls(daily){
+  var seasonEl=document.getElementById('nflGpSeason'),weekEl=document.getElementById('nflGpWeek'),dateEl=document.getElementById('nflGpDate');
+  if(!seasonEl||!weekEl||!dateEl)return;
+  var boardDate=(document.getElementById('datePicker')||{}).value||'';
+  var latest=(daily||[]).reduce(function(v,d){return String(d.date||'')>v?String(d.date):v;},'');
+  var target=dateEl.dataset.ready==='1'?'':((daily||[]).some(function(d){return d.date===boardDate;})?boardDate:latest);
+  var seasons=[];
+  (daily||[]).forEach(function(d){var s=_nflSeasonKey(d.date);if(s!=null&&seasons.indexOf(s)<0)seasons.push(s);});
+  seasons.sort(function(a,b){return b-a;});
+  var oldSeason=seasonEl.value,oldWeek=weekEl.value,oldDate=dateEl.value;
+  seasonEl.innerHTML=seasons.map(function(s){return '<option value="'+s+'">'+s+' Season</option>';}).join('');
+  var desiredSeason=target?_nflSeasonKey(target):(oldSeason||seasons[0]);
+  if(seasons.indexOf(Number(desiredSeason))<0)desiredSeason=seasons[0];
+  if(desiredSeason!=null)seasonEl.value=String(desiredSeason);
+  weekEl.innerHTML='<option value="all">All Weeks</option>'+Array.from({length:22},function(_,i){return '<option value="'+(i+1)+'">Week '+(i+1)+'</option>';}).join('');
+  var desiredWeek=target?_nflGpWeekNumber(target):(oldWeek||'all');
+  if(desiredWeek!=='all'&&(!isFinite(Number(desiredWeek))||Number(desiredWeek)<1||Number(desiredWeek)>22))desiredWeek='all';
+  weekEl.value=String(desiredWeek||'all');
+  var matching=(daily||[]).filter(function(d){
+    return String(_nflSeasonKey(d.date))===seasonEl.value&&(weekEl.value==='all'||String(_nflGpWeekNumber(d.date))===weekEl.value);
+  });
+  matching.sort(function(a,b){return String(a.date).localeCompare(String(b.date));});
+  dateEl.innerHTML='<option value="all">All dates in selection</option>'+matching.map(function(d){
+    var games=(d.games||[]).map(function(g){return (g.away_abbr||'?')+' @ '+(g.home_abbr||'?');}).join(', ');
+    return '<option value="'+_esc(d.date)+'">'+_esc(d.date)+(games?' · '+_esc(games):'')+'</option>';
+  }).join('');
+  if(target&&matching.some(function(d){return d.date===target;}))dateEl.value=target;
+  else if(oldDate&&matching.some(function(d){return d.date===oldDate;}))dateEl.value=oldDate;
+  else dateEl.value='all';
+  dateEl.dataset.ready='1';
+}
+function _nflGpData(){
+  var hist=_nflTrkSource()==='historical';
+  if(!_nflTrkData)return null;
+  if(!hist)return _nflTrkData.game_predictor||null;
+  return _nflTrkData.historical===true
+    ?(_nflTrkData.game_predictor||null)
+    :(_nflTrkData.historical_game_predictor||null);
+}
+function _nflGpDaily(){
+  var gp=_nflGpData();
+  return (gp&&gp.daily)||[];
+}
+function _nflGpControlChanged(which){
+  var dateEl=document.getElementById('nflGpDate');
+  if(which==='season'){
+    var weekEl=document.getElementById('nflGpWeek');if(weekEl)weekEl.value='all';
+  }
+  if(dateEl){dateEl.value='all';dateEl.dataset.ready='1';}
+  _nflGpPopulateControls(_nflGpDaily());
+  renderNflGpRecord();
+}
 function renderNflGpRecord(){
   var sumEl=document.getElementById('nflGpTrkSummary'),bodyEl=document.getElementById('nflGpTrkBody');
   if(!sumEl||!bodyEl) return;
   var hist=_nflTrkSource()==='historical';
-  var gp=_nflTrkData&&(hist
-    ?(_nflTrkData.historical_game_predictor||_nflTrkData.game_predictor)
-    :_nflTrkData.game_predictor);
+  var gp=_nflGpData();
   var daily=(gp&&gp.daily)||[];
   if(!daily.length){
+    _nflGpPopulateControls([]);
     sumEl.innerHTML='';
     bodyEl.innerHTML='<p style="color:#6b7280;padding:18px 0;text-align:center">No saved Game Predictor forecasts yet. New pre-game winner and total calls will appear here after games finish.</p>';
     return;
   }
+  _nflGpPopulateControls(daily);
   var allGames=[];
   daily.forEach(function(day){(day.games||[]).forEach(function(g){allGames.push(Object.assign({record_date:day.date},g));});});
   function rec(key){
@@ -7595,7 +7903,6 @@ function renderNflGpRecord(){
     var p=allGames.filter(function(g){return g[key]==='PUSH';}).length;
     return {w:w,l:l,p:p,rate:(w+l)?(w/(w+l)*100):null};
   }
-  var wr=rec('winner_result'),tr=rec('total_result');
   var replay=_nflTrkData&&_nflTrkData.historical
     ?'<div style="background:rgba(245,158,11,.1);border:1px solid rgba(245,158,11,.35);border-radius:9px;padding:9px 12px;margin-bottom:10px;color:#fbbf24;font-size:.76rem;font-weight:800">Historical Replay — these results are view-only and excluded from the official Game Predictor record.</div>'
     :'';
@@ -7606,20 +7913,32 @@ function renderNflGpRecord(){
       +(r.p?' <span style="font-size:.72rem;color:#94a3b8">('+r.p+' push)</span>':'')+'</div>'
       +'<div style="font-size:.82rem;color:'+color+';font-weight:800;margin-top:3px">'+(r.rate==null?'Pending':r.rate.toFixed(1)+'% hit rate')+'</div></div>';
   }
+  var seasonEl=document.getElementById('nflGpSeason'),weekEl=document.getElementById('nflGpWeek'),dateEl=document.getElementById('nflGpDate');
+  var season=seasonEl?seasonEl.value:'',week=weekEl?weekEl.value:'all',sel=dateEl?dateEl.value:'all';
+  var scopeGames=allGames.filter(function(g){
+    return (!season||String(_nflSeasonKey(g.record_date))===season)
+      &&(week==='all'||String(_nflGpWeekNumber(g.record_date))===week)
+      &&(sel==='all'||g.record_date===sel);
+  });
+  var shown=[].concat(scopeGames).sort(function(a,b){return String(b.record_date||'').localeCompare(String(a.record_date||''));}).slice(0,80);
+  function selectedRec(key){
+    var w=scopeGames.filter(function(g){return g[key]==='WIN';}).length,l=scopeGames.filter(function(g){return g[key]==='LOSS';}).length,p=scopeGames.filter(function(g){return g[key]==='PUSH';}).length;
+    return {w:w,l:l,p:p,rate:(w+l)?(w/(w+l)*100):null};
+  }
+  var wr=selectedRec('winner_result'),tr=selectedRec('total_result');
   sumEl.innerHTML=replay+'<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px">'
     +statCard('Game Winners',wr,'#a78bfa')+statCard('Point Totals',tr,'#38bdf8')+'</div>';
-  var dp=document.getElementById('nflTrkDate'),sel=dp?dp.value:'';
-  var day=daily.find(function(d){return d.date===sel;});
-  var shown=sel
-    ?(day?(day.games||[]).map(function(g){return Object.assign({record_date:day.date},g);}):[])
-    :allGames;
-  shown=[].concat(shown).sort(function(a,b){return String(b.record_date||'').localeCompare(String(a.record_date||''));}).slice(0,80);
   function badge(result){
     if(!result)return '<span style="color:#64748b;font-weight:800">PENDING</span>';
     var color=result==='WIN'?'#4ade80':result==='LOSS'?'#f87171':'#fbbf24';
     return '<span style="color:'+color+';font-weight:900">'+result+'</span>';
   }
-  var label=sel?'Results for '+sel:'All recorded games';
+  var label=(sel!=='all'?'Results for '+sel:'Results for '+(season||'selected season')+(week!=='all'?' · Week '+week:' · All Weeks'));
+  if(!shown.length){
+    bodyEl.innerHTML='<div style="color:#94a3b8;font-size:.72rem;font-weight:900;text-transform:uppercase;letter-spacing:.08em;margin:2px 0 8px">'+label+'</div>'
+      +'<p style="color:#6b7280;padding:18px 0;text-align:center">No saved Game Predictor forecast exists for this selection. Run Full Week before kickoff to capture every game in that week.</p>';
+    return;
+  }
   function gpGroup(title,key,pickKey,actualKey,accent,record){
     var rows=shown.map(function(g){
       var actual=key==='winner_result'
@@ -7854,7 +8173,7 @@ function downloadNflMyBetsCSV(){
 }
 document.addEventListener('DOMContentLoaded',function(){
   var dp=document.getElementById('nflTrkDate');
-  if(dp){dp.value=new Date().toISOString().slice(0,10);
+  if(dp){dp.value=_nflTodayLocal();
     dp.addEventListener('change',function(){_nflTrkDayName();renderNflTrackDay();renderNflGpRecord();});}
   _nflTrkDayName();
   loadNflTrackRecord(false);
