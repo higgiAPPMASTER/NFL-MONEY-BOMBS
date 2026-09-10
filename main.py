@@ -1596,13 +1596,28 @@ def _trim_prop_lines(lines: list, df) -> list:
                 team = home or away or ""
             stat_col = line.get("stat_col") or ""
             score = volume_maps.get(stat_col, {}).get(name, 0) or 0
-            group_key = (home, away, market, team)
-            groups.setdefault(group_key, []).append((float(score), idx))
+            limit = _MAX_PROP_CANDIDATES_PER_TEAM_MARKET
+            if market == "player_anytime_td":
+                position = str(line.get("roster_position") or "").upper().strip()
+                if position == "RB":
+                    position_group = "RB"
+                    limit = 1
+                elif position in ("WR", "TE"):
+                    position_group = "WR_TE"
+                    limit = 2
+                else:
+                    continue
+                group_key = (home, away, market, team, position_group)
+            else:
+                group_key = (home, away, market, team, "PRIMARY")
+            groups.setdefault(group_key, {"limit": limit, "rows": []})["rows"].append(
+                (float(score), idx))
 
         keep = set()
-        for candidates in groups.values():
+        for group in groups.values():
+            candidates = group["rows"]
             candidates.sort(key=lambda item: (-item[0], item[1]))
-            keep.update(idx for _, idx in candidates[:_MAX_PROP_CANDIDATES_PER_TEAM_MARKET])
+            keep.update(idx for _, idx in candidates[:group["limit"]])
         return [line for idx, line in enumerate(lines) if idx in keep]
     except Exception as e:
         print(f"[PropTrim] skipped: {e}")
@@ -2134,8 +2149,9 @@ def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str) -> Optional[Dict
     # rate is not enough: a 44% TD rate loses at +100 and only starts to clear
     # the break-even point around +127. Keep the signal in `all` for review,
     # but only promote it to the bet board when it has a real over price,
-    # enough recent observations, and a 5-point probability cushion over the
-    # book's break-even rate.
+    # enough recent observations, and positive model edge over the book's
+    # break-even rate. Team-level selection later keeps only one RB and one
+    # combined WR/TE scorer per team.
     bet_qualified = True
     value_edge = None
     value_reason = ""
@@ -2145,15 +2161,15 @@ def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str) -> Optional[Dict
         value_edge = round(score - implied, 1) if implied is not None else None
         bet_qualified = bool(
             pick == "OVER" and implied is not None
-            and tot_b >= 5 and value_edge is not None and value_edge >= 5
+            and tot_b >= 5 and value_edge is not None and value_edge > 0
         )
         if not bet_qualified:
             if implied is None:
                 value_reason = "No TD price available"
             elif tot_b < 5:
                 value_reason = "Needs at least 5 recent games"
-            elif value_edge is None or value_edge < 5:
-                value_reason = "Model edge below 5 points over break-even"
+            elif value_edge is None or value_edge <= 0:
+                value_reason = "No positive model edge over break-even"
             else:
                 value_reason = "Model does not project an OVER"
 
@@ -2844,10 +2860,10 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False,
         if result:
             all_results.append(result)
 
-    # 6. Starter filter — for EVERY market keep only the player per team with the
-    # highest career volume in that stat column (the starter / primary option).
-    # If only one player per team appears for a market they are kept regardless.
-    # This removes backups, 3rd-string RBs, etc. across all categories.
+    # 6. Starter filter — normally keep one primary player per team/market.
+    # Anytime TD is intentionally different: retain at most one RB plus one
+    # combined WR/TE candidate per team, selected by model-versus-book edge.
+    # This keeps useful TD depth without opening the board to every longshot.
     def _starter_score(r):
         try:
             nm  = r["name"].lower()
@@ -2859,10 +2875,27 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False,
         except Exception:
             return 0
 
-    _scored = [(r, _starter_score(r)) for r in all_results]
+    def _selection_group(r):
+        if r.get("market") != "player_anytime_td":
+            return (r.get("team", ""), r.get("mkt", ""), "PRIMARY")
+        position = str(r.get("position") or "").upper().strip()
+        if position == "RB":
+            return (r.get("team", ""), r.get("mkt", ""), "RB")
+        if position in ("WR", "TE"):
+            return (r.get("team", ""), r.get("mkt", ""), "WR_TE")
+        return None
+
+    def _selection_score(r):
+        if r.get("market") == "player_anytime_td":
+            edge = r.get("valueEdge")
+            return float(edge) if edge is not None else float("-inf")
+        return _starter_score(r)
+
+    _scored = [(r, _selection_score(r)) for r in all_results
+               if _selection_group(r) is not None]
     _team_mkt_best: dict = {}
     for r, score in _scored:
-        key = (r.get("team",""), r.get("mkt",""))
+        key = _selection_group(r)
         if key not in _team_mkt_best or score > _team_mkt_best[key][1]:
             _team_mkt_best[key] = (r, score)
     all_results = [v[0] for v in _team_mkt_best.values()]
@@ -5726,6 +5759,7 @@ tr:last-child td{border-bottom:none}
  .nfl-parlay-filter-actions button{background:#1f2937;color:#cbd5e1;border:1px solid #374151;border-radius:6px;padding:4px 7px;font-size:.6rem;font-weight:900;cursor:pointer}
  .nfl-parlay-filter-actions button:hover{border-color:#f59e0b;color:#fbbf24}
  .nfl-parlay-cat-list{display:grid;grid-template-columns:1fr;gap:5px;max-height:190px;overflow:auto;padding-right:3px}
+ .nfl-game-filter-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(125px,1fr));gap:6px;max-height:150px;overflow:auto;padding-right:3px}
  .nfl-parlay-cat{display:flex;align-items:flex-start;gap:7px;color:#9ca3af;font-size:.67rem;line-height:1.3;cursor:pointer}
  .nfl-parlay-cat input{accent-color:#f59e0b;margin-top:1px}
  .nfl-parlay-cat-empty{color:#64748b;font-size:.65rem;line-height:1.4}
@@ -5806,6 +5840,10 @@ tr:last-child td{border-bottom:none}
       <button class="btn" onclick="generateParlay()" style="background:#1f2937;color:#fff">🎲 Generate New</button>
     </div>
     <div class="nfl-parlay-filters">
+      <div class="nfl-parlay-filter-group" style="grid-column:1/-1;border-color:rgba(59,130,246,.35)">
+        <div class="nfl-parlay-filter-head"><div class="nfl-parlay-filter-title" style="color:#93c5fd">Choose Games</div><div class="nfl-parlay-filter-actions"><button type="button" onclick="_nflGameSetAll('parlay',true)">All</button><button type="button" onclick="_nflGameSetAll('parlay',false)">None</button></div></div>
+        <div id="nflParlayGames" class="nfl-game-filter-list"><div class="nfl-parlay-cat-empty">Run today&#39;s picks to load games.</div></div>
+      </div>
       <div class="nfl-parlay-filter-group">
         <div class="nfl-parlay-filter-head"><div class="nfl-parlay-filter-title">Normal Plays</div><div class="nfl-parlay-filter-actions"><button type="button" onclick="_nflParlaySetAll('normal',true)">All</button><button type="button" onclick="_nflParlaySetAll('normal',false)">None</button></div></div>
         <div id="nflParlayNormalCats" class="nfl-parlay-cat-list"><div class="nfl-parlay-cat-empty">Run today&#39;s picks to load categories.</div></div>
@@ -5833,6 +5871,10 @@ tr:last-child td{border-bottom:none}
       <button class="nfl-coach-preset" onclick="askNflCoachPreset('Show the best receiving plays','receiving')">Receiving</button>
       <button class="nfl-coach-preset" onclick="askNflCoachPreset('Show the best positive Coach Edge Anytime TD scorers','td_scorers')" style="border-color:#eab308;color:#fde68a">TD Scorers</button>
       <button class="nfl-coach-preset" onclick="askNflCoachPreset('Show the best under plays','best_unders')">Best unders</button>
+    </div>
+    <div class="nfl-parlay-filter-group" style="margin:10px 0 12px;border-color:rgba(56,189,248,.35)">
+      <div class="nfl-parlay-filter-head"><div class="nfl-parlay-filter-title" style="color:#7dd3fc">Choose Games for Coach</div><div class="nfl-parlay-filter-actions"><button type="button" onclick="_nflGameSetAll('coach',true)">All</button><button type="button" onclick="_nflGameSetAll('coach',false)">None</button></div></div>
+      <div id="nflCoachGames" class="nfl-game-filter-list"><div class="nfl-parlay-cat-empty">Run today&#39;s picks to load games.</div></div>
     </div>
     <div class="nfl-coach-row">
       <input id="nflCoachInput" class="nfl-coach-input" placeholder="Example: Safest rushing unders from -300 to -150" onkeydown="if(event.key==='Enter')askNflCoach()"/>
@@ -5996,6 +6038,60 @@ function _nflLeg(p){
 }
 function _nflParlayCatKey(c){return String(c.market||'NFL Prop')+'|'+String(c.dir||'');}
 function _nflParlayCatLabel(c){return String(c.market||'NFL Prop')+(c.dir?' · '+c.dir:'');}
+window.__NFL_GAME_FILTERS__={parlay:{},coach:{}};
+function _nflGameKey(team,opp){
+  return [String(team||'').toUpperCase(),String(opp||'').toUpperCase()].sort().join('|');
+}
+function _nflLoadedGames(){
+  var d=(window._nflState||{}).d||{},seen={},games=[];
+  (d.games||[]).forEach(function(g){
+    var away=String(g.away_abbr||g.away_team||'').toUpperCase();
+    var home=String(g.home_abbr||g.home_team||'').toUpperCase();
+    var key=_nflGameKey(away,home);
+    if(!away||!home||seen[key])return;
+    seen[key]=1;games.push({key:key,label:away+' @ '+home});
+  });
+  if(!games.length){
+    (d.all||[]).forEach(function(p){
+      var team=String(p.team||'').toUpperCase(),opp=String(p.opponent||p.opp||'').toUpperCase();
+      var key=_nflGameKey(team,opp);
+      if(!team||!opp||seen[key])return;
+      seen[key]=1;games.push({key:key,label:team+' vs '+opp});
+    });
+  }
+  return games.sort(function(a,b){return a.label.localeCompare(b.label);});
+}
+function _nflGameFilterOn(scope,team,opp){
+  var group=(window.__NFL_GAME_FILTERS__||{})[scope]||{};
+  return group[_nflGameKey(team,opp)]!==false;
+}
+function _nflGameSync(scope){
+  var group=window.__NFL_GAME_FILTERS__[scope]||(window.__NFL_GAME_FILTERS__[scope]={});
+  document.querySelectorAll('.nfl-game-choice[data-scope="'+scope+'"]').forEach(function(cb){
+    group[decodeURIComponent(cb.getAttribute('data-key')||'')]=!!cb.checked;
+  });
+}
+function _nflGameSetAll(scope,on){
+  document.querySelectorAll('.nfl-game-choice[data-scope="'+scope+'"]').forEach(function(cb){cb.checked=!!on;});
+  _nflGameSync(scope);
+}
+function _nflGameFilterActive(scope){
+  var games=_nflLoadedGames();
+  return games.some(function(g){return !_nflGameFilterOn(scope,g.key.split('|')[0],g.key.split('|')[1]);});
+}
+function _nflGameFilterHtml(scope){
+  var games=_nflLoadedGames(),group=(window.__NFL_GAME_FILTERS__||{})[scope]||{};
+  if(!games.length)return '<div class="nfl-parlay-cat-empty">Run today&#39;s picks to load games.</div>';
+  return games.map(function(g){
+    return '<label class="nfl-parlay-cat"><input class="nfl-game-choice" type="checkbox" data-scope="'+scope+'" data-key="'+encodeURIComponent(g.key)+'"'
+      +(group[g.key]!==false?' checked':'')+' onchange="_nflGameSync(\\''+scope+'\\')"> <span>'+_esc(g.label)+'</span></label>';
+  }).join('');
+}
+function _renderNflGameFilters(){
+  var parlay=document.getElementById('nflParlayGames'),coach=document.getElementById('nflCoachGames');
+  if(parlay)parlay.innerHTML=_nflGameFilterHtml('parlay');
+  if(coach)coach.innerHTML=_nflGameFilterHtml('coach');
+}
 function _nflNormalParlayCandidates(){
   var plays=window.__NFL_PLAYS__||[],out=[];
   plays.forEach(function(p){
@@ -6023,7 +6119,9 @@ function _nflCoachParlayCandidates(){
       if(!key||seen[key])return false;seen[key]=1;return true;
     }).slice(0,limit||5);
   }
-  var positive=_nflCoachSafest(_nflCoachProps()).filter(function(p){return p.edge>0;});
+  var positive=_nflCoachSafest(_nflCoachProps()).filter(function(p){
+    return p.edge>0&&_nflGameFilterOn('parlay',p.team,p.opponent);
+  });
   var byEdge=function(a,b){return b.edge-a.edge||b.appProb-a.appProb;};
   var bySafe=function(a,b){return b.implied-a.implied||b.appProb-a.appProb;};
   var pools={
@@ -6035,7 +6133,8 @@ function _nflCoachParlayCandidates(){
     td_scorers:select(positive.filter(function(p){return _nflCoachFamily(p.market)==='td'&&p.side==='OVER';}),byEdge,5),
     best_unders:select(positive.filter(function(p){return p.side==='UNDER';}),byEdge,5),
     alt_line_edge:(window.__NFL_ALT_PARLAY_CANDIDATES__||[]).filter(function(p){
-      return p&&p.odds!=null&&p.odds>=-500&&p.edge>0&&p.appProb>=85&&p.implied>=70;
+      return p&&_nflGameFilterOn('parlay',p.team,p.opponent)
+        &&p.odds!=null&&p.odds>=-500&&p.edge>0&&p.appProb>=85&&p.implied>=70;
     }).slice(0,10)
   },merged={};
   Object.keys(pools).forEach(function(cat){
@@ -6090,12 +6189,14 @@ function _nflParlayCategoryHtml(source,cands){
 }
 function _renderNflParlayFilters(){
   var normal=document.getElementById('nflParlayNormalCats'),coach=document.getElementById('nflParlayCoachCats');
+  _renderNflGameFilters();
   if(normal)normal.innerHTML=_nflParlayCategoryHtml('normal',_nflNormalParlayCandidates());
   if(coach)coach.innerHTML=_nflParlayCategoryHtml('coach',_nflCoachParlayCandidates());
 }
 function _parlayPool(){
   _nflParlaySyncFilters();
   var combined=_nflNormalParlayCandidates().concat(_nflCoachParlayCandidates()).filter(function(c){
+    if(!_nflGameFilterOn('parlay',c.team,c.opp))return false;
     if(c.source==='coach'){
       return (c.coachCats||[]).some(function(cat){return _nflParlayFilterOn('coach',cat);});
     }
@@ -6117,7 +6218,7 @@ function _renderParlay(randomize){
   var out=document.getElementById('parlayResult');
   if(!out)return;
   var cands=_parlayPool();
-  if(!cands.length){out.innerHTML='<div style="color:#888;padding:10px">Run today&#39;s picks first, then build a parlay.</div>';return;}
+  if(!cands.length){out.innerHTML='<div style="color:#888;padding:10px">No qualifying plays match the selected games and categories.</div>';return;}
   if(cands.length<n){out.innerHTML='<div style="color:#f87171;padding:10px">Only '+cands.length+' qualifying play'+(cands.length!==1?'s':'')+' on the board. Pick a smaller parlay.</div>';return;}
   function _pick(ordered,avoid){var used={},picked=[],i,c;for(i=0;i<ordered.length&&picked.length<n;i++){c=ordered[i];if(used[c.player])continue;if(avoid&&avoid[c.player])continue;used[c.player]=1;picked.push(c);}for(i=0;i<ordered.length&&picked.length<n;i++){c=ordered[i];if(used[c.player])continue;used[c.player]=1;picked.push(c);}return picked;}
   var legs;
@@ -6753,7 +6854,7 @@ function _openNflGamePred(i){
   var gp=(window.__NFL_GP__||[])[i]; if(!gp) return;
   var ov=document.getElementById('nfl-gp-modal');
   if(!ov){ov=document.createElement('div');ov.id='nfl-gp-modal';
-    ov.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.85);z-index:10000;display:flex;align-items:center;justify-content:center;padding:16px;overflow:auto';
+    ov.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.85);z-index:10000;display:flex;align-items:flex-start;justify-content:center;padding:16px;overflow:hidden;box-sizing:border-box';
     ov.onclick=function(e){if(e.target===ov)ov.style.display='none';};
     document.body.appendChild(ov);}
   ov.style.display='flex';
@@ -6778,7 +6879,7 @@ function _openNflGamePred(i){
     +'<div style="margin-top:3px">'+h2hBlendLine+'</div>'
     +(gp.h2h_games?('<div style="margin-top:3px;color:#e2e8f0">Venue-aware H2H scoring: '+_esc(gp.home_abbr)+' '+_nflGpFix(gp.h2h_home_avg)+' · '+_esc(gp.away_abbr)+' '+_nflGpFix(gp.h2h_away_avg)+'</div>'):'')
     +'</div>';
-  ov.innerHTML='<div style="background:#0d1117;border:1px solid #7c3aed;border-radius:18px;max-width:500px;width:100%;padding:22px;box-shadow:0 20px 60px rgba(0,0,0,.7)">'
+  ov.innerHTML='<div style="background:#0d1117;border:1px solid #7c3aed;border-radius:18px;max-width:820px;width:100%;max-height:calc(100vh - 32px);overflow-y:auto;box-sizing:border-box;margin:auto;padding:22px;box-shadow:0 20px 60px rgba(0,0,0,.7)">'
     +'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">'
     +'<div style="font-size:1rem;font-weight:900;color:#c4b5fd">'+_esc(gp.away_abbr)+' @ '+_esc(gp.home_abbr)+'</div>'
     +'<button onclick="document.getElementById(&#39;nfl-gp-modal&#39;).style.display=&#39;none&#39;" style="background:none;border:none;color:#64748b;font-size:1.2rem;cursor:pointer">&#10005;</button></div>'
@@ -7082,6 +7183,8 @@ function _nflCoachRender(question,rows,total,mode){
 }
 function _nflCoachCapture(category,rows){
   var status=document.getElementById('nflCoachCaptureStatus'),dp=document.getElementById('datePicker'),token=localStorage.getItem('__mpa_token')||'';
+  var captureSeq=(window.__NFL_COACH_CAPTURE_SEQ__||0)+1;
+  window.__NFL_COACH_CAPTURE_SEQ__=captureSeq;
   if(!rows||!rows.length){if(status)status.textContent='Nothing saved: no qualifying displayed plays.';return;}
   var fallback=(dp&&dp.value)||window.__NFL_DATE__||'',groups={};
   rows.forEach(function(p){
@@ -7094,11 +7197,19 @@ function _nflCoachCapture(category,rows){
     var payload={category:category,date:ds,rows:groups[ds]};
     return fetch('/api/nfl/coach-track/capture?token='+encodeURIComponent(token),{method:'POST',headers:{'Content-Type':'application/json','Authorization':token?'Bearer '+token:''},body:JSON.stringify(payload)}).then(function(r){return r.json().then(function(x){if(!r.ok)throw new Error(x.detail||'Save failed');return x;});});
   });
-  Promise.all(requests).then(function(results){if(status){var changed=results.filter(function(x){return x.status==='saved'||x.status==='updated';}).length,refused=results.length-changed,updated=results.some(function(x){return x.status==='updated';});status.style.color=refused?'#fbbf24':'#86efac';status.textContent=changed?((updated?'Updated latest pregame':'Saved')+' '+changed+' game-date snapshot'+(changed===1?'':'s')+'. The final run before kickoff is banked.'+(refused?' '+refused+' date was already frozen or newer.':'')):('No snapshot changed: '+results.map(function(x){return x.message||x.status;}).join(' '));}}).catch(function(e){if(status){status.style.color='#f87171';status.textContent='Not saved: '+e.message;}});
+  Promise.all(requests).then(function(results){if(status&&window.__NFL_COACH_CAPTURE_SEQ__===captureSeq){var changed=results.filter(function(x){return x.status==='saved'||x.status==='updated';}).length,refused=results.length-changed,updated=results.some(function(x){return x.status==='updated';});status.style.color=refused?'#fbbf24':'#86efac';status.textContent=changed?((updated?'Updated latest pregame':'Saved')+' '+changed+' game-date snapshot'+(changed===1?'':'s')+'. The final run before kickoff is banked.'+(refused?' '+refused+' date was already frozen or newer.':'')):('No snapshot changed: '+results.map(function(x){return x.message||x.status;}).join(' '));}}).catch(function(e){if(status&&window.__NFL_COACH_CAPTURE_SEQ__===captureSeq){status.style.color='#f87171';status.textContent='Not saved: '+e.message;}});
 }
-function askNflCoachPreset(q,category){var input=document.getElementById('nflCoachInput');if(input)input.value=q;_nflCoachCapture(category,askNflCoach());}
+function askNflCoachPreset(q,category){
+  var input=document.getElementById('nflCoachInput');if(input)input.value=q;
+  window.__NFL_COACH_IGNORE_GAME_FILTER__=true;
+  var full=askNflCoach();
+  delete window.__NFL_COACH_IGNORE_GAME_FILTER__;
+  var shown=askNflCoach();
+  _nflCoachCapture(category,full);
+  return shown;
+}
 async function askNflAltCoach(){
-  var btn=document.getElementById('nflAltCoachBtn'),answer=document.getElementById('nflCoachAnswer');
+  var btn=document.getElementById('nflAltCoachBtn'),answer=document.getElementById('nflCoachAnswer'),captureStatus=document.getElementById('nflCoachCaptureStatus');
   if(window.__NFL_ALT_COACH_ABORT__){
     window.__NFL_ALT_COACH_ABORT__.abort();
     delete window.__NFL_ALT_COACH_ABORT__;
@@ -7111,6 +7222,8 @@ async function askNflAltCoach(){
   var hadPrevious=Object.prototype.hasOwnProperty.call(d,'coach_candidates');
   var controller=new AbortController(),timer=setTimeout(function(){controller.abort();},125000);
   window.__NFL_ALT_COACH_ABORT__=controller;
+  window.__NFL_COACH_CAPTURE_SEQ__=(window.__NFL_COACH_CAPTURE_SEQ__||0)+1;
+  if(captureStatus){captureStatus.textContent='';captureStatus.style.color='';}
   if(btn){btn.disabled=false;btn.textContent='Cancel alternate-line scan';}
   if(answer){answer.style.display='block';answer.innerHTML='<div class="nfl-coach-summary">Fetching genuine sportsbook alternate-line ladders. This can take up to two minutes on a cold start. Click the button again to cancel.</div>';}
   try{
@@ -7125,9 +7238,12 @@ async function askNflAltCoach(){
     window.__NFL_COACH_ALT_ACTIVE__=true;
     var input=document.getElementById('nflCoachInput');
     if(input)input.value='Show the top 10 safe-value alternate-line plays priced -500 or better, at 85% model probability and 70% book probability or better';
+    window.__NFL_COACH_IGNORE_GAME_FILTER__=true;
+    var full=askNflCoach();
+    delete window.__NFL_COACH_IGNORE_GAME_FILTER__;
     var shown=askNflCoach();
-    window.__NFL_ALT_PARLAY_CANDIDATES__=shown.slice();
-    _nflCoachCapture('alt_line_edge',shown);
+    window.__NFL_ALT_PARLAY_CANDIDATES__=full.slice();
+    _nflCoachCapture('alt_line_edge',full);
     _renderNflParlayFilters();
   }catch(e){
     var msg=e&&e.name==='AbortError'
@@ -7147,6 +7263,9 @@ function askNflCoach(){
   var input=document.getElementById('nflCoachInput'),question=String(input&&input.value||'').trim();if(!question){if(input)input.focus();return;}
   var props=_nflCoachProps();if(!props.length){_nflCoachRender(question,[],0,'edge');return [];}
   var f=_nflCoachParse(question,props),candidates=_nflCoachSafest(props);
+  if(!window.__NFL_COACH_IGNORE_GAME_FILTER__){
+    candidates=candidates.filter(function(p){return _nflGameFilterOn('coach',p.team,p.opponent);});
+  }
   if(window.__NFL_COACH_LIMIT_OVERRIDE__)f.limit=Number(window.__NFL_COACH_LIMIT_OVERRIDE__)||f.limit;
   var rows=candidates.filter(function(p){
     if(f.mode!=='safe'&&p.edge<=0)return false;
