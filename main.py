@@ -139,7 +139,10 @@ _BOOK_PRIORITY = {b: i for i, b in enumerate(_PRIORITY_BOOKS)}
 # reducing the response size and Odds API point usage substantially.
 ODDS_BOOKMAKERS = "draftkings,fanduel,betmgm,caesars,bet365,bet99,thescore"
 _NFL_PROP_FETCH_CONCURRENCY = 3
-_NFL_ALT_FETCH_CONCURRENCY = 1
+# Alternate ladders are still one Odds API request per game, but fetching them
+# serially can exceed the two-minute UI deadline on a full slate. Match the
+# standard prop fetcher's conservative concurrency without increasing call count.
+_NFL_ALT_FETCH_CONCURRENCY = 3
 _BOOK_LABEL = {"bet99":"Bet99","thescore":"theScore","bet365":"Bet365","draftkings":"DK",
                "fanduel":"FanDuel","betmgm":"BetMGM","caesars":"Caesars",
                "williamhill_us":"Caesars","betrivers":"BetRivers","ballybet":"Bally Bet",
