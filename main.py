@@ -251,10 +251,11 @@ def _odds_cache_set(date_key, props, game_lines):
 _ALT_COACH_TTL = 15 * 60
 _ALT_COACH_INFLIGHT: Dict[str, asyncio.Task] = {}
 
-def _alt_coach_cache_get(date_key):
+def _alt_coach_cache_get(date_key, allow_stale=False):
     p = _CACHE_DIR / f"nfl_alt_coach_v3_{date_key}.json"
     try:
-        if p.exists() and (time.time() - p.stat().st_mtime) < _ALT_COACH_TTL:
+        if p.exists() and (allow_stale or
+                           (time.time() - p.stat().st_mtime) < _ALT_COACH_TTL):
             return json.loads(p.read_text(encoding="utf-8"))
     except Exception as e:
         print(f"[AltCoachCache] read error: {e}")
@@ -625,15 +626,24 @@ async def _startup_preload():
 # ── ESPN Schedule ──────────────────────────────────────────────────────────────
 async def get_espn_games(date_str: str) -> List[Dict]:
     dc = date_str.replace("-", "")
-    try:
-        async with httpx.AsyncClient(timeout=10) as c:
-            r = await c.get(
-                "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard",
-                params={"dates": dc})
-            if not r.is_success: return []
-            games = []
-            for ev in r.json().get("events", []):
-                comp  = ev.get("competitions", [{}])[0]
+    endpoint = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
+
+    def parse_games(payload, wanted_date):
+        games = []
+        for ev in (payload or {}).get("events", []):
+            comp = ev.get("competitions", [{}])[0]
+            raw_start = ev.get("date", "") or comp.get("date", "")
+            try:
+                event_date = (
+                    datetime.fromisoformat(str(raw_start).replace("Z", "+00:00"))
+                    .astimezone(ZoneInfo("America/New_York"))
+                    .strftime("%Y-%m-%d")
+                )
+            except Exception:
+                event_date = str(raw_start)[:10]
+            if wanted_date and event_date != wanted_date:
+                continue
+            try:
                 competitors = comp.get("competitors", [])
                 teams = {t["homeAway"]: t["team"] for t in competitors}
                 team_rows = {t["homeAway"]: t for t in competitors}
@@ -652,7 +662,7 @@ async def get_espn_games(date_str: str) -> List[Dict]:
                     "away_abbr": away.get("abbreviation", ""),
                     "game":      f"{away.get('displayName','')} @ {home.get('displayName','')}",
                     # ISO kickoff time — picks carry this so finished games drop off board
-                    "start":     ev.get("date", "") or comp.get("date", ""),
+                    "start":     raw_start,
                     "season":    season_obj.get("year"),
                     "season_type": "POST" if str(season_type_num) == "3" else "REG",
                     "week":      week_obj.get("number"),
@@ -660,10 +670,45 @@ async def get_espn_games(date_str: str) -> List[Dict]:
                     "away_score": away_row.get("score"),
                     "completed": ev.get("status", {}).get("type", {}).get("completed", False),
                 })
-            print(f"[ESPN] {len(games)} NFL games for {date_str}")
+            except Exception as exc:
+                print(f"[ESPN] skipped malformed event: {exc}")
+        return games
+
+    daily_succeeded = False
+    last_error = None
+    async with httpx.AsyncClient(timeout=12) as c:
+        for attempt in range(3):
+            try:
+                r = await c.get(endpoint, params={"dates": dc})
+                r.raise_for_status()
+                daily_succeeded = True
+                games = parse_games(r.json(), date_str)
+                if games:
+                    print(f"[ESPN] {len(games)} NFL games for {date_str}")
+                    return games
+            except Exception as exc:
+                last_error = exc
+                print(f"[ESPN] daily attempt {attempt + 1}/3 failed: {exc}")
+            if attempt < 2:
+                await asyncio.sleep(0.6 * (attempt + 1))
+
+        # ESPN occasionally returns a transient empty daily scoreboard. Its
+        # season response still contains the event, keyed by UTC kickoff, so
+        # filter that fallback using the Eastern football date.
+        try:
+            r = await c.get(endpoint, params={
+                "dates": date_str[:4], "limit": "1000"})
+            r.raise_for_status()
+            games = parse_games(r.json(), date_str)
+            print(f"[ESPN] season fallback found {len(games)} NFL games for {date_str}")
             return games
-    except Exception as e:
-        print(f"[ESPN] {e}"); return []
+        except Exception as exc:
+            last_error = exc
+            print(f"[ESPN] season fallback failed: {exc}")
+
+    if daily_succeeded:
+        return []
+    raise RuntimeError(f"ESPN schedule lookup failed for {date_str}: {last_error}")
 
 # ── Historical season batch scheduling ─────────────────────────────────────────
 # Season discovery is ESPN-only. It deliberately does not call the Odds API, so
@@ -2678,7 +2723,16 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False,
 
     # 1. Get game schedule from ESPN
     _p("Fetching NFL schedule from ESPN…")
-    espn_games = await get_espn_games(date_str)
+    try:
+        espn_games = await get_espn_games(date_str)
+    except Exception as exc:
+        return {
+            "picks": [], "all": [],
+            "error": (
+                "NFL schedule is temporarily unavailable. ESPN could not be "
+                f"reached after retries: {exc}"
+            ),
+        }
     if not espn_games:
         return {"picks":[],"all":[],"error":f"No NFL games found for {date_str} — NFL season runs Sept–Feb. (Note: check the exact date — e.g. Championship Sunday was Jan 26, not Jan 25.)"}
     if simulate:
@@ -3080,14 +3134,19 @@ async def _build_alt_coach(date_str: str) -> dict:
             return await get_prop_lines(
                 game.get("id", ""), date_str, alternate_only=True)
     requests = [_one_alt(game) for game in games]
-    batches = await asyncio.gather(*requests)
-    failed_events = [
-        game.get("game") or game.get("id") or "game"
-        for game in games
-        if _NFL_PROP_FETCH_STATUS.get(
-            (str(game.get("id") or ""), str(date_str), True)) != "success"
-    ]
-    if failed_events:
+    raw_batches = await asyncio.gather(*requests, return_exceptions=True)
+    batches, failed_events = [], []
+    for game, batch in zip(games, raw_batches):
+        failed = (isinstance(batch, Exception) or
+                  _NFL_PROP_FETCH_STATUS.get(
+                      (str(game.get("id") or ""), str(date_str), True))
+                  != "success")
+        if failed:
+            failed_events.append(game.get("game") or game.get("id") or "game")
+            batches.append([])
+        else:
+            batches.append(batch)
+    if failed_events and len(failed_events) == len(games):
         raise RuntimeError(
             "Alternate sportsbook fetch failed for "
             + ", ".join(failed_events[:3])
@@ -3126,7 +3185,13 @@ async def _build_alt_coach(date_str: str) -> dict:
         if (result and result.get("coachEligible", True)
                 and selected_odds is not None and selected_odds >= -500):
             picks.append(result)
-    payload = {"date": date_str, "picks": picks, "lines": len(lines)}
+    payload = {
+        "date": date_str, "picks": picks, "lines": len(lines),
+        "warning": (
+            "Some games could not refresh: " + ", ".join(failed_events[:3])
+            if failed_events else ""
+        ),
+    }
     _alt_coach_cache_set(date_str, payload)
     return payload
 
@@ -3146,9 +3211,28 @@ async def api_nfl_coach_alternates(request: Request, date_str: str = "",
     try:
         return JSONResponse(await asyncio.wait_for(_warm_alt_coach(ds), timeout=120))
     except asyncio.TimeoutError:
-        raise HTTPException(
-            status_code=504,
-            detail="The alternate-line scan timed out after 2 minutes. Please try again; completed data will be reused from cache.")
+        stale = _alt_coach_cache_get(ds, allow_stale=True)
+        if stale:
+            payload = dict(stale)
+            payload["stale"] = True
+            payload["warning"] = (
+                "Showing the last completed alternate-line result while "
+                "the refresh continues in the background.")
+            return JSONResponse(payload)
+        return JSONResponse({
+            "pending": True,
+            "detail": "The alternate-line scan is still running."
+        }, status_code=202)
+    except Exception as exc:
+        stale = _alt_coach_cache_get(ds, allow_stale=True)
+        if stale:
+            payload = dict(stale)
+            payload["stale"] = True
+            payload["warning"] = (
+                "The refresh failed; showing the last completed "
+                "alternate-line result.")
+            return JSONResponse(payload)
+        raise HTTPException(status_code=503, detail=str(exc))
 
 _ADMIN_EMAILS = {e.strip().lower() for e in os.environ.get("ADMIN_EMAIL", "higgi117711@gmail.com").split(",") if e.strip()}
 
@@ -7369,20 +7453,29 @@ async function askNflAltCoach(){
   var oldText=btn?btn.textContent:'';
   var state=window._nflState||{},d=state.d||{},previous=d.coach_candidates;
   var hadPrevious=Object.prototype.hasOwnProperty.call(d,'coach_candidates');
-  var controller=new AbortController(),timer=setTimeout(function(){controller.abort();},125000);
+  var controller=new AbortController(),timer=setTimeout(function(){controller.abort();},310000);
   window.__NFL_ALT_COACH_ABORT__=controller;
   window.__NFL_COACH_CAPTURE_SEQ__=(window.__NFL_COACH_CAPTURE_SEQ__||0)+1;
   if(captureStatus){captureStatus.textContent='';captureStatus.style.color='';}
   if(btn){btn.disabled=false;btn.textContent='Cancel alternate-line scan';}
-  if(answer){answer.style.display='block';answer.innerHTML='<div class="nfl-coach-summary">Fetching genuine sportsbook alternate-line ladders. This can take up to two minutes on a cold start. Click the button again to cancel.</div>';}
+  var lastAlt=Array.isArray(window.__NFL_LAST_ALT_COACH__) ? window.__NFL_LAST_ALT_COACH__ : [];
+  if(answer&&!lastAlt.length){answer.style.display='block';answer.innerHTML='<div class="nfl-coach-summary">Fetching genuine sportsbook alternate-line ladders. A cold scan can take several minutes; it will continue in the background if the first request times out. Click the button again to cancel.</div>';}
   try{
     var token=localStorage.getItem('__mpa_token')||'';
     var dateEl=document.getElementById('datePicker');
     var date=(dateEl&&dateEl.value)||window.__NFL_DATE__||'';
-    var res=await fetch('/api/nfl/coach-alternates?date_str='+encodeURIComponent(date)+'&token='+encodeURIComponent(token),{signal:controller.signal});
-    var data=await res.json();
+    var res,data;
+    while(true){
+      res=await fetch('/api/nfl/coach-alternates?date_str='+encodeURIComponent(date)+'&token='+encodeURIComponent(token),{signal:controller.signal});
+      data=await res.json();
+      if(res.status!==202||!data.pending)break;
+      if(captureStatus){captureStatus.textContent='Alternate scan still running — checking again automatically…';captureStatus.style.color='#fbbf24';}
+      await new Promise(function(resolve){setTimeout(resolve,5000);});
+      if(controller.signal.aborted)throw new DOMException('Aborted','AbortError');
+    }
     if(!res.ok||data.error)throw new Error(data.detail||data.error||('HTTP '+res.status));
     d.coach_candidates=data.picks||[];
+    window.__NFL_LAST_ALT_COACH__=d.coach_candidates.slice();
     window.__NFL_COACH_LIMIT_OVERRIDE__=10;
     window.__NFL_COACH_ALT_ACTIVE__=true;
     var input=document.getElementById('nflCoachInput');
@@ -7394,11 +7487,20 @@ async function askNflAltCoach(){
     window.__NFL_ALT_PARLAY_CANDIDATES__=full.slice();
     _nflCoachCapture('alt_line_edge',full);
     _renderNflParlayFilters();
+    if(data.warning&&captureStatus){captureStatus.textContent=data.warning;captureStatus.style.color='#fbbf24';}
   }catch(e){
     var msg=e&&e.name==='AbortError'
       ?'The alternate-line scan was cancelled or exceeded two minutes. Click the button to retry.'
       :(e.message||'Alternate-line scan failed.');
-    if(answer)answer.innerHTML='<div class="nfl-coach-summary" style="color:#f87171">'+_esc(msg)+'</div>';
+    if(lastAlt.length){
+      d.coach_candidates=lastAlt;
+      window.__NFL_COACH_LIMIT_OVERRIDE__=10;
+      window.__NFL_COACH_ALT_ACTIVE__=true;
+      window.__NFL_COACH_IGNORE_GAME_FILTER__=true;
+      askNflCoach();
+      delete window.__NFL_COACH_IGNORE_GAME_FILTER__;
+      if(captureStatus){captureStatus.textContent=msg+' Showing the last successful result.';captureStatus.style.color='#fbbf24';}
+    }else if(answer)answer.innerHTML='<div class="nfl-coach-summary" style="color:#f87171">'+_esc(msg)+'</div>';
   }finally{
     clearTimeout(timer);
     if(window.__NFL_ALT_COACH_ABORT__===controller)delete window.__NFL_ALT_COACH_ABORT__;
