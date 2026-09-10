@@ -4217,7 +4217,8 @@ def _nfl_coach_hist_select(candidates, category, alternate=False):
             continue
         seen_players.add(player_key)
         unique.append(row)
-    return unique[:10 if alternate else 5]
+    limit = 10 if alternate or category == "td_scorers" else 5
+    return unique[:limit]
 
 async def _nfl_build_historical_coach(date_str, picks, games, df, roster_map,
                                       replay_box, target_teams):
@@ -5669,19 +5670,19 @@ tr:last-child td{border-bottom:none}
 .nfl-coach-answer{display:none;margin-top:14px;border-top:1px solid rgba(56,189,248,.25);padding-top:14px}
 .nfl-coach-question{margin-left:auto;max-width:82%;background:#10243a;border:1px solid rgba(56,189,248,.3);border-radius:12px 12px 3px 12px;padding:9px 12px;color:#bae6fd;font-size:.75rem}
 .nfl-coach-summary{margin:11px 0;color:#cbd5e1;font-size:.76rem;line-height:1.5}
-.nfl-coach-play{margin-top:16px;background:#0b1220;border:2px solid rgba(56,189,248,.4);border-left:5px solid #38bdf8;border-radius:12px;padding:12px 14px;box-shadow:0 5px 14px rgba(0,0,0,.34)}
-.nfl-coach-play>summary{display:flex;justify-content:space-between;gap:12px;list-style:none;cursor:pointer;color:#fff;font-size:.8rem;font-weight:900}
+.nfl-coach-play{margin-top:9px;background:#0b1220;border:1px solid rgba(56,189,248,.4);border-left:4px solid #38bdf8;border-radius:11px;padding:9px 12px;box-shadow:0 4px 11px rgba(0,0,0,.26)}
+.nfl-coach-play>summary{display:flex;justify-content:space-between;align-items:center;gap:12px;list-style:none;cursor:pointer;color:#fff;font-size:.86rem;font-weight:900}
 .nfl-coach-play>summary::-webkit-details-marker{display:none}
 .nfl-coach-play>summary:after{content:"Expand";color:#38bdf8;font-size:.61rem;text-transform:uppercase}
 .nfl-coach-play[open]>summary:after{content:"Collapse"}
-.nfl-coach-ident{display:flex;align-items:center;gap:10px;min-width:0}
-.nfl-coach-avatar{position:relative;width:42px;height:42px;flex:0 0 42px;border-radius:50%;background:#1e293b;border:1px solid #475569;display:flex;align-items:center;justify-content:center;color:#cbd5e1;font-size:.7rem;font-weight:950}
+.nfl-coach-ident{display:flex;align-items:center;gap:9px;min-width:0}
+.nfl-coach-avatar{position:relative;width:36px;height:36px;flex:0 0 36px;border-radius:50%;background:#1e293b;border:1px solid #475569;display:flex;align-items:center;justify-content:center;color:#cbd5e1;font-size:.68rem;font-weight:950}
 .nfl-coach-avatar>img:first-of-type{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;border-radius:50%}
-.nfl-coach-avatar .team-logo{position:absolute;right:-4px;bottom:-3px;width:18px;height:18px;object-fit:contain;background:#0b1220;border-radius:50%;padding:1px}
-.nfl-coach-name{font-size:.82rem;font-weight:950;color:#fff}
-.nfl-coach-meta{display:flex;gap:6px;align-items:center;flex-wrap:wrap;color:#94a3b8;font-size:.62rem;margin-top:3px}
+.nfl-coach-avatar .team-logo{position:absolute;right:-4px;bottom:-3px;width:16px;height:16px;object-fit:contain;background:#0b1220;border-radius:50%;padding:1px}
+.nfl-coach-name{font-size:.94rem;font-weight:950;color:#fff}
+.nfl-coach-meta{display:flex;gap:6px;align-items:center;flex-wrap:wrap;color:#a8b4c5;font-size:.67rem;margin-top:3px}
 .nfl-coach-pos{color:#7dd3fc;border:1px solid rgba(56,189,248,.35);background:rgba(14,116,144,.14);border-radius:999px;padding:2px 6px;font-weight:950}
-.nfl-coach-pickmeta{text-align:right;color:#e2e8f0;white-space:nowrap;font-size:.72rem;line-height:1.45}
+.nfl-coach-pickmeta{text-align:right;color:#f1f5f9;white-space:nowrap;font-size:.78rem;line-height:1.4}
 .nfl-coach-copy{color:#94a3b8;font-size:.7rem;line-height:1.5;margin-top:8px}
 .nfl-coach-stats{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px;margin-top:10px}
 .nfl-coach-stat{background:#111827;border:1px solid #263449;border-radius:8px;padding:8px}
@@ -5772,6 +5773,9 @@ tr:last-child td{border-bottom:none}
  .nfl-td-title{font-family:'Playfair Display',serif;color:#fff;font-size:1.4rem;margin-top:4px}
  .nfl-td-sub{color:#94a3b8;font-size:.74rem;line-height:1.5;margin-top:5px;max-width:720px}
  .nfl-td-count{color:#fde68a;background:rgba(250,204,21,.1);border:1px solid rgba(250,204,21,.3);border-radius:999px;padding:6px 11px;font-size:.68rem;font-weight:950}
+  .nfl-td-controls{display:flex;align-items:flex-end;justify-content:flex-end;gap:8px;flex-wrap:wrap}
+  .nfl-td-game-label{display:flex;flex-direction:column;gap:4px;color:#a3a38d;font-size:.56rem;font-weight:900;letter-spacing:.08em;text-transform:uppercase;text-align:left}
+  .nfl-td-game-select{min-width:170px;max-width:240px;background:#11110d;color:#fff;border:1px solid rgba(250,204,21,.35);border-radius:8px;padding:7px 9px;font-size:.7rem;font-weight:800}
  .nfl-td-table-wrap{overflow-x:auto;margin-top:14px;border:1px solid #2d2d22;border-radius:12px}
  .nfl-td-table{width:100%;border-collapse:collapse;min-width:790px;font-size:.72rem}
  .nfl-td-table th{background:#11110d;color:#a3a38d;text-align:left;padding:9px 10px;font-size:.58rem;text-transform:uppercase;letter-spacing:.07em}
@@ -5785,7 +5789,7 @@ tr:last-child td{border-bottom:none}
  .nfl-gp-filters{display:grid;grid-template-columns:minmax(130px,160px) minmax(110px,140px) minmax(0,1fr);gap:10px;align-items:end;margin-bottom:14px}
  .nfl-gp-filter{display:flex;flex-direction:column;gap:6px;min-width:0;color:#9ca3af;font-size:.72rem;font-weight:800;text-transform:uppercase;letter-spacing:.09em}
  .nfl-gp-filter .date-input{display:block;width:100%;max-width:100%;min-width:0;box-sizing:border-box}
-  .nfl-gp-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(360px,1fr));gap:14px}
+  .nfl-gp-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,460px));justify-content:center;gap:14px}
   .nfl-gp-game{position:relative;overflow:hidden;background:linear-gradient(145deg,#111a2d 0%,#090f1c 72%);border:1px solid #334155;border-radius:18px;cursor:pointer;box-shadow:0 14px 30px rgba(0,0,0,.28);transition:transform .18s ease,border-color .18s ease,box-shadow .18s ease}
   .nfl-gp-game:hover{transform:translateY(-2px);border-color:#8b5cf6;box-shadow:0 18px 38px rgba(76,29,149,.26)}
   .nfl-gp-game:focus-visible{outline:3px solid rgba(167,139,250,.55);outline-offset:3px}
@@ -5813,6 +5817,12 @@ tr:last-child td{border-bottom:none}
   .nfl-gp-callout .k{color:#64748b;font-size:.54rem;font-weight:900;letter-spacing:.08em;text-transform:uppercase}
   .nfl-gp-callout .v{color:#f8fafc;font-size:.73rem;font-weight:900;margin-top:4px;line-height:1.35}
   .nfl-gp-why{padding:10px 16px;border-top:1px solid rgba(148,163,184,.12);color:#aab8cc;font-size:.66rem;line-height:1.5}
+  .nfl-gp-track{margin:0;border-top:1px solid #1e293b;background:#070d1a}
+  .nfl-gp-track summary{list-style:none;cursor:pointer;padding:8px 12px;color:#a78bfa;font-size:.62rem;font-weight:900;letter-spacing:.07em}
+  .nfl-gp-track summary::-webkit-details-marker{display:none}
+  .nfl-gp-track summary:after{content:'Show';float:right;color:#64748b}
+  .nfl-gp-track[open] summary:after{content:'Hide'}
+  .nfl-gp-track-body{border-top:1px solid #111c2e}
   .nfl-games-jump{cursor:pointer;border-color:rgba(245,158,11,.55)!important;background:linear-gradient(145deg,rgba(245,158,11,.16),rgba(17,24,39,.8))!important}
   .nfl-games-jump .val,.nfl-games-jump .lbl{color:#fbbf24!important}
   .nfl-by-game{margin-top:20px;border:1px solid rgba(245,158,11,.35);border-radius:16px;background:linear-gradient(145deg,rgba(120,53,15,.12),rgba(15,23,42,.72));overflow:hidden;scroll-margin-top:16px}
@@ -5833,7 +5843,7 @@ tr:last-child td{border-bottom:none}
   .nfl-game-group-body{border-top:1px solid #263244;padding:5px 12px 10px}
  @media(max-width:620px){.nfl-parlay-filters{grid-template-columns:1fr}}
  @media(max-width:680px){
-    .nfl-gp-grid{grid-template-columns:1fr}.nfl-gp-game{border-radius:14px}.nfl-gp-head{align-items:flex-start}.nfl-gp-team{grid-template-columns:34px 38px minmax(0,1fr) 46px 46px;gap:6px}.nfl-gp-logo{width:32px;height:32px}.nfl-gp-callouts{grid-template-columns:1fr}.nfl-game-group summary{align-items:flex-start}.nfl-game-group-meta{flex-direction:column;align-items:flex-end}
+    .nfl-gp-grid{grid-template-columns:minmax(0,1fr)}.nfl-gp-game{border-radius:14px}.nfl-gp-head{align-items:flex-start}.nfl-gp-team{grid-template-columns:34px 38px minmax(0,1fr) 46px 46px;gap:6px}.nfl-gp-logo{width:32px;height:32px}.nfl-gp-callouts{grid-template-columns:1fr}.nfl-game-group summary{align-items:flex-start}.nfl-game-group-meta{flex-direction:column;align-items:flex-end}
    .nfl-gp-filters{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}
    .nfl-gp-filter-date{grid-column:1/-1}
    .nfl-trk-group-head{padding:14px}.nfl-trk-group-name{font-size:1.02rem}.nfl-trk-tbl{font-size:.88rem}.nfl-trk-tbl th{font-size:.68rem;padding:11px}.nfl-trk-tbl td{padding:11px 12px}
@@ -5916,7 +5926,7 @@ tr:last-child td{border-bottom:none}
       <button class="nfl-coach-preset" onclick="askNflCoachPreset('Show the best passing plays','passing')">Passing</button>
       <button class="nfl-coach-preset" onclick="askNflCoachPreset('Show the best rushing plays','rushing')">Rushing</button>
       <button class="nfl-coach-preset" onclick="askNflCoachPreset('Show the best receiving plays','receiving')">Receiving</button>
-      <button class="nfl-coach-preset" onclick="askNflCoachPreset('Show the best positive Coach Edge Anytime TD scorers','td_scorers')" style="border-color:#eab308;color:#fde68a">TD Scorers</button>
+      <button class="nfl-coach-preset" onclick="askNflTdCoach()" style="border-color:#eab308;color:#fde68a">TD Scorers · Top 10 / Game Top 5</button>
       <button class="nfl-coach-preset" onclick="askNflCoachPreset('Show the best under plays','best_unders')">Best unders</button>
     </div>
     <div class="nfl-parlay-filter-group" style="margin:10px 0 12px;border-color:rgba(56,189,248,.35)">
@@ -5970,8 +5980,8 @@ tr:last-child td{border-bottom:none}
   <div id="nfl-td-predictor-card" class="card nfl-td-card">
     <div class="nfl-td-head">
       <div><div class="nfl-td-kicker">Touchdown Intelligence</div><h2 class="nfl-td-title">Anytime TD Predictor</h2>
-      <div class="nfl-td-sub">Qualified touchdown scorers ranked from recent scoring frequency, opponent history, defensive adjustment, genuine sportsbook probability, and positive model-versus-price edge.</div></div>
-      <div id="nflTdPredictorCount" class="nfl-td-count"></div>
+      <div class="nfl-td-sub">Touchdown scorers ranked by their strongest displayed hit-rate signal. Model probability and sportsbook value edge remain visible as separate checks.</div></div>
+      <div class="nfl-td-controls"><label class="nfl-td-game-label">Pick Game<select id="nflTdGameSelect" class="nfl-td-game-select" onchange="_renderNflTdPredictor((window._nflState||{}).d||{})"><option value="">All Games</option></select></label><div id="nflTdPredictorCount" class="nfl-td-count"></div></div>
     </div>
     <div id="nfl-td-predictor-body"></div>
   </div>
@@ -6840,9 +6850,9 @@ function _nflGpBetPanel(g,idx){
     if(g.total_under_odds!=null) rows+=_row('UNDER '+g.total_line,g.total_under_odds,g.total_under_book,_regTot('UNDER',g.total_under_odds,g.total_under_book,'u'),g.total_pick==='UNDER');
   }
   if(!rows) return '';
-  return '<div style="margin-top:8px;margin-left:-15px;margin-right:-15px;margin-bottom:-13px;border-top:1px solid #1e293b;border-radius:0 0 14px 14px;overflow:hidden;background:#070d1a">'
-    +'<div style="padding:4px 12px 3px;font-size:.58rem;font-weight:800;color:#7c3aed;letter-spacing:.07em;background:rgba(124,58,237,.1)">&#128203; TRACK &#9733; = model pick</div>'
-    +rows+'</div>';
+  return '<details class="nfl-gp-track">'
+    +'<summary>TRACK SPORTSBOOK LINES &#183; &#9733; MODEL PICK</summary>'
+    +'<div class="nfl-gp-track-body">'+rows+'</div></details>';
 }
 function _nflGpCard(g,i){
   var cc=_nflGpConfClr(g.conf);
@@ -7208,7 +7218,7 @@ function _nflCoachAccordions(p){
     +'<div class="nfl-coach-stat"><div class="k">Source</div><div class="v">'+_esc(p.book||'Sportsbook line')+'</div></div>'
     +'<div class="nfl-coach-stat"><div class="k">Quote checked</div><div class="v">'+_esc(quoteUpdated)+'</div></div>'
     +'</div><div style="margin-top:7px">Only genuine prices from a sportsbook response refreshed within 15 minutes are eligible for live Coach rankings.</div></div></details>'
-    +'<details open><summary>Hit Rate Chart</summary><div class="nfl-coach-accord-body">'+_nflCoachRateTiles(p)+_nflCoachGameTiles(p)+'</div></details>'
+    +'<details><summary>Hit Rate Chart</summary><div class="nfl-coach-accord-body">'+_nflCoachRateTiles(p)+_nflCoachGameTiles(p)+'</div></details>'
     +'<details><summary>Line Movement</summary><div class="nfl-coach-accord-body">'+_nflCoachLineMovement(p)+'</div></details>'
     +'<details><summary>Key Stats</summary><div class="nfl-coach-accord-body"><div class="nfl-coach-stats">'
     +'<div class="nfl-coach-stat"><div class="k">Projection</div><div class="v">'+projection+'</div></div>'
@@ -7246,7 +7256,7 @@ function _nflCoachRender(question,rows,total,mode){
     var s=p.source||{},head=_esc(s.head||''),logo='https://a.espncdn.com/i/teamlogos/nfl/500/'+_logoAbbr(p.team)+'.png';
     var venue=s.homeRoad==='H'?'HOME':(s.homeRoad==='R'?'AWAY':'');
     var status=String(s.injuryStatus||'UNVERIFIED'),statusColor=status==='ACTIVE'?'#4ade80':'#fbbf24';
-    return '<details class="nfl-coach-play" open><summary><span class="nfl-coach-ident"><span class="nfl-coach-avatar">'+_esc(_initials(p.player))
+    return '<details class="nfl-coach-play"><summary><span class="nfl-coach-ident"><span class="nfl-coach-avatar">'+_esc(_initials(p.player))
       +(head?'<img src="'+head+'" alt="" onerror="this.style.display=\\'none\\'"/>':'')
       +'<img class="team-logo" src="'+_esc(logo)+'" alt="" onerror="this.style.display=\\'none\\'"/></span>'
       +'<span><span class="nfl-coach-name">'+(i+1)+'. '+_esc(p.player)+'</span><span class="nfl-coach-meta">'
@@ -7285,6 +7295,26 @@ function askNflCoachPreset(q,category){
   delete window.__NFL_COACH_IGNORE_GAME_FILTER__;
   var shown=askNflCoach();
   _nflCoachCapture(category,full);
+  return shown;
+}
+function askNflTdCoach(){
+  var q='Show the best positive Coach Edge Anytime TD scorers';
+  var input=document.getElementById('nflCoachInput');if(input)input.value=q;
+  _nflGameSync('coach');
+  var games=_nflLoadedGames();
+  var selected=games.filter(function(g){
+    var teams=g.key.split('|');
+    return _nflGameFilterOn('coach',teams[0],teams[1]);
+  });
+  var gameFilterActive=_nflGameFilterActive('coach');
+  window.__NFL_COACH_LIMIT_OVERRIDE__=10;
+  window.__NFL_COACH_IGNORE_GAME_FILTER__=true;
+  var full=askNflCoach();
+  delete window.__NFL_COACH_IGNORE_GAME_FILTER__;
+  window.__NFL_COACH_LIMIT_OVERRIDE__=gameFilterActive&&selected.length===1?5:10;
+  var shown=askNflCoach();
+  delete window.__NFL_COACH_LIMIT_OVERRIDE__;
+  _nflCoachCapture('td_scorers',full);
   return shown;
 }
 async function askNflAltCoach(){
@@ -7507,21 +7537,42 @@ function renderNflCoachTrack(){
 function _renderNflTdPredictor(d){
   var card=document.getElementById('nfl-td-predictor-card'),body=document.getElementById('nfl-td-predictor-body');
   if(!card||!body)return;
-  var source=(d&&d.td_picks)||((d&&d.all)||[]).filter(function(p){
-    return p.market==='player_anytime_td'&&p.pick==='OVER'&&p.betQualified!==false;
+  var gameSelect=document.getElementById('nflTdGameSelect'),games=_nflLoadedGames();
+  if(gameSelect){
+    var selectedValue=gameSelect.value||'';
+    gameSelect.innerHTML='<option value="">All Games</option>'+games.map(function(g){return '<option value="'+_esc(g.key)+'">'+_esc(g.label)+'</option>';}).join('');
+    gameSelect.value=games.some(function(g){return g.key===selectedValue;})?selectedValue:'';
+  }
+  var selectedGame=gameSelect?gameSelect.value:'';
+  var source=((d&&d.all)||[]).filter(function(p){
+    return p.market==='player_anytime_td'&&p.pick==='OVER'
+      &&p.realOdds!=null&&Number(p.vsLineTotal||p.totB||0)>=5
+      &&p.coachEligible!==false&&p.availabilityVerified!==false;
   });
-  var rows=source.filter(function(p){return !_nflGameDone(p);}).slice().sort(function(a,b){
-    return Number(b.score||b.dispScore||0)-Number(a.score||a.dispScore||0)
+  var rows=source.filter(function(p){
+    return !_nflGameDone(p)&&(!selectedGame||_nflGameKey(p.team,p.opponent||p.opp)===selectedGame);
+  }).slice().sort(function(a,b){
+    var br=Math.max(Number(b.rateA||0),Number(b.rateB||0),Number(b.vsLineRate||0));
+    var ar=Math.max(Number(a.rateA||0),Number(a.rateB||0),Number(a.vsLineRate||0));
+    return br-ar||Number(b.score||b.dispScore||0)-Number(a.score||a.dispScore||0)
       ||Number(b.valueEdge||0)-Number(a.valueEdge||0);
-  }).slice(0,10);
-  if(!rows.length){card.style.display='none';body.innerHTML='';return;}
+  }).slice(0,selectedGame?5:10);
+  if(!rows.length){
+    if(!selectedGame){card.style.display='none';body.innerHTML='';return;}
+    card.style.display='block';
+    var emptyCount=document.getElementById('nflTdPredictorCount');
+    if(emptyCount)emptyCount.textContent='TOP 5 · 0 SCORERS';
+    body.innerHTML='<div style="margin-top:14px;border:1px solid #2d2d22;border-radius:12px;padding:18px;text-align:center;color:#a3a38d;font-size:.76rem">No priced Anytime TD scorer with enough recent history is available for this matchup.</div>';
+    return;
+  }
   card.style.display='block';
   var count=document.getElementById('nflTdPredictorCount');
-  if(count)count.textContent=rows.length+' QUALIFIED SCORER'+(rows.length===1?'':'S');
+  if(count)count.textContent=(selectedGame?'TOP 5 · ':'TOP 10 · ')+rows.length+' SCORER'+(rows.length===1?'':'S');
   var table=rows.map(function(p,i){
     var key=_ladKey(p);window.__NFLLAD__[key]=p;
     var odds=_nflSideOdds(p,'OVER'),implied=_nflCoachImplied(odds);
     var prob=Number(p.score!=null?p.score:p.dispScore||0);
+    var rankRate=Math.max(Number(p.rateA||0),Number(p.rateB||0),Number(p.vsLineRate||0));
     var edge=p.valueEdge!=null?Number(p.valueEdge):(implied==null?null:prob-implied);
     var recent=p.vsLineTotal?Number(p.vsLineHits||0)+'/'+Number(p.vsLineTotal||0)+' ('+Number(p.vsLineRate||0).toFixed(0)+'%)':'—';
     var versus=p.totA?Number(p.hitsA||0)+'/'+Number(p.totA||0)+' ('+Number(p.rateA||0).toFixed(0)+'%)':'—';
@@ -7530,13 +7581,14 @@ function _renderNflTdPredictor(d){
       +'<td><button type="button" class="nfl-td-player" onclick="openNflLadder(\\''+key+'\\')">'+_esc(p.name)+'</button><br><small style="color:#6b7280">'+_esc(p.team||'')+' vs '+_esc(p.opponent||'')+(p.slate_date?' · '+_esc(p.slate_date):'')+'</small></td>'
       +'<td style="font-weight:900;color:#fde68a">OVER 0.5 TD</td>'
       +'<td style="font-family:monospace;color:#fbbf24;font-weight:900">'+(_fmtOdds(odds)||'—')+'<br><small style="color:#6b7280">'+_esc(p.over_book||'')+'</small></td>'
+      +'<td class="nfl-td-prob">'+rankRate.toFixed(0)+'%</td>'
       +'<td>'+(implied==null?'—':implied.toFixed(1)+'%')+'</td>'
-      +'<td class="nfl-td-prob">'+prob.toFixed(1)+'%</td>'
+      +'<td style="font-family:monospace;font-weight:900;color:#c4b5fd">'+prob.toFixed(1)+'%</td>'
       +'<td class="nfl-td-edge">'+(edge==null?'—':(edge>=0?'+':'')+edge.toFixed(1)+' pts')+'</td>'
       +'<td>'+recent+'</td><td>'+versus+'</td><td>'+defense+'</td></tr>';
   }).join('');
-  body.innerHTML='<div class="nfl-td-table-wrap"><table class="nfl-td-table"><thead><tr><th>#</th><th>Player</th><th>Play</th><th>Best Odds</th><th>Implied</th><th>TD Confidence</th><th>Value Edge</th><th>L10 vs Line</th><th>Vs Opponent</th><th>Opponent Defense</th></tr></thead><tbody>'+table+'</tbody></table></div>'
-    +'<div class="nfl-td-method">TD Confidence is calibrated against walk-forward results from multiple completed seasons: every backtest prediction uses only games played earlier than that matchup. Workload uses carries, targets, target share, team scoring environment, and red-zone/end-zone/snap inputs only when nflverse publishes them. Players need five prior games; reliability bins are shrunk until 100 outcomes. Qualification also requires a genuine Anytime TD price and at least a five-point edge over sportsbook break-even. Passing touchdowns never count—only rushing or receiving touchdowns settle this market. Click any player for the full game log.</div>';
+  body.innerHTML='<div class="nfl-td-table-wrap"><table class="nfl-td-table"><thead><tr><th>#</th><th>Player</th><th>Play</th><th>Best Odds</th><th>Rank Rate</th><th>Implied</th><th>Model Prob</th><th>Value Edge</th><th>L10 vs Line</th><th>Vs Opponent</th><th>Opponent Defense</th></tr></thead><tbody>'+table+'</tbody></table></div>'
+    +'<div class="nfl-td-method">Rank Rate is the strongest displayed hit rate from the player’s recent, venue, book-line, or opponent sample, matching the percentage used in the game’s Anytime TD list. Model Prob remains the calibrated walk-forward probability, and Value Edge remains Model Prob minus sportsbook break-even. Players require a genuine Anytime TD price and at least five recent games. Passing touchdowns never count—only rushing or receiving touchdowns settle this market. Click any player for the full game log.</div>';
 }
 function renderResults(d){
   var res=document.getElementById('results');
@@ -7552,14 +7604,7 @@ function renderResults(d){
   var weekNotice=d.week_notice?('<div style="margin-bottom:10px;padding:11px 14px;border:1px solid #6d28d9;background:rgba(109,40,217,.12);border-radius:10px;color:#ddd6fe;font-size:.82rem">'+d.week_notice+'</div>'):'';
   var note=d.data_note?('<div style="margin-bottom:10px;padding:11px 14px;border:1px solid #24506b;background:#0b2230;border-radius:10px;color:#9bd5f5;font-size:.82rem">'+d.data_note+'</div>'):'';
   var warn=d.data_warning?('<div class="err-box" style="margin-bottom:10px">'+d.data_warning+'</div>'):'';
-  var tdAll=(d.all||[]).filter(function(p){return p.market==='player_anytime_td'&&p.pick==='OVER';});
-  var tdQualified=tdAll.filter(function(p){return p.betQualified!==false;}).length;
-  var tdNote=tdAll.length
-    ?'<div style="margin-bottom:10px;padding:11px 14px;border:1px solid rgba(56,189,248,.35);background:rgba(14,116,144,.14);border-radius:10px;color:#bae6fd;font-size:.78rem">'
-      +'<strong>Anytime TD value gate:</strong> '+tdQualified+' of '+tdAll.length
-      +' signals clear the book break-even probability by at least 5 points with 5+ recent games. The rest remain review-only.</div>'
-    :'';
-  res.innerHTML=weekNotice+note+warn+tdNote+'<div class="nfl-toolbar"><input id="nflSearch" type="text" placeholder="Search player…" oninput="_nflPaint(this.value)"/></div><div id="nflBody"></div>';
+  res.innerHTML=weekNotice+note+warn+'<div class="nfl-toolbar"><input id="nflSearch" type="text" placeholder="Search player…" oninput="_nflPaint(this.value)"/></div><div id="nflBody"></div>';
   _renderNflGamePredictor(d);
   _renderNflTdPredictor(d);
   _nflPaint('');
