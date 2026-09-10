@@ -5793,6 +5793,21 @@ tr:last-child td{border-bottom:none}
 .nfl-coach-accord-body{padding:0 2px 12px;color:#94a3b8;font-size:.67rem;line-height:1.5}
 .nfl-coach-ratebar{height:4px;background:#1e293b;border-radius:99px;overflow:hidden;margin-top:8px}
 .nfl-coach-ratebar span{display:block;height:100%;background:#38bdf8;border-radius:99px}
+.nfl-coach-opp-history{min-width:0}
+.nfl-coach-opp-history>summary{list-style:none;cursor:pointer}
+.nfl-coach-opp-history>summary::-webkit-details-marker{display:none}
+.nfl-coach-opp-history>summary .k{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.nfl-coach-opp-history>summary .k:after{content:"VIEW GAMES +";color:#38bdf8;font-size:.57rem;letter-spacing:.04em}
+.nfl-coach-opp-history[open]>summary .k:after{content:"HIDE GAMES −"}
+.nfl-coach-opp-history>summary:hover{border-color:#38bdf8;background:#101b2e}
+.nfl-coach-opp-games{margin-top:7px;padding:8px;border:1px solid #24334d;border-radius:9px;background:#08111f}
+.nfl-coach-opp-head{color:#94a3b8;font-size:.62rem;line-height:1.35;margin-bottom:6px}
+.nfl-coach-opp-row{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:5px 0;border-top:1px solid #17243a;font-size:.66rem}
+.nfl-coach-opp-row:first-of-type{border-top:0}
+.nfl-coach-opp-row .result{font-weight:800}
+.nfl-coach-opp-row.hit .result{color:#4ade80}
+.nfl-coach-opp-row.miss .result{color:#f87171}
+.nfl-coach-opp-row.push .result{color:#fbbf24}
 .nfl-coach-games{display:flex;gap:6px;flex-wrap:wrap;margin-top:10px}
 .nfl-coach-game{min-width:48px;background:#0b1220;border:1px solid #263449;border-radius:7px;padding:6px;text-align:center}
 .nfl-coach-game.hit{border-color:rgba(74,222,128,.45)}.nfl-coach-game.miss{border-color:rgba(248,113,113,.4)}
@@ -7269,6 +7284,22 @@ function _nflCoachRateTile(label,rate,hits,total){
   var shown=rate!=null&&Number(total)>0,pct=shown?Math.max(0,Math.min(100,Number(rate))):0;
   return '<div class="nfl-coach-stat"><div class="k">'+_esc(label)+'</div><div class="v">'+(shown?Number(rate).toFixed(0)+'% · '+hits+'/'+total:'N/A')+'</div><div class="nfl-coach-ratebar"><span style="width:'+pct+'%"></span></div></div>';
 }
+function _nflCoachOppHistory(p,rate,hits,total){
+  var s=p.source||{},games=s.vsOppLog||[],shown=rate!=null&&Number(total)>0;
+  var pct=shown?Math.max(0,Math.min(100,Number(rate))):0;
+  var rows=games.length?games.map(function(g){
+    var hit=_nflCoachHit(p.side,g.v,p.line);
+    var cls=hit==null?'push':(hit?'hit':'miss');
+    var result=hit==null?'PUSH':(hit?'HIT':'MISS');
+    return '<div class="nfl-coach-opp-row '+cls+'"><span>'+_esc(g.d)+'</span><span><b>'+Number(g.v).toFixed(1)+'</b> <span class="result">'+result+'</span></span></div>';
+  }).join(''):'<div class="nfl-coach-opp-head">No game-by-game opponent history is available.</div>';
+  return '<details class="nfl-coach-opp-history">'
+    +'<summary class="nfl-coach-stat" title="View every '+_esc(p.market)+' game against '+_esc(p.opponent)+'">'
+    +'<div class="k">vs Opponent</div><div class="v">'+(shown?Number(rate).toFixed(0)+'% · '+hits+'/'+total:'N/A')+'</div>'
+    +'<div class="nfl-coach-ratebar"><span style="width:'+pct+'%"></span></div></summary>'
+    +'<div class="nfl-coach-opp-games"><div class="nfl-coach-opp-head">'+_esc(p.player)+' vs '+_esc(p.opponent)
+    +' · '+_esc(p.market)+' · '+p.side+' '+Number(p.line).toFixed(1)+'</div>'+rows+'</div></details>';
+}
 function _nflCoachRateTiles(p){
   var s=p.source||{},l5=_nflCoachLogRate(p,5),l10=_nflCoachLogRate(p,10);
   var venueRate=p.side==='UNDER'?(s.totB?100-Number(s.rateB||0):null):Number(s.rateB);
@@ -7283,7 +7314,7 @@ function _nflCoachRateTiles(p){
     +_nflCoachRateTile('L10',l10.rate,l10.hits,l10.total)
     +_nflCoachRateTile(s.homeRoad==='H'?'Home split':(s.homeRoad==='R'?'Away split':'Venue split'),venueRate,venueHits,s.totB)
     +_nflCoachRateTile('vs Book Line',bookRate,bookHits,s.vsLineTotal)
-    +_nflCoachRateTile('vs Opponent',oppRate,oppHits,s.totA)
+    +_nflCoachOppHistory(p,oppRate,oppHits,s.totA)
     +_nflCoachRateTile(p.side==='OVER'?'Under L10':'Over L10',oppositeRate,oppositeHits,l10.total)
     +'</div>';
 }
