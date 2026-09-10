@@ -1610,9 +1610,12 @@ def _trim_prop_lines(lines: list, df) -> list:
                 if position == "RB":
                     position_group = "RB"
                     limit = 1
-                elif position in ("WR", "TE"):
-                    position_group = "WR_TE"
-                    limit = 2
+                elif position == "WR":
+                    position_group = "WR"
+                    limit = 3
+                elif position == "TE":
+                    position_group = "TE"
+                    limit = 1
                 else:
                     continue
                 group_key = (home, away, market, team, position_group)
@@ -2856,42 +2859,30 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False,
             print(f"[nfl_sim] point-in-time filter failed closed: {exc}")
             analysis_df = df.iloc[0:0]
 
-    # 5. Analyze every sportsbook-listed active player. Do not pre-trim offense
-    # or defense by career volume: every listed starter/role player must get the
-    # same qualification pass, and the market boards apply their own Top-10 caps.
-    _p(f"Analyzing all {len(all_lines)} sportsbook-listed player prop histories…")
+    # 5. Analyze every sportsbook-listed active player in standard offense,
+    # defense, and kicking markets. Anytime TD is the only exception: reduce its
+    # pool to starter-level RB and WR/TE candidates before analysis so backup
+    # longshots cannot displace the real starters on the dedicated TD lists.
+    standard_lines = [
+        pl for pl in all_lines if pl.get("market") != "player_anytime_td"
+    ]
+    td_lines = [
+        pl for pl in all_lines if pl.get("market") == "player_anytime_td"
+    ]
+    td_starter_lines = _trim_prop_lines(td_lines, analysis_df)
+    all_lines = standard_lines + td_starter_lines
+    _p(
+        f"Analyzing all {len(standard_lines)} standard player props plus "
+        f"{len(td_starter_lines)} starter-level Anytime TD candidates…")
     all_results = []
     for pl in all_lines:
         result = _analyze_prop(pl, analysis_df, pl.get("home_abbr",""), pl.get("away_abbr",""))
         if result:
             all_results.append(result)
 
-    # 6. Preserve every qualified offense, defense, and kicking result. Anytime
-    # TD keeps its separate one-RB plus one-WR/TE-per-team rule, selected by
-    # model-versus-book edge, as required by the dedicated TD board.
-    def _td_selection_group(r):
-        if r.get("market") != "player_anytime_td":
-            return None
-        position = str(r.get("position") or "").upper().strip()
-        if position == "RB":
-            return (r.get("team", ""), r.get("mkt", ""), "RB")
-        if position in ("WR", "TE"):
-            return (r.get("team", ""), r.get("mkt", ""), "WR_TE")
-        return None
-
-    _non_td_results = [
-        r for r in all_results if r.get("market") != "player_anytime_td"
-    ]
-    _td_best: dict = {}
-    for r in all_results:
-        key = _td_selection_group(r)
-        if key is None:
-            continue
-        edge = r.get("valueEdge")
-        score = float(edge) if edge is not None else float("-inf")
-        if key not in _td_best or score > _td_best[key][1]:
-            _td_best[key] = (r, score)
-    all_results = _non_td_results + [v[0] for v in _td_best.values()]
+    # 6. Preserve every analyzed result. The TD starter prefilter above removes
+    # backup longshots; there is no later team cap, so every qualifying starter
+    # can compete for the slate-wide Top 10 by the displayed hit-rate ranking.
 
     picks   = sorted([r for r in all_results
                       if r.get("pick") and r.get("betQualified", True)],
