@@ -6317,7 +6317,7 @@ function _nflLeg(p){
   var line=(p.realLine!=null?p.realLine:(p.dispLine!=null?p.dispLine:0));
   var rate=(p.vsLineRate||p.rateB||p.rateA||p.dispScore||0);
   var odds=(dir==='OVER')?p.realOdds:(dir==='UNDER')?p.realUnderOdds:null;var dec=_amToDec(odds);
-  return {player:p.name,team:p.team||'',opp:p.opponent||'',market:p.mkt||p.label||'',dir:dir,line:line,rate:Math.round(rate||0),odds:odds,dec:dec,hasOdds:!!dec,source:'normal'};
+  return {player:p.name,team:p.team||'',opp:p.opponent||'',market:p.mkt||p.label||'',dir:dir,line:line,rate:Math.round(rate||0),odds:odds,book:_nflSideBook(p,dir),dec:dec,hasOdds:!!dec,source:'normal',detail:p};
 }
 function _nflParlayCatKey(c){return String(c.market||'NFL Prop')+'|'+String(c.dir||'');}
 function _nflParlayCatLabel(c){return String(c.market||'NFL Prop')+(c.dir?' · '+c.dir:'');}
@@ -6407,7 +6407,8 @@ function _nflCoachParlayCandidates(){
     var dec=_amToDec(p.odds);
     return {player:p.player,team:p.team||'',opp:p.opponent||'',market:p.market||'NFL Prop',
       dir:p.side,line:p.line,rate:Math.round(p.appProb||0),odds:p.odds,dec:dec,hasOdds:!!dec,
-      edge:Number(p.edge||0),isAlternate:!!p.isAlternate,source:'coach',coachCats:[]};
+      book:p.book||'Sportsbook line',edge:Number(p.edge||0),isAlternate:!!p.isAlternate,
+      source:'coach',coachCats:[],detail:p.source||null,coachDetail:p};
   }
   function select(rows,sorter,limit){
     var seen={};
@@ -6558,7 +6559,7 @@ function _paintNflParlay(){
   legs.forEach(function(l){if(l.dec){dec*=l.dec;priced++;}else{missing++;}});
   var am=priced?_decToAm(dec):null;var payout=priced?(100*dec):null;
   var dirColor=function(d){return d==='OVER'?'#4ade80':d==='UNDER'?'#f87171':'#9ca3af';};
-  var rows=legs.map(function(l,i){var fo=_fmtOdds(l.odds);return '<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;padding:10px 12px;border-bottom:1px solid #1a1a1a">'
+  var rows=legs.map(function(l,i){var fo=_fmtOdds(l.odds);return '<div role="button" tabindex="0" onclick="_openNflParlayLeg('+i+')" onkeydown="if(event.key===\\'Enter\\'||event.key===\\' \\'){event.preventDefault();_openNflParlayLeg('+i+')}" title="Open player matchup details" style="display:flex;justify-content:space-between;align-items:center;gap:10px;padding:10px 12px;border-bottom:1px solid #1a1a1a;cursor:pointer">'
     +'<div style="min-width:0">'
     +'<div style="font-weight:800;color:#fff;font-size:.85rem">'+(i+1)+'. '+l.player+' <span style="color:#777;font-size:.7rem">'+l.team+(l.opp?(' vs '+l.opp):'')+'</span><span class="nfl-parlay-source '+(l.source==='coach'?'coach':'normal')+'">'+(l.source==='coach'?'COACH EDGE':'NORMAL')+'</span></div>'
     +'<div style="color:#999;font-size:.72rem;margin-top:2px">'+l.market+(l.line!=null?(' · line '+l.line):'')+(l.rate?(' · '+l.rate+'% hit'):'')+'</div>'
@@ -6578,6 +6579,27 @@ function _paintNflParlay(){
     +'<div style="text-align:right">'+(am?('<div style="font-weight:900;color:#4ade80;font-size:1.05rem">'+am+'</div><div style="color:#999;font-size:.7rem">$100 → $'+payout.toFixed(2)+(missing?(' · '+priced+'/'+n+' legs priced'):'')+'</div>'):('<div style="color:#888;font-size:.78rem">No book odds available for these legs</div>'))+'</div>'
     +'</div>';
   out.innerHTML='<div style="background:#0e0e0e;border:1px solid #262626;border-radius:12px;overflow:hidden">'+header+rows+summary+'</div>';
+}
+function _openNflParlayLeg(idx){
+  var leg=(window._nflParlayLegs||[])[idx];if(!leg)return;
+  if(leg.source==='coach'&&leg.coachDetail&&typeof _nflCoachAccordions==='function'){
+    var p=leg.coachDetail;
+    var why='<div style="background:rgba(34,197,94,.08);border:1px solid rgba(34,197,94,.25);border-radius:10px;padding:11px 12px;margin:10px 0 14px;color:#cbd5e1;font-size:.78rem;line-height:1.5">'
+      +'<b style="color:#86efac">Why this parlay leg:</b> This was a positive Coach Edge candidate that passed your game, category, and odds filters. '
+      +'Model probability is <b>'+Number(p.appProb||0).toFixed(1)+'%</b>, sportsbook-implied probability is <b>'+Number(p.implied||0).toFixed(1)+'%</b>, and Coach Edge is <b>'+_nflCoachSigned(Number(p.edge||0))+' points</b>.'
+      +'</div>';
+    _openModal(_esc(p.player),_esc(p.market)+' · '+_esc(p.team)+' vs '+_esc(p.opponent)+' · '+p.side+' '+p.line+' · '+_nflCoachOdds(p.odds)+' · '+_esc(p.book||'Sportsbook line'),why+_nflCoachAccordions(p));
+    return;
+  }
+  if(leg.detail){
+    var key='nfl_parlay_'+idx;
+    var detail=Object.assign({},leg.detail,{
+      pick:leg.dir,dispLine:leg.line,realLine:leg.line,
+      parlayWhy:'Selected after your game, category, and odds filters as one of the strongest remaining eligible plays. Displayed ranking rate: '+Number(leg.rate||0).toFixed(0)+'%.'
+    });
+    window.__NFLLAD__[key]=detail;
+    openNflLadder(key);
+  }
 }
 function _replaceNflParlayLeg(idx){
   var legs=window._nflParlayLegs;
@@ -6981,7 +7003,7 @@ function openNflLadder(key){
   var p=window.__NFLLAD__[key]; if(!p) return;
   var line=p.dispLine;
   var chips=(p.glog||[]).map(function(g){
-    var hit=g.v>line; var cls=hit?'hit':'miss';
+    var hit=p.pick==='UNDER'?g.v<line:g.v>line; var cls=hit?'hit':'miss';
     var od=g.o?(' · '+g.o):'';
     return `<div class="glchip ${cls}"><div class="d">${g.d}${od}</div><div class="v">${g.v}</div></div>`;
   }).join('');
@@ -6994,14 +7016,18 @@ function openNflLadder(key){
   var voHtml='';
   if(vol.length){
     voHtml='<div style="font-size:.7rem;color:#6b7280;text-transform:uppercase;letter-spacing:.08em;font-weight:700;margin:12px 0 4px">Every game vs '+p.opponent+' ('+vol.length+')</div>';
-    voHtml+=vol.map(function(g){var hit=g.v>line;return '<div class="vsopp-row"><span style="color:#9ca3af">'+g.d+'</span><span style="font-weight:700;color:'+(hit?'#4ade80':'#f87171')+'">'+g.v+'</span></div>';}).join('');
+    voHtml+=vol.map(function(g){var hit=p.pick==='UNDER'?g.v<line:g.v>line;return '<div class="vsopp-row"><span style="color:#9ca3af">'+g.d+'</span><span style="font-weight:700;color:'+(hit?'#4ade80':'#f87171')+'">'+g.v+'</span></div>';}).join('');
   }
+  var parlayWhy=p.parlayWhy
+    ?'<div style="background:rgba(59,130,246,.08);border:1px solid rgba(59,130,246,.25);border-radius:10px;padding:10px 11px;margin:8px 0 13px;color:#cbd5e1;font-size:.77rem;line-height:1.5"><b style="color:#7dd3fc">Why this parlay leg:</b> '+_esc(p.parlayWhy)+'</div>'
+    :'';
   var html=`
     <div class="lad-modal" onclick="event.stopPropagation()">
       <button class="lad-close" onclick="closeNflLadder()">✕</button>
       <h3>${p.name}</h3>
       <div class="lad-sub">${p.mkt} · ${p.team} vs ${p.opponent} · Line ${p.dispLine} · ${p.pick||''} · ${_esc(_nflSideBook(p))}</div>
-      <div style="font-size:.7rem;color:#6b7280;text-transform:uppercase;letter-spacing:.08em;font-weight:700;margin-bottom:4px">Recent Games (green = over line)</div>
+      ${parlayWhy}
+      <div style="font-size:.7rem;color:#6b7280;text-transform:uppercase;letter-spacing:.08em;font-weight:700;margin-bottom:4px">Recent Games (green = ${p.pick==='UNDER'?'under':'over'} line)</div>
       <div class="lad-glog">${chips}</div>
       ${voHtml}
       <div class="lad-stat"><span class="k">Career vs ${p.opponent}</span><span class="v">${_rateHtml(p.rateA,p.hitsA,p.totA)}</span></div>
