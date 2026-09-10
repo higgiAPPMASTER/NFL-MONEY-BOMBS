@@ -5785,8 +5785,55 @@ tr:last-child td{border-bottom:none}
  .nfl-gp-filters{display:grid;grid-template-columns:minmax(130px,160px) minmax(110px,140px) minmax(0,1fr);gap:10px;align-items:end;margin-bottom:14px}
  .nfl-gp-filter{display:flex;flex-direction:column;gap:6px;min-width:0;color:#9ca3af;font-size:.72rem;font-weight:800;text-transform:uppercase;letter-spacing:.09em}
  .nfl-gp-filter .date-input{display:block;width:100%;max-width:100%;min-width:0;box-sizing:border-box}
+  .nfl-gp-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(360px,1fr));gap:14px}
+  .nfl-gp-game{position:relative;overflow:hidden;background:linear-gradient(145deg,#111a2d 0%,#090f1c 72%);border:1px solid #334155;border-radius:18px;cursor:pointer;box-shadow:0 14px 30px rgba(0,0,0,.28);transition:transform .18s ease,border-color .18s ease,box-shadow .18s ease}
+  .nfl-gp-game:hover{transform:translateY(-2px);border-color:#8b5cf6;box-shadow:0 18px 38px rgba(76,29,149,.26)}
+  .nfl-gp-game:focus-visible{outline:3px solid rgba(167,139,250,.55);outline-offset:3px}
+  .nfl-gp-head{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:14px 16px 11px;border-bottom:1px solid rgba(148,163,184,.14)}
+  .nfl-gp-matchup{color:#f8fafc;font-size:.88rem;font-weight:950;letter-spacing:.04em}
+  .nfl-gp-date{display:block;color:#94a3b8;font-size:.62rem;margin-top:3px;font-weight:750}
+  .nfl-gp-badges{display:flex;align-items:center;justify-content:flex-end;gap:5px;flex-wrap:wrap}
+  .nfl-gp-badge{border-radius:999px;padding:4px 8px;color:#fff;font-size:.58rem;font-weight:950;letter-spacing:.05em;white-space:nowrap}
+  .nfl-gp-teams{padding:8px 16px 4px}
+  .nfl-gp-team{display:grid;grid-template-columns:38px 42px minmax(0,1fr) 54px 52px;gap:9px;align-items:center;padding:9px 0}
+  .nfl-gp-team+.nfl-gp-team{border-top:1px solid rgba(148,163,184,.1)}
+  .nfl-gp-team.pick{margin:0 -8px;padding:10px 8px;border-radius:12px;background:linear-gradient(90deg,rgba(124,58,237,.18),rgba(34,197,94,.06))}
+  .nfl-gp-logo{width:36px;height:36px;object-fit:contain;filter:drop-shadow(0 3px 5px rgba(0,0,0,.45))}
+  .nfl-gp-abbr{color:#cbd5e1;font-size:.9rem;font-weight:950}
+  .nfl-gp-team.pick .nfl-gp-abbr{color:#fff}
+  .nfl-gp-bar{height:9px;border-radius:999px;background:#07101f;overflow:hidden;box-shadow:inset 0 0 0 1px rgba(148,163,184,.08)}
+  .nfl-gp-bar>span{display:block;height:100%;border-radius:inherit}
+  .nfl-gp-sp{margin-top:4px;color:#94a3b8;font-size:.59rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .nfl-gp-proj{text-align:center;color:#e2e8f0;font-size:.94rem;font-weight:950}
+  .nfl-gp-proj small,.nfl-gp-win small{display:block;color:#64748b;font-size:.5rem;letter-spacing:.08em;text-transform:uppercase;margin-top:2px}
+  .nfl-gp-win{text-align:right;color:#94a3b8;font-size:.96rem;font-weight:950}
+  .nfl-gp-team.pick .nfl-gp-win{color:#4ade80}
+  .nfl-gp-callouts{display:grid;grid-template-columns:1fr 1fr;gap:8px;padding:8px 16px 14px}
+  .nfl-gp-callout{min-width:0;border:1px solid rgba(148,163,184,.15);border-radius:10px;background:rgba(3,7,18,.55);padding:9px 10px}
+  .nfl-gp-callout .k{color:#64748b;font-size:.54rem;font-weight:900;letter-spacing:.08em;text-transform:uppercase}
+  .nfl-gp-callout .v{color:#f8fafc;font-size:.73rem;font-weight:900;margin-top:4px;line-height:1.35}
+  .nfl-gp-why{padding:10px 16px;border-top:1px solid rgba(148,163,184,.12);color:#aab8cc;font-size:.66rem;line-height:1.5}
+  .nfl-games-jump{cursor:pointer;border-color:rgba(245,158,11,.55)!important;background:linear-gradient(145deg,rgba(245,158,11,.16),rgba(17,24,39,.8))!important}
+  .nfl-games-jump .val,.nfl-games-jump .lbl{color:#fbbf24!important}
+  .nfl-by-game{margin-top:20px;border:1px solid rgba(245,158,11,.35);border-radius:16px;background:linear-gradient(145deg,rgba(120,53,15,.12),rgba(15,23,42,.72));overflow:hidden;scroll-margin-top:16px}
+  .nfl-by-game-head{padding:16px 18px;border-bottom:1px solid rgba(245,158,11,.2);display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
+  .nfl-by-game-title{color:#fbbf24;font-size:1.05rem;font-weight:950}
+  .nfl-by-game-sub{color:#94a3b8;font-size:.7rem;margin-top:4px}
+  .nfl-by-game-count{color:#fde68a;background:rgba(245,158,11,.12);border:1px solid rgba(245,158,11,.3);border-radius:999px;padding:5px 10px;font-size:.66rem;font-weight:900}
+  .nfl-by-game-list{padding:12px}
+  .nfl-game-group{margin-bottom:8px;border:1px solid #263244;border-radius:12px;background:#0a1120;overflow:hidden}
+  .nfl-game-group:last-child{margin-bottom:0}
+  .nfl-game-group summary{list-style:none;display:flex;align-items:center;justify-content:space-between;gap:10px;padding:12px 14px;cursor:pointer;color:#f8fafc;font-size:.82rem;font-weight:900}
+  .nfl-game-group summary::-webkit-details-marker{display:none}
+  .nfl-game-group summary:hover{background:rgba(124,58,237,.1)}
+  .nfl-game-group summary:after{content:'Show picks';color:#a78bfa;font-size:.62rem;font-weight:900}
+  .nfl-game-group[open] summary:after{content:'Hide picks'}
+  .nfl-game-group-meta{display:flex;align-items:center;gap:8px;color:#94a3b8;font-size:.63rem;font-weight:750}
+  .nfl-game-pick-count{color:#fbbf24;background:rgba(245,158,11,.1);border-radius:999px;padding:3px 8px;font-weight:900}
+  .nfl-game-group-body{border-top:1px solid #263244;padding:5px 12px 10px}
  @media(max-width:620px){.nfl-parlay-filters{grid-template-columns:1fr}}
  @media(max-width:680px){
+    .nfl-gp-grid{grid-template-columns:1fr}.nfl-gp-game{border-radius:14px}.nfl-gp-head{align-items:flex-start}.nfl-gp-team{grid-template-columns:34px 38px minmax(0,1fr) 46px 46px;gap:6px}.nfl-gp-logo{width:32px;height:32px}.nfl-gp-callouts{grid-template-columns:1fr}.nfl-game-group summary{align-items:flex-start}.nfl-game-group-meta{flex-direction:column;align-items:flex-end}
    .nfl-gp-filters{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}
    .nfl-gp-filter-date{grid-column:1/-1}
    .nfl-trk-group-head{padding:14px}.nfl-trk-group-name{font-size:1.02rem}.nfl-trk-tbl{font-size:.88rem}.nfl-trk-tbl th{font-size:.68rem;padding:11px}.nfl-trk-tbl td{padding:11px 12px}
@@ -6631,6 +6678,44 @@ function _marketModal(m){
   var body=plays.length?plays.map(_playRow).join(''):'<div class="mt" style="color:#6b7280;padding:10px">No plays.</div>';
   _openModal(_mIcon(m)+' '+m, plays.length+' plays · tap any play for its game log', body);
 }
+function _nflJumpToGames(){
+  var el=document.getElementById('nfl-by-game-section');
+  if(!el)return;
+  el.scrollIntoView({behavior:'smooth',block:'start'});
+  el.setAttribute('data-highlight','1');
+  el.style.boxShadow='0 0 0 3px rgba(245,158,11,.28),0 18px 45px rgba(0,0,0,.32)';
+  setTimeout(function(){el.style.boxShadow='';el.removeAttribute('data-highlight');},1400);
+}
+function _nflByGameHtml(d){
+  var games=(d&&d.games)||[],all=(d&&d.all)||[];
+  if(!games.length)return '';
+  var groups=games.map(function(g){return {game:g,plays:[]};});
+  all.forEach(function(p){
+    var idx=games.findIndex(function(g){
+      if(p.game&&g.game)return String(p.game)===String(g.game);
+      var pa=String(p.team||''),po=String(p.opponent||p.opp||'');
+      var ga=String(g.away_abbr||g.away_team||''),gh=String(g.home_abbr||g.home_team||'');
+      return (pa===ga&&po===gh)||(pa===gh&&po===ga);
+    });
+    if(idx>=0)groups[idx].plays.push(p);
+  });
+  var total=groups.reduce(function(n,x){return n+x.plays.length;},0);
+  var body=groups.map(function(group,gi){
+    var g=group.game,mu=(g.away_abbr||g.away_team||'?')+' @ '+(g.home_abbr||g.home_team||'?');
+    var plays=group.plays.slice().sort(function(a,b){
+      var ai=_MORDER.indexOf(a.mkt||a.label),bi=_MORDER.indexOf(b.mkt||b.label);
+      return ai-bi||_edge(b)-_edge(a)||(a.name||'').localeCompare(b.name||'');
+    });
+    var rows='';
+    _MORDER.forEach(function(m){
+      var mp=plays.filter(function(p){return (p.mkt||p.label)===m;});
+      if(mp.length)rows+='<div class="mk-hdr">'+_mIcon(m)+' '+_esc(m)+'</div>'+mp.map(_playRow).join('');
+    });
+    if(!rows)rows='<div style="padding:13px;color:#64748b;font-size:.72rem">No analyzed picks for this matchup.</div>';
+    return '<details class="nfl-game-group" id="nfl-game-group-'+gi+'"><summary><span>'+_esc(mu)+'</span><span class="nfl-game-group-meta"><span>'+_esc(g.slate_date||d.date||'')+'</span><span class="nfl-game-pick-count">'+plays.length+' pick'+(plays.length===1?'':'s')+'</span></span></summary><div class="nfl-game-group-body">'+rows+'</div></details>';
+  }).join('');
+  return '<section id="nfl-by-game-section" class="nfl-by-game"><div class="nfl-by-game-head"><div><div class="nfl-by-game-title">All Picks by Game</div><div class="nfl-by-game-sub">Open any matchup to see every analyzed player prop for that game. Tap a player for the complete game log.</div></div><div class="nfl-by-game-count">'+games.length+' games · '+total+' picks</div></div><div class="nfl-by-game-list">'+body+'</div></section>';
+}
 function _underBox(picks){
   // Sort best rate first, then keep only 1 play per player (their best)
   var sorted=(picks||[]).filter(function(p){return p.underTotal>=2 && p.underRate>=60;})
@@ -6762,51 +6847,45 @@ function _nflGpBetPanel(g,idx){
 function _nflGpCard(g,i){
   var cc=_nflGpConfClr(g.conf);
   function teamRow(abbr,sp,proj,win,isPick,book){
-    var barClr=isPick?'#a78bfa':'#334155';
-    return '<div style="display:flex;align-items:center;gap:8px;padding:5px 0">'
-      +'<div style="width:44px;font-weight:900;color:'+(isPick?'#e9d5ff':'#cbd5e1')+';font-size:.9rem">'+_esc(abbr)+'</div>'
-      +'<div style="flex:1;min-width:0"><div style="height:8px;background:#0f172a;border-radius:5px;overflow:hidden"><div style="height:100%;width:'+win+'%;background:'+barClr+'"></div></div>'
-      +'<div style="font-size:.6rem;color:#64748b;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">'+_esc(sp||'TBD')+' · '+_esc(book||'Book unavailable')+'</div></div>'
-      +'<div style="width:32px;text-align:right;font-weight:800;color:#e2e8f0;font-size:.82rem">'+_nflGpFix(proj)+'</div>'
-      +'<div style="width:42px;text-align:right;font-weight:900;color:'+(isPick?'#4ade80':'#94a3b8')+';font-size:.82rem">'+win+'%</div>'
+    var barClr=isPick?'linear-gradient(90deg,#7c3aed,#4ade80)':'#475569';
+    var logo='https://a.espncdn.com/i/teamlogos/nfl/500/'+_logoAbbr(abbr)+'.png';
+    return '<div class="nfl-gp-team'+(isPick?' pick':'')+'">'
+      +'<img class="nfl-gp-logo" src="'+_esc(logo)+'" alt="" onerror="this.style.visibility=\\'hidden\\'"/>'
+      +'<div class="nfl-gp-abbr">'+_esc(abbr)+'</div>'
+      +'<div style="min-width:0"><div class="nfl-gp-bar"><span style="width:'+win+'%;background:'+barClr+'"></span></div>'
+      +'<div class="nfl-gp-sp">'+_esc(sp||'Starter TBD')+' · '+_esc(book||'Book unavailable')+'</div></div>'
+      +'<div class="nfl-gp-proj">'+_nflGpFix(proj)+'<small>Proj</small></div>'
+      +'<div class="nfl-gp-win">'+win+'%<small>Win</small></div>'
       +'</div>';
   }
   var drivers=(g.drivers||[]).map(function(d){return _esc(d);}).join(' &#183; ');
   var vb=g.value_flag?('<span style="background:#166534;color:#fff;font-weight:900;font-size:.62rem;border-radius:6px;padding:2px 7px;letter-spacing:.04em">VALUE +'+g.mkt_edge+'%</span>'):'';
   var bdr=g.value_flag?'#166534':'#1e293b';
-  // Total row
-  var totRow='';
+  var totValue='',totalBook='';
   if(g.total_line==null){
-    totRow='<div style="margin-top:8px;padding-top:7px;border-top:1px solid #111c2e;font-size:.66rem;color:#64748b">POINT TOTAL <span style="color:#cbd5e1;font-weight:800">'+_nflGpFix(g.proj_total)+'</span> proj &#183; no line posted</div>';
+    totValue='Proj '+_nflGpFix(g.proj_total)+' · no book line';
   } else {
     var ov=g.total_pick==='OVER'; var ec=(g.total_edge>0?'+':'')+_nflGpFix(g.total_edge);
-    var totalBook=ov?g.total_over_book:g.total_under_book;
-    totRow='<div style="margin-top:8px;padding-top:7px;border-top:1px solid #111c2e;display:flex;align-items:center;justify-content:space-between">'
-      +'<span style="font-size:.66rem;color:#64748b;font-weight:700">POINT TOTAL <span style="color:#cbd5e1">'+_nflGpFix(g.proj_total)+'</span> vs line '+_nflGpFix(g.total_line)+'</span>'
-      +'<span style="background:'+(ov?'#166534':'#7f1d1d')+';color:#fff;font-weight:900;font-size:.62rem;border-radius:6px;padding:2px 8px">'+g.total_pick+' '+ec+' · '+_esc(totalBook||'Book unavailable')+'</span>'
-      +'</div>';
+    totalBook=ov?g.total_over_book:g.total_under_book;
+    totValue='<span style="color:'+(ov?'#4ade80':'#fca5a5')+'">'+g.total_pick+' '+_nflGpFix(g.total_line)+'</span> · proj '+_nflGpFix(g.proj_total)+' · '+ec+' pts<br><span style="color:#94a3b8;font-size:.6rem">'+_esc(totalBook||'Book unavailable')+'</span>';
   }
-  // Market edge row
-  var mktRow='';
+  var mktValue='No moneyline edge available';
   if(g.mkt_edge!=null){
     var mp=(g.pick_home?g.mkt_home_pct:g.mkt_away_pct), md=(g.pick_home?g.win_home:g.win_away);
-    var col=(g.mkt_edge>0?'#166534':(g.mkt_edge<0?'#7f1d1d':'#334155')), sign=(g.mkt_edge>0?'+':'');
-    mktRow='<div style="margin-top:6px;padding-top:6px;border-top:1px solid #111c2e;display:flex;align-items:center;justify-content:space-between">'
-      +'<span style="font-size:.66rem;color:#64748b;font-weight:700">MARKET '+_esc(g.pick_abbr)+' <span style="color:#cbd5e1">'+mp+'%</span> vs model '+md+'%</span>'
-      +'<span style="background:'+col+';color:#fff;font-weight:900;font-size:.62rem;border-radius:6px;padding:2px 8px">EDGE '+sign+g.mkt_edge+'%</span>'
-      +'</div>';
+    var sign=(g.mkt_edge>0?'+':'');
+    mktValue='<span style="color:#c4b5fd">'+_esc(g.pick_abbr)+' '+md+'%</span> vs market '+mp+'% · <span style="color:'+(g.mkt_edge>0?'#4ade80':g.mkt_edge<0?'#f87171':'#cbd5e1')+'">'+sign+g.mkt_edge+'% edge</span>';
   }
-  return '<div onclick="_openNflGamePred('+i+')" style="background:#0a1120;border:1px solid '+bdr+';border-radius:14px;padding:13px 15px;cursor:pointer" onmouseover="this.style.borderColor=&#39;#3b2c63&#39;" onmouseout="this.style.borderColor=&#39;'+bdr+'&#39;">'
-    +'<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:7px">'
-    +'<div style="font-weight:800;color:#94a3b8;font-size:.72rem;letter-spacing:.04em">'+_esc(g.away_abbr)+' @ '+_esc(g.home_abbr)+(g.slate_date?' · '+_esc(g.slate_date):'')+'</div>'
-    +'<div style="display:flex;gap:6px;align-items:center">'+vb
-    +'<span style="background:'+cc+';color:#fff;font-weight:900;font-size:.62rem;border-radius:6px;padding:2px 7px;letter-spacing:.04em">'+_esc(g.conf)+'</span>'
-    +'<span style="background:rgba(167,139,250,.15);color:#c4b5fd;font-weight:900;font-size:.68rem;border-radius:6px;padding:2px 8px">PICK '+_esc(g.pick_abbr)+'</span>'
-    +'</div></div>'
+  return '<div class="nfl-gp-game" role="button" tabindex="0" onclick="_openNflGamePred('+i+')" onkeydown="if(event.key===\\'Enter\\'||event.key===\\' \\'){event.preventDefault();_openNflGamePred('+i+')}">'
+    +'<div class="nfl-gp-head"><div><div class="nfl-gp-matchup">'+_esc(g.away_abbr)+' @ '+_esc(g.home_abbr)+'</div><span class="nfl-gp-date">'+_esc(g.slate_date||'Today')+' · tap for full breakdown</span></div>'
+    +'<div class="nfl-gp-badges">'+vb
+    +'<span class="nfl-gp-badge" style="background:'+cc+'">'+_esc(g.conf)+'</span>'
+    +'<span class="nfl-gp-badge" style="background:#166534">PICK '+_esc(g.pick_abbr)+'</span></div></div>'
+    +'<div class="nfl-gp-teams">'
     +teamRow(g.away_abbr,g.away_sp,g.proj_away,g.win_away,!g.pick_home,g.away_ml_book)
     +teamRow(g.home_abbr,g.home_sp,g.proj_home,g.win_home,g.pick_home,g.home_ml_book)
-    +totRow+mktRow
-    +'<div style="margin-top:6px;font-size:.66rem;color:#94a3b8;line-height:1.5"><span style="color:#7c3aed;font-weight:800">Why:</span> '+drivers+'</div>'
+    +'</div><div class="nfl-gp-callouts"><div class="nfl-gp-callout"><div class="k">Point total</div><div class="v">'+totValue+'</div></div>'
+    +'<div class="nfl-gp-callout"><div class="k">Winner value</div><div class="v">'+mktValue+'</div></div></div>'
+    +'<div class="nfl-gp-why"><span style="color:#c4b5fd;font-weight:900">WHY THIS PICK</span> · '+drivers+'</div>'
     +_nflGpBetPanel(g,i)
     +'</div>';
 }
@@ -6950,7 +7029,7 @@ function _renderNflGamePredictor(d){
   if(!gp.length){card.style.display='none';return;}
   window.__NFL_GP__=gp;
   card.style.display='';
-  var html='<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:12px">';
+  var html='<div class="nfl-gp-grid">';
   for(var i=0;i<gp.length;i++) html+=_nflGpCard(gp[i],i);
   html+='</div>';
   document.getElementById('nfl-gp-body').innerHTML=html;
@@ -7507,7 +7586,7 @@ function _nflPaint(q){
 
   // Chips (market chips are tappable -> all plays for that market)
   h+='<div class="chips">';
-  h+='<div class="chip"><div class="val">'+((d.games||[]).length)+'</div><div class="lbl">Games</div></div>';
+  h+='<div class="chip nfl-games-jump" role="button" tabindex="0" onclick="_nflJumpToGames()" onkeydown="if(event.key===\\'Enter\\'||event.key===\\' \\'){event.preventDefault();_nflJumpToGames()}"><div class="val">'+((d.games||[]).length)+'</div><div class="lbl">View Games</div></div>';
   _MORDER.forEach(function(m){ if(byM[m]&&byM[m].length){ h+='<div class="chip" style="cursor:pointer" onclick="_marketModal(&#39;'+m+'&#39;)"><div class="val">'+byM[m].length+'</div><div class="lbl">'+(_MLBL[m]||m)+'</div></div>'; }});
   h+='</div>';
 
@@ -7633,6 +7712,7 @@ function _nflPaint(q){
       h+=_collapseSec('sp_'+i, _mIcon(m)+' '+m, nflCardGrid(sp), true);
     });
   }
+  h+=_nflByGameHtml(d);
 
   document.getElementById('nflBody').innerHTML=h;
 }
