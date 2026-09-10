@@ -5549,8 +5549,8 @@ body.is-admin #parlayCard{display:block}
 .chip{background:#161616;border:1px solid #262626;border-top:3px solid #f59e0b;border-radius:14px;padding:16px 10px;text-align:center}
 .chip .val{font-size:1.8rem;font-weight:900;color:#f59e0b;font-family:'Playfair Display',serif}
 .chip .lbl{font-size:.65rem;color:#6b7280;text-transform:uppercase;letter-spacing:.1em;margin-top:4px;font-weight:600}
-.sec{display:flex;align-items:center;gap:10px;font-size:.78rem;font-weight:700;color:#f59e0b;text-transform:uppercase;letter-spacing:.15em;margin:28px 0 12px}
-.sec::after{content:'';flex:1;height:1px;background:rgba(245,158,11,.15)}
+.sec{display:flex;align-items:center;gap:12px;font-size:.94rem;font-weight:900;color:#fbbf24;text-transform:uppercase;letter-spacing:.13em;margin:30px 0 14px}
+.sec::after{content:'';flex:1;height:3px;border-radius:999px;background:linear-gradient(90deg,#f59e0b,#fbbf24 72%,rgba(251,191,36,.2))}
 .games{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:10px;margin-bottom:24px}
 .gcard{background:#161616;border:1px solid #262626;border-radius:14px;padding:14px;text-align:center;transition:border-color .2s}
 .gcard:hover{border-color:#f59e0b}
@@ -5586,18 +5586,14 @@ tr:last-child td{border-bottom:none}
 .picks-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:16px;margin-bottom:10px}
 .pick-card{position:relative;background:linear-gradient(160deg,#1a1a1a,#121212);border:1px solid #2a2a2a;border-radius:18px;padding:18px 16px 14px;overflow:hidden;transition:border-color .2s,transform .2s}
 .pick-card:hover{border-color:#f59e0b;transform:translateY(-2px)}
-.pick-card.acc-rush{border-top:3px solid #34d399}
-.pick-card.acc-rec{border-top:3px solid #60a5fa}
-.pick-card.acc-pass{border-top:3px solid #f59e0b}
-.pick-card.acc-recpt{border-top:3px solid #a78bfa}
-.pick-card.acc-td{border-top:3px solid #f87171}
-.pick-card.acc-ptd{border-top:3px solid #38bdf8}
-.pick-card.acc-def{border-top:3px solid #fb7185}
-.pick-card.acc-kick{border-top:3px solid #2dd4bf}
+.pick-card.acc-rush,.pick-card.acc-rec,.pick-card.acc-pass,.pick-card.acc-recpt,
+.pick-card.acc-td,.pick-card.acc-ptd,.pick-card.acc-def,.pick-card.acc-kick{border-top:4px solid #f59e0b}
 .nfl-toolbar{display:flex;justify-content:flex-end;margin:0 0 14px}
 #nflSearch{background:#111;color:#fff;border:1px solid #2a2a2a;border-radius:8px;padding:8px 14px;font-size:.9rem;outline:none;width:240px;max-width:60vw;font-family:'Source Sans Pro',sans-serif}
-.sec-hdr{cursor:pointer;display:flex;align-items:center;justify-content:space-between;user-select:none}
-.sec-caret{font-size:.85rem;color:#9ca3af;margin-left:10px}
+.sec-hdr{cursor:pointer;display:flex;align-items:center;justify-content:flex-start;user-select:none}
+.sec-hdr>span:first-child{order:1;flex:0 1 auto}
+.sec-hdr::after{order:2}
+.sec-caret{order:3;font-size:1rem;color:#fbbf24;margin-left:2px}
 .gcard{cursor:pointer}
 .gc-hint{font-size:.62rem;color:#6b7280;margin-top:3px;text-transform:uppercase;letter-spacing:.08em}
 .big-modal{max-width:680px;width:92%;max-height:86vh;overflow:auto}
@@ -7145,8 +7141,27 @@ function _nflCoachParse(question,props){
   if(q.indexOf('safe')>=0||q.indexOf('most likely')>=0||q.indexOf('highest probability')>=0)f.mode='safe';
   var top=words.match(/ top +([0-9]{1,2}) /);if(top)f.limit=Math.max(1,Math.min(5,Number(top[1])));
   if(words.indexOf(' under ')>=0)f.side='UNDER';else if(words.indexOf(' over ')>=0)f.side='OVER';
-  var passYardTerms=['passing yards','passing yard','passing yds','passing yd','pass yards','pass yard','pass yds','pass yd'];
-  if(passYardTerms.some(function(term){return q.indexOf(term)>=0;}))f.marketExact='Pass Yds';
+  var exactMarkets=[
+    {label:'Completions',terms:['qb completions','qb completion','quarterback completions','quarterback completion','pass completions','pass completion','passing completions','passing completion','completions']},
+    {label:'Pass Att',terms:['qb attempts','qb attempt','quarterback attempts','quarterback attempt','pass attempts','pass attempt','passing attempts','passing attempt']},
+    {label:'Pass Yds',terms:['passing yards','passing yard','passing yds','passing yd','pass yards','pass yard','pass yds','pass yd']},
+    {label:'Pass TDs',terms:['passing touchdowns','passing touchdown','passing tds','passing td','pass touchdowns','pass touchdown','pass tds','pass td']},
+    {label:'INT Thrown',terms:['interceptions thrown','interception thrown','passing interceptions','passing interception','qb interceptions','qb interception','pass ints','pass int']},
+    {label:'Rush Att',terms:['rushing attempts','rushing attempt','rush attempts','rush attempt','carries']},
+    {label:'Rush Yds',terms:['rushing yards','rushing yard','rushing yds','rushing yd','rush yards','rush yard','rush yds','rush yd']},
+    {label:'Rec Yds',terms:['receiving yards','receiving yard','receiving yds','receiving yd','reception yards','reception yard','rec yards','rec yard','rec yds','rec yd']},
+    {label:'Receptions',terms:['receptions','reception','catches','catch']},
+    {label:'Anytime TD',terms:['anytime touchdowns','anytime touchdown','anytime tds','anytime td','td scorers','td scorer']},
+    {label:'Tackles+Ast',terms:['tackles assists','tackles assist','tackles plus assists','tackles+assists','tackle assists','tackle assist','total tackles']},
+    {label:'Sacks',terms:['player sacks','player sack','defensive sacks','defensive sack','sacks','sack']},
+    {label:'Def INT',terms:['defensive interceptions','defensive interception','defender interceptions','defender interception','def ints','def int']},
+    {label:'Kick Pts',terms:['kicking points','kicking point','kicker points','kicker point','kick points','kick point']},
+    {label:'FG Made',terms:['field goals made','field goal made','field goals','field goal','fgs made','fg made']}
+  ];
+  exactMarkets.some(function(def){
+    if(def.terms.some(function(term){return q.indexOf(term)>=0;})){f.marketExact=def.label;return true;}
+    return false;
+  });
   var markets=[['passing','pass'],['pass ','pass'],['rushing','rush'],['rush ','rush'],['receiving','rec'],['reception','rec'],['touchdown','td'],[' td','td'],['tackle','def'],['sack','def'],['defense','def'],['kicking','kick'],['field goal','kick']];
   markets.some(function(x){if(q.indexOf(x[0])>=0){f.market=x[1];return true;}return false;});
   var neg=q.match(/-[0-9]{2,4}/g)||[];if(neg.length>=2){var ns=neg.slice(0,2).map(Number);f.minOdds=Math.min.apply(null,ns);f.maxOdds=Math.max.apply(null,ns);}
@@ -7778,20 +7793,6 @@ function _nflPaint(q){
     h+='<div class="no-picks">No qualifying picks'+(q?' for "'+q+'"':' for '+(d.date||'today'))+'.</div>';
   }
 
-  // Under track (collapsible)
-  var ub=_underBox(allF);
-  if(ub){ h+=_collapseSec('under_track','⬇ UNDER Track', ub, expand); }
-
-  // Special — Best Plays: same clickable cards as the top boards (open by default)
-  var present=_MORDER.filter(function(m){return byM[m]&&byM[m].length;});
-  if(present.length){
-    h+='<div class="sec">⭐ Special — Best Plays</div>';
-    present.forEach(function(m,i){
-      var sp=(byM[m]||[]).filter(function(p){return !_nflGameDone(p);}).slice(0,6);
-      if(!sp.length) return;
-      h+=_collapseSec('sp_'+i, _mIcon(m)+' '+m, nflCardGrid(sp), true);
-    });
-  }
   h+=_nflByGameHtml(d);
 
   document.getElementById('nflBody').innerHTML=h;
