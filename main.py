@@ -5519,14 +5519,16 @@ async def nfl_coach_track_capture(request: Request, token: str = ""):
     if category not in _NFL_COACH_CATS or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_str) or not isinstance(rows, list) or not rows:
         raise HTTPException(400, "Invalid preset capture; no snapshot was saved.")
     canonical = _nfl_coach_canonical_capture(date_str, category)
-    submitted_ids = [_nfl_coach_capture_identity(row) for row in rows]
     canonical_ids = [_nfl_coach_capture_identity(row) for row in canonical]
-    if (not canonical_ids or any(item is None for item in submitted_ids)
-            or submitted_ids != canonical_ids):
+    if not canonical_ids or any(item is None for item in canonical_ids):
         raise HTTPException(
             409,
-            "Coach capture rejected: the displayed list is not the complete "
-            "latest server-ranked preset. Run that Coach preset again.")
+            "Coach capture rejected: the server could not rebuild a complete "
+            "current preset. Run Get Picks again.")
+    # Always bank the complete, latest server-ranked preset.  The browser may
+    # display the same valid rows in a different order or briefly hold an older
+    # rendered array; neither should prevent official Coach tracking.
+    rows = canonical
     existing = _nfl_sb_get("mpa_track_ledger", {"app":f"eq.{_NFL_COACH_TRK_APP}","date":f"eq.{date_str}","category":f"eq.{category}","side":"eq.ALL","select":"date,locked,locked_at,detail","limit":"1"})
     if existing and existing[0].get("locked"):
         return {"ok":True,"status":"locked",
