@@ -2198,6 +2198,29 @@ def _def_factor_map(df, stat_col: str, n_games: int = 8) -> dict:
     _DEFF_CACHE["maps"][stat_col] = out
     return out
 
+_NFL_PLAYER_LOOKUP = {"df_ref": None, "names": None, "groups": {}, "matches": {}}
+
+def _nfl_player_history(df, name):
+    """Reuse exact player slices within an immutable analysis dataframe."""
+    cache = _NFL_PLAYER_LOOKUP
+    if cache["df_ref"] is not df:
+        names = df["player_display_name"].fillna("").astype(str).str.lower()
+        cache.update({
+            "df_ref": df, "names": names,
+            "groups": names.groupby(names, sort=False).indices, "matches": {},
+        })
+    key = name.lower()
+    if key not in cache["matches"]:
+        positions = cache["groups"].get(key)
+        if positions is not None:
+            pdf = df.iloc[positions]
+        else:
+            # Preserve the existing surname-suffix fallback exactly.
+            last = name.split()[-1].lower()
+            pdf = df[cache["names"].str.endswith(last, na=False)]
+        cache["matches"][key] = pdf
+    return cache["matches"][key]
+
 def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str) -> Optional[Dict]:
     """Emit the shared NORMALIZED pick-field contract (same keys as the NHL app)
     so the card grid, ladder modal, special boxes and parlay are market-agnostic.
@@ -2212,12 +2235,7 @@ def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str) -> Optional[Dict
         return None
 
     # Find player
-    player_names = df["player_display_name"].fillna("").astype(str).str.lower()
-    mask = player_names == name.lower()
-    pdf  = df[mask]
-    if pdf.empty:
-        last = name.split()[-1].lower()
-        pdf  = df[player_names.str.endswith(last, na=False)]
+    pdf = _nfl_player_history(df, name)
     if pdf.empty:
         return None
 
@@ -2938,11 +2956,9 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False,
     )
     if cached:
         return cached
-    # Alternate markets have their own Coach-only cache and must never leak into
-    # the standard props, picks, or tracking path. Warm only after ruling out a
-    # fully enriched live result-cache hit.
-    if not simulate:
-        _schedule_alt_coach_warm(date_str)
+    # Do not start full Coach analysis here: it shares the analysis lock with
+    # the standard board and can consume the foreground job's entire deadline.
+    # Warm it automatically after the main board has been saved instead.
 
     # 1. Get game schedule from ESPN
     _p("Fetching NFL schedule from ESPN…")
@@ -3219,19 +3235,29 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False,
     _p(
         f"Analyzing all {len(standard_lines)} standard player props plus "
         f"{len(td_starter_lines)} starter-level Anytime TD candidates…")
+    analysis_cancelled = _bt_th.Event()
     def _analyze_all_props():
         # Keep the serial order (and therefore TD calibration/cache semantics)
         # while moving the pandas-heavy loop out of the event loop.
         analyzed = []
         with _NFL_ANALYSIS_LOCK:
             for pl in all_lines:
+                if analysis_cancelled.is_set():
+                    break
                 result = _analyze_prop(
                     pl, analysis_df,
                     pl.get("home_abbr", ""), pl.get("away_abbr", ""))
                 if result:
                     analyzed.append(result)
         return analyzed
-    all_results = await asyncio.to_thread(_analyze_all_props)
+    try:
+        all_results = await asyncio.to_thread(_analyze_all_props)
+    except asyncio.CancelledError:
+        # Cancelling to_thread alone does not stop its worker. Release shared
+        # analysis resources after the current player instead of processing a
+        # whole abandoned slate while a retry waits behind it.
+        analysis_cancelled.set()
+        raise
 
     # 6. Preserve every analyzed result. The TD starter prefilter above removes
     # backup longshots; there is no later team cap, so every qualifying starter
@@ -3368,6 +3394,7 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False,
         await asyncio.to_thread(push_picks_to_replit, "nfl", result)
     except Exception as _e:
         print(f"[replit_push] nfl push failed: {_e}")
+    _schedule_alt_coach_warm(date_str)
     return result
 
 # ── Routes ─────────────────────────────────────────────────────────────────────
@@ -3470,8 +3497,10 @@ async def _build_alt_coach(date_str: str) -> dict:
     def _analyze_alt_lines():
         # pandas-heavy history analysis must not run on the ASGI event loop.
         analyzed_picks = []
-        with _NFL_ANALYSIS_LOCK:
-            for line in lines:
+        for line in lines:
+            # A foreground run must not wait for the entire alternate ladder.
+            # Each pick still holds the lock while using shared model caches.
+            with _NFL_ANALYSIS_LOCK:
                 result = _analyze_prop(
                     line, df, line.get("home_abbr", ""), line.get("away_abbr", ""))
                 selected_odds = None
@@ -3692,10 +3721,13 @@ async def api_run(request: Request):
                 _work(), timeout=_NFL_WEEK_JOB_TIMEOUT if scope == "week" else 300)
             JOBS[job_id].update({"status":"done","result":result})
         except asyncio.TimeoutError:
+            last_stage = JOBS.get(job_id, {}).get("progress", "starting the run")
+            print(f"[Pipeline] Job timed out during: {last_stage}")
             JOBS[job_id].update({"status":"error",
                 "error":("Weekly run timed out after 20 minutes"
                          if scope == "week" else "Run timed out after 5 minutes")
-                        + " — the data sources may be slow right now. Please try again."})
+                        + " during: " + last_stage
+                        + ". No completed board was returned."})
         except Exception as e:
             JOBS[job_id].update({"status":"error","error":str(e)})
     asyncio.create_task(_run())
