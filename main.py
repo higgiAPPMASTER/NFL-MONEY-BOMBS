@@ -7,6 +7,8 @@ Schedule:          ESPN scoreboard API
 
 import os, re, asyncio, uuid, time, json, pathlib, csv, io
 import threading as _bt_th
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from typing import Dict, List, Optional
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -557,7 +559,7 @@ def _load_nfl_stats_sync():
         results: dict = {}
         # Keep the full-history download parallel without opening one socket per
         # file; the old layout can produce dozens of requests.
-        with ThreadPoolExecutor(max_workers=min(24, max(1, len(all_tasks)))) as ex:
+        with ThreadPoolExecutor(max_workers=min(3, max(1, len(all_tasks)))) as ex:
             fut_map = {ex.submit(_dl_csv, url): tag for tag, url in all_tasks}
             for fut in as_completed(fut_map):
                 tag = fut_map[fut]
@@ -2212,14 +2214,14 @@ def _nfl_player_history(df, name):
     key = name.lower()
     if key not in cache["matches"]:
         positions = cache["groups"].get(key)
-        if positions is not None:
-            pdf = df.iloc[positions]
-        else:
+        if positions is None:
             # Preserve the existing surname-suffix fallback exactly.
             last = name.split()[-1].lower()
-            pdf = df[cache["names"].str.endswith(last, na=False)]
-        cache["matches"][key] = pdf
-    return cache["matches"][key]
+            positions = cache["names"].str.endswith(last, na=False).to_numpy().nonzero()[0]
+        # Cache tiny row-position arrays, not a second copy of every player's
+        # full history alongside the source dataframe.
+        cache["matches"][key] = positions
+    return df.iloc[cache["matches"][key]]
 
 def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str) -> Optional[Dict]:
     """Emit the shared NORMALIZED pick-field contract (same keys as the NHL app)
@@ -2494,6 +2496,19 @@ def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str) -> Optional[Dict
 
 # ── NFL Game Predictor helpers ─────────────────────────────────────────────────
 
+_NFL_GP_WORKER = ThreadPoolExecutor(max_workers=1, thread_name_prefix="nfl-gp")
+
+async def _nfl_gp_compute(fn, *args, **kwargs):
+    # One worker across all dates/jobs bounds simultaneous pandas allocations.
+    return await asyncio.get_running_loop().run_in_executor(
+        _NFL_GP_WORKER, partial(fn, *args, **kwargs))
+
+def _nfl_gp_frame(df):
+    """All rows/seasons, but only columns actually read by Game Predictor."""
+    columns = ["season", "season_type", "week", "recent_team", "opponent_team",
+               "passing_yards", "rushing_yards", "player_display_name", "position"]
+    return df.loc[:, [c for c in columns if c in df.columns]]
+
 def _nfl_stats_before_game(df, target_season=None, target_week=None,
                            target_type: str = "REG"):
     """Exclude every stats row at or after the selected game's week."""
@@ -2526,6 +2541,7 @@ def _nfl_team_pts_projection(team_abbr: str, df, n_games: int = 5,
     """Project a team's offensive point output from their L5 total yards (nfl-verse).
     ~350 total yards per game ≈ league avg 23 pts; clamped 10-45."""
     try:
+        df = df[df["recent_team"] == team_abbr]
         df = _nfl_stats_before_game(df, target_season, target_week, target_type)
         off_cols = [c for c in ["passing_yards", "rushing_yards"] if c in df.columns]
         if not off_cols:
@@ -2550,6 +2566,7 @@ def _nfl_team_def_strength(opp_abbr: str, df, n_games: int = 5,
     """Defensive strength multiplier (1.0 = league avg, <1 = strong, >1 = weak).
     Measures how many offensive yards opponents piled up against this team."""
     try:
+        df = df[df["opponent_team"] == opp_abbr]
         df = _nfl_stats_before_game(df, target_season, target_week, target_type)
         off_cols = [c for c in ["passing_yards", "rushing_yards"] if c in df.columns]
         if not off_cols or "opponent_team" not in df.columns:
@@ -2678,6 +2695,7 @@ async def _build_nfl_game_predictions(espn_games: list, df, date_str: str,
     returns (predictions, newly_fetched_lines_by_event_id) so the caller can
     persist them — every skipped historical call saves 10x-priced credits."""
     HOME_ADJ = 1.05
+    df = await _nfl_gp_compute(_nfl_gp_frame, df)
     predictions = []
     gl_cache = dict(gl_cache or {})
     fetched: dict = {}
@@ -2767,31 +2785,31 @@ async def _build_nfl_game_predictions(espn_games: list, df, date_str: str,
             # Team profiles and the L5 projections below perform pandas
             # groupby/filter work.  Keep it off the ASGI loop while preserving
             # the same per-reference-season cache and model inputs.
-            season_profile_cache[reference_season] = await asyncio.to_thread(
+            season_profile_cache[reference_season] = await _nfl_gp_compute(
                 _nfl_season_team_profiles, df, reference_season)
         season_profiles = season_profile_cache[reference_season]
         # Offensive projections (L5 team yards → pts)
         # Defensive strength belongs to the opponent being faced: away defense
         # suppresses home scoring and home defense suppresses away.  These four
-        # pandas scans are independent and are deliberately thread-offloaded.
-        home_off, away_off, home_def_str, away_def_str = await asyncio.gather(
-            asyncio.to_thread(
+        # Keep these sequential: concurrent full-history copies exceeded the
+        # 512 MB instance limit. The worker keeps HTTP responsive without
+        # multiplying the memory needed by pandas.
+        home_off = await _nfl_gp_compute(
                 _nfl_team_pts_projection, ha, df,
                 target_season=target_season, target_week=target_week,
-                target_type=target_type),
-            asyncio.to_thread(
+                target_type=target_type)
+        away_off = await _nfl_gp_compute(
                 _nfl_team_pts_projection, aa, df,
                 target_season=target_season, target_week=target_week,
-                target_type=target_type),
-            asyncio.to_thread(
+                target_type=target_type)
+        home_def_str = await _nfl_gp_compute(
                 _nfl_team_def_strength, ha, df,
                 target_season=target_season, target_week=target_week,
-                target_type=target_type),
-            asyncio.to_thread(
+                target_type=target_type)
+        away_def_str = await _nfl_gp_compute(
                 _nfl_team_def_strength, aa, df,
                 target_season=target_season, target_week=target_week,
-                target_type=target_type),
-        )
+                target_type=target_type)
         recent_home = home_off * away_def_str * HOME_ADJ
         recent_away = away_off * home_def_str
         hp = season_profiles.get(ha, {})
@@ -2860,12 +2878,10 @@ async def _build_nfl_game_predictions(espn_games: list, df, date_str: str,
             total_pick = "OVER" if proj_total > total_line else "UNDER"
             total_edge = round(proj_total - total_line, 1)
         # Starter names (QB = highest career passing_yards)
-        away_sp, home_sp = await asyncio.gather(
-            asyncio.to_thread(
-                _nfl_starter_name, aa, df, "passing_yards", roster_map),
-            asyncio.to_thread(
-                _nfl_starter_name, ha, df, "passing_yards", roster_map),
-        )
+        away_sp = await _nfl_gp_compute(
+            _nfl_starter_name, aa, df, "passing_yards", roster_map)
+        home_sp = await _nfl_gp_compute(
+            _nfl_starter_name, ha, df, "passing_yards", roster_map)
         # Driver phrases
         drivers = []
         if pick_home:
