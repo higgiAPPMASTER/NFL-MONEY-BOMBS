@@ -4667,7 +4667,7 @@ def _nfl_coach_hist_select(candidates, category, alternate=False):
             continue
         seen_players.add(player_key)
         unique.append(row)
-    limit = 10 if alternate or category == "td_scorers" else 5
+    limit = 10
     return unique[:limit]
 
 async def _nfl_build_historical_coach(date_str, picks, games, df, roster_map,
@@ -6457,7 +6457,7 @@ tr:last-child td{border-bottom:none}
       <button class="nfl-coach-preset" onclick="askNflCoachPreset('Show the best receiving plays','receiving')">Receiving</button>
       <button class="nfl-coach-preset" onclick="askNflCoachPreset('Show the best defensive player prop plays','defense')">Best Defense Plays</button>
       <button class="nfl-coach-preset" onclick="askNflCoachPreset('Show the best kicker prop plays','kicking')">Best Kicker Plays</button>
-      <button class="nfl-coach-preset" onclick="askNflTdCoach()" style="border-color:#eab308;color:#fde68a">TD Scorers · Top 10 / Game Top 5</button>
+      <button class="nfl-coach-preset" onclick="askNflTdCoach()" style="border-color:#eab308;color:#fde68a">TD Scorers · Top 10</button>
       <button class="nfl-coach-preset" onclick="askNflCoachPreset('Show the best under plays','best_unders')">Best unders</button>
     </div>
     <details class="nfl-parlay-filter-group nfl-game-filter-dropdown" style="margin:10px 0 12px;border-color:rgba(56,189,248,.35)">
@@ -7714,13 +7714,13 @@ function _nflCoachSafest(props){
 }
 function _nflCoachParse(question,props){
   var q=String(question||'').toLowerCase(),words=' '+q.replace(/[^a-z0-9]+/g,' ').replace(/ +/g,' ').trim()+' ';
-  var f={mode:'edge',limit:5,side:'',market:'',marketExact:'',players:[],teams:[],minOdds:null,maxOdds:null,onePerCategory:false};
+  var f={mode:'edge',limit:10,side:'',market:'',marketExact:'',players:[],teams:[],minOdds:null,maxOdds:null,onePerCategory:false};
   if(q.indexOf('safe')>=0||q.indexOf('most likely')>=0||q.indexOf('highest probability')>=0)f.mode='safe';
   if(/(?:each|every|all)\\s+(?:available\\s+)?(?:market\\s+)?categor/.test(q)
       ||/(?:each|every|all)\\s+(?:available\\s+)?market/.test(q)){
     f.onePerCategory=true;
   }
-  var top=words.match(/ top +([0-9]{1,2}) /);if(top)f.limit=Math.max(1,Math.min(5,Number(top[1])));
+  var top=words.match(/ top +([0-9]{1,2}) /);if(top)f.limit=Math.max(1,Math.min(10,Number(top[1])));
   if(words.indexOf(' under ')>=0)f.side='UNDER';else if(words.indexOf(' over ')>=0)f.side='OVER';
   var exactMarkets=[
     {label:'RB Total Yds',terms:['rushing and receiving yards','rushing plus receiving yards','rush and receiving yards','rush plus receiving yards','rush receiving yards','rush rec yards','combined yards','total yards']},
@@ -7963,7 +7963,7 @@ function askNflTdCoach(){
   window.__NFL_COACH_IGNORE_GAME_FILTER__=true;
   var full=askNflCoach();
   delete window.__NFL_COACH_IGNORE_GAME_FILTER__;
-  window.__NFL_COACH_LIMIT_OVERRIDE__=gameFilterActive&&selected.length===1?5:10;
+  window.__NFL_COACH_LIMIT_OVERRIDE__=10;
   var shown=askNflCoach();
   delete window.__NFL_COACH_LIMIT_OVERRIDE__;
   _nflCoachCapture('td_scorers',full);
