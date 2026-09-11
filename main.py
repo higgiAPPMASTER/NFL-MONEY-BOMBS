@@ -141,8 +141,12 @@ _BOOK_PRIORITY = {b: i for i, b in enumerate(_PRIORITY_BOOKS)}
 # bookmaker. These books cover the user's main US/Canadian options while
 # reducing the response size and Odds API point usage substantially.
 ODDS_BOOKMAKERS = "draftkings,fanduel,betmgm,caesars,bet365,bet99,thescore"
-_NFL_PROP_FETCH_CONCURRENCY = 3
+_NFL_PROP_FETCH_CONCURRENCY = 6
 _NFL_PROP_GAME_TIMEOUT = 28
+# Independent per-game deadlines are not enough when later games are still
+# waiting for the concurrency semaphore. Cap the complete slate fetch as well
+# so the job always advances to analysis instead of appearing frozen at N/13.
+_NFL_PROP_STAGE_TIMEOUT = 90
 # Alternate ladders are still one Odds API request per game, but fetching them
 # serially can exceed the two-minute UI deadline on a full slate. Match the
 # standard prop fetcher's conservative concurrency without increasing call count.
@@ -152,6 +156,75 @@ _BOOK_LABEL = {"bet99":"Bet99","thescore":"theScore","bet365":"Bet365","draftkin
                "williamhill_us":"Caesars","betrivers":"BetRivers","ballybet":"Bally Bet",
                "espnbet":"ESPN BET","fliff":"Fliff","mybookieag":"MyBookie",
                "betonlineag":"BetOnline","bovada":"Bovada"}
+
+async def _collect_prop_fetch_tasks(tasks, espn_games, date_str, progress=None):
+    """Collect game prop tasks without letting one request stall the slate."""
+    def report(message):
+        if progress:
+            progress(message)
+
+    fetched_games = [None] * len(tasks)
+    completed = 0
+    pending = set(tasks)
+    stage_deadline = (
+        asyncio.get_running_loop().time() + _NFL_PROP_STAGE_TIMEOUT)
+    while pending:
+        remaining = stage_deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            break
+        done, pending = await asyncio.wait(
+            pending,
+            timeout=remaining,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if not done:
+            break
+        for task in done:
+            try:
+                gi, ev, lines = task.result()
+            except Exception as exc:
+                print(f"[OddsAPI props] game task failed: {exc}")
+                continue
+            fetched_games[gi] = (ev, lines)
+            completed += 1
+            report(f"Prop lines complete — {completed}/{len(espn_games)}: "
+                   f"{ev.get('game','')} ({len(lines)} lines)")
+
+    if pending:
+        print(f"[OddsAPI props] slate hard deadline after "
+              f"{_NFL_PROP_STAGE_TIMEOUT}s; cancelling {len(pending)} "
+              f"unfinished game request(s)")
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+
+    # Fill every unfinished/failed slot explicitly. Downstream analysis can
+    # finish with the complete schedule and a visible skipped-game warning
+    # instead of hanging or crashing while unpacking a missing result.
+    for gi, item in enumerate(fetched_games):
+        if item is not None:
+            continue
+        ev = espn_games[gi]
+        _NFL_PROP_FETCH_STATUS[
+            (str(ev.get("id", "")), str(date_str), False)] = "timeout"
+        fetched_games[gi] = (ev, [])
+        completed += 1
+        report(f"Prop lines skipped — {completed}/{len(espn_games)}: "
+               f"{ev.get('game','')} (provider deadline)")
+
+    return fetched_games
+
+def _prop_fetch_skipped_matchups(fetched_games, date_str):
+    skipped = []
+    for ev, _ in fetched_games:
+        fetch_status = _NFL_PROP_FETCH_STATUS.get(
+            (str(ev.get("id", "")), str(date_str), False))
+        if fetch_status != "success":
+            skipped.append(
+                ev.get("game")
+                or f"{ev.get('away_abbr', '')} at {ev.get('home_abbr', '')}".strip()
+                or "Unknown matchup")
+    return skipped
 
 def _book_label(k):
     return _BOOK_LABEL.get(k, (k or "").replace("_", " ").title())
@@ -2883,24 +2956,13 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False,
             asyncio.create_task(_fetch_game_props(gi, ev))
             for gi, ev in enumerate(espn_games)
         ]
-        fetched_games = [None] * len(tasks)
-        completed = 0
-        for task in asyncio.as_completed(tasks):
-            gi, ev, lines = await task
-            fetched_games[gi] = (ev, lines)
-            completed += 1
-            _p(f"Prop lines complete — {completed}/{len(espn_games)}: "
-               f"{ev.get('game','')} ({len(lines)} lines)")
+        fetched_games = await _collect_prop_fetch_tasks(
+            tasks, espn_games, date_str, _p)
+        skipped_matchups.extend(
+            _prop_fetch_skipped_matchups(fetched_games, date_str))
 
         # Preserve schedule order so downstream ranking remains deterministic.
         for ev, lines in fetched_games:
-            fetch_status = _NFL_PROP_FETCH_STATUS.get(
-                (str(ev.get("id", "")), str(date_str), False))
-            if fetch_status != "success":
-                skipped_matchups.append(
-                    ev.get("game")
-                    or f"{ev.get('away_abbr', '')} at {ev.get('home_abbr', '')}".strip()
-                    or "Unknown matchup")
             home_abbr = ev.get("home_abbr", "") or _name_to_abbr(ev.get("home_team",""))
             away_abbr = ev.get("away_abbr", "") or _name_to_abbr(ev.get("away_team",""))
             for l in lines:
