@@ -142,6 +142,7 @@ _BOOK_PRIORITY = {b: i for i, b in enumerate(_PRIORITY_BOOKS)}
 # reducing the response size and Odds API point usage substantially.
 ODDS_BOOKMAKERS = "draftkings,fanduel,betmgm,caesars,bet365,bet99,thescore"
 _NFL_PROP_FETCH_CONCURRENCY = 3
+_NFL_PROP_GAME_TIMEOUT = 28
 # Alternate ladders are still one Odds API request per game, but fetching them
 # serially can exceed the two-minute UI deadline on a full slate. Match the
 # standard prop fetcher's conservative concurrency without increasing call count.
@@ -2807,7 +2808,19 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False,
             async with fetch_sem:
                 print(f"[OddsAPI props] start game {gi+1}/{len(espn_games)}: "
                       f"{ev.get('game','')}")
-                lines = await get_prop_lines(ev_id, date_str) if ev_id else []
+                try:
+                    lines = (
+                        await asyncio.wait_for(
+                            get_prop_lines(ev_id, date_str),
+                            timeout=_NFL_PROP_GAME_TIMEOUT)
+                        if ev_id else [])
+                except asyncio.TimeoutError:
+                    fetch_key = (str(ev_id), str(date_str), False)
+                    _NFL_PROP_FETCH_STATUS[fetch_key] = "timeout"
+                    print(f"[OddsAPI props] hard timeout after "
+                          f"{_NFL_PROP_GAME_TIMEOUT}s for game "
+                          f"{gi+1}/{len(espn_games)}: {ev.get('game','')}")
+                    lines = []
                 # A live response can occasionally succeed with no markets.
                 # Retry that exact game without adding any new API calls when
                 # the first response is complete.
@@ -2826,7 +2839,17 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False,
                         print(f"[OddsAPI props] empty for {ev_id}; "
                               f"retry {retry + 1}/2 in {wait_s:.1f}s")
                         await asyncio.sleep(wait_s)
-                        lines = await get_prop_lines(ev_id, date_str)
+                        try:
+                            lines = await asyncio.wait_for(
+                                get_prop_lines(ev_id, date_str),
+                                timeout=_NFL_PROP_GAME_TIMEOUT)
+                        except asyncio.TimeoutError:
+                            _NFL_PROP_FETCH_STATUS[
+                                (str(ev_id), str(date_str), False)] = "timeout"
+                            print(f"[OddsAPI props] retry hard timeout after "
+                                  f"{_NFL_PROP_GAME_TIMEOUT}s for "
+                                  f"{ev.get('game','')}")
+                            lines = []
                         if lines:
                             print(f"[OddsAPI props] retry recovered "
                                   f"{len(lines)} lines for {ev_id}")
