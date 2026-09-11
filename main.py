@@ -147,6 +147,10 @@ _NFL_PROP_GAME_TIMEOUT = 28
 # waiting for the concurrency semaphore. Cap the complete slate fetch as well
 # so the job always advances to analysis instead of appearing frozen at N/13.
 _NFL_PROP_STAGE_TIMEOUT = 90
+# Game Predictor lines are auxiliary to the stats forecast.  Keep each
+# sportsbook request independent so one slow provider response cannot hold the
+# whole predictor (or the status endpoint) open indefinitely.
+_NFL_GP_GAME_LINE_TIMEOUT = 15
 # Alternate ladders are still one Odds API request per game, but fetching them
 # serially can exceed the two-minute UI deadline on a full slate. Match the
 # standard prop fetcher's conservative concurrency without increasing call count.
@@ -372,7 +376,10 @@ async def _warm_alt_coach(date_str: str) -> dict:
     today = _nfl_today()
     if date_str < today:
         return {}
-    cached = _alt_coach_cache_get(date_str)
+    # Cache helpers use synchronous filesystem I/O.  The alternate scan is
+    # intentionally shared with the Coach endpoint, so do not let a cache read
+    # briefly pause unrelated HTTP requests.
+    cached = await asyncio.to_thread(_alt_coach_cache_get, date_str)
     if cached is not None:
         return cached
     task = _ALT_COACH_INFLIGHT.get(date_str)
@@ -691,13 +698,12 @@ async def get_nfl_stats():
     async with _nfl_df_lock:
         if _nfl_df is not None:
             return _nfl_df
-        loop = asyncio.get_event_loop()
         try:
             # Hard wall-clock deadline: even a pathological slow-drip download
             # can't hold the job in "running" forever — after 150s we give up
             # and the pipeline returns a clean error the user can retry.
             return await asyncio.wait_for(
-                loop.run_in_executor(None, _load_nfl_stats_sync), timeout=150)
+                asyncio.to_thread(_load_nfl_stats_sync), timeout=150)
         except asyncio.TimeoutError:
             print("[NFL Data] Stats load exceeded 150s deadline — giving up this run")
             return None
@@ -1049,6 +1055,8 @@ async def _nfl_run_historical_batch(job_id: str):
                         "Paused between dates while a live NFL run finishes.")
             await asyncio.sleep(5)
             continue
+        persist_job = None
+        finished = False
         with _NFL_HIST_BATCH_LOCK:
             job = _NFL_HIST_BATCHES.get(job_id)
             if not job:
@@ -1067,13 +1075,21 @@ async def _nfl_run_historical_batch(job_id: str):
                     else "Season replay finished with failed dates."
                 )
                 job["finished_at"] = datetime.now(timezone.utc).isoformat()
-                _nfl_batch_persist(job)
-                return
-            date_str = pending[0]
-            job["status"] = "running"
-            job["current_date"] = date_str
-            job["current_progress"] = f"Starting historical replay for {date_str}…"
-            _nfl_batch_persist(job)
+                persist_job = job
+                finished = True
+            else:
+                date_str = pending[0]
+                job["status"] = "running"
+                job["current_date"] = date_str
+                job["current_progress"] = f"Starting historical replay for {date_str}…"
+                persist_job = job
+        if persist_job is not None:
+            # Supabase uses synchronous httpx helpers; never await it while
+            # holding the threading lock (the worker would need that lock to
+            # serialize its payload).
+            await asyncio.to_thread(_nfl_batch_persist, persist_job)
+        if finished:
+            return
 
         def progress(message):
             with _NFL_HIST_BATCH_LOCK:
@@ -1100,13 +1116,17 @@ async def _nfl_run_historical_batch(job_id: str):
                 raise RuntimeError("Historical Analysis save was not confirmed")
             if not result.get("historicalCoachSaved"):
                 raise RuntimeError("Historical Edge Coach save was not confirmed")
+            persist_job = None
             with _NFL_HIST_BATCH_LOCK:
                 active = _NFL_HIST_BATCHES.get(job_id)
                 if active:
                     active["completed_dates"].append(date_str)
                     active["current_progress"] = f"Completed historical replay for {date_str}."
-                    _nfl_batch_persist(active)
+                    persist_job = active
+            if persist_job is not None:
+                await asyncio.to_thread(_nfl_batch_persist, persist_job)
         except Exception as exc:
+            persist_job = None
             with _NFL_HIST_BATCH_LOCK:
                 active = _NFL_HIST_BATCHES.get(job_id)
                 if active:
@@ -1119,7 +1139,9 @@ async def _nfl_run_historical_batch(job_id: str):
                     else:
                         failures.append(item)
                     active["current_progress"] = f"Failed {date_str}: {exc}"
-                    _nfl_batch_persist(active)
+                    persist_job = active
+            if persist_job is not None:
+                await asyncio.to_thread(_nfl_batch_persist, persist_job)
 
 @app.get("/api/nfl/historical-batch/estimate")
 async def nfl_historical_batch_estimate(
@@ -1293,7 +1315,11 @@ async def _load_nfl_games_history() -> list:
                 r = await c.get(_NFL_GAMES_HISTORY_URL)
             if not r.is_success:
                 return []
-            rows = list(csv.DictReader(io.StringIO(r.content.decode("utf-8-sig"))))
+            # CSV decoding can be sizeable on a cold deploy; keep it off the
+            # loop just like the later matchup filtering.
+            rows = await asyncio.to_thread(
+                lambda: list(csv.DictReader(
+                    io.StringIO(r.content.decode("utf-8-sig")))))
             if rows:
                 _NFL_GAMES_HISTORY = rows
                 _NFL_GAMES_HISTORY_TS = now
@@ -1302,22 +1328,9 @@ async def _load_nfl_games_history() -> list:
             print(f"[NFL H2H] Schedule history failed: {e}")
             return []
 
-async def get_nfl_game_history(home_abbr: str, away_abbr: str,
-                               before_date: str = "") -> dict:
-    """Return the five most recent completed meetings before the selected game.
-    ESPN team schedules give us venue, home/away, final scores, and winner
-    without making any additional sportsbook request."""
-    home = str(home_abbr or "").upper().strip()
-    away = str(away_abbr or "").upper().strip()
-    if not home or not away or home == away:
-        return {"games": [], "error": "Invalid matchup"}
-    key = f"{away}@{home}:{before_date or _cur_season}"
-    now = time.time()
-    cached = _NFL_H2H_CACHE.get(key)
-    if cached and now - cached.get("ts", 0) < _NFL_H2H_TTL:
-        return cached.get("payload", {"games": []})
-
-    schedule_rows = await _load_nfl_games_history()
+def _nfl_game_history_payload(home: str, away: str, before_date: str,
+                              schedule_rows: list) -> dict:
+    """Filter/shape one matchup from the cached schedule off the event loop."""
     meetings = []
     for row in schedule_rows:
         raw_home = str(row.get("home_team") or "").upper()
@@ -1348,7 +1361,26 @@ async def get_nfl_game_history(home_abbr: str, away_abbr: str,
             "city_state": "",
         })
     meetings.sort(key=lambda x: x.get("date", ""), reverse=True)
-    payload = {"games": meetings[:5], "home_abbr": home, "away_abbr": away}
+    return {"games": meetings[:5], "home_abbr": home, "away_abbr": away}
+
+async def get_nfl_game_history(home_abbr: str, away_abbr: str,
+                               before_date: str = "") -> dict:
+    """Return the five most recent completed meetings before the selected game.
+    ESPN team schedules give us venue, home/away, final scores, and winner
+    without making any additional sportsbook request."""
+    home = str(home_abbr or "").upper().strip()
+    away = str(away_abbr or "").upper().strip()
+    if not home or not away or home == away:
+        return {"games": [], "error": "Invalid matchup"}
+    key = f"{away}@{home}:{before_date or _cur_season}"
+    now = time.time()
+    cached = _NFL_H2H_CACHE.get(key)
+    if cached and now - cached.get("ts", 0) < _NFL_H2H_TTL:
+        return cached.get("payload", {"games": []})
+
+    schedule_rows = await _load_nfl_games_history()
+    payload = await asyncio.to_thread(
+        _nfl_game_history_payload, home, away, before_date, schedule_rows)
     _NFL_H2H_CACHE[key] = {"ts": now, "payload": payload}
     return payload
 
@@ -1873,6 +1905,10 @@ _OPP_ADJ_COLS = {
 _DEFF_CACHE: dict = {"df_ref": None, "maps": {}}
 _TD_CAL_CACHE: dict = {"df_ref": None, "bins": None, "report": None}
 _TD_OPP_CACHE: dict = {"df_ref": None, "values": {}}
+# Standard runs, Coach warms, and historical replays can now analyze in worker
+# threads.  Keep the existing serial cache semantics for pandas/model caches
+# without putting the lock on the ASGI event loop.
+_NFL_ANALYSIS_LOCK = _bt_th.RLock()
 
 def _td_mean(rows, col, default=None):
     try:
@@ -2616,7 +2652,8 @@ def _nfl_starter_name(team_abbr: str, df, col: str = "passing_yards",
 
 async def _build_nfl_game_predictions(espn_games: list, df, date_str: str,
                                       gl_cache: dict = None,
-                                      roster_map: dict = None) -> tuple:
+                                      roster_map: dict = None,
+                                      progress=None) -> tuple:
     """Build Game Predictor payload for every game on today's slate.
     Fetches h2h + totals for all games concurrently via get_nfl_game_lines.
     Uses cached game lines when available (past-date lines are final) and
@@ -2627,18 +2664,52 @@ async def _build_nfl_game_predictions(espn_games: list, df, date_str: str,
     gl_cache = dict(gl_cache or {})
     fetched: dict = {}
     season_profile_cache = {}
+    completed_lines = 0
+
+    def report(message):
+        if progress:
+            try:
+                progress(message)
+            except Exception:
+                pass
+
     async def _one_gl(g):
+        nonlocal completed_lines
         eid = g.get("id", "")
-        if eid and eid in gl_cache:
-            return gl_cache[eid]
-        gl = await get_nfl_game_lines(eid, date_str)
-        if eid and gl:
-            fetched[eid] = gl
-        return gl
+        game_name = g.get("game", "") or f"{g.get('away_abbr', '')} @ {g.get('home_abbr', '')}"
+        try:
+            if eid and eid in gl_cache:
+                return gl_cache[eid]
+            if not eid:
+                return {}
+            # A separate deadline is required even though the underlying
+            # httpx client has a timeout: connection retries and provider
+            # response-body reads can otherwise keep one game pending while
+            # the rest of a 13-game slate is already complete.
+            gl = await asyncio.wait_for(
+                get_nfl_game_lines(eid, date_str),
+                timeout=_NFL_GP_GAME_LINE_TIMEOUT)
+            if eid and gl:
+                fetched[eid] = gl
+            return gl
+        except asyncio.TimeoutError:
+            print(f"[GP GameLines] {game_name} skipped after "
+                  f"{_NFL_GP_GAME_LINE_TIMEOUT}s deadline")
+            return {}
+        except Exception as exc:
+            print(f"[GP GameLines] {game_name} failed: {exc}")
+            return {}
+        finally:
+            completed_lines += 1
+            report(f"Game Predictor: game lines {completed_lines}/{len(espn_games)}")
+
+    report(f"Game Predictor: fetching game lines for {len(espn_games)} games…")
+
     async def _all_h2h():
         # H2H is a secondary, free-data nudge. Download it in parallel with
         # sportsbook game lines and fail open to the stats baseline if GitHub
         # is slow; it must never hold the whole picks run at this stage.
+        report("Game Predictor: loading matchup history…")
         try:
             rows = await asyncio.wait_for(
                 _load_nfl_games_history(), timeout=_NFL_GP_HISTORY_TIMEOUT)
@@ -2657,7 +2728,10 @@ async def _build_nfl_game_predictions(espn_games: list, df, date_str: str,
         asyncio.gather(*[_one_gl(g) for g in espn_games]),
         _all_h2h(),
     )
+    report("Game Predictor: sportsbook lines and matchup history loaded")
     for game_index, (g, gl) in enumerate(zip(espn_games, all_gl)):
+        report(f"Game Predictor: modeling game {game_index + 1}/{len(espn_games)}")
+        gl = gl or {}
         ha = g.get("home_abbr", ""); aa = g.get("away_abbr", "")
         if not ha or not aa:
             continue
@@ -2672,24 +2746,34 @@ async def _build_nfl_game_predictions(espn_games: list, df, date_str: str,
         target_type = str(g.get("season_type") or "REG").upper()
         reference_season = target_season if target_type == "POST" else target_season - 1
         if reference_season not in season_profile_cache:
-            season_profile_cache[reference_season] = _nfl_season_team_profiles(
-                df, reference_season)
+            # Team profiles and the L5 projections below perform pandas
+            # groupby/filter work.  Keep it off the ASGI loop while preserving
+            # the same per-reference-season cache and model inputs.
+            season_profile_cache[reference_season] = await asyncio.to_thread(
+                _nfl_season_team_profiles, df, reference_season)
         season_profiles = season_profile_cache[reference_season]
         # Offensive projections (L5 team yards → pts)
-        home_off = _nfl_team_pts_projection(
-            ha, df, target_season=target_season, target_week=target_week,
-            target_type=target_type)
-        away_off = _nfl_team_pts_projection(
-            aa, df, target_season=target_season, target_week=target_week,
-            target_type=target_type)
-        # Defensive strength belongs to the opponent being faced:
-        # away defense suppresses home scoring and home defense suppresses away.
-        home_def_str = _nfl_team_def_strength(
-            ha, df, target_season=target_season, target_week=target_week,
-            target_type=target_type)
-        away_def_str = _nfl_team_def_strength(
-            aa, df, target_season=target_season, target_week=target_week,
-            target_type=target_type)
+        # Defensive strength belongs to the opponent being faced: away defense
+        # suppresses home scoring and home defense suppresses away.  These four
+        # pandas scans are independent and are deliberately thread-offloaded.
+        home_off, away_off, home_def_str, away_def_str = await asyncio.gather(
+            asyncio.to_thread(
+                _nfl_team_pts_projection, ha, df,
+                target_season=target_season, target_week=target_week,
+                target_type=target_type),
+            asyncio.to_thread(
+                _nfl_team_pts_projection, aa, df,
+                target_season=target_season, target_week=target_week,
+                target_type=target_type),
+            asyncio.to_thread(
+                _nfl_team_def_strength, ha, df,
+                target_season=target_season, target_week=target_week,
+                target_type=target_type),
+            asyncio.to_thread(
+                _nfl_team_def_strength, aa, df,
+                target_season=target_season, target_week=target_week,
+                target_type=target_type),
+        )
         recent_home = home_off * away_def_str * HOME_ADJ
         recent_away = away_off * home_def_str
         hp = season_profiles.get(ha, {})
@@ -2758,8 +2842,12 @@ async def _build_nfl_game_predictions(espn_games: list, df, date_str: str,
             total_pick = "OVER" if proj_total > total_line else "UNDER"
             total_edge = round(proj_total - total_line, 1)
         # Starter names (QB = highest career passing_yards)
-        away_sp = _nfl_starter_name(aa, df, "passing_yards", roster_map)
-        home_sp = _nfl_starter_name(ha, df, "passing_yards", roster_map)
+        away_sp, home_sp = await asyncio.gather(
+            asyncio.to_thread(
+                _nfl_starter_name, aa, df, "passing_yards", roster_map),
+            asyncio.to_thread(
+                _nfl_starter_name, ha, df, "passing_yards", roster_map),
+        )
         # Driver phrases
         drivers = []
         if pick_home:
@@ -2782,6 +2870,18 @@ async def _build_nfl_game_predictions(espn_games: list, df, date_str: str,
             drivers.append(f"model {pick_abbr} {model_pct}% vs market {mkt_pct}% — +{mkt_edge}% value edge")
         elif mkt_edge is not None:
             drivers.append(f"model {pick_abbr} {model_pct}% vs market {mkt_pct}%")
+        odds_warning_parts = []
+        if away_ml is None or home_ml is None:
+            odds_warning_parts.append("moneyline prices unavailable")
+        if total_line is None:
+            odds_warning_parts.append("total price unavailable")
+        odds_warning = ""
+        if odds_warning_parts:
+            odds_warning = (
+                "Sportsbook game lines are unavailable for this matchup "
+                f"({'; '.join(odds_warning_parts)}); model prediction shown without prices."
+            )
+            drivers.append(f"⚠️ {odds_warning}")
         predictions.append({
             "away_abbr": aa, "home_abbr": ha,
             "away_sp": away_sp, "home_sp": home_sp,
@@ -2797,6 +2897,8 @@ async def _build_nfl_game_predictions(espn_games: list, df, date_str: str,
             "total_under_book": gl.get("total_under_book", ""),
             "mkt_home_pct": mkt_home_pct, "mkt_away_pct": mkt_away_pct,
             "mkt_edge": mkt_edge, "value_flag": value_flag,
+            "game_line_available": bool(gl),
+            "odds_warning": odds_warning,
             "drivers": drivers, "game_start": g.get("start", ""),
             "h2h_games": len(hgames),
             "h2h_home_avg": round(h2h_home_avg, 1) if h2h_home_avg is not None else None,
@@ -2830,7 +2932,10 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False,
                 simulate = True
         except Exception:
             pass
-    cached = None if (simulate or force_refresh) else _cache_get(date_str)
+    cached = (
+        None if (simulate or force_refresh)
+        else await asyncio.to_thread(_cache_get, date_str)
+    )
     if cached:
         return cached
     # Alternate markets have their own Coach-only cache and must never leak into
@@ -2883,7 +2988,9 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False,
     #      All games are fetched concurrently (asyncio.gather) then cached for 6h.
     #      On a cache hit the result cache (6h) fires first so no API calls happen.
     all_lines, game_lines_by_id, skipped_matchups = (
-        (None, None, []) if force_refresh else _odds_cache_get(date_str))
+        (None, None, [])
+        if force_refresh
+        else await asyncio.to_thread(_odds_cache_get, date_str))
     if all_lines is None:
         # 2. Match Odds API event IDs
         _p(f"Matching {len(espn_games)} games with sportsbook events…")
@@ -2977,7 +3084,8 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False,
                 l["target_type"] = ev.get("season_type", "REG")
             all_lines.extend(lines)
         if all_lines:
-            _odds_cache_set(date_str, all_lines, {}, skipped_matchups)
+            await asyncio.to_thread(
+                _odds_cache_set, date_str, all_lines, {}, skipped_matchups)
 
     if not all_lines:
         today = _nfl_today()
@@ -3028,7 +3136,7 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False,
         roster_filtered.append(line)
     all_lines = roster_filtered
     if not simulate:
-        _apply_nfl_injury_context(all_lines, roster_map)
+        await asyncio.to_thread(_apply_nfl_injury_context, all_lines, roster_map)
     # Keep the complete sportsbook set for later game-line cache updates.
     # _trim_prop_lines intentionally reduces analysis volume, but that reduced
     # list must never overwrite the raw odds cache.
@@ -3060,30 +3168,41 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False,
     if simulate and espn_games:
         tg = espn_games[0]
         ts, tw, tt = tg.get("season"), tg.get("week"), tg.get("season_type", "REG")
-        try:
-            stats_week = _nflverse_week(tt, tw or 1)
-            target_rows = df[
-                (df["season"].fillna(0).astype(int) == int(ts)) &
-                (df["week"].fillna(0).astype(int) == int(stats_week))
-            ]
-            if "season_type" in target_rows.columns:
-                target_rows = target_rows[
-                    target_rows["season_type"].fillna("REG").astype(str).str.upper() == str(tt).upper()
+        def _point_in_time_filter():
+            try:
+                stats_week = _nflverse_week(tt, tw or 1)
+                selected_rows = df[
+                    (df["season"].fillna(0).astype(int) == int(ts)) &
+                    (df["week"].fillna(0).astype(int) == int(stats_week))
                 ]
-            for _, tr in target_rows.iterrows():
-                raw_name = tr.get("player_display_name", "")
-                nm = _norm(str(raw_name)) if raw_name is not None else ""
-                tm = str(tr.get("recent_team") or "")
-                if nm and tm:
-                    target_teams[nm] = tm
-            for line in all_lines:
-                tm = target_teams.get(_norm(line.get("name", "")))
-                if tm in (line.get("home_abbr"), line.get("away_abbr")):
-                    line["roster_team"] = tm
-            analysis_df = _nfl_stats_before_game(df, ts, tw, tt)
-        except Exception as exc:
-            print(f"[nfl_sim] point-in-time filter failed closed: {exc}")
-            analysis_df = df.iloc[0:0]
+                if "season_type" in selected_rows.columns:
+                    selected_rows = selected_rows[
+                        selected_rows["season_type"].fillna("REG").astype(str).str.upper()
+                        == str(tt).upper()
+                    ]
+                selected_teams = {}
+                for _, tr in selected_rows.iterrows():
+                    raw_name = tr.get("player_display_name", "")
+                    nm = _norm(str(raw_name)) if raw_name is not None else ""
+                    tm = str(tr.get("recent_team") or "")
+                    if nm and tm:
+                        selected_teams[nm] = tm
+                for line in all_lines:
+                    tm = selected_teams.get(_norm(line.get("name", "")))
+                    if tm in (line.get("home_abbr"), line.get("away_abbr")):
+                        line["roster_team"] = tm
+                return (
+                    selected_rows, selected_teams,
+                    _nfl_stats_before_game(df, ts, tw, tt))
+            except Exception as exc:
+                print(f"[nfl_sim] point-in-time filter failed closed: {exc}")
+                try:
+                    empty = df.iloc[0:0]
+                except Exception:
+                    empty = df
+                return empty, {}, empty
+        target_rows, target_teams, analysis_df = await asyncio.to_thread(
+            _point_in_time_filter)
 
     # 5. Analyze every sportsbook-listed active player in standard offense,
     # defense, and kicking markets. Anytime TD is the only exception: reduce its
@@ -3092,18 +3211,27 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False,
     standard_lines = [
         pl for pl in all_lines if pl.get("market") != "player_anytime_td"
     ]
-    all_lines = _analysis_prop_lines(all_lines, analysis_df)
+    all_lines = await asyncio.to_thread(
+        _analysis_prop_lines, all_lines, analysis_df)
     td_starter_lines = [
         pl for pl in all_lines if pl.get("market") == "player_anytime_td"
     ]
     _p(
         f"Analyzing all {len(standard_lines)} standard player props plus "
         f"{len(td_starter_lines)} starter-level Anytime TD candidates…")
-    all_results = []
-    for pl in all_lines:
-        result = _analyze_prop(pl, analysis_df, pl.get("home_abbr",""), pl.get("away_abbr",""))
-        if result:
-            all_results.append(result)
+    def _analyze_all_props():
+        # Keep the serial order (and therefore TD calibration/cache semantics)
+        # while moving the pandas-heavy loop out of the event loop.
+        analyzed = []
+        with _NFL_ANALYSIS_LOCK:
+            for pl in all_lines:
+                result = _analyze_prop(
+                    pl, analysis_df,
+                    pl.get("home_abbr", ""), pl.get("away_abbr", ""))
+                if result:
+                    analyzed.append(result)
+        return analyzed
+    all_results = await asyncio.to_thread(_analyze_all_props)
 
     # 6. Preserve every analyzed result. The TD starter prefilter above removes
     # backup longshots; there is no later team cap, so every qualifying starter
@@ -3127,11 +3255,12 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False,
     #    so player-prop market quota is never shared with game-level markets)
     _p("Building game predictions…")
     game_predictions, new_gl = await _build_nfl_game_predictions(
-        espn_games, df, date_str, game_lines_by_id, roster_map)
+        espn_games, df, date_str, game_lines_by_id, roster_map, progress=_p)
     if new_gl:
         # Persist freshly-bought game lines so re-runs never re-buy them
         merged_gl = {**(game_lines_by_id or {}), **new_gl}
-        _odds_cache_set(
+        await asyncio.to_thread(
+            _odds_cache_set,
             date_str, raw_cached_lines, merged_gl, skipped_matchups)
     _p("Finishing up…")
     # Data health: the current season is normally absent before its first games.
@@ -3140,7 +3269,8 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False,
     data_warning = ""
     data_note = ""
     try:
-        loaded_seasons = sorted({int(s) for s in df["season"].dropna().unique()})
+        loaded_seasons = await asyncio.to_thread(
+            lambda: sorted({int(s) for s in df["season"].dropna().unique()}))
         completed = [y for y in NFL_SEASONS if y != _cur_season]
         missing_completed = [y for y in completed if y not in loaded_seasons]
         if missing_completed:
@@ -3162,10 +3292,15 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False,
 
     td_calibration = next((r.get("tdCalibrationReport") for r in td_picks
                            if r.get("tdCalibrationReport")), [])
+    game_predictor_warnings = [
+        p.get("odds_warning") for p in game_predictions
+        if p.get("odds_warning")
+    ]
     result  = {"picks":picks, "all":all_results, "td_picks":td_picks, "date":date_str,
                "games":games_out, "qualified":len(picks),
                "prop_coverage_complete": prop_coverage_complete,
                "skipped_matchups": skipped_matchups,
+               "game_predictor_warnings": game_predictor_warnings,
                "data_warning": data_warning,
                "data_note": data_note,
                "td_calibration": {
@@ -3179,17 +3314,18 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False,
                "game_predictions": game_predictions}
     if simulate:
         result["simulation"] = True
-        replay_box = _nfl_box_from_stats_rows(target_rows)
-        result["historicalTrackRecord"] = _nfl_historical_replay_payload(
-            result, espn_games, replay_box)
-        historical_saved = _nfl_save_historical_replay(
+        replay_box = await asyncio.to_thread(_nfl_box_from_stats_rows, target_rows)
+        result["historicalTrackRecord"] = await asyncio.to_thread(
+            _nfl_historical_replay_payload, result, espn_games, replay_box)
+        historical_saved = await asyncio.to_thread(
+            _nfl_save_historical_replay,
             date_str, result["historicalTrackRecord"])
         _p("Building Historical Edge Coach recommendations…")
         historical_coach = await _nfl_build_historical_coach(
             date_str, picks, espn_games, analysis_df, roster_map, replay_box,
             target_teams)
-        historical_coach_saved = _nfl_save_historical_coach(
-            date_str, historical_coach)
+        historical_coach_saved = await asyncio.to_thread(
+            _nfl_save_historical_coach, date_str, historical_coach)
         result["historical_saved"] = historical_saved
         result["historicalSaved"] = historical_saved
         result["historicalCoachSaved"] = historical_coach_saved
@@ -3208,7 +3344,10 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False,
             "enter the official NFL Track Record."
         )
         return result
-    _nfl_attach_line_movement(date_str, result)
+    # Line movement and snapshot helpers use synchronous Supabase/httpx calls.
+    # Keep the tracking semantics/order intact, but never run those calls on
+    # the ASGI event loop.
+    await asyncio.to_thread(_nfl_attach_line_movement, date_str, result)
     official_capture = (
         capture_official and _nfl_official_capture_allowed(date_str, result))
     result["official_tracking"] = official_capture
@@ -3217,16 +3356,16 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False,
             "Weekly opening-line snapshot only; official picks remain available "
             "for the first eligible game-day run.")
     if official_capture:
-        _nfl_save_picks_snapshot(date_str, result)
-        _nfl_save_gp_snapshot(date_str, result)
+        await asyncio.to_thread(_nfl_save_picks_snapshot, date_str, result)
+        await asyncio.to_thread(_nfl_save_gp_snapshot, date_str, result)
     else:
         print(f"[nfl_track] official snapshot skipped for {date_str}: "
               + ("weekly opening-line mode"
                  if not capture_official else "capture was not before every kickoff"))
-    _cache_set(date_str, result)
+    await asyncio.to_thread(_cache_set, date_str, result)
     try:
         from replit_push import push_picks_to_replit
-        push_picks_to_replit("nfl", result)
+        await asyncio.to_thread(push_picks_to_replit, "nfl", result)
     except Exception as _e:
         print(f"[replit_push] nfl push failed: {_e}")
     return result
@@ -3246,7 +3385,7 @@ async def health(): return {"status":"ok"}
 @app.get("/api/warm")
 async def api_warm():
     today = _nfl_today()
-    cached = _cache_get(today)
+    cached = await asyncio.to_thread(_cache_get, today)
     if cached:
         return {"ok":True,"source":"cache","date":today,"picks":len(cached.get("picks",[]))}
     result = await run_pipeline(today)
@@ -3271,7 +3410,7 @@ def _verify_hub_token(token: str) -> bool:
         return False
 
 async def _build_alt_coach(date_str: str) -> dict:
-    cached = _alt_coach_cache_get(date_str)
+    cached = await asyncio.to_thread(_alt_coach_cache_get, date_str)
     if cached:
         return cached
     games = await get_espn_games(date_str)
@@ -3324,23 +3463,28 @@ async def _build_alt_coach(date_str: str) -> dict:
                 "roster_position": (info or {}).get("position", ""),
             })
             lines.append(line)
-    _apply_nfl_injury_context(lines, roster_map)
+    await asyncio.to_thread(_apply_nfl_injury_context, lines, roster_map)
     df = await get_nfl_stats()
     if df is None:
         raise RuntimeError("NFL stats are unavailable.")
-    picks = []
-    for line in lines:
-        result = _analyze_prop(
-            line, df, line.get("home_abbr", ""), line.get("away_abbr", ""))
-        selected_odds = None
-        if result:
-            selected_odds = (
-                result.get("realOdds") if result.get("pick") == "OVER"
-                else result.get("realUnderOdds")
-            )
-        if (result and result.get("coachEligible", True)
-                and selected_odds is not None and selected_odds >= -500):
-            picks.append(result)
+    def _analyze_alt_lines():
+        # pandas-heavy history analysis must not run on the ASGI event loop.
+        analyzed_picks = []
+        with _NFL_ANALYSIS_LOCK:
+            for line in lines:
+                result = _analyze_prop(
+                    line, df, line.get("home_abbr", ""), line.get("away_abbr", ""))
+                selected_odds = None
+                if result:
+                    selected_odds = (
+                        result.get("realOdds") if result.get("pick") == "OVER"
+                        else result.get("realUnderOdds")
+                    )
+                if (result and result.get("coachEligible", True)
+                        and selected_odds is not None and selected_odds >= -500):
+                    analyzed_picks.append(result)
+        return analyzed_picks
+    picks = await asyncio.to_thread(_analyze_alt_lines)
     payload = {
         "date": date_str, "picks": picks, "lines": len(lines),
         "warning": (
@@ -3348,7 +3492,7 @@ async def _build_alt_coach(date_str: str) -> dict:
             if failed_events else ""
         ),
     }
-    _alt_coach_cache_set(date_str, payload)
+    await asyncio.to_thread(_alt_coach_cache_set, date_str, payload)
     return payload
 
 @app.get("/api/nfl/coach-alternates")
@@ -3367,7 +3511,7 @@ async def api_nfl_coach_alternates(request: Request, date_str: str = "",
     try:
         return JSONResponse(await asyncio.wait_for(_warm_alt_coach(ds), timeout=120))
     except asyncio.TimeoutError:
-        stale = _alt_coach_cache_get(ds, allow_stale=True)
+        stale = await asyncio.to_thread(_alt_coach_cache_get, ds, allow_stale=True)
         if stale:
             payload = dict(stale)
             payload["stale"] = True
@@ -3380,7 +3524,7 @@ async def api_nfl_coach_alternates(request: Request, date_str: str = "",
             "detail": "The alternate-line scan is still running."
         }, status_code=202)
     except Exception as exc:
-        stale = _alt_coach_cache_get(ds, allow_stale=True)
+        stale = await asyncio.to_thread(_alt_coach_cache_get, ds, allow_stale=True)
         if stale:
             payload = dict(stale)
             payload["stale"] = True
@@ -3476,7 +3620,7 @@ async def api_run(request: Request):
                     async def _run_week_date(index, ds):
                         nonlocal completed
                         if ds < today:
-                            saved = _cache_get(ds)
+                            saved = await asyncio.to_thread(_cache_get, ds)
                             results[index] = saved or {
                                 "date": ds, "picks": [], "all": [], "games": [],
                                 "game_predictions": [], "td_picks": [],
@@ -3500,13 +3644,16 @@ async def api_run(request: Request):
                                                         f"Full week: {completed}/7 complete · "
                                                         f"{d}: {m}")})),
                                         timeout=_NFL_WEEK_DAY_TIMEOUT)
-                                    _nfl_capture_opening_lines(ds, result)
-                                    _nfl_attach_line_movement(ds, result)
+                                    await asyncio.to_thread(
+                                        _nfl_capture_opening_lines, ds, result)
+                                    await asyncio.to_thread(
+                                        _nfl_attach_line_movement, ds, result)
                                     # A full-week run is a valid pre-kickoff
                                     # Game Predictor forecast for each slate.
                                     # Keep player-prop official capture in its
                                     # existing game-day-only path.
-                                    _nfl_save_gp_snapshot(ds, result)
+                                    await asyncio.to_thread(
+                                        _nfl_save_gp_snapshot, ds, result)
                                     results[index] = result
                                 except asyncio.TimeoutError:
                                     results[index] = {
@@ -3538,7 +3685,8 @@ async def api_run(request: Request):
                     date_str,
                     force_refresh=True,
                     progress=lambda m: JOBS.get(job_id, {}).update({"progress": m}))
-                _nfl_attach_line_movement(date_str, result)
+                await asyncio.to_thread(
+                    _nfl_attach_line_movement, date_str, result)
                 return result
             result = await asyncio.wait_for(
                 _work(), timeout=_NFL_WEEK_JOB_TIMEOUT if scope == "week" else 300)
@@ -4476,13 +4624,15 @@ def _nfl_coach_hist_select(candidates, category, alternate=False):
 
 async def _nfl_build_historical_coach(date_str, picks, games, df, roster_map,
                                       replay_box, target_teams):
-    standard = _nfl_coach_hist_candidates(picks)
-    output = {
-        category: _nfl_coach_hist_select(standard, category)
-        for category in _NFL_COACH_CATS if category != "alt_line_edge"
-    }
+    def _build_standard():
+        standard = _nfl_coach_hist_candidates(picks)
+        return {
+            category: _nfl_coach_hist_select(standard, category)
+            for category in _NFL_COACH_CATS if category != "alt_line_edge"
+        }
+    output = await asyncio.to_thread(_build_standard)
     sem = asyncio.Semaphore(_NFL_PROP_FETCH_CONCURRENCY)
-    alt_cache = _hist_alt_raw_cache_get(date_str)
+    alt_cache = await asyncio.to_thread(_hist_alt_raw_cache_get, date_str)
     alt_cache_lock = asyncio.Lock()
     async def fetch_alt(game):
         event_id = game.get("id", "")
@@ -4519,37 +4669,45 @@ async def _nfl_build_historical_coach(date_str, picks, games, df, roster_map,
                 if successful_empty:
                     async with alt_cache_lock:
                         alt_cache[event_id] = []
-                        _hist_alt_raw_cache_set(date_str, alt_cache)
+                        await asyncio.to_thread(
+                            _hist_alt_raw_cache_set, date_str, alt_cache)
                 return game, []
             async with alt_cache_lock:
                 alt_cache[event_id] = lines
-                _hist_alt_raw_cache_set(date_str, alt_cache)
+                await asyncio.to_thread(
+                    _hist_alt_raw_cache_set, date_str, alt_cache)
             return game, lines
     batches = await asyncio.gather(*(fetch_alt(game) for game in games))
-    alt_results = []
-    for game, lines in batches:
-        home = game.get("home_abbr", "") or _name_to_abbr(game.get("home_team", ""))
-        away = game.get("away_abbr", "") or _name_to_abbr(game.get("away_team", ""))
-        for line in lines:
-            player_key = _norm(line.get("name", ""))
-            info = roster_map.get(player_key) if roster_map else None
-            if info and not info.get("eligible", True):
-                continue
-            line.update({
-                "home_team": game.get("home_team", ""), "away_team": game.get("away_team", ""),
-                "home_abbr": home, "away_abbr": away, "game": game.get("game", ""),
-                "game_start": game.get("start", ""), "target_season": game.get("season"),
-                "target_week": game.get("week"), "target_type": game.get("season_type", "REG"),
-                "roster_team": target_teams.get(
-                    player_key, (info or {}).get("team", "")),
-                "roster_position": (info or {}).get("position", ""),
-            })
-            analyzed = _analyze_prop(line, df, home, away)
-            if analyzed:
-                alt_results.append(analyzed)
-    alt_candidates = _nfl_coach_hist_candidates(alt_results)
-    output["alt_line_edge"] = _nfl_coach_hist_select(
-        alt_candidates, "alt_line_edge", alternate=True)
+    def _analyze_historical_alts():
+        # Alternate-history analysis is another pandas-heavy path.  Preserve
+        # batch/order/category behavior while keeping it off the event loop.
+        analyzed_rows = []
+        with _NFL_ANALYSIS_LOCK:
+            for game, lines in batches:
+                home = game.get("home_abbr", "") or _name_to_abbr(game.get("home_team", ""))
+                away = game.get("away_abbr", "") or _name_to_abbr(game.get("away_team", ""))
+                for line in lines:
+                    player_key = _norm(line.get("name", ""))
+                    info = roster_map.get(player_key) if roster_map else None
+                    if info and not info.get("eligible", True):
+                        continue
+                    line.update({
+                        "home_team": game.get("home_team", ""), "away_team": game.get("away_team", ""),
+                        "home_abbr": home, "away_abbr": away, "game": game.get("game", ""),
+                        "game_start": game.get("start", ""), "target_season": game.get("season"),
+                        "target_week": game.get("week"), "target_type": game.get("season_type", "REG"),
+                        "roster_team": target_teams.get(
+                            player_key, (info or {}).get("team", "")),
+                        "roster_position": (info or {}).get("position", ""),
+                    })
+                    analyzed = _analyze_prop(line, df, home, away)
+                    if analyzed:
+                        analyzed_rows.append(analyzed)
+        return analyzed_rows
+    alt_results = await asyncio.to_thread(_analyze_historical_alts)
+    alt_candidates = await asyncio.to_thread(_nfl_coach_hist_candidates, alt_results)
+    output["alt_line_edge"] = await asyncio.to_thread(
+        _nfl_coach_hist_select, alt_candidates, "alt_line_edge", alternate=True)
     for category, rows in output.items():
         for row in rows:
             row.update({
@@ -6747,7 +6905,7 @@ function _flashNoNflSwap(idx){
   setTimeout(function(){b.innerHTML=old;b.style.background='#1e3a8a';b.style.color='#bfdbfe';},1000);
 }
 
-var jobId=null, pollTimer=null;
+var jobId=null, pollTimer=null, _pollBusy=false;
 
 function _nflRunScope(){
   var el=document.getElementById('runScope');
@@ -6765,6 +6923,7 @@ function _nflRunScopeChanged(){
 }
 
 async function runPicks(){
+  if(document.getElementById('runBtn').disabled)return;
   var date=document.getElementById('datePicker').value;
   var scope=_nflRunScope();
   if(!date){alert('Please select a date');return;}
@@ -6779,7 +6938,10 @@ async function runPicks(){
   try{
     const r=await fetch('/api/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({date:date,scope:scope,token:_nflTok})});
     const d=await r.json();
+    if(!r.ok || !d.job_id)throw new Error(d.detail||d.error||'Could not start run');
     jobId=d.job_id;
+    _pollFails=0;
+    clearInterval(pollTimer);
     pollTimer=setInterval(pollJob,2500);
   }catch(e){
     status.textContent='Error: '+e.message;
@@ -6789,9 +6951,12 @@ async function runPicks(){
 
 var _pollFails=0;
 async function pollJob(){
-  if(!jobId)return;
+  if(!jobId || _pollBusy)return;
+  _pollBusy=true;
+  const controller=new AbortController();
+  const requestTimer=setTimeout(()=>controller.abort(),15000);
   try{
-    const r=await fetch('/api/run/'+jobId);
+    const r=await fetch('/api/run/'+jobId,{signal:controller.signal,cache:'no-store'});
     if(!r.ok){
       // 404 = job gone (server restarted mid-run); stop and tell user
       if(r.status===404){
@@ -6799,8 +6964,9 @@ async function pollJob(){
         document.getElementById('statusMsg').textContent='Server restarted mid-run — please try again.';
         document.getElementById('runBtn').disabled=false;
         document.getElementById('runBtn').textContent='Run Picks';
+        return;
       }
-      return;
+      throw new Error('Status request failed: HTTP '+r.status);
     }
     const d=await r.json();
     _pollFails=0;
@@ -6843,10 +7009,15 @@ async function pollJob(){
     _pollFails++;
     if(_pollFails>=5){
       clearInterval(pollTimer);
-      document.getElementById('statusMsg').textContent='Connection lost — please refresh and try again.';
+      document.getElementById('statusMsg').textContent='Status connection lost. The server job may still be running; check Get Picks before starting another run.';
       document.getElementById('runBtn').disabled=false;
       document.getElementById('runBtn').textContent='Run Picks';
+    }else{
+      document.getElementById('statusMsg').textContent='Waiting for server status — retry '+_pollFails+'/5. The last progress update may be stale.';
     }
+  }finally{
+    clearTimeout(requestTimer);
+    _pollBusy=false;
   }
 }
 
