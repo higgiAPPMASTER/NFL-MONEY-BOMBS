@@ -221,7 +221,7 @@ def _cache_set(date_key, result):
 _ODDS_TTL = 15 * 60
 
 def _odds_cache_get(date_key):
-    """Returns (props_list, game_lines_by_id) or (None, None) on miss.
+    """Returns (props_list, game_lines_by_id, skipped_matchups) on hit.
     Handles the old list-only format for backward compat."""
     # Historical replays keep the original permanent filename so paid archived
     # Odds API data remains reusable. Live slates use v2 for quote timestamps.
@@ -234,19 +234,24 @@ def _odds_cache_get(date_key):
             print(f"[OddsCache] HIT nfl/{date_key}")
             raw = json.loads(p.read_text(encoding="utf-8"))
             if isinstance(raw, dict) and "props" in raw:
-                return raw["props"], raw.get("game_lines", {})
-            return raw, {}   # old list-only format
+                return (raw["props"], raw.get("game_lines", {}),
+                        raw.get("skipped_matchups", []))
+            return raw, {}, []   # old list-only format
     except Exception as e:
         print(f"[OddsCache] read error: {e}")
-    return None, None
+    return None, None, []
 
-def _odds_cache_set(date_key, props, game_lines):
+def _odds_cache_set(date_key, props, game_lines, skipped_matchups=None):
     try:
         p = _CACHE_DIR / (
             f"nfl_odds_{date_key}.json" if _is_past_date(date_key)
             else f"nfl_odds_v2_{date_key}.json")
         p.write_text(
-            json.dumps({"props": props, "game_lines": game_lines}, ensure_ascii=False),
+            json.dumps({
+                "props": props,
+                "game_lines": game_lines,
+                "skipped_matchups": list(skipped_matchups or []),
+            }, ensure_ascii=False),
             encoding="utf-8")
         print(f"[OddsCache] SET nfl/{date_key} ({len(props)} props, {len(game_lines)} games)")
     except Exception as e:
@@ -1171,6 +1176,7 @@ async def nfl_historical_batch_retry(job_id: str, request: Request):
 # The history loads only after the user opens a predictor card and is cached.
 _NFL_H2H_CACHE: dict = {}
 _NFL_H2H_TTL = 24 * 3600
+_NFL_GP_HISTORY_TIMEOUT = 18
 _NFL_GAMES_HISTORY: list = []
 _NFL_GAMES_HISTORY_TS = 0.0
 _NFL_GAMES_HISTORY_LOCK = asyncio.Lock()
@@ -2556,11 +2562,28 @@ async def _build_nfl_game_predictions(espn_games: list, df, date_str: str,
         if eid and gl:
             fetched[eid] = gl
         return gl
-    all_gl = await asyncio.gather(*[_one_gl(g) for g in espn_games])
-    h2h_payloads = await asyncio.gather(*[
-        get_nfl_game_history(g.get("home_abbr", ""), g.get("away_abbr", ""), date_str)
-        for g in espn_games
-    ])
+    async def _all_h2h():
+        # H2H is a secondary, free-data nudge. Download it in parallel with
+        # sportsbook game lines and fail open to the stats baseline if GitHub
+        # is slow; it must never hold the whole picks run at this stage.
+        try:
+            rows = await asyncio.wait_for(
+                _load_nfl_games_history(), timeout=_NFL_GP_HISTORY_TIMEOUT)
+        except asyncio.TimeoutError:
+            print(f"[NFL H2H] skipped after {_NFL_GP_HISTORY_TIMEOUT}s deadline")
+            return [{} for _ in espn_games]
+        if not rows:
+            return [{} for _ in espn_games]
+        return await asyncio.gather(*[
+            get_nfl_game_history(
+                g.get("home_abbr", ""), g.get("away_abbr", ""), date_str)
+            for g in espn_games
+        ])
+
+    all_gl, h2h_payloads = await asyncio.gather(
+        asyncio.gather(*[_one_gl(g) for g in espn_games]),
+        _all_h2h(),
+    )
     for game_index, (g, gl) in enumerate(zip(espn_games, all_gl)):
         ha = g.get("home_abbr", ""); aa = g.get("away_abbr", "")
         if not ha or not aa:
@@ -2786,8 +2809,8 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False,
     # 2+3. Odds layer — ONE call per game fetches props + h2h + totals together.
     #      All games are fetched concurrently (asyncio.gather) then cached for 6h.
     #      On a cache hit the result cache (6h) fires first so no API calls happen.
-    all_lines, game_lines_by_id = (
-        (None, None) if force_refresh else _odds_cache_get(date_str))
+    all_lines, game_lines_by_id, skipped_matchups = (
+        (None, None, []) if force_refresh else _odds_cache_get(date_str))
     if all_lines is None:
         # 2. Match Odds API event IDs
         _p(f"Matching {len(espn_games)} games with sportsbook events…")
@@ -2871,6 +2894,13 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False,
 
         # Preserve schedule order so downstream ranking remains deterministic.
         for ev, lines in fetched_games:
+            fetch_status = _NFL_PROP_FETCH_STATUS.get(
+                (str(ev.get("id", "")), str(date_str), False))
+            if fetch_status != "success":
+                skipped_matchups.append(
+                    ev.get("game")
+                    or f"{ev.get('away_abbr', '')} at {ev.get('home_abbr', '')}".strip()
+                    or "Unknown matchup")
             home_abbr = ev.get("home_abbr", "") or _name_to_abbr(ev.get("home_team",""))
             away_abbr = ev.get("away_abbr", "") or _name_to_abbr(ev.get("away_team",""))
             for l in lines:
@@ -2885,7 +2915,7 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False,
                 l["target_type"] = ev.get("season_type", "REG")
             all_lines.extend(lines)
         if all_lines:
-            _odds_cache_set(date_str, all_lines, {})
+            _odds_cache_set(date_str, all_lines, {}, skipped_matchups)
 
     if not all_lines:
         today = _nfl_today()
@@ -2893,7 +2923,10 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False,
             msg = f"No prop data found for {date_str} — the Odds API may not have archived lines for these games."
         else:
             msg = "No prop lines available yet — check back closer to game time"
-        return {"picks":[],"all":[],"games":len(espn_games),"error":msg}
+        return {
+            "picks": [], "all": [], "games": len(espn_games),
+            "skipped_matchups": skipped_matchups, "error": msg,
+        }
     if simulate:
         uncovered = []
         for game in espn_games:
@@ -3036,7 +3069,8 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False,
     if new_gl:
         # Persist freshly-bought game lines so re-runs never re-buy them
         merged_gl = {**(game_lines_by_id or {}), **new_gl}
-        _odds_cache_set(date_str, raw_cached_lines, merged_gl)
+        _odds_cache_set(
+            date_str, raw_cached_lines, merged_gl, skipped_matchups)
     _p("Finishing up…")
     # Data health: the current season is normally absent before its first games.
     # That is expected for Week 1, so show it as an informational note; only
@@ -3069,6 +3103,7 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False,
     result  = {"picks":picks, "all":all_results, "td_picks":td_picks, "date":date_str,
                "games":games_out, "qualified":len(picks),
                "prop_coverage_complete": prop_coverage_complete,
+               "skipped_matchups": skipped_matchups,
                "data_warning": data_warning,
                "data_note": data_note,
                "td_calibration": {
@@ -3485,6 +3520,7 @@ def _nfl_merge_week_results(anchor_date: str, daily_results: list) -> dict:
         "week_dates": dates,
         "picks": [], "all": [], "td_picks": [], "games": [],
         "game_predictions": [], "qualified": 0,
+        "skipped_matchups": [],
         "daily_status": [],
     }
     notes, warnings, successful = [], [], []
@@ -3513,6 +3549,8 @@ def _nfl_merge_week_results(anchor_date: str, daily_results: list) -> dict:
             copy = dict(game)
             copy["slate_date"] = ds
             merged["game_predictions"].append(copy)
+        for matchup in result.get("skipped_matchups") or []:
+            merged["skipped_matchups"].append(f"{ds}: {matchup}")
         if result.get("data_warning") and result["data_warning"] not in warnings:
             warnings.append(result["data_warning"])
         if result.get("data_note") and result["data_note"] not in warnings:
@@ -7968,7 +8006,9 @@ function renderResults(d){
   var res=document.getElementById('results');
   if(!d){ res.innerHTML=''; return; }
   if(d.error){
-    res.innerHTML='<div class="err-box">'+d.error+'<div style="font-size:13px;color:#9ca3af;margin-top:6px;font-weight:400">NFL season runs September through February</div></div>';
+    var failed=(d.skipped_matchups||[]);
+    var failedDetail=failed.length?('<div style="font-size:13px;color:#fbbf24;margin-top:8px;font-weight:700">Skipped matchups: '+failed.map(_esc).join(', ')+'</div>'):'';
+    res.innerHTML='<div class="err-box">'+_esc(d.error)+failedDetail+'<div style="font-size:13px;color:#9ca3af;margin-top:6px;font-weight:400">NFL season runs September through February</div></div>';
     return;
   }
   window._nflState={d:d, all:(d.all||[])};
@@ -7978,7 +8018,9 @@ function renderResults(d){
   var weekNotice=d.week_notice?('<div style="margin-bottom:10px;padding:11px 14px;border:1px solid #6d28d9;background:rgba(109,40,217,.12);border-radius:10px;color:#ddd6fe;font-size:.82rem">'+d.week_notice+'</div>'):'';
   var note=d.data_note?('<div style="margin-bottom:10px;padding:11px 14px;border:1px solid #24506b;background:#0b2230;border-radius:10px;color:#9bd5f5;font-size:.82rem">'+d.data_note+'</div>'):'';
   var warn=d.data_warning?('<div class="err-box" style="margin-bottom:10px">'+d.data_warning+'</div>'):'';
-  res.innerHTML=weekNotice+note+warn+'<div class="nfl-toolbar"><input id="nflSearch" type="text" placeholder="Search player…" oninput="_nflPaint(this.value)"/></div><div id="nflBody"></div>';
+  var skipped=(d.skipped_matchups||[]);
+  var completenessWarn=skipped.length?('<div class="err-box" style="margin-bottom:10px"><strong>Incomplete sportsbook slate:</strong> no player props were loaded for '+skipped.map(_esc).join(', ')+'. These matchups were skipped after the sportsbook request timed out or failed.</div>'):'';
+  res.innerHTML=weekNotice+completenessWarn+note+warn+'<div class="nfl-toolbar"><input id="nflSearch" type="text" placeholder="Search player…" oninput="_nflPaint(this.value)"/></div><div id="nflBody"></div>';
   _renderNflGamePredictor(d);
   _renderNflTdPredictor(d);
   _nflPaint('');
