@@ -6036,7 +6036,8 @@ def _nfl_coach_canonical_capture(date_str, category, filters=None):
             _nfl_coach_hist_candidates(picks), filters)
         return _nfl_coach_hist_select(candidates, category, alternate=True)
     source = _cache_get(date_str)
-    picks = ((source.get("coach_candidates") or source.get("picks") or [])
+    picks = ((source.get("coach_candidates") or source.get("all")
+              or source.get("picks") or [])
              if isinstance(source, dict) else [])
     candidates = _nfl_coach_filter_candidates(
         _nfl_coach_hist_candidates(picks), filters)
@@ -6783,7 +6784,7 @@ tr:last-child td{border-bottom:none}
   <div id="nfl-coach-track-section" class="card" style="display:none;max-width:960px;margin:0 auto 16px;padding:20px 22px">
     <div style="margin-bottom:14px">
       <h2 style="font-family:'Playfair Display',serif;font-size:1.4rem;font-weight:700;color:#fff">&#128202; NFL AI Coach Track Record</h2>
-      <div style="color:#7c8aa0;font-size:.76rem;margin-top:4px">Write-once pre-kickoff recommendations from all eight Coach presets. Kept separate from the main, Overflow, Game Predictor, and historical records.</div>
+       <div style="color:#7c8aa0;font-size:.76rem;margin-top:4px">Write-once pre-kickoff recommendations from all Coach presets. Kept separate from the main, Overflow, Game Predictor, and historical records.</div>
     </div>
     <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:14px">
       <label style="color:#9ca3af;font-size:.78rem;font-weight:700;text-transform:uppercase;letter-spacing:.1em">Record</label>
@@ -8055,7 +8056,9 @@ function _nflCoachOdds(v){var n=Number(v);return n>0?'+'+n:String(n);}
 function _nflCoachSigned(v){var n=Number(v||0);return (n>=0?'+':'')+n.toFixed(2);}
 function _nflCoachProps(sourceCandidates){
   var d=(window._nflState||{}).d||{},seen={},out=[];
-  var source=Array.isArray(sourceCandidates)?sourceCandidates:(d.coach_candidates||d.picks||[]);
+  // Coach categories must scan the complete analyzed slate. `d.picks` is the
+  // reduced board list and can omit an otherwise valid priced market family.
+  var source=Array.isArray(sourceCandidates)?sourceCandidates:(d.coach_candidates||d.all||d.picks||[]);
   source.forEach(function(p){
     if(p.coachEligible===false || p.availabilityVerified===false)return;
     var quoteTs=p.quoteFetchedAt?Date.parse(p.quoteFetchedAt):NaN;
@@ -8352,7 +8355,7 @@ async function askNflAltCoach(){
   if(active){
     active.cancelled=true;
     if(active.requestController)active.requestController.abort();
-    if(answer){answer.style.display='block';answer.innerHTML='<div class="nfl-coach-summary">Alternate-line polling cancelled. The shared background scan continues; no cancelled result was shown or captured. Click again to check it.</div>';}
+    if(answer&&(window.__NFL_COACH_VIEW_SEQ__||0)===active.viewSeq){answer.style.display='block';answer.innerHTML='<div class="nfl-coach-summary">Alternate-line polling cancelled. The shared background scan continues; no cancelled result was shown or captured. Click again to check it.</div>';}
     if(captureStatus){captureStatus.textContent='Polling cancelled; the shared alternate scan continues in the background.';captureStatus.style.color='#fbbf24';}
     if(btn){btn.disabled=false;btn.textContent='Best Alt-Line Edge Plays · Top 10';}
     return;
@@ -8361,6 +8364,7 @@ async function askNflAltCoach(){
   var dateEl=document.getElementById('datePicker');
   var date=(dateEl&&dateEl.value)||window.__NFL_DATE__||'';
   var run={date:date,seq:(window.__NFL_ALT_COACH_SEQ__||0)+1,cancelled:false,requestController:null,deadline:Date.now()+10*60*1000};
+  run.viewSeq=window.__NFL_COACH_VIEW_SEQ__||0;
   window.__NFL_ALT_COACH_SEQ__=run.seq;
   window.__NFL_ALT_COACH_RUN__=run;
   window.__NFL_COACH_CAPTURE_SEQ__=(window.__NFL_COACH_CAPTURE_SEQ__||0)+1;
@@ -8372,6 +8376,7 @@ async function askNflAltCoach(){
   function ensureCurrent(skipDeadline){
     if(run.cancelled)throw {kind:'cancelled',name:'AltCancelled'};
     if(window.__NFL_ALT_COACH_RUN__!==run)throw {kind:'stale',name:'AltStale'};
+    if((window.__NFL_COACH_VIEW_SEQ__||0)!==run.viewSeq)throw {kind:'stale-view',name:'AltStaleView'};
     var currentDate=(document.getElementById('datePicker')||{}).value||window.__NFL_DATE__||'';
     if(currentDate!==date)throw {kind:'stale-date',name:'AltStaleDate'};
     if(!skipDeadline&&Date.now()>run.deadline)throw {kind:'timeout',name:'AltTimeout'};
@@ -8418,6 +8423,7 @@ async function askNflAltCoach(){
     var input=document.getElementById('nflCoachInput');
     if(input)input.value='Show the top 10 safe-value alternate-line plays priced -1000 or better, at 85% model probability and 70% book probability or better';
     var shown=askNflCoach({props:altProps,alternate:true});
+    run.viewSeq=window.__NFL_COACH_VIEW_SEQ__||run.viewSeq;
     window.__NFL_ALT_PARLAY_CANDIDATES__=shown.slice();
     window.__NFL_ALT_PARLAY_DATE__=date;
     _renderNflParlayFilters();
@@ -8431,17 +8437,18 @@ async function askNflAltCoach(){
       ?'Alternate-line polling cancelled. The shared background scan continues; no result was captured.'
       :kind==='timeout'
         ?'The alternate-line scan did not finish before the client wait window. The shared background scan continues; try again shortly.'
-        :kind==='stale-date'
-          ?'The selected date changed before the alternate result arrived. The late result was discarded.'
+        :(kind==='stale-date'||kind==='stale-view')
+          ?'The selected date changed or a newer Coach request replaced this scan. The late result was discarded.'
           :(e&&e.message||'Alternate-line scan failed.');
-    if(kind!=='cancelled'&&kind!=='stale-date'&&lastAlt.length&&window.__NFL_ALT_COACH_RUN__===run){
+    if(kind!=='cancelled'&&kind!=='stale-date'&&kind!=='stale-view'&&lastAlt.length&&window.__NFL_ALT_COACH_RUN__===run){
       ensureCurrent(true);
       var fallbackShown=askNflCoach({props:_nflCoachProps(lastAlt),alternate:true});
+      run.viewSeq=window.__NFL_COACH_VIEW_SEQ__||run.viewSeq;
       window.__NFL_ALT_PARLAY_CANDIDATES__=fallbackShown.slice();
       window.__NFL_ALT_PARLAY_DATE__=date;
       _renderNflParlayFilters();
       if(captureStatus){captureStatus.textContent=msg+' Showing the last successful result for '+date+'; it is stale fallback and was not captured.';captureStatus.style.color='#fbbf24';}
-    }else if(answer)answer.innerHTML='<div class="nfl-coach-summary" style="color:'+(kind==='cancelled'?'#fbbf24':'#f87171')+'">'+_esc(msg)+'</div>';
+    }else if(answer&&(window.__NFL_COACH_VIEW_SEQ__||0)===run.viewSeq)answer.innerHTML='<div class="nfl-coach-summary" style="color:'+(kind==='cancelled'?'#fbbf24':'#f87171')+'">'+_esc(msg)+'</div>';
   }finally{
     if(window.__NFL_ALT_COACH_RUN__===run)delete window.__NFL_ALT_COACH_RUN__;
     if(btn){btn.disabled=false;btn.textContent=oldText;}
@@ -8449,6 +8456,7 @@ async function askNflAltCoach(){
 }
 function askNflCoach(options){
   options=options||{};
+  window.__NFL_COACH_VIEW_SEQ__=(window.__NFL_COACH_VIEW_SEQ__||0)+1;
   var input=document.getElementById('nflCoachInput'),question=String(input&&input.value||'').trim();if(!question){if(input)input.focus();return;}
   var props=Array.isArray(options.props)?options.props:_nflCoachProps();
   props=_nflCoachVisibleProps(props);
