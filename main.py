@@ -8058,13 +8058,16 @@ function _nflCoachProps(sourceCandidates){
   var d=(window._nflState||{}).d||{},seen={},out=[];
   // Coach categories must scan the complete analyzed slate. `d.picks` is the
   // reduced board list and can omit an otherwise valid priced market family.
-  var source=Array.isArray(sourceCandidates)?sourceCandidates:(d.coach_candidates||d.all||d.picks||[]);
+  // An explicitly present but empty coach_candidates array must not shadow the
+  // populated full slate.
+  var source=Array.isArray(sourceCandidates)?sourceCandidates:
+    (Array.isArray(d.coach_candidates)&&d.coach_candidates.length?d.coach_candidates:
+      (Array.isArray(d.all)&&d.all.length?d.all:(d.picks||[])));
   source.forEach(function(p){
     if(p.coachEligible===false || p.availabilityVerified===false)return;
-    var quoteTs=p.quoteFetchedAt?Date.parse(p.quoteFetchedAt):NaN;
-    var injuryTs=p.injuryUpdatedAt?Date.parse(p.injuryUpdatedAt):NaN;
-    if(p.quoteStatus==='LIVE' && (!isFinite(quoteTs)||Date.now()-quoteTs>20*60*1000))return;
-    if(p.quoteStatus!=='ARCHIVED' && (!isFinite(injuryTs)||Date.now()-injuryTs>20*60*1000))return;
+    // The live API only serves the current result cache for 15 minutes. Do not
+    // apply a second browser-clock/per-row timestamp gate: old-format rows or a
+    // page left open can otherwise erase every Coach candidate after loading.
     var side=String(p.pick||'OVER').toUpperCase();
     var odds=_nflSideOdds(p,side),implied=_nflCoachImplied(odds);
     var line=p.realLine!=null?p.realLine:p.dispLine;
