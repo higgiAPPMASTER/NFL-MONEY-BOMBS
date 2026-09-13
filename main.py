@@ -4655,7 +4655,7 @@ def _nfl_line_identity(row: dict) -> str:
 
 
 def _nfl_opening_lines(date_str: str) -> dict:
-    """Read the write-once weekly opening line snapshot for one game date."""
+    """Read the scheduled opening-line snapshot for one game date."""
     rows = _nfl_sb_get("mpa_track_ledger", {
         "app": f"eq.{_NFL_LINE_MOVEMENT_APP}",
         "date": f"eq.{date_str}",
@@ -4686,7 +4686,25 @@ def _nfl_opening_lines(date_str: str) -> dict:
 
 
 def _nfl_capture_opening_lines(date_str: str, result: dict) -> bool:
-    """Write the first weekly line snapshot once; later runs never replace it."""
+    """Save the scheduled pregame baseline for Thursday, Sunday, or Monday.
+
+    Wednesday captures Thursday, Friday captures Sunday, and Saturday captures
+    Monday. A later run on the same capture day replaces the earlier one so the
+    baseline includes the fullest sportsbook board available that day.
+    """
+    try:
+        target = datetime.strptime(date_str, "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return False
+    capture_day = _nfl_today_date()
+    weekday_to_offset = {
+        2: 1,  # Wednesday -> Thursday
+        4: 2,  # Friday -> Sunday
+        5: 2,  # Saturday -> Monday
+    }
+    offset = weekday_to_offset.get(capture_day.weekday())
+    if offset is None or target != capture_day + timedelta(days=offset):
+        return False
     lines, seen = [], set()
     for row in result.get("all") or []:
         key = _nfl_line_identity(row)
@@ -4709,7 +4727,7 @@ def _nfl_capture_opening_lines(date_str: str, result: dict) -> bool:
         })
     if not lines:
         return False
-    inserted = _nfl_sb_insert_ignore("mpa_track_ledger", [{
+    return _nfl_sb_upsert("mpa_track_ledger", [{
         "app": _NFL_LINE_MOVEMENT_APP,
         "date": date_str,
         "category": _NFL_LINE_OPEN_CATEGORY,
@@ -4717,11 +4735,14 @@ def _nfl_capture_opening_lines(date_str: str, result: dict) -> bool:
         "wins": 0, "losses": 0, "locked": True,
         "detail": {
             "captured_at": datetime.now(timezone.utc).isoformat(),
-            "source": "full_week_run",
+            "source": {
+                2: "wednesday_for_thursday",
+                4: "friday_for_sunday",
+                5: "saturday_for_monday",
+            }[capture_day.weekday()],
             "lines": lines,
         },
-    }], "app,date,category,side")
-    return inserted is not None
+    }], on_conflict="app,date,category,side")
 
 
 def _nfl_attach_line_movement(date_str: str, result: dict) -> dict:
@@ -7545,7 +7566,7 @@ async function pollJob(){
       document.getElementById('runBtn').textContent='Run Picks';
       document.getElementById('statusMsg').textContent=
         d.result&&d.result.week_mode
-          ?'Full NFL week loaded and opening lines saved by game date. Official pick tracking remains open for the first eligible game-day run.'
+          ?'Full NFL week loaded. The scheduled opening snapshot was saved only for the eligible game date: Wednesday→Thursday, Friday→Sunday, or Saturday→Monday.'
           :
         d.result&&d.result.historicalTrackRecord
           ?'HISTORICAL REPLAY — this run excludes the selected date from model inputs and is excluded from the official Track Record.'
@@ -8342,7 +8363,7 @@ function _nflCoachGameTiles(p){
 function _nflCoachLineMovement(p){
   var s=p.source||{};
   if(!s.lineMovementAvailable||s.openingLine==null||s.currentLine==null){
-    return '<div>No Wednesday weekly opening line is stored for this exact player and market yet. Run Full Week on Wednesday, then use Run Picks on game day to fetch and compare fresh lines.</div>';
+    return '<div>No scheduled opening line is stored for this exact player and market. Use Full Week on Wednesday for Thursday games, Friday for Sunday games, or Saturday for Monday games; then Run Picks on game day for the comparison.</div>';
   }
   var open=Number(s.openingLine),current=Number(s.currentLine),move=Number(s.lineMove||0);
   var direction=move>0?'UP':(move<0?'DOWN':'UNCHANGED');
@@ -8353,7 +8374,7 @@ function _nflCoachLineMovement(p){
       ?(p.side==='OVER'?'The higher line makes this Over harder to clear.':'The higher line gives this Under more room.')
       :(p.side==='OVER'?'The lower line makes this Over easier to clear.':'The lower line gives this Under less room.'));
   var openOdds=s.openingOdds!=null?_nflCoachOdds(s.openingOdds):'N/A';
-  var captured=s.lineOpenCapturedAt?new Date(s.lineOpenCapturedAt).toLocaleString():'Wednesday weekly run';
+  var captured=s.lineOpenCapturedAt?new Date(s.lineOpenCapturedAt).toLocaleString():'scheduled opening run';
   return '<div class="nfl-coach-stats">'
     +'<div class="nfl-coach-stat"><div class="k">Weekly opening line</div><div class="v">'+open+'</div></div>'
     +'<div class="nfl-coach-stat"><div class="k">Current game-day line</div><div class="v">'+current+'</div></div>'
