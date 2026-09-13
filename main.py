@@ -1820,7 +1820,10 @@ def _limit_prop_candidates(lines: list, volume_maps: dict,
             position_group = "PRIMARY"
         elif market == "player_anytime_td":
             position = str(line.get("roster_position") or "").upper().strip()
-            if position == "RB":
+            if position == "QB":
+                position_group = "QB"
+                limit = 1
+            elif position == "RB":
                 position_group = "RB"
                 limit = 1
             elif position == "WR":
@@ -2448,8 +2451,8 @@ def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str) -> Optional[Dict
     # the break-even point around +127. Keep the signal in `all` for review,
     # but only promote it to the bet board when it has a real over price,
     # enough recent observations, and positive model edge over the book's
-    # break-even rate. Team-level selection later keeps only one RB and one
-    # combined WR/TE scorer per team.
+    # break-even rate. Team-level selection includes the leading QB and RB,
+    # plus the established WR/TE candidate limits for each team.
     bet_qualified = True
     value_edge = None
     value_reason = ""
@@ -3304,8 +3307,8 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False,
 
     # 5. Analyze every sportsbook-listed active player in standard offense,
     # defense, and kicking markets. Anytime TD is the only exception: reduce its
-    # pool to starter-level RB and WR/TE candidates before analysis so backup
-    # longshots cannot displace the real starters on the dedicated TD lists.
+    # pool to starter-level QB, RB, WR, and TE candidates before analysis so
+    # backup longshots cannot displace the real starters on dedicated TD lists.
     standard_lines = [
         pl for pl in all_lines if pl.get("market") != "player_anytime_td"
     ]
@@ -3316,7 +3319,7 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False,
     ]
     _p(
         f"Analyzing all {len(standard_lines)} standard player props plus "
-        f"{len(td_starter_lines)} starter-level Anytime TD candidates…")
+        f"{len(td_starter_lines)} starter-level QB/RB/WR/TE Anytime TD candidates…")
     analysis_cancelled = _bt_th.Event()
     def _analyze_all_props():
         # Keep the serial order (and therefore TD calibration/cache semantics)
