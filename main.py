@@ -3358,7 +3358,8 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False,
         reverse=True)
     games_out = [{"home_team":g.get("home_team",""), "away_team":g.get("away_team",""),
                   "home_abbr":g.get("home_abbr",""), "away_abbr":g.get("away_abbr",""),
-                  "game":g.get("game","")} for g in espn_games]
+                   "game":g.get("game",""), "game_start":g.get("start","")}
+                  for g in espn_games]
     # 7. Game Predictor — fetches h2h + totals concurrently (separate calls from props
     #    so player-prop market quota is never shared with game-level markets)
     _p("Building game predictions…")
@@ -3456,6 +3457,10 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False,
     # Keep the tracking semantics/order intact, but never run those calls on
     # the ASGI event loop.
     await asyncio.to_thread(_nfl_attach_line_movement, date_str, result)
+    # The short-lived /tmp cache is only an accelerator. Persist each game's
+    # latest completed pre-kickoff board independently so a service restart or
+    # an early kickoff cannot erase/block the still-bettable late-game slate.
+    await asyncio.to_thread(_nfl_save_board_snapshots, date_str, result)
     official_capture = (
         capture_official and _nfl_official_capture_allowed(date_str, result))
     result["official_tracking"] = official_capture
@@ -4170,7 +4175,7 @@ async def api_cached(request: Request, target_date: str = "", token: str = "",
     if str(scope).lower() == "week":
         daily = []
         for ds in _nfl_week_dates(date_str):
-            cached_day = _cache_get(ds)
+            cached_day = _cache_get(ds) or _nfl_load_board_snapshots(ds)
             if cached_day:
                 _nfl_attach_line_movement(ds, cached_day)
             daily.append(cached_day or {
@@ -4182,7 +4187,7 @@ async def api_cached(request: Request, target_date: str = "", token: str = "",
         if result.get("all") or result.get("games"):
             return result
         raise HTTPException(status_code=404, detail="No saved picks for this NFL week.")
-    cached = _cache_get(date_str)
+    cached = _cache_get(date_str) or _nfl_load_board_snapshots(date_str)
     if cached:
         _nfl_attach_line_movement(date_str, cached)
         return cached
@@ -4748,6 +4753,7 @@ def _nfl_attach_line_movement(date_str: str, result: dict) -> dict:
 # ── Pick snapshot ─────────────────────────────────────────────────────────────
 _NFL_TRK_APP   = "nfl"
 _NFL_PICKS_CAT = "__official_picks__"
+_NFL_BOARD_CAT_PREFIX = "__saved_board__:"
 _NFL_GP_CAT    = "__official_gp__"
 _NFL_LEDGER_CAT = "__official_ledger__"
 _NFL_DETAIL_CAT = "__official_detail__"
@@ -5160,6 +5166,87 @@ def _nfl_save_historical_replay(date_str: str, replay: dict):
     return ok
 
 _NFL_PICKS_SNAPSHOT_LOCK = _bt_th.Lock()
+_NFL_BOARD_SNAPSHOT_LOCK = _bt_th.Lock()
+
+def _nfl_snapshot_kickoff(value):
+    try:
+        kickoff = datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
+        return (kickoff.replace(tzinfo=timezone.utc) if kickoff.tzinfo is None
+                else kickoff.astimezone(timezone.utc))
+    except (TypeError, ValueError):
+        return None
+
+def _nfl_save_board_snapshots(date_str: str, result: dict):
+    """Save the latest completed board separately for every unstarted game."""
+    predictions = result.get("game_predictions") or []
+    now = datetime.now(timezone.utc)
+    rows = []
+    for prediction in predictions:
+        start = str(prediction.get("game_start") or "")
+        game = str(prediction.get("game") or "")
+        kickoff = _nfl_snapshot_kickoff(start)
+        if not kickoff or now >= kickoff:
+            continue
+        def _same_game(item):
+            return (
+                str(item.get("game_start") or "") == start
+                and (not game or str(item.get("game") or "") == game)
+            )
+        mini = {
+            key: value for key, value in result.items()
+            if key not in ("picks", "all", "td_picks", "game_predictions", "games")
+        }
+        mini.update({
+            "date": date_str,
+            "picks": [p for p in (result.get("picks") or []) if _same_game(p)],
+            "all": [p for p in (result.get("all") or []) if _same_game(p)],
+            "td_picks": [p for p in (result.get("td_picks") or []) if _same_game(p)],
+            "game_predictions": [prediction],
+            "games": [g for g in (result.get("games") or []) if _same_game(g)],
+            "saved_board_captured_at": now.isoformat(),
+        })
+        identity = f"{start}-{game}"
+        category = _NFL_BOARD_CAT_PREFIX + re.sub(
+            r"[^0-9A-Za-z]+", "-", identity).strip("-")
+        rows.append({
+            "app": _NFL_TRK_APP, "date": date_str, "category": category,
+            "side": "ALL", "wins": 0, "losses": 0, "locked": False,
+            "locked_at": kickoff.isoformat(), "detail": mini,
+        })
+    if not rows:
+        return False
+    with _NFL_BOARD_SNAPSHOT_LOCK:
+        ok = _nfl_sb_upsert(
+            "mpa_track_ledger", rows, on_conflict="app,date,category,side")
+    print(f"[nfl_board] {'saved' if ok else 'FAILED'}: "
+          f"{len(rows)} unstarted game snapshots -> {date_str}")
+    return ok
+
+def _nfl_load_board_snapshots(date_str: str):
+    """Rebuild a day's board from durable per-game pre-kickoff snapshots."""
+    rows = _nfl_sb_get("mpa_track_ledger", {
+        "app": f"eq.{_NFL_TRK_APP}", "date": f"eq.{date_str}",
+        "category": f"like.{_NFL_BOARD_CAT_PREFIX}*",
+        "side": "eq.ALL", "select": "detail", "limit": "64",
+    })
+    parts = [row.get("detail") for row in rows
+             if isinstance(row.get("detail"), dict)]
+    if not parts:
+        return None
+    parts.sort(key=lambda p: min(
+        [str(x.get("game_start") or "") for x in p.get("game_predictions", [])]
+        or [""]))
+    merged = {
+        key: value for key, value in parts[-1].items()
+        if key not in ("picks", "all", "td_picks", "game_predictions", "games")
+    }
+    for key in ("picks", "all", "td_picks", "game_predictions", "games"):
+        merged[key] = [
+            item for part in parts for item in (part.get(key) or [])
+        ]
+    merged["date"] = date_str
+    merged["durable_snapshot"] = True
+    return merged
 
 def _nfl_save_picks_snapshot(date_str: str, result: dict):
     """Persist the latest complete pre-kickoff board for later grading.
@@ -7521,15 +7608,15 @@ _nflCoachRenderMarketFilters();
 function _nflGameDone(p){
   var s=p&&p.game_start; if(!s) return false;
   var t=new Date(s).getTime(); if(!t||isNaN(t)) return false;
-  // A merged weekly board is still a live betting view, so remove every game
-  // once its normal four-hour completion window has elapsed.
+  // A saved board is a betting view: once a game kicks off its picks are no
+  // longer actionable, while later-game snapshots remain available.
   if(window._nflState&&window._nflState.d&&window._nflState.d.week_mode)
-    return Date.now() > (t + 4*3600*1000);
+    return Date.now() >= t;
   // Only auto-hide finished games on TODAY'S live slate. When browsing a
   // past date every game is long over — show ALL picks (historical review).
   var d=new Date(t), now=new Date();
   if(d.toDateString()!==now.toDateString()) return false;
-  return Date.now() > (t + 4*3600*1000);
+  return Date.now() >= t;
 }
 function rateClass(r){ return r >= 70 ? 'green' : r >= 55 ? 'gold' : 'red-txt'; }
 function _initials(name){
