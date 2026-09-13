@@ -5232,7 +5232,35 @@ def _nfl_load_board_snapshots(date_str: str):
     parts = [row.get("detail") for row in rows
              if isinstance(row.get("detail"), dict)]
     if not parts:
-        return None
+        # Boards captured before per-game persistence was deployed still exist
+        # in the official pre-kickoff ledger. Recover that final run rather
+        # than telling the user the day's picks are gone.
+        official = _nfl_load_picks_snapshot(date_str)
+        if not official:
+            return None
+        games = {}
+        for pick in official:
+            game = str(pick.get("game") or "")
+            start = str(pick.get("game_start") or "")
+            key = (game, start)
+            if key not in games:
+                games[key] = {
+                    "game": game, "game_start": start,
+                    "home_team": pick.get("home_team", ""),
+                    "away_team": pick.get("away_team", ""),
+                    "home_abbr": pick.get("home_abbr", ""),
+                    "away_abbr": pick.get("away_abbr", ""),
+                }
+        return {
+            "date": date_str, "picks": official, "all": official,
+            "td_picks": [
+                pick for pick in official
+                if pick.get("market") == "player_anytime_td"
+            ],
+            "games": list(games.values()), "game_predictions": [],
+            "qualified": len(official), "official_tracking": True,
+            "durable_snapshot": True, "recovered_official_snapshot": True,
+        }
     parts.sort(key=lambda p: min(
         [str(x.get("game_start") or "") for x in p.get("game_predictions", [])]
         or [""]))
