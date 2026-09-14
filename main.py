@@ -1861,7 +1861,7 @@ def _limit_prop_candidates(lines: list, volume_maps: dict,
     """Apply per-team candidate limits after dataframe stats are summarized."""
     groups = {}
     for idx, line in enumerate(lines):
-        name = str(line.get("name") or "").strip().lower()
+        name = _nfl_player_identity_key(line.get("name"))
         market = line.get("market") or ""
         home = line.get("home_abbr") or ""
         away = line.get("away_abbr") or ""
@@ -1919,7 +1919,7 @@ def _trim_prop_lines(lines: list, df) -> list:
         # candidate slot for the current matchup.
         latest_team = {}
         for row in df[["player_display_name", "recent_team", "season", "week"]].itertuples(index=False):
-            name = str(row.player_display_name or "").strip().lower()
+            name = _nfl_player_identity_key(row.player_display_name)
             if not name:
                 continue
             try:
@@ -1933,7 +1933,7 @@ def _trim_prop_lines(lines: list, df) -> list:
         # Precomputing these maps keeps the reduction cheap even with thousands
         # of raw Odds API props.
         volume_maps = {}
-        name_series = df["player_display_name"].astype(str).str.strip().str.lower()
+        name_series = df["player_display_name"].map(_nfl_player_identity_key)
         for stat_col in set(PROP_TO_COL.values()):
             if stat_col not in df.columns:
                 continue
@@ -2331,22 +2331,28 @@ def _def_factor_map(df, stat_col: str, n_games: int = 8) -> dict:
 
 _NFL_PLAYER_LOOKUP = {"df_ref": None, "names": None, "groups": {}, "matches": {}}
 
+def _nfl_player_identity_key(name) -> str:
+    """Match full player names across provider suffix/punctuation variations."""
+    tokens = re.sub(r"[^a-z0-9 ]+", " ", str(name or "").lower()).split()
+    suffixes = {"jr", "sr", "ii", "iii", "iv", "v"}
+    while tokens and tokens[-1] in suffixes:
+        tokens.pop()
+    return " ".join(tokens)
+
 def _nfl_player_history(df, name):
-    """Reuse exact player slices within an immutable analysis dataframe."""
+    """Reuse full-name player slices, including suffix variants and old teams."""
     cache = _NFL_PLAYER_LOOKUP
     if cache["df_ref"] is not df:
-        names = df["player_display_name"].fillna("").astype(str).str.lower()
+        names = df["player_display_name"].map(_nfl_player_identity_key)
         cache.update({
             "df_ref": df, "names": names,
             "groups": names.groupby(names, sort=False).indices, "matches": {},
         })
-    key = name.lower()
+    key = _nfl_player_identity_key(name)
     if key not in cache["matches"]:
         positions = cache["groups"].get(key)
         if positions is None:
-            # Preserve the existing surname-suffix fallback exactly.
-            last = name.split()[-1].lower()
-            positions = cache["names"].str.endswith(last, na=False).to_numpy().nonzero()[0]
+            positions = []
         # Cache tiny row-position arrays, not a second copy of every player's
         # full history alongside the source dataframe.
         cache["matches"][key] = positions
@@ -2727,11 +2733,11 @@ def _new_market_gap(market, line):
 
 
 def _new_exact_history(df, name):
-    """NEW identity rule: exact display-name only; never surname-match."""
+    """NEW full-name identity includes suffix variants and previous teams."""
     if df is None or "player_display_name" not in df.columns:
         return df.iloc[0:0] if df is not None else None
-    target = str(name or "").strip().casefold()
-    names = df["player_display_name"].fillna("").astype(str).str.strip().str.casefold()
+    target = _nfl_player_identity_key(name)
+    names = df["player_display_name"].map(_nfl_player_identity_key)
     return df[names == target]
 
 
