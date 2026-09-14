@@ -5370,7 +5370,7 @@ _NFL_TRK_STAKE = 20.0
 _NFL_TRK_TOP   = 10   # picks per market+direction that count in main record
 _NFL_COACH_TRK_APP = "nfl_coach_track"
 _NFL_COACH_HIST_APP = "nfl_coach_historical"
-_NFL_COACH_CATS = ("safest_bets", "coach_edge", "alt_line_edge", "passing",
+_NFL_COACH_CATS = ("app_hit_rate_100", "safest_bets", "coach_edge", "alt_line_edge", "passing",
                    "rushing", "receiving", "defense", "kicking",
                    "td_scorers", "best_unders")
 _NFL_COACH_CAPTURE_GUARD_SECONDS = 120
@@ -5492,6 +5492,18 @@ def _nfl_coach_hist_candidates(picks):
     return selected
 
 def _nfl_coach_hist_select(candidates, category, alternate=False):
+    if category == "app_hit_rate_100":
+        rows = [
+            dict(row) for row in candidates
+            if not row.get("alternate") and
+            abs(float(row.get("model_probability", -1)) - 100.0) < 0.05
+        ]
+        rows.sort(key=lambda x: (
+            str(x.get("market_label") or ""),
+            str(x.get("player") or ""),
+            str(x.get("side") or ""),
+        ))
+        return rows
     family = {
         "passing": "pass", "rushing": "rush", "receiving": "rec",
         "defense": "def", "kicking": "kick", "td_scorers": "td",
@@ -7561,6 +7573,7 @@ tr:last-child td{border-bottom:none}
       <div><button onclick="openNflCoachTrack()" style="background:#0e7490;color:#fff;border:0;border-radius:8px;padding:8px 11px;font-weight:900;font-size:.7rem;cursor:pointer">AI Coach Track Record</button><div style="color:#86efac;border:1px solid rgba(74,222,128,.35);border-radius:999px;padding:5px 9px;height:max-content;font-size:.62rem;font-weight:900;margin-top:6px">NO INVENTED PLAYS</div></div>
     </div>
     <div class="nfl-coach-presets">
+      <button class="nfl-coach-preset" onclick="askNflCoachPreset('Show every play with a 100% App Hit Rate','app_hit_rate_100')" style="border-color:#22c55e;color:#bbf7d0">100% App Hit Rate</button>
       <button class="nfl-coach-preset" onclick="askNflCoachPreset('Show me the safest bets','safest_bets')">Safest bets</button>
       <button class="nfl-coach-preset" onclick="askNflCoachPreset('Show the best positive Coach Edge plays','coach_edge')">Coach Edge</button>
       <button class="nfl-coach-preset" id="nflAltCoachBtn" onclick="askNflAltCoach()" style="border-color:#f59e0b;color:#fde68a">Best Alt-Line Edge Plays · Top 10</button>
@@ -9251,12 +9264,14 @@ function _nflCoachAccordions(p){
 function _nflCoachRender(question,rows,total,mode,isAlternate){
   var el=document.getElementById('nflCoachAnswer');if(!el)return;
   el.style.display='block';
-  var summary=mode==='safe'
+  var summary=mode==='hundred'
+    ?'Every displayed Coach-eligible NFL play with an exact 100.0% app hit rate is shown. This category is not capped at 10 and does not remove additional markets from the same player.'
+    :mode==='safe'
     ?'I checked the selected sides across '+total+' priced NFL candidates and ranked these by sportsbook-implied win probability. Safer favorites can require substantially more risk for a smaller return.'
     :(isAlternate
       ?'I checked '+total+' genuine alternate-line candidates for the safer-value sweet spot. Every result is priced -1000 or better, has at least 85% app probability, at least 70% sportsbook-implied probability, and positive Coach Edge; each player keeps the qualifying line with the largest edge, with a maximum of 10 distinct players.'
       :'I checked '+total+' priced NFL board plays and ranked the matching positive Coach Edge results. Coach Edge is probability edge, not guaranteed monetary profit.');
-  if(!rows.length){el.innerHTML='<div class="nfl-coach-question">'+_esc(question)+'</div><div class="nfl-coach-summary">No loaded priced NFL prop matched that request.</div>';return;}
+  if(!rows.length){el.innerHTML='<div class="nfl-coach-question">'+_esc(question)+'</div><div class="nfl-coach-summary">'+(mode==='hundred'?'No loaded Coach-eligible NFL play currently has an exact 100.0% app hit rate.':'No loaded priced NFL prop matched that request.')+'</div>';return;}
   var cards=rows.map(function(p,i){
     var s=p.source||{},head=_esc(s.head||''),logo='https://a.espncdn.com/i/teamlogos/nfl/500/'+_logoAbbr(p.team)+'.png';
     var venue=s.homeRoad==='H'?'HOME':(s.homeRoad==='R'?'AWAY':'');
@@ -9423,7 +9438,8 @@ function askNflCoach(options){
   var input=document.getElementById('nflCoachInput'),question=String(input&&input.value||'').trim();if(!question){if(input)input.focus();return;}
   var props=Array.isArray(options.props)?options.props:_nflCoachProps();
   props=_nflCoachVisibleProps(props);
-  if(!props.length){_nflCoachRender(question,[],0,'edge',options.alternate===true);return [];}
+  var exactHundred=/100(?:\\.0)?\\s*%?\\s*(?:app\\s*)?(?:hit\\s*rate|probability)/i.test(question);
+  if(!props.length){_nflCoachRender(question,[],0,exactHundred?'hundred':'edge',options.alternate===true);return [];}
   var f=_nflCoachParse(question,props),candidates=_nflCoachSafest(props);
   var selectedSides=_nflCoachSelectedSides();
   candidates=candidates.filter(function(p){return selectedSides.indexOf(String(p.side||'').toUpperCase())>=0;});
@@ -9432,7 +9448,9 @@ function askNflCoach(options){
   }
   if(options.limit!=null)f.limit=Number(options.limit)||f.limit;
   var rows=candidates.filter(function(p){
-    if(f.mode!=='safe'&&p.edge<=0)return false;
+    if(exactHundred&&Math.abs(Number(p.appProb)-100)>0.05)return false;
+    if(exactHundred&&p.isAlternate)return false;
+    if(!exactHundred&&f.mode!=='safe'&&p.edge<=0)return false;
     if(options.alternate&&p.appProb<85)return false;
     if(options.alternate&&p.implied<70)return false;
     if(options.alternate&&(p.odds==null||p.odds<-1000))return false;
@@ -9449,6 +9467,11 @@ function askNflCoach(options){
     :(f.mode==='safe'
       ?function(a,b){return b.implied-a.implied||b.appProb-a.appProb;}
       :function(a,b){return b.edge-a.edge||b.appProb-a.appProb;}));
+  if(exactHundred){
+    rows.sort(function(a,b){return String(a.market||'').localeCompare(String(b.market||''))||String(a.player||'').localeCompare(String(b.player||''))||String(a.side||'').localeCompare(String(b.side||''));});
+    _nflCoachRender(question,rows,candidates.length,'hundred',false);
+    return rows;
+  }
   if(f.onePerCategory){
     var seenCategories={},categoryRows=[];
     rows.forEach(function(p){
@@ -9470,7 +9493,7 @@ function askNflCoach(options){
 }
 var _nflCoachTrackData=null,_nflCoachTrackTabMode='cat';
 var _NFL_COACH_TRACK_LABELS={
-  safest_bets:'Safest Bets',coach_edge:'Coach Edge',
+  app_hit_rate_100:'100% App Hit Rate',safest_bets:'Safest Bets',coach_edge:'Coach Edge',
   alt_line_edge:'Best Alt-Line Edge Plays',passing:'Passing',
   rushing:'Rushing',receiving:'Receiving',defense:'Best Defense Plays',
   kicking:'Best Kicker Plays',td_scorers:'TD Scorers',best_unders:'Best Unders'
