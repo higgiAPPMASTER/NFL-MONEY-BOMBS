@@ -8532,6 +8532,18 @@ function fmtVsLine(p){
     :Math.round(Number(p.vsLineHits))+'/'+p.vsLineTotal;
   return '<span class="'+(valid?rateClass(n):'gray')+'">'+sample+' ('+(valid?n.toFixed(1)+'%':'--')+')</span>';
 }
+function _nflOppVenueLabel(p){
+  var side=String((p&&p.pick)||'PICK').toUpperCase();
+  if(p&&p.homeRoad==='R')return side+' in '+String(p.opponent||'Opponent');
+  if(p&&p.homeRoad==='H')return side+' at Home vs '+String(p.opponent||'Opponent');
+  return side+' vs '+String((p&&p.opponent)||'Opponent');
+}
+function _nflRecentVenueLabel(p){
+  var side=String((p&&p.pick)||'PICK').toUpperCase();
+  if(p&&p.homeRoad==='R')return side+' · L10 Away';
+  if(p&&p.homeRoad==='H')return side+' · L10 Home';
+  return side+' · L10 H/A';
+}
 function nflCard(p,i){
   var key=_ladKey(p); window.__NFLLAD__[key]=p;
   var ha=p.homeRoad==='H';
@@ -8574,8 +8586,8 @@ function nflCard(p,i){
      <div class="pc-tagrow">${fmtTag(p.tag)}</div>
       <div class="pc-line-row"><span>${lineHtml}</span><span class="od">Odds / Book</span></div>
      <div class="pc-stats">
-       <div class="pc-stat"><div class="k">Career vs ${p.opponent}</div><div class="v">${_rateHtml(p.rateA,p.hitsA,p.totA)}</div></div>
-       <div class="pc-stat"><div class="k">L10 ${hasHA?(ha?'Home':'Away'):'H/A'}</div><div class="v">${_rateHtml(p.rateB,p.hitsB,p.totB)}</div></div>
+       <div class="pc-stat"><div class="k">${_esc(_nflOppVenueLabel(p))}</div><div class="v">${_rateHtml(p.rateA,p.hitsA,p.totA)}</div></div>
+       <div class="pc-stat"><div class="k">${_esc(_nflRecentVenueLabel(p))}</div><div class="v">${_rateHtml(p.rateB,p.hitsB,p.totB)}</div></div>
        <div class="pc-stat"><div class="k">Avg</div><div class="v gold">${p.avg}</div></div>
        ${lastStat}
      </div>
@@ -8693,8 +8705,8 @@ function openNflLadder(key){
       <div style="font-size:.7rem;color:#6b7280;text-transform:uppercase;letter-spacing:.08em;font-weight:700;margin-bottom:4px">Recent Games (green = ${p.pick==='UNDER'?'under':'over'} line)</div>
       <div class="lad-glog">${chips}</div>
       ${voHtml}
-      <div class="lad-stat"><span class="k">Career vs ${p.opponent}</span><span class="v">${_rateHtml(p.rateA,p.hitsA,p.totA)}</span></div>
-      <div class="lad-stat"><span class="k">L10 ${hasHA?(p.homeRoad==='H'?'Home':'Away'):'H/A'}</span><span class="v">${_rateHtml(p.rateB,p.hitsB,p.totB)}</span></div>
+      <div class="lad-stat"><span class="k">${_esc(_nflOppVenueLabel(p))}</span><span class="v">${_rateHtml(p.rateA,p.hitsA,p.totA)}</span></div>
+      <div class="lad-stat"><span class="k">${_esc(_nflRecentVenueLabel(p))}</span><span class="v">${_rateHtml(p.rateB,p.hitsB,p.totB)}</span></div>
       ${vslRow}
       <div class="lad-stat"><span class="k">Under Line L10</span><span class="v ${rateClass(p.underRate)}">${p.underHits}/${p.underTotal} (${p.underRate}%)</span></div>
       <div class="lad-stat"><span class="k">Average</span><span class="v gold">${p.avg}</span></div>
