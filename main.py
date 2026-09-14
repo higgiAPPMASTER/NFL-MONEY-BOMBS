@@ -2952,6 +2952,26 @@ def _analyze_new_prop_raw(pl: Dict, df, home_abbr: str, away_abbr: str) -> Optio
                     })
             except (TypeError, ValueError, KeyError):
                 continue
+    # The legacy cards expect an integer hit count, sample count, and a short
+    # percentage for the selected side. Keep NEW's weighted rates, but satisfy
+    # that display contract instead of leaking None and raw float precision.
+    display_over = pick != "UNDER"
+    def display_sample(vals):
+        clean = []
+        for value in vals:
+            try:
+                number = float(value)
+                if math.isfinite(number):
+                    clean.append(number)
+            except (TypeError, ValueError):
+                continue
+        hits = sum(1 for value in clean
+                   if (value > line if display_over else value < line))
+        rate = weighted_rate(clean, display_over)
+        return hits, len(clean), (round(rate, 1) if rate is not None else None)
+    opp_hits, opp_total, opp_rate = display_sample(opp_values)
+    ha_hits, ha_total, ha_rate = display_sample(ha_values)
+    recent_hits, recent_total, recent_rate = display_sample(recent)
     return {
         "name": name, "pid": pid, "position": position, "roster_position": position,
         "team": team, "opponent": opp, "homeRoad": home_road, "side": side,
@@ -2964,10 +2984,13 @@ def _analyze_new_prop_raw(pl: Dict, df, home_abbr: str, away_abbr: str) -> Optio
         "sourceMarket": pl.get("source_market", market), "quoteFetchedAt": pl.get("quote_fetched_at"),
         "quoteStatus": pl.get("quote_status", "UNVERIFIED"), "avg": avg,
         "avgA": round(opp_mean, 1) if opp_mean is not None else None,
-        "rateA": weighted_rate(opp_values, True), "hitsA": None, "totA": len(opp_values),
-        "rateB": weighted_rate(ha_values, True), "hitsB": None, "totB": len(ha_values),
-        "vsLineHits": None, "vsLineTotal": n_total, "vsLineRate": round(over_rate or 0, 1),
-        "underHits": None, "underTotal": n_total, "underRate": round(under_rate or 0, 1),
+        "rateA": opp_rate, "hitsA": opp_hits, "totA": opp_total,
+        "rateB": ha_rate, "hitsB": ha_hits, "totB": ha_total,
+        "vsLineHits": recent_hits, "vsLineTotal": recent_total,
+        "vsLineRate": recent_rate,
+        "underHits": sum(1 for value in recent if value < line),
+        "underTotal": recent_total,
+        "underRate": round(under_rate, 1) if under_rate is not None else None,
         "underLine": line, "defAdj": def_adj, "defRank": def_rank, "defLbl": def_lbl,
         "projAvg": projection, "baseProjAvg": evidence, "injuryAdj": injury_adj,
         "injuryOpportunityFactor": injury_opportunity_factor,
@@ -2984,9 +3007,9 @@ def _analyze_new_prop_raw(pl: Dict, df, home_abbr: str, away_abbr: str) -> Optio
         "glog": glog, "vsOppLog": vs_opp_log, "sparseHistory": sparse,
         "sparseStatus": sparse_status, "model_version": "NEW-v1-ewma-blend",
         "opp": opp, "vs_opp_avg": round(opp_mean, 1) if opp_mean is not None else None,
-        "vs_opp_games": len(opp_values), "vs_opp_hits": None,
-        "vs_opp_rate": weighted_rate(opp_values, True), "l10_avg": avg,
-        "l10_games": len(recent), "l10_hits": None, "l10_rate": weighted_rate(recent, True),
+        "vs_opp_games": opp_total, "vs_opp_hits": opp_hits,
+        "vs_opp_rate": opp_rate, "l10_avg": avg,
+        "l10_games": recent_total, "l10_hits": recent_hits, "l10_rate": recent_rate,
         "games": n_total, "history": ", ".join(str(round(float(v), 1)) for v in recent[:8]) or "--",
         "system": "NEW",
     }
@@ -8471,8 +8494,11 @@ function _logoAbbr(t){
 function _ladKey(p){ return 'flad_'+p.pid+'_'+String(p.mkt||'').replace(/[^a-z]/gi,''); }
 function _rateHtml(rate,hits,tot){
   if(!tot) return '<span class="gray">—</span>';
-  var pct=(rate==null)?'--':rate+'%';
-  return '<span class="'+(rate==null?'gray':rateClass(rate))+'">'+hits+'/'+tot+' ('+pct+')</span>';
+  var n=Number(rate),valid=isFinite(n),pct=valid?n.toFixed(1)+'%':'--';
+  var sample=(hits==null||hits===''||!isFinite(Number(hits)))
+    ?tot+' games'
+    :Math.round(Number(hits))+'/'+tot;
+  return '<span class="'+(valid?rateClass(n):'gray')+'">'+sample+' ('+pct+')</span>';
 }
 function fmtTag(t){
   if(t==='SUGGESTED') return '<span class="tag-sug">⭐ PICK</span>';
@@ -8500,7 +8526,11 @@ function _nflIsRoiFocusPick(p){
 }
 function fmtVsLine(p){
   if(p.realLine==null||!p.vsLineTotal) return '<span class="gray">—</span>';
-  return '<span class="'+rateClass(p.vsLineRate)+'">'+p.vsLineHits+'/'+p.vsLineTotal+' ('+p.vsLineRate+'%)</span>';
+  var n=Number(p.vsLineRate),valid=isFinite(n);
+  var sample=(p.vsLineHits==null||p.vsLineHits===''||!isFinite(Number(p.vsLineHits)))
+    ?p.vsLineTotal+' games'
+    :Math.round(Number(p.vsLineHits))+'/'+p.vsLineTotal;
+  return '<span class="'+(valid?rateClass(n):'gray')+'">'+sample+' ('+(valid?n.toFixed(1)+'%':'--')+')</span>';
 }
 function nflCard(p,i){
   var key=_ladKey(p); window.__NFLLAD__[key]=p;
