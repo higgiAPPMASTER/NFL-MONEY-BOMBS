@@ -4805,32 +4805,87 @@ async def whoami(request: Request, token: str = ""):
 # ─────────────────────────────────────────────────────────────────────────────
 #  My Bets (bet tracking) — admin-only, mirrors NBA/NHL/MLB
 # ─────────────────────────────────────────────────────────────────────────────
-import threading as _bt_th, uuid as _bt_uuid
+import threading as _bt_th, uuid as _bt_uuid, hashlib as _bt_hashlib
 from datetime import date as _bt_date
 
 _NFL_BET_LOG_PATH = str(_CACHE_DIR / "_nfl_bet_log.json")
 _NFL_BET_LOCK = _bt_th.Lock()
+_NFL_BET_LEDGER_APP = "nfl_bets"
+_NFL_BET_LEDGER_DATE = "2000-01-01"
+_NFL_BET_LEDGER_PREFIX = "__my_bets__:"
 _NFL_BET_STAT_KEYS = tuple(PROP_MARKETS)
 _NFL_STAT_LABEL = dict(PROP_LABELS)
 _NFL_CAT_ORDER = [PROP_LABELS[m] for m in PROP_MARKETS]
 
 
-def _nfl_load_bets() -> dict:
+def _nfl_bet_ledger_category(user_key: str) -> str:
+    digest = _bt_hashlib.sha256(
+        str(user_key or "__admin__").encode("utf-8")).hexdigest()[:32]
+    return _NFL_BET_LEDGER_PREFIX + digest
+
+
+def _nfl_load_local_bets(user_key: str) -> list:
+    """One-time migration source for bets saved before Supabase persistence."""
     try:
         with open(_NFL_BET_LOG_PATH) as f:
-            return json.load(f)
+            data = json.load(f)
+        bets = data.get(user_key, []) if isinstance(data, dict) else []
+        return list(bets) if isinstance(bets, list) else []
     except Exception:
-        return {}
+        return []
 
 
-def _nfl_save_bets(data: dict):
+def _nfl_load_bets(user_key: str) -> list:
+    """Load one user's NFL bets from the durable Supabase ledger."""
+    if not _SB_URL or not _SB_KEY:
+        raise RuntimeError("Supabase is not configured")
+    category = _nfl_bet_ledger_category(user_key)
     try:
-        tmp = _NFL_BET_LOG_PATH + f".{os.getpid()}.tmp"
-        with open(tmp, "w") as f:
-            json.dump(data, f)
-        os.replace(tmp, _NFL_BET_LOG_PATH)
-    except Exception as e:
-        print(f"[nfl_bet_log] save failed: {e}")
+        response = httpx.get(
+            f"{_SB_URL}/rest/v1/mpa_track_ledger",
+            headers={"apikey": _SB_KEY, "Authorization": f"Bearer {_SB_KEY}"},
+            params={
+                "app": f"eq.{_NFL_BET_LEDGER_APP}",
+                "date": f"eq.{_NFL_BET_LEDGER_DATE}",
+                "category": f"eq.{category}",
+                "side": "eq.ALL",
+                "select": "detail",
+                "limit": "1",
+            },
+            timeout=15)
+        if response.status_code != 200:
+            raise RuntimeError(f"Supabase read returned HTTP {response.status_code}")
+        rows = response.json()
+    except Exception as exc:
+        raise RuntimeError(f"NFL My Bets could not be loaded: {exc}") from exc
+    if rows:
+        bets = rows[0].get("detail") or []
+        return list(bets) if isinstance(bets, list) else []
+
+    # Import the old local bet log once. The durable empty row created by a
+    # later delete prevents removed bets from being resurrected from disk.
+    local_bets = _nfl_load_local_bets(user_key)
+    if local_bets:
+        _nfl_save_bets(user_key, local_bets)
+    return local_bets
+
+
+def _nfl_save_bets(user_key: str, bets: list):
+    """Replace one user's durable NFL bet list; never report false success."""
+    row = {
+        "app": _NFL_BET_LEDGER_APP,
+        "date": _NFL_BET_LEDGER_DATE,
+        "category": _nfl_bet_ledger_category(user_key),
+        "side": "ALL",
+        "wins": 0,
+        "losses": 0,
+        "locked": False,
+        "detail": list(bets or []),
+    }
+    if not _nfl_sb_upsert(
+            "mpa_track_ledger", [row],
+            on_conflict="app,date,category,side"):
+        raise RuntimeError("NFL My Bets could not be saved to Supabase")
 
 
 def _nfl_bet_admin_ok(tok: str, admin: str) -> bool:
@@ -6557,10 +6612,12 @@ async def nfl_get_bets(request: Request, token: str = "", admin: str = "", settl
     tok = token or request.headers.get("Authorization", "").replace("Bearer ", "").strip()
     if not _nfl_bet_admin_ok(tok, admin):
         raise HTTPException(status_code=403, detail="Admin only")
-    with _NFL_BET_LOCK:
-        data = _nfl_load_bets()
-        key = _nfl_bet_user_key(tok, admin)
-        snapshot = list(data.get(key, []))
+    key = _nfl_bet_user_key(tok, admin)
+    try:
+        with _NFL_BET_LOCK:
+            snapshot = _nfl_load_bets(key)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
     # Settle OFF-lock (see NBA): ESPN calls (now cached) must not hold _NFL_BET_LOCK.
     # Merge settled fields by id so a concurrently-added bet is never clobbered.
     if settle and _nfl_settle_batch(snapshot):
@@ -6570,14 +6627,17 @@ async def nfl_get_bets(request: Request, token: str = "", admin: str = "", settl
         settled = {b.get("id"): b for b in snapshot
                    if b.get("id") and b.get("result") in ("WIN", "LOSS", "PUSH")}
         if settled:
-            with _NFL_BET_LOCK:
-                data = _nfl_load_bets()
-                for b in data.get(key, []):
-                    s = settled.get(b.get("id"))
-                    if s and b.get("result") not in ("WIN", "LOSS", "PUSH"):
-                        for f in ("result", "actual", "profit", "settled_at"):
-                            b[f] = s.get(f)
-                _nfl_save_bets(data)
+            try:
+                with _NFL_BET_LOCK:
+                    current = _nfl_load_bets(key)
+                    for b in current:
+                        s = settled.get(b.get("id"))
+                        if s and b.get("result") not in ("WIN", "LOSS", "PUSH"):
+                            for f in ("result", "actual", "profit", "settled_at"):
+                                b[f] = s.get(f)
+                    _nfl_save_bets(key, current)
+            except RuntimeError as exc:
+                raise HTTPException(status_code=503, detail=str(exc))
     snapshot.sort(key=lambda b: (b.get("date", ""), b.get("placed_at", "")), reverse=True)
     return {"bets": snapshot, "summary": _nfl_summarize_bets(snapshot)}
 
@@ -6616,11 +6676,14 @@ async def nfl_add_bet(request: Request, token: str = "", admin: str = ""):
         _nfl_settle_bet(bet)
     except Exception:
         pass
-    with _NFL_BET_LOCK:
-        data = _nfl_load_bets()
-        key = _nfl_bet_user_key(tok, admin)
-        data.setdefault(key, []).append(bet)
-        _nfl_save_bets(data)
+    key = _nfl_bet_user_key(tok, admin)
+    try:
+        with _NFL_BET_LOCK:
+            bets = _nfl_load_bets(key)
+            bets.append(bet)
+            _nfl_save_bets(key, bets)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
     return {"ok": True, "bet": bet}
 
 
@@ -6629,14 +6692,15 @@ async def nfl_delete_bet(bet_id: str, request: Request, token: str = "", admin: 
     tok = token or request.headers.get("Authorization", "").replace("Bearer ", "").strip()
     if not _nfl_bet_admin_ok(tok, admin):
         raise HTTPException(status_code=403, detail="Admin only")
-    with _NFL_BET_LOCK:
-        data = _nfl_load_bets()
-        key = _nfl_bet_user_key(tok, admin)
-        bets = data.get(key, [])
-        new_bets = [b for b in bets if b.get("id") != bet_id]
-        if len(new_bets) != len(bets):
-            data[key] = new_bets
-            _nfl_save_bets(data)
+    key = _nfl_bet_user_key(tok, admin)
+    try:
+        with _NFL_BET_LOCK:
+            bets = _nfl_load_bets(key)
+            new_bets = [b for b in bets if b.get("id") != bet_id]
+            if len(new_bets) != len(bets):
+                _nfl_save_bets(key, new_bets)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
     return {"ok": True}
 
 
@@ -6645,14 +6709,15 @@ async def nfl_bets_summary(request: Request, token: str = "", admin: str = "", s
     tok = token or request.headers.get("Authorization", "").replace("Bearer ", "").strip()
     if not _nfl_bet_admin_ok(tok, admin):
         raise HTTPException(status_code=403, detail="Admin only")
-    with _NFL_BET_LOCK:
-        data = _nfl_load_bets()
-        key = _nfl_bet_user_key(tok, admin)
-        bets = data.get(key, [])
-        if settle and _nfl_settle_batch(bets):
-            data[key] = bets
-            _nfl_save_bets(data)
-        snapshot = list(bets)
+    key = _nfl_bet_user_key(tok, admin)
+    try:
+        with _NFL_BET_LOCK:
+            bets = _nfl_load_bets(key)
+            if settle and _nfl_settle_batch(bets):
+                _nfl_save_bets(key, bets)
+            snapshot = list(bets)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
     return {"sport": "NFL", "summary": _nfl_summarize_bets(snapshot)}
 
 
