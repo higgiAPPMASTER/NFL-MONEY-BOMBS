@@ -9625,7 +9625,7 @@ function _nflCoachRender(question,rows,total,mode,isAlternate){
     :mode==='safe'
     ?'I checked the selected sides across '+total+' priced NFL candidates and ranked these by sportsbook-implied win probability. Safer favorites can require substantially more risk for a smaller return.'
     :(isAlternate
-      ?'I checked '+total+' genuine alternate-line candidates for the safer-value sweet spot. Every result is priced -1000 or better, has at least 85% app probability, at least 70% sportsbook-implied probability, and positive Coach Edge; each player keeps the qualifying line with the largest edge, with a maximum of 10 distinct players.'
+      ?'I checked '+total+' genuine alternate-line candidates for the safer-value sweet spot. Every result is priced -1000 or better, has at least 85% app probability, at least 70% sportsbook-implied probability, and positive Coach Edge; each player can appear once per qualifying market, using that player-market’s largest-edge line, with a maximum of 10 plays.'
       :'I checked '+total+' priced NFL board plays and ranked the matching positive Coach Edge results. Coach Edge is probability edge, not guaranteed monetary profit.');
   if(!rows.length){el.innerHTML='<div class="nfl-coach-question">'+_esc(question)+'</div><div class="nfl-coach-summary">'+(mode==='hundred'?'No loaded Coach-eligible NFL play currently has an exact 100.0% app hit rate.':'No loaded priced NFL prop matched that request.')+'</div>';return;}
   var cards=rows.map(function(p,i){
@@ -9841,7 +9841,8 @@ function askNflCoach(options){
   }
   var seenPlayers={};
   rows=rows.filter(function(p){
-    var key=String(p.player||'').trim().toLowerCase();
+    var key=String(p.player||'').trim().toLowerCase()
+      +(options.alternate?'|'+String(p.market||'').trim().toLowerCase():'');
     if(!key||seenPlayers[key])return false;
     seenPlayers[key]=1;return true;
   });
