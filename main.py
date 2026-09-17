@@ -2441,8 +2441,12 @@ def _td_calibrated_probability(pdf, df, team, opp_abbr, def_factor):
     return round(calibrated * 100, 1), round(raw * 100, 1), opportunity, rec.get("n", 0), report
 
 def _def_factor_map(df, stat_col: str, n_games: int = 8) -> dict:
-    """{team_abbr: (factor, rank)} — factor clamped 0.90-1.10, rank 1 = stingiest
-    (allows the LEAST of this stat per game over its last n_games)."""
+    """{team_abbr: (factor, rank)} using the restrained defensive nudge.
+
+    The underlying allowed-per-game ratio is deliberately shrunk toward 1.0
+    before it reaches a player projection.  Defense is a supporting signal, not
+    a replacement for the player's own history.
+    """
     if _DEFF_CACHE["df_ref"] is not df:   # hold the object itself, not id() (reusable after gc)
         _DEFF_CACHE["df_ref"] = df
         _DEFF_CACHE["maps"] = {}
@@ -2465,12 +2469,24 @@ def _def_factor_map(df, stat_col: str, n_games: int = 8) -> dict:
             if lg > 0:
                 ranked = sorted(per_team.items(), key=lambda kv: kv[1])
                 for i, (tm, allowed) in enumerate(ranked):
-                    f = max(0.90, min(1.10, allowed / lg))
+                    f = _nfl_restrained_def_factor(allowed / lg)
                     out[tm] = (round(f, 3), i + 1)
     except Exception as e:
         print(f"[DefFactor] {stat_col} failed: {e}")
     _DEFF_CACHE["maps"][stat_col] = out
     return out
+
+def _nfl_restrained_def_factor(raw_factor: float) -> float:
+    """Shrink positional-defense influence to a maximum +/-3% nudge.
+
+    Raw ratios are bounded at +/-10% for audit consistency, then shrunk
+    linearly around league average.  Thus .90 -> .97 and 1.10 -> 1.03.
+    """
+    try:
+        raw = max(.90, min(1.10, float(raw_factor)))
+    except (TypeError, ValueError):
+        raw = 1.0
+    return round(1.0 + (raw - 1.0) * .30, 3)
 
 # Auditable, point-in-time role and positional-defense inputs.  These consume
 # the caller's already-filtered nflverse frame, so historical replay cannot see
@@ -2593,11 +2609,18 @@ def _nfl_posdef_profile(df, defense, pos, stat):
         for tm,g in df[df.position.fillna("").astype(str).str.upper().eq(pos)].groupby("opponent_team"):
             gg=g.groupby(["season","week"])[stat].sum()
             if len(gg)>=2: vals[str(tm)]=float(gg.tail(8).mean())
-        out={"factor":round(factor,3),"rank":1+sum(v<allowed for v in vals.values()),"allowed":round(float(allowed),1),"sample":len(games),"label":f"{pos} {stat.replace('_',' ')} D","confidence":round(min(.95,.25+len(games)*.035),2)}
+        raw_factor = max(.90, min(1.10, float(factor)))
+        out={"factor":_nfl_restrained_def_factor(raw_factor),
+             "rawFactor":round(raw_factor,3),
+             "rank":1+sum(v<allowed for v in vals.values()),
+             "allowed":round(float(allowed),1),"sample":len(games),
+             "label":f"{pos} {stat.replace('_',' ')} D",
+             "confidence":round(min(.95,.25+len(games)*.035),2)}
     except Exception as exc: print(f"[PosDef] {pos}/{stat} failed: {exc}")
     _POSDEF_CACHE[key]=out; return out
 
 _NFL_PLAYER_LOOKUP = {"df_ref": None, "groups": {}, "matches": {}}
+_NFL_OPP_PLAYER_LOOKUP = {"df_ref": None, "groups": {}, "matches": {}}
 
 def _nfl_player_identity_key(name) -> str:
     """Match full player names across provider suffix/punctuation variations."""
@@ -2607,9 +2630,9 @@ def _nfl_player_identity_key(name) -> str:
         tokens.pop()
     return " ".join(tokens)
 
-def _nfl_player_history(df, name):
+def _nfl_player_history(df, name, lookup=None):
     """Reuse full-name player slices, including suffix variants and old teams."""
-    cache = _NFL_PLAYER_LOOKUP
+    cache = lookup if lookup is not None else _NFL_PLAYER_LOOKUP
     if cache["df_ref"] is not df:
         # Keep only the small row-position index.  A pandas Series containing a
         # normalized copy of every player name is needlessly retained for the
@@ -2638,10 +2661,13 @@ def _nfl_clear_slate_caches():
     compact DataFrames derived from a replay slate and otherwise accumulate
     across the seven sequential dates of a full-week run.
     """
-    global _NFL_PLAYER_LOOKUP
+    global _NFL_PLAYER_LOOKUP, _NFL_OPP_PLAYER_LOOKUP
     _ROLE_CACHE.clear()
     _POSDEF_CACHE.clear()
     _NFL_PLAYER_LOOKUP = {
+        "df_ref": None, "groups": {}, "matches": {}
+    }
+    _NFL_OPP_PLAYER_LOOKUP = {
         "df_ref": None, "groups": {}, "matches": {}
     }
     _DEFF_CACHE.update({"df_ref": None, "maps": {}})
@@ -2652,7 +2678,8 @@ def _nfl_clear_slate_caches():
         _TD_CAL_CACHE.update({"df_ref": None, "bins": None, "report": None})
     gc.collect()
 
-def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str) -> Optional[Dict]:
+def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str,
+                   opponent_df=None) -> Optional[Dict]:
     """Emit the shared NORMALIZED pick-field contract (same keys as the NHL app)
     so the card grid, ladder modal, special boxes and parlay are market-agnostic.
     Stats: career vs opponent (H/A filtered) + last-10 H/A + hits-vs-book-line L10."""
@@ -2702,15 +2729,26 @@ def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str) -> Optional[Dict
     if not pid:
         pid = _norm(name)
 
-    # Career vs opponent (H/A filtered, fallback to all-vs-opp)
-    vs_opp_all = pdf[pdf["opponent_team"] == opp_abbr] if opp_abbr else pdf
-    if is_home is not None and _HA_LOADED and not vs_opp_all.empty:
-        vs_ha = vs_opp_all[vs_opp_all.apply(lambda r: _ha_side(r, is_home), axis=1)]
-        vs_opp = vs_ha if not vs_ha.empty else vs_opp_all
-    else:
-        vs_opp = vs_opp_all
+    # Opponent history deliberately uses its own all-season, point-in-time
+    # frame.  The regular ``df`` is the strict two-season model frame and must
+    # never make an old Goff-vs-BUF meeting disappear from this section.
+    opp_source = opponent_df if opponent_df is not None else df
+    opp_pdf = (
+        _nfl_player_history(opp_source, name, _NFL_OPP_PLAYER_LOOKUP)
+        if opp_source is not None else pdf
+    )
+    # Career vs opponent (H/A filtered, fallback to all-vs-opp).  All venues
+    # remain available for the displayed game log and last-five sample.
+    vs_opp_all = opp_pdf[opp_pdf["opponent_team"] == opp_abbr] if opp_abbr else opp_pdf
+    # Matchup history is venue-neutral.  Home/away remains relevant to the
+    # side-aware L10/UNDER rates below, not to this opponent sample.
+    vs_opp = vs_opp_all.sort_values(["season", "week"], ascending=False)
 
-    vs_vals = vs_opp[stat_col].dropna().tolist() if not vs_opp.empty else []
+    # OLD treats every valid, completed game against today's opponent as an
+    # observation. The separate team-strength factor below is the only input
+    # restricted to the current and previous season.
+    vs_opp = vs_opp.dropna(subset=[stat_col])
+    vs_vals = vs_opp[stat_col].tolist() if not vs_opp.empty else []
     avg_a   = round(sum(vs_vals)/len(vs_vals), 1) if vs_vals else None
     hits_a  = sum(1 for v in vs_vals if v > line)
     tot_a   = len(vs_vals)
@@ -2865,7 +2903,8 @@ def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str) -> Optional[Dict
     # H/A-filtered set that drives the vs-opp RATE stats.
     vs_opp_log = []
     if not vs_opp_all.empty:
-        for _, r in vs_opp_all.sort_values(["season", "week"], ascending=False).iterrows():
+        for _, r in (vs_opp_all.sort_values(["season", "week"], ascending=False)
+                     .dropna(subset=[stat_col]).iterrows()):
             try:
                 v = r[stat_col]
                 if v is None or (isinstance(v, float) and v != v):
@@ -2908,7 +2947,9 @@ def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str) -> Optional[Dict
         "roleConfidence": role.get("confidence"), "roleFactor": role_factor,
         "roleReason": role.get("reason"), "positionGroup": effective_position,
         "defAllowed": posdef.get("allowed"), "defSample": posdef.get("sample", 0),
-        "defConfidence": posdef.get("confidence", .15), "defFactor": def_factor,
+        "defConfidence": posdef.get("confidence", .15),
+        "defRawFactor": posdef.get("rawFactor"),
+        "defFactor": def_factor,
         "combinedFactor": combined_factor, "baseProjection": ref_avg,
         "baseProbability": base_score, "adjustedProjection": adj_avg,
         "adjustedProbability": score,
@@ -3042,16 +3083,15 @@ def _new_market_gap(market, line):
     return max(1.0, abs(float(line or 0)) * 0.035)
 
 
-def _new_exact_history(df, name):
+def _new_exact_history(df, name, lookup=None):
     """NEW full-name identity includes suffix variants and previous teams."""
     if df is None or "player_display_name" not in df.columns:
         return df.iloc[0:0] if df is not None else None
-    target = _nfl_player_identity_key(name)
-    names = df["player_display_name"].map(_nfl_player_identity_key)
-    return df[names == target]
+    return _nfl_player_history(df, name, lookup)
 
 
-def _analyze_new_prop_raw(pl: Dict, df, home_abbr: str, away_abbr: str) -> Optional[Dict]:
+def _analyze_new_prop_raw(pl: Dict, df, home_abbr: str, away_abbr: str,
+                          opponent_df=None) -> Optional[Dict]:
     """Independent NEW model.
 
     It intentionally has a different contract internally from OLD: identity is
@@ -3120,12 +3160,21 @@ def _analyze_new_prop_raw(pl: Dict, df, home_abbr: str, away_abbr: str) -> Optio
         ha_rows = participation_pdf
     ha_values = _new_numeric_values(ha_rows, stat_col, 10)
     ha_mean = _new_weighted_mean(ha_values[:10])
-    opp_rows = participation_pdf[
-        participation_pdf["opponent_team"].astype(str).str.upper() == opp
-    ] if (not participation_pdf.empty and "opponent_team" in participation_pdf.columns) \
-        else participation_pdf.iloc[0:0]
-    opp_values = _new_numeric_values(opp_rows, stat_col, 8)
-    opp_mean = _new_weighted_mean(opp_values[:8])
+    # NEW participation logic applies to the separate all-season opponent
+    # frame; recent form above remains restricted to the two-season model df.
+    opp_source = opponent_df if opponent_df is not None else df
+    opp_pdf = _new_exact_history(
+        opp_source, name, _NFL_OPP_PLAYER_LOOKUP)
+    opp_participation_pdf = _new_participation_rows(
+        opp_pdf.sort_values(["season", "week"], ascending=False),
+        market, position, stat_col)
+    opp_rows = opp_participation_pdf[
+        opp_participation_pdf["opponent_team"].astype(str).str.upper() == opp
+    ] if (not opp_participation_pdf.empty and "opponent_team" in opp_participation_pdf.columns) \
+        else opp_participation_pdf.iloc[0:0]
+    opp_rows = opp_rows.sort_values(["season", "week"], ascending=False)
+    opp_values = _new_numeric_values(opp_rows, stat_col)
+    opp_mean = _new_weighted_mean(opp_values)
 
     role = _nfl_role_profile(df, team, position, name, stat_col)
     posdef = _nfl_posdef_profile(df, opp, position, stat_col)
@@ -3317,7 +3366,8 @@ def _analyze_new_prop_raw(pl: Dict, df, home_abbr: str, away_abbr: str) -> Optio
         "teamOptionRank": role.get("option_rank"), "roleConfidence": role.get("confidence"),
         "roleFactor": role_factor, "roleReason": role.get("reason"),
         "defAllowed": posdef.get("allowed"), "defSample": posdef.get("sample",0),
-        "defConfidence": posdef.get("confidence",.15), "defFactor": def_factor,
+        "defConfidence": posdef.get("confidence",.15),
+        "defRawFactor": posdef.get("rawFactor"), "defFactor": def_factor,
         "combinedFactor": combined_factor, "baseProjection": evidence,
         "baseProbability": side_rate, "adjustedProjection": projection,
         "adjustedProbability": score,
@@ -3343,9 +3393,10 @@ def _analyze_new_prop_raw(pl: Dict, df, home_abbr: str, away_abbr: str) -> Optio
         "system": "NEW",
     }
 
-def _analyze_new_prop(pl: Dict, df, home_abbr: str, away_abbr: str) -> Optional[Dict]:
+def _analyze_new_prop(pl: Dict, df, home_abbr: str, away_abbr: str,
+                      opponent_df=None) -> Optional[Dict]:
     return _new_sanitize_json(
-        _analyze_new_prop_raw(pl, df, home_abbr, away_abbr))
+        _analyze_new_prop_raw(pl, df, home_abbr, away_abbr, opponent_df))
 
 
 # ── NFL Game Predictor helpers ─────────────────────────────────────────────────
@@ -4449,6 +4500,12 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False,
     if simulate and espn_games:
         analysis_df = await asyncio.to_thread(
             _nfl_prop_analysis_frame, analysis_df, prop_season, prop_week, prop_type)
+    # Keep matchup history separate from the model frame.  General form,
+    # role, positional defense, projections, and probabilities use only the
+    # selected season plus its predecessor; vs-opponent uses all available
+    # prior seasons, still cut off before the selected game.
+    opponent_history_df = await asyncio.to_thread(
+        _nfl_stats_before_game, df, prop_season, prop_week, prop_type)
 
     # 5. Analyze every sportsbook-listed active player in standard offense,
     # defense, and kicking markets. Anytime TD is the only exception: reduce its
@@ -4488,7 +4545,8 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False,
                     analyzer = _analyze_new_prop if system == "NEW" else _analyze_prop
                     result = analyzer(
                         pl, analysis_df,
-                        pl.get("home_abbr", ""), pl.get("away_abbr", ""))
+                        pl.get("home_abbr", ""), pl.get("away_abbr", ""),
+                        opponent_history_df)
                     if result:
                         analyzed.append(result)
             return analyzed
@@ -5416,7 +5474,8 @@ async def api_historical_season(request: Request):
         "content-type", "").startswith("application/json") else {}
     tok = body.get("token", "") or request.headers.get(
         "Authorization", "").replace("Bearer ", "").strip()
-    if not _is_admin_token(tok):
+    if not _nfl_batch_admin_ok(
+            request, token=tok, admin=str(body.get("admin") or "")):
         raise HTTPException(status_code=403, detail="Admin access required")
     system = "NEW" if str(body.get("system") or "OLD").upper() == "NEW" else "OLD"
     try:
@@ -5512,7 +5571,7 @@ async def api_historical_season_poll(request: Request, job_id: str,
                                      token: str = "", system: str = "OLD"):
     tok = token or request.headers.get(
         "Authorization", "").replace("Bearer ", "").strip()
-    if not _is_admin_token(tok):
+    if not _nfl_batch_admin_ok(request, token=tok):
         raise HTTPException(status_code=403, detail="Admin access required")
     job = SEASON_JOBS.get(job_id)
     if not job:
@@ -9520,9 +9579,7 @@ function fmtVsLine(p){
 }
 function _nflOppVenueLabel(p){
   var side=String((p&&p.pick)||'PICK').toUpperCase();
-  if(p&&p.homeRoad==='R')return side+' in '+String(p.opponent||'Opponent');
-  if(p&&p.homeRoad==='H')return side+' at Home vs '+String(p.opponent||'Opponent');
-  return side+' vs '+String((p&&p.opponent)||'Opponent');
+  return side+' vs '+String((p&&p.opponent)||'Opponent')+' · all meetings';
 }
 function _nflRecentVenueLabel(p){
   var side=String((p&&p.pick)||'PICK').toUpperCase();
@@ -9693,8 +9750,26 @@ function openNflLadder(key){
   var vol=(p.vsOppLog||[]);
   var voHtml='';
   if(vol.length){
-    voHtml='<div style="font-size:.7rem;color:#6b7280;text-transform:uppercase;letter-spacing:.08em;font-weight:700;margin:12px 0 4px">Every game vs '+p.opponent+' ('+vol.length+')</div>';
-    voHtml+=vol.map(function(g){var hit=p.pick==='UNDER'?g.v<line:g.v>line;return '<div class="vsopp-row"><span style="color:#9ca3af">'+g.d+'</span><span style="font-weight:700;color:'+(hit?'#4ade80':'#f87171')+'">'+g.v+'</span></div>';}).join('');
+    var oppOver=0,oppUnder=0,oppPush=0;
+    vol.forEach(function(g){
+      var v=Number(g.v);
+      if(v>line)oppOver++;else if(v<line)oppUnder++;else oppPush++;
+    });
+    var oppPct=function(n){return vol.length?(n/vol.length*100).toFixed(1):'0.0';};
+    voHtml='<div style="margin:14px 0 10px;background:#0d1422;border:1px solid #25324a;border-radius:12px;padding:13px">'
+      +'<div style="font-size:.72rem;color:#e2e8f0;text-transform:uppercase;letter-spacing:.08em;font-weight:900">History vs '+_esc(p.opponent)+' · all '+vol.length+' meetings</div>'
+      +'<div style="font-size:.67rem;color:#94a3b8;line-height:1.45;margin-top:5px">Each past '+_esc(p.mkt)+' result below is compared with today’s sportsbook line of <b style="color:#f8fafc">'+line+'</b>. These are not the old lines from those games.</div>'
+      +'<div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px;margin-top:10px">'
+      +'<div style="background:rgba(34,197,94,.09);border:1px solid rgba(34,197,94,.28);border-radius:8px;padding:9px"><div style="font-size:.58rem;color:#86efac;font-weight:900">OVER '+line+'</div><div style="font-size:1rem;color:#4ade80;font-weight:900;margin-top:3px">'+oppOver+'/'+vol.length+' <small style="font-size:.62rem">('+oppPct(oppOver)+'%)</small></div></div>'
+      +'<div style="background:rgba(248,113,113,.08);border:1px solid rgba(248,113,113,.25);border-radius:8px;padding:9px"><div style="font-size:.58rem;color:#fca5a5;font-weight:900">UNDER '+line+'</div><div style="font-size:1rem;color:#f87171;font-weight:900;margin-top:3px">'+oppUnder+'/'+vol.length+' <small style="font-size:.62rem">('+oppPct(oppUnder)+'%)</small></div></div>'
+      +'<div style="background:rgba(148,163,184,.08);border:1px solid rgba(148,163,184,.22);border-radius:8px;padding:9px"><div style="font-size:.58rem;color:#cbd5e1;font-weight:900">EXACT / PUSH</div><div style="font-size:1rem;color:#cbd5e1;font-weight:900;margin-top:3px">'+oppPush+'/'+vol.length+'</div></div></div>'
+      +'<div style="margin-top:10px">';
+    voHtml+=vol.map(function(g){
+      var v=Number(g.v),result=v>line?'OVER':(v<line?'UNDER':'PUSH');
+      var color=result==='OVER'?'#4ade80':(result==='UNDER'?'#f87171':'#cbd5e1');
+      return '<div class="vsopp-row"><span style="color:#9ca3af">'+_esc(g.d)+'</span><span style="font-weight:800;color:'+color+'">'+g.v+' · '+result+'</span></div>';
+    }).join('');
+    voHtml+='</div></div>';
   }
   var parlayWhy=p.parlayWhy
     ?'<div style="background:rgba(59,130,246,.08);border:1px solid rgba(59,130,246,.25);border-radius:10px;padding:10px 11px;margin:8px 0 13px;color:#cbd5e1;font-size:.77rem;line-height:1.5"><b style="color:#7dd3fc">Why this parlay leg:</b> '+_esc(p.parlayWhy)+'</div>'
@@ -9708,12 +9783,11 @@ function openNflLadder(key){
       <div style="font-size:.7rem;color:#6b7280;text-transform:uppercase;letter-spacing:.08em;font-weight:700;margin-bottom:4px">Recent Games (green = ${p.pick==='UNDER'?'under':'over'} line)</div>
       <div class="lad-glog">${chips}</div>
       ${voHtml}
-      <div class="lad-stat"><span class="k">${_esc(_nflOppVenueLabel(p))}</span><span class="v">${_rateHtml(p.rateA,p.hitsA,p.totA)}</span></div>
       <div class="lad-stat"><span class="k">${_esc(_nflRecentVenueLabel(p))}</span><span class="v">${_rateHtml(p.rateB,p.hitsB,p.totB)}</span></div>
       ${vslRow}
       <div class="lad-stat"><span class="k">Under Line L10</span><span class="v ${rateClass(p.underRate)}">${p.underHits}/${p.underTotal} (${p.underRate}%)</span></div>
       <div class="lad-stat"><span class="k">Average</span><span class="v gold">${p.avg}</span></div>
-      ${(p.defRank!=null&&p.defAdj!=null)?`<div class="lad-stat"><span class="k">Opp Def Rank Factor (#${p.defRank} ${p.defLbl||'D'})</span><span class="v" style="color:${p.defAdj>0?'#4ade80':(p.defAdj<0?'#f87171':'#9ca3af')}">${p.defAdj>0?'+':''}${p.defAdj}% confidence</span></div>`:''}
+      ${(p.defRank!=null&&p.defAdj!=null)?`<div class="lad-stat"><span class="k">Opp Def Rank Factor (#${p.defRank} ${p.defLbl||'D'})</span><span class="v" style="color:${p.defAdj>0?'#4ade80':(p.defAdj<0?'#f87171':'#9ca3af')}">${p.defAdj>0?'+':''}${p.defAdj}% projection nudge</span></div>`:''}
       ${p.role?`<div class="lad-stat"><span class="k">Role / opportunity</span><span class="v">${_esc(p.role)}${p.teamOptionRank!=null?' · team receiving option #'+p.teamOptionRank:''} (${Math.round(Number(p.roleConfidence||0)*100)}% confidence)</span></div>`:''}
       ${(p.baseProjection!=null||p.adjustedProjection!=null)?`<div class="lad-stat"><span class="k">Base → adjusted projection</span><span class="v">${p.baseProjection!=null?Number(p.baseProjection).toFixed(1):'—'} → ${p.adjustedProjection!=null?Number(p.adjustedProjection).toFixed(1):'—'}${p.defAllowed!=null?' · '+p.defAllowed+' allowed per game · current + last season ('+(p.defSample||0)+' games)':''}</span></div>`:''}
       ${(p.baseProbability!=null||p.adjustedProbability!=null)?`<div class="lad-stat"><span class="k">Base → adjusted probability</span><span class="v">${p.baseProbability!=null?Number(p.baseProbability).toFixed(1):'—'}% → ${p.adjustedProbability!=null?Number(p.adjustedProbability).toFixed(1):'—'}%</span></div>`:''}
@@ -9729,7 +9803,7 @@ function closeNflLadder(){var o=document.getElementById('nflLadOv');if(o)o.remov
 function buildNormTable(picks, startNum){
   var thead = '<thead><tr><th>#</th><th>PLAYER</th><th>TEAM</th><th>OPP</th><th>H/A</th>' +
     '<th>BOOK</th><th>AVG vs OPP</th><th>AVG L10 H/A</th><th>HITS BOOK L10</th>' +
-    '<th>GAP vs BOOK</th><th>Career vs OPP</th><th>L10 H/A</th><th>SCORE</th><th>PICK</th><th>TAG</th></tr></thead>';
+    '<th>GAP vs BOOK</th><th>vs OPP all meetings</th><th>L10 H/A</th><th>SCORE</th><th>PICK</th><th>TAG</th></tr></thead>';
   var rows = '';
   picks.forEach(function(p, i){
     var hasHA=(p.homeRoad==='H'||p.homeRoad==='R');
@@ -10154,18 +10228,19 @@ function _nflCoachRateTile(label,rate,hits,total){
 function _nflCoachOppHistory(p,rate,hits,total){
   var s=p.source||{},games=s.vsOppLog||[],shown=rate!=null&&Number(total)>0;
   var pct=shown?Math.max(0,Math.min(100,Number(rate))):0;
+  var line=Number(p.line),over=0,under=0,push=0;
+  games.forEach(function(g){var v=Number(g.v);if(v>line)over++;else if(v<line)under++;else push++;});
   var rows=games.length?games.map(function(g){
-    var hit=_nflCoachHit(p.side,g.v,p.line);
-    var cls=hit==null?'push':(hit?'hit':'miss');
-    var result=hit==null?'PUSH':(hit?'HIT':'MISS');
-    return '<div class="nfl-coach-opp-row '+cls+'"><span>'+_esc(g.d)+'</span><span><b>'+Number(g.v).toFixed(1)+'</b> <span class="result">'+result+'</span></span></div>';
+    var v=Number(g.v),result=v>line?'OVER':(v<line?'UNDER':'PUSH');
+    var cls=result==='PUSH'?'push':(result===p.side?'hit':'miss');
+    return '<div class="nfl-coach-opp-row '+cls+'"><span>'+_esc(g.d)+'</span><span><b>'+v.toFixed(1)+'</b> <span class="result">'+result+'</span></span></div>';
   }).join(''):'<div class="nfl-coach-opp-head">No game-by-game opponent history is available.</div>';
   return '<details class="nfl-coach-opp-history">'
     +'<summary class="nfl-coach-stat" title="View every '+_esc(p.market)+' game against '+_esc(p.opponent)+'">'
-    +'<div class="k">vs Opponent</div><div class="v">'+(shown?Number(rate).toFixed(0)+'% · '+hits+'/'+total:'N/A')+'</div>'
+    +'<div class="k">vs '+_esc(p.opponent)+' · all meetings</div><div class="v">'+(games.length?'OVER '+over+'/'+games.length+' · UNDER '+under+'/'+games.length+(push?' · PUSH '+push:''):'N/A')+'</div>'
     +'<div class="nfl-coach-ratebar"><span style="width:'+pct+'%"></span></div></summary>'
     +'<div class="nfl-coach-opp-games"><div class="nfl-coach-opp-head">'+_esc(p.player)+' vs '+_esc(p.opponent)
-    +' · '+_esc(p.market)+' · '+p.side+' '+Number(p.line).toFixed(1)+'</div>'+rows+'</div></details>';
+    +' · every result compared with today’s '+_esc(p.market)+' line of '+line.toFixed(1)+'</div>'+rows+'</div></details>';
 }
 function _nflCoachRateTiles(p){
   var s=p.source||{},l5=_nflCoachLogRate(p,5),l10=_nflCoachLogRate(p,10);
