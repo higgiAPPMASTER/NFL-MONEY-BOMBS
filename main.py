@@ -2103,6 +2103,22 @@ def _ha_side(row, is_home):
         return True
     return val == ("HOME" if is_home else "AWAY")
 
+def _nfl_history_venue(row) -> str:
+    """Return the player's actual HOME/AWAY side for a historical stat row."""
+    if not _HA_LOADED:
+        return ""
+    try:
+        season_type = str(row.get("season_type", "REG") or "REG").upper()
+        week = _espn_ha_week(season_type, row["week"])
+        key = (
+            int(row["season"]), season_type, week,
+            str(row.get("recent_team") or ""),
+        )
+        side = str(_HA_LOOKUP.get(key) or "").upper()
+        return side if side in {"HOME", "AWAY"} else ""
+    except Exception:
+        return ""
+
 def _book_tag_nfl(pick, score, gap, under_rate):
     """SUGGESTED when the OVER side has a strong recent hit rate + edge over the
     line; FADE when the UNDER side is strong + the line sits above the average."""
@@ -2775,10 +2791,11 @@ def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str,
     vsl_tot    = len(la_vals)
     vsl_rate   = round(vsl_hits/vsl_tot*100, 1) if vsl_tot >= 1 else None
 
-    # Matchup history takes precedence over generic venue form. If this player
-    # has faced today's opponent, project from that opponent-specific sample;
-    # use L10 home/away only when no opponent history exists.
-    ref_avg = avg_a if avg_a is not None else avg_b
+    # Projection volume comes from current-form L10 at today's venue. Historical
+    # meetings against the opponent influence the side-aware probability below,
+    # but their raw stat average must never become the yardage projection (one
+    # outlier game can make that number meaningless).
+    ref_avg = avg_b
 
     # Market-specific opponent positional defense and current offensive role
     # change the projection itself; generic defense remains a low-data fallback.
@@ -2909,7 +2926,11 @@ def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str,
                 v = r[stat_col]
                 if v is None or (isinstance(v, float) and v != v):
                     continue
-                vs_opp_log.append({"d": f"{int(r['season'])} W{int(r['week'])}", "v": round(float(v), 1)})
+                vs_opp_log.append({
+                    "d": f"{int(r['season'])} W{int(r['week'])}",
+                    "v": round(float(v), 1),
+                    "ha": _nfl_history_venue(r),
+                })
             except Exception:
                 continue
 
@@ -3204,7 +3225,10 @@ def _analyze_new_prop_raw(pl: Dict, df, home_abbr: str, away_abbr: str,
     except (TypeError, ValueError):
         injury_opportunity_factor = 1.0
     participation_scale = 0.15 + 0.85 * participation_probability
-    components = [(recent_mean, .50), (ha_mean, .20), (opp_mean, .20)]
+    # Projection volume uses current-form and venue form only. Opponent history
+    # remains side/rate evidence and must not inject its raw stat average into
+    # the projection, where one outlier meeting can overwhelm the estimate.
+    components = [(recent_mean, .70), (ha_mean, .30)]
     known = [(v, w) for v, w in components if v is not None]
     if known:
         denom = sum(w for _, w in known)
@@ -3319,6 +3343,7 @@ def _analyze_new_prop_raw(pl: Dict, df, home_abbr: str, away_abbr: str,
                     vs_opp_log.append({
                         "d": f"{int(observed['season'])} W{int(observed['week'])}",
                         "v": round(value, 1),
+                        "ha": _nfl_history_venue(observed),
                     })
             except (TypeError, ValueError, KeyError):
                 continue
@@ -9767,7 +9792,8 @@ function openNflLadder(key){
     voHtml+=vol.map(function(g){
       var v=Number(g.v),result=v>line?'OVER':(v<line?'UNDER':'PUSH');
       var color=result==='OVER'?'#4ade80':(result==='UNDER'?'#f87171':'#cbd5e1');
-      return '<div class="vsopp-row"><span style="color:#9ca3af">'+_esc(g.d)+'</span><span style="font-weight:800;color:'+color+'">'+g.v+' · '+result+'</span></div>';
+      var venue=g.ha?(' · '+_esc(g.ha)):'';
+      return '<div class="vsopp-row"><span style="color:#9ca3af">'+_esc(g.d)+venue+'</span><span style="font-weight:800;color:'+color+'">'+g.v+' · '+result+'</span></div>';
     }).join('');
     voHtml+='</div></div>';
   }
@@ -9789,7 +9815,7 @@ function openNflLadder(key){
       <div class="lad-stat"><span class="k">Average</span><span class="v gold">${p.avg}</span></div>
       ${(p.defRank!=null&&p.defAdj!=null)?`<div class="lad-stat"><span class="k">Opp Def Rank Factor (#${p.defRank} ${p.defLbl||'D'})</span><span class="v" style="color:${p.defAdj>0?'#4ade80':(p.defAdj<0?'#f87171':'#9ca3af')}">${p.defAdj>0?'+':''}${p.defAdj}% projection nudge</span></div>`:''}
       ${p.role?`<div class="lad-stat"><span class="k">Role / opportunity</span><span class="v">${_esc(p.role)}${p.teamOptionRank!=null?' · team receiving option #'+p.teamOptionRank:''} (${Math.round(Number(p.roleConfidence||0)*100)}% confidence)</span></div>`:''}
-      ${(p.baseProjection!=null||p.adjustedProjection!=null)?`<div class="lad-stat"><span class="k">Base → adjusted projection</span><span class="v">${p.baseProjection!=null?Number(p.baseProjection).toFixed(1):'—'} → ${p.adjustedProjection!=null?Number(p.adjustedProjection).toFixed(1):'—'}${p.defAllowed!=null?' · '+p.defAllowed+' allowed per game · current + last season ('+(p.defSample||0)+' games)':''}</span></div>`:''}
+      ${(p.baseProjection!=null||p.adjustedProjection!=null)?`<div class="lad-stat"><span class="k">L10 H/A base → adjusted projection</span><span class="v">${p.baseProjection!=null?Number(p.baseProjection).toFixed(1):'—'} → ${p.adjustedProjection!=null?Number(p.adjustedProjection).toFixed(1):'—'}${p.defAllowed!=null?' · '+p.defAllowed+' allowed per game · current + last season ('+(p.defSample||0)+' games)':''}</span></div>`:''}
       ${(p.baseProbability!=null||p.adjustedProbability!=null)?`<div class="lad-stat"><span class="k">Base → adjusted probability</span><span class="v">${p.baseProbability!=null?Number(p.baseProbability).toFixed(1):'—'}% → ${p.adjustedProbability!=null?Number(p.adjustedProbability).toFixed(1):'—'}%</span></div>`:''}
       <div class="lad-stat"><span class="k">Score</span><span class="v" style="color:#f59e0b">${p.dispScore}</span></div>
     </div>`;
@@ -10233,7 +10259,8 @@ function _nflCoachOppHistory(p,rate,hits,total){
   var rows=games.length?games.map(function(g){
     var v=Number(g.v),result=v>line?'OVER':(v<line?'UNDER':'PUSH');
     var cls=result==='PUSH'?'push':(result===p.side?'hit':'miss');
-    return '<div class="nfl-coach-opp-row '+cls+'"><span>'+_esc(g.d)+'</span><span><b>'+v.toFixed(1)+'</b> <span class="result">'+result+'</span></span></div>';
+    var venue=g.ha?(' · '+_esc(g.ha)):'';
+    return '<div class="nfl-coach-opp-row '+cls+'"><span>'+_esc(g.d)+venue+'</span><span><b>'+v.toFixed(1)+'</b> <span class="result">'+result+'</span></span></div>';
   }).join(''):'<div class="nfl-coach-opp-head">No game-by-game opponent history is available.</div>';
   return '<details class="nfl-coach-opp-history">'
     +'<summary class="nfl-coach-stat" title="View every '+_esc(p.market)+' game against '+_esc(p.opponent)+'">'
