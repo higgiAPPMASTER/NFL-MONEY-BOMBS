@@ -264,9 +264,11 @@ def _take_odds(entry, price_field, book_field, price, book_key):
 app  = FastAPI(title="NFL Money Bombs", docs_url=None, redoc_url=None)
 JOBS: Dict[str, Dict] = {}
 SEASON_JOBS: Dict[str, Dict] = {}
-_NFL_WEEK_DATE_CONCURRENCY = 2
-_NFL_WEEK_DAY_TIMEOUT = 480
-_NFL_WEEK_JOB_TIMEOUT = 1200
+# Daily analysis uses a process-wide serial lock. Keep weekly work serial too:
+# running two slates at once only makes the second slate spend its deadline
+# waiting for the first one, especially on the large Sunday board.
+_NFL_WEEK_DAY_TIMEOUT = 720
+_NFL_WEEK_JOB_TIMEOUT = 3600
 
 # ── File cache ─────────────────────────────────────────────────────────────────
 _CACHE_DIR = pathlib.Path("/tmp/mpa_cache")
@@ -4703,7 +4705,6 @@ async def api_run(request: Request):
                     dates = _nfl_week_dates(date_str)
                     results = [None] * len(dates)
                     today = _nfl_today()
-                    week_sem = asyncio.Semaphore(_NFL_WEEK_DATE_CONCURRENCY)
                     completed = 0
 
                     async def _run_week_date(index, ds):
@@ -4714,68 +4715,126 @@ async def api_run(request: Request):
                             if not saved:
                                 saved = await asyncio.to_thread(
                                     _nfl_load_board_snapshots, ds, system)
+                            if not saved:
+                                try:
+                                    scheduled_games = await get_espn_games(ds)
+                                except Exception as exc:
+                                    scheduled_games = None
+                                    schedule_error = str(exc)
+                                else:
+                                    schedule_error = ""
+                                if scheduled_games == []:
+                                    past_error = (
+                                        "No NFL games found for "
+                                        f"{ds} — NFL season runs Sept–Feb.")
+                                elif scheduled_games is None:
+                                    past_error = (
+                                        "Past NFL game date could not verify "
+                                        f"the schedule for {ds}: {schedule_error}")
+                                else:
+                                    past_error = (
+                                        "Past NFL game date has no saved "
+                                        f"pre-game board: {ds}")
+                            else:
+                                past_error = ""
                             results[index] = saved or {
                                 "date": ds, "picks": [], "all": [], "games": [],
                                 "game_predictions": [], "td_picks": [],
-                                "error": "Past day has no saved pre-game board; skipped without buying historical odds.",
+                                "error": past_error,
                             }
                         else:
-                            async with week_sem:
+                            # Do not start another daily pipeline until this one
+                            # (including its one allowed retry) is finished:
+                            # run_pipeline's analysis lock is process-global.
+                            JOBS.get(job_id, {}).update({
+                                "progress": (
+                                    f"Full week: {completed}/7 complete · "
+                                    f"{ds}: checking slate…")})
+
+                            async def _run_attempt():
+                                return await run_pipeline(
+                                    ds,
+                                    force_refresh=True,
+                                    capture_official=False,
+                                    system=system,
+                                    progress=lambda m, d=ds: JOBS.get(
+                                        job_id, {}).update({
+                                            "progress": (
+                                                f"Full week: {completed}/7 complete · "
+                                                f"{d}: {m}")}))
+
+                            task = asyncio.create_task(_run_attempt())
+                            try:
+                                result = await asyncio.wait_for(
+                                    asyncio.shield(task), timeout=_NFL_WEEK_DAY_TIMEOUT)
+                            except asyncio.TimeoutError:
                                 JOBS.get(job_id, {}).update({
                                     "progress": (
                                         f"Full week: {completed}/7 complete · "
-                                        f"{ds}: checking slate…")})
+                                        f"{ds}: still processing beyond the first "
+                                        f"{_NFL_WEEK_DAY_TIMEOUT // 60}-minute window")})
                                 try:
                                     result = await asyncio.wait_for(
-                                        run_pipeline(
-                                            ds,
-                                            force_refresh=True,
-                                            capture_official=False,
-                                            system=system,
-                                            progress=lambda m, d=ds: JOBS.get(
-                                                job_id, {}).update({
-                                                    "progress": (
-                                                        f"Full week: {completed}/7 complete · "
-                                                        f"{d}: {m}")})),
-                                        timeout=_NFL_WEEK_DAY_TIMEOUT)
-                                    if system == "OLD":
-                                        await asyncio.to_thread(
-                                            _nfl_capture_opening_lines, ds, result)
-                                        await asyncio.to_thread(
-                                            _nfl_attach_line_movement, ds, result)
-                                    # A full-week run is a valid pre-kickoff
-                                    # Game Predictor forecast for each slate.
-                                    # Keep player-prop official capture in its
-                                    # existing game-day-only path.
-                                    await asyncio.to_thread(
-                                        _nfl_save_gp_snapshot, ds, result, system)
-                                    results[index] = result
+                                        asyncio.shield(task), timeout=_NFL_WEEK_DAY_TIMEOUT)
                                 except asyncio.TimeoutError:
+                                    task.cancel()
                                     results[index] = {
                                         "date": ds, "picks": [], "all": [],
                                         "games": [], "game_predictions": [],
                                         "td_picks": [],
                                         "error": (
-                                            "This date exceeded the 8-minute "
-                                            "data-source deadline. Run Full Week "
-                                            "again to retry this date."),
+                                            "This date exceeded the extended "
+                                            "24-minute data-source deadline while "
+                                            "the same analysis task remained in progress."),
                                     }
+                                    result = None
                                 except Exception as exc:
                                     results[index] = {
                                         "date": ds, "picks": [], "all": [],
                                         "games": [], "game_predictions": [],
                                         "td_picks": [],
-                                        "error": f"This date failed: {exc}",
+                                        "error": f"This date failed during its continuation: {exc}",
                                     }
+                                    result = None
+                            except Exception as exc:
+                                results[index] = {
+                                    "date": ds, "picks": [], "all": [],
+                                    "games": [], "game_predictions": [],
+                                    "td_picks": [],
+                                    "error": f"This date failed: {exc}",
+                                }
+                                result = None
+                            if result is not None:
+                                if system == "OLD":
+                                    await asyncio.to_thread(
+                                        _nfl_capture_opening_lines, ds, result)
+                                    await asyncio.to_thread(
+                                        _nfl_attach_line_movement, ds, result)
+                                # A full-week run is a valid pre-kickoff
+                                # Game Predictor forecast for each slate.
+                                # Keep player-prop official capture in its
+                                # existing game-day-only path.
+                                await asyncio.to_thread(
+                                    _nfl_save_gp_snapshot, ds, result, system)
+                                results[index] = result
                         completed += 1
                         JOBS.get(job_id, {}).update({
                             "progress": f"Full week: {completed}/7 complete"})
 
-                    await asyncio.gather(*[
-                        _run_week_date(index, ds)
-                        for index, ds in enumerate(dates)
-                    ])
+                    # Sequential by design: run_pipeline's analysis lock is
+                    # process-global, so daily tasks must never overlap.
+                    for index, ds in enumerate(dates):
+                        await _run_week_date(index, ds)
                     merged = _nfl_merge_week_results(date_str, results)
+                    failed_dates = merged.get("failed_dates") or []
+                    if failed_dates:
+                        JOBS.get(job_id, {}).update({
+                            "progress": (
+                                f"Full week incomplete — {len(failed_dates)} "
+                                f"date(s) failed: {', '.join(failed_dates)}")})
+                    else:
+                        JOBS.get(job_id, {}).update({
+                            "progress": "Full week complete"})
                     if system == "NEW":
                         merged["system"] = "NEW"
                         merged["model_version"] = "NEW-v1-ewma-blend"
@@ -4796,7 +4855,7 @@ async def api_run(request: Request):
             last_stage = JOBS.get(job_id, {}).get("progress", "starting the run")
             print(f"[Pipeline] Job timed out during: {last_stage}")
             JOBS[job_id].update({"status":"error",
-                "error":("Weekly run timed out after 20 minutes"
+                "error":("Weekly run timed out after 60 minutes"
                          if scope == "week" else "Run timed out after 5 minutes")
                         + " during: " + last_stage
                         + ". No completed board was returned."})
@@ -4837,7 +4896,7 @@ def _nfl_merge_week_results(anchor_date: str, daily_results: list) -> dict:
         "skipped_matchups": [],
         "daily_status": [],
     }
-    notes, warnings, successful = [], [], []
+    notes, warnings, successful, failed_dates = [], [], [], []
     for ds, result in zip(dates, daily_results):
         result = result or {}
         error = str(result.get("error") or "")
@@ -4848,6 +4907,11 @@ def _nfl_merge_week_results(anchor_date: str, daily_results: list) -> dict:
         })
         if error:
             notes.append(f"{ds}: {error}")
+            # A date with no NFL slate is expected in the Wednesday–Tuesday
+            # display week.  Other errors represent an incomplete week even
+            # when other dates produced perfectly usable boards.
+            if "No NFL games found" not in error:
+                failed_dates.append(ds)
         else:
             successful.append(result)
         for key in ("all", "picks", "td_picks"):
@@ -4874,13 +4938,19 @@ def _nfl_merge_week_results(anchor_date: str, daily_results: list) -> dict:
         w for w in warnings if str(w).startswith("⚠"))
     merged["data_note"] = " · ".join(
         w for w in warnings if not str(w).startswith("⚠"))
+    merged["incomplete"] = bool(failed_dates)
+    merged["failed_dates"] = failed_dates
+    merged["failed_date_count"] = len(failed_dates)
     merged["week_notice"] = (
+        ("INCOMPLETE — " if failed_dates else "") +
         f"Full NFL week: {dates[0]} through {dates[-1]} (Wednesday–Tuesday). "
         f"{len(merged['games'])} games loaded. Opening lines are stored by game "
         "date; this weekly run does not lock the official pick tracker."
-        + (f" {len(notes)} date(s) had no usable saved/live board." if notes else "")
+        + (f" Failed date(s): {', '.join(failed_dates)}." if failed_dates else "")
+        + (f" {len(notes)} date(s) had no usable saved/live board."
+           if notes and not failed_dates else "")
     )
-    merged["official_tracking"] = bool(successful) and all(
+    merged["official_tracking"] = (not failed_dates) and bool(successful) and all(
         result.get("official_tracking") is True for result in successful)
     if not successful and not merged["all"]:
         merged["error"] = "No saved or live NFL boards were available for this week."
@@ -10075,7 +10145,7 @@ function renderResults(d){
   window.__NFL_PLAYS__=d.all||[];
   window.__NFL_DATE__=d.anchor_date||d.date||'';
   _renderNflParlayFilters();
-  var weekNotice=d.week_notice?('<div style="margin-bottom:10px;padding:11px 14px;border:1px solid #6d28d9;background:rgba(109,40,217,.12);border-radius:10px;color:#ddd6fe;font-size:.82rem">'+d.week_notice+'</div>'):'';
+  var weekNotice=d.week_notice?('<div style="margin-bottom:10px;padding:11px 14px;border:1px solid '+(d.incomplete?'#b45309':'#6d28d9')+';background:'+(d.incomplete?'rgba(180,83,9,.16)':'rgba(109,40,217,.12)')+';border-radius:10px;color:'+(d.incomplete?'#fde68a':'#ddd6fe')+';font-size:.82rem;font-weight:'+(d.incomplete?'700':'400')+'">'+_esc(d.week_notice)+'</div>'):'';
   var note=d.data_note?('<div style="margin-bottom:10px;padding:11px 14px;border:1px solid #24506b;background:#0b2230;border-radius:10px;color:#9bd5f5;font-size:.82rem">'+d.data_note+'</div>'):'';
   var warn=d.data_warning?('<div class="err-box" style="margin-bottom:10px">'+d.data_warning+'</div>'):'';
   var skipped=(d.skipped_matchups||[]);
