@@ -5,7 +5,7 @@ Historical stats:  nfl_data_py (nfl-verse GitHub data — no rate limits)
 Schedule:          ESPN scoreboard API
 """
 
-import os, re, asyncio, uuid, time, json, pathlib, csv, io, math
+import os, re, asyncio, uuid, time, json, pathlib, csv, io, math, gc
 import threading as _bt_th
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
@@ -2143,6 +2143,7 @@ _TD_OPP_CACHE: dict = {"df_ref": None, "values": {}}
 # threads.  Keep the existing serial cache semantics for pandas/model caches
 # without putting the lock on the ASGI event loop.
 _NFL_ANALYSIS_LOCK = _bt_th.RLock()
+_NFL_ANALYSIS_EVENTS = None
 
 def _td_mean(rows, col, default=None):
     try:
@@ -2252,10 +2253,21 @@ def _td_walk_forward_calibration(df):
         return _TD_CAL_CACHE["bins"], _TD_CAL_CACHE["report"]
     bins = {i: {"n": 0, "hits": 0, "raw_sum": 0.0} for i in range(10)}
     try:
-        d = df[df["anytime_td"].notna()].copy()
+        # Calibration only reads these columns.  Avoid carrying the complete
+        # nflverse frame through the seven-season walk-forward loop.
+        calibration_cols = [
+            c for c in (
+                "player_display_name", "recent_team", "opponent_team",
+                "season", "week", "anytime_td", "season_type",
+                "target_share", "carries", "targets",
+            ) if c in df.columns
+        ]
+        d = df[calibration_cols]
+        d = d[d["anytime_td"].notna()].copy()
         d = d.sort_values(["season", "week"])
         first_season = int(d["season"].min())
-        history, team_history, defense_history, examples = {}, {}, {}, []
+        history, team_history, defense_history = {}, {}, {}
+        season_bins = {}
         # Process a whole week as one block. Updating state only after every
         # player in that week is predicted prevents same-week teammate leakage.
         if "season_type" in d.columns:
@@ -2300,8 +2312,15 @@ def _td_walk_forward_calibration(df):
                     raw = (.50 * td_rate + .15 * opp_rate + .20 * opportunity
                            + .10 * min(1.0, team_env / 1.35) + .05 * .50)
                     raw = max(.03, min(.90, raw * def_factor))
-                    examples.append((int(r.get("season") or 0), raw,
-                                     int(float(r.get("anytime_td") or 0) > 0)))
+                    season = int(r.get("season") or 0)
+                    b = min(9, int(raw * 10))
+                    aggregate = season_bins.setdefault(
+                        season, {}).setdefault(
+                            b, {"n": 0, "hits": 0, "raw_sum": 0.0})
+                    aggregate["n"] += 1
+                    aggregate["hits"] += int(
+                        float(r.get("anytime_td") or 0) > 0)
+                    aggregate["raw_sum"] += raw
                 ts = r.get("target_share")
                 try:
                     ts = float(ts)
@@ -2322,23 +2341,31 @@ def _td_walk_forward_calibration(df):
                 history.setdefault(name, []).append(item)
                 team_totals[team] = team_totals.get(team, 0.0) + item["td_count"]
             for team, total in team_totals.items():
-                team_history.setdefault(team, []).append(total)
+                team_values = team_history.setdefault(team, [])
+                team_values.append(total)
+                del team_values[:-8]
             for team, total in team_totals.items():
                 # The opponent defense allowed this team's scorer touchdowns.
                 opponents = [opp for _, tm, opp, _ in pending if tm == team and opp]
                 if opponents:
-                    defense_history.setdefault(opponents[0], []).append(total)
-        example_seasons = sorted({s for s, _, _ in examples})
+                    defense_values = defense_history.setdefault(opponents[0], [])
+                    defense_values.append(total)
+                    del defense_values[:-8]
+        example_seasons = sorted(
+            season for season, aggregate_bins in season_bins.items()
+            if any(rec["n"] > 0 for rec in aggregate_bins.values()))
         holdout_season = example_seasons[-1] if len(example_seasons) >= 2 else None
-        training = [x for x in examples if holdout_season is None or x[0] < holdout_season]
-        evaluation = [x for x in examples if holdout_season is not None and x[0] == holdout_season]
-        if not training:
-            training, evaluation, holdout_season = examples, [], None
-        for _, raw, actual in training:
-            b = min(9, int(raw * 10))
-            bins[b]["n"] += 1
-            bins[b]["hits"] += actual
-            bins[b]["raw_sum"] += raw
+        training_seasons = (
+            [season for season in example_seasons if season < holdout_season]
+            if holdout_season is not None else example_seasons)
+        if not any(season_bins.get(season) for season in training_seasons):
+            training_seasons = example_seasons
+            holdout_season = None
+        for season in training_seasons:
+            for b, aggregate in season_bins.get(season, {}).items():
+                bins[b]["n"] += aggregate["n"]
+                bins[b]["hits"] += aggregate["hits"]
+                bins[b]["raw_sum"] += aggregate["raw_sum"]
         report = []
         for b, rec in bins.items():
             midpoint = (b + .5) / 10.0
@@ -2348,14 +2375,15 @@ def _td_walk_forward_calibration(df):
             rec["calibrated"] = actual * weight + midpoint * (1.0 - weight)
         eval_bins = {i: {"n": 0, "hits": 0, "raw_sum": 0.0,
                          "calibrated_sum": 0.0} for i in range(10)}
-        for _, raw, actual in evaluation:
-            b = min(9, int(raw * 10))
-            trained = bins[b]
-            calibrated = trained["calibrated"] if trained["n"] >= 25 else raw
-            eval_bins[b]["n"] += 1
-            eval_bins[b]["hits"] += actual
-            eval_bins[b]["raw_sum"] += raw
-            eval_bins[b]["calibrated_sum"] += calibrated
+        if holdout_season is not None:
+            for b, aggregate in season_bins.get(holdout_season, {}).items():
+                trained = bins[b]
+                eval_bins[b]["n"] += aggregate["n"]
+                eval_bins[b]["hits"] += aggregate["hits"]
+                eval_bins[b]["raw_sum"] += aggregate["raw_sum"]
+                eval_bins[b]["calibrated_sum"] += (
+                    trained["calibrated"] * aggregate["n"]
+                    if trained["n"] >= 25 else aggregate["raw_sum"])
         for b, rec in bins.items():
             midpoint = (b + .5) / 10.0
             n = rec["n"]
@@ -2553,7 +2581,7 @@ def _nfl_posdef_profile(df, defense, pos, stat):
     except Exception as exc: print(f"[PosDef] {pos}/{stat} failed: {exc}")
     _POSDEF_CACHE[key]=out; return out
 
-_NFL_PLAYER_LOOKUP = {"df_ref": None, "names": None, "groups": {}, "matches": {}}
+_NFL_PLAYER_LOOKUP = {"df_ref": None, "groups": {}, "matches": {}}
 
 def _nfl_player_identity_key(name) -> str:
     """Match full player names across provider suffix/punctuation variations."""
@@ -2567,11 +2595,14 @@ def _nfl_player_history(df, name):
     """Reuse full-name player slices, including suffix variants and old teams."""
     cache = _NFL_PLAYER_LOOKUP
     if cache["df_ref"] is not df:
-        names = df["player_display_name"].map(_nfl_player_identity_key)
-        cache.update({
-            "df_ref": df, "names": names,
-            "groups": names.groupby(names, sort=False).indices, "matches": {},
-        })
+        # Keep only the small row-position index.  A pandas Series containing a
+        # normalized copy of every player name is needlessly retained for the
+        # lifetime of the process (and was especially costly for weekly replays).
+        groups = {}
+        for row_number, player_name in enumerate(df["player_display_name"]):
+            identity = _nfl_player_identity_key(player_name)
+            groups.setdefault(identity, []).append(row_number)
+        cache.update({"df_ref": df, "groups": groups, "matches": {}})
     key = _nfl_player_identity_key(name)
     if key not in cache["matches"]:
         positions = cache["groups"].get(key)
@@ -2581,6 +2612,29 @@ def _nfl_player_history(df, name):
         # full history alongside the source dataframe.
         cache["matches"][key] = positions
     return df.iloc[cache["matches"][key]]
+
+
+def _nfl_clear_slate_caches():
+    """Release caches whose keys are derived from one daily analysis frame.
+
+    The process-wide nflverse frame and its expensive long-lived caches are
+    intentionally untouched.  Role/positional-defense entries, however, hold
+    compact DataFrames derived from a replay slate and otherwise accumulate
+    across the seven sequential dates of a full-week run.
+    """
+    global _NFL_PLAYER_LOOKUP
+    _ROLE_CACHE.clear()
+    _POSDEF_CACHE.clear()
+    _NFL_PLAYER_LOOKUP = {
+        "df_ref": None, "groups": {}, "matches": {}
+    }
+    _DEFF_CACHE.update({"df_ref": None, "maps": {}})
+    _TD_OPP_CACHE.update({"df_ref": None, "values": {}})
+    # Keep the calibration for the process-global base frame: it is expensive
+    # and safe to reuse.  Replay/date-specific frames must not stay retained.
+    if _TD_CAL_CACHE.get("df_ref") is not _nfl_df:
+        _TD_CAL_CACHE.update({"df_ref": None, "bins": None, "report": None})
+    gc.collect()
 
 def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str) -> Optional[Dict]:
     """Emit the shared NORMALIZED pick-field contract (same keys as the NHL app)
@@ -4061,24 +4115,38 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False,
     _p(
         f"Analyzing all {len(standard_lines)} standard player props plus "
         f"{len(td_starter_lines)} QB/RB/WR/TE Anytime TD candidates…")
+    global _NFL_ANALYSIS_EVENTS
     analysis_cancelled = _bt_th.Event()
+    analysis_started = _bt_th.Event()
+    analysis_finished = _bt_th.Event()
+    _NFL_ANALYSIS_EVENTS = (analysis_started, analysis_finished)
     def _analyze_all_props():
         # Keep the serial order (and therefore TD calibration/cache semantics)
         # while moving the pandas-heavy loop out of the event loop.
         analyzed = []
-        with _NFL_ANALYSIS_LOCK:
-            for pl in all_lines:
-                if analysis_cancelled.is_set():
-                    break
-                analyzer = _analyze_new_prop if system == "NEW" else _analyze_prop
-                result = analyzer(
-                    pl, analysis_df,
-                    pl.get("home_abbr", ""), pl.get("away_abbr", ""))
-                if result:
-                    analyzed.append(result)
-        return analyzed
+        try:
+            analysis_started.set()
+            with _NFL_ANALYSIS_LOCK:
+                for pl in all_lines:
+                    if analysis_cancelled.is_set():
+                        break
+                    analyzer = _analyze_new_prop if system == "NEW" else _analyze_prop
+                    result = analyzer(
+                        pl, analysis_df,
+                        pl.get("home_abbr", ""), pl.get("away_abbr", ""))
+                    if result:
+                        analyzed.append(result)
+            return analyzed
+        finally:
+            # asyncio cancellation cannot stop the worker created by
+            # asyncio.to_thread.  The weekly runner uses this barrier before
+            # permitting the next date, preventing abandoned pandas work from
+            # overlapping the next slate.
+            analysis_finished.set()
     try:
         all_results = await asyncio.to_thread(_analyze_all_props)
+        if _NFL_ANALYSIS_EVENTS == (analysis_started, analysis_finished):
+            _NFL_ANALYSIS_EVENTS = None
     except asyncio.CancelledError:
         # Cancelling to_thread alone does not stop its worker. Release shared
         # analysis resources after the current player instead of processing a
@@ -4778,6 +4846,21 @@ async def api_run(request: Request):
                                         asyncio.shield(task), timeout=_NFL_WEEK_DAY_TIMEOUT)
                                 except asyncio.TimeoutError:
                                     task.cancel()
+                                    # A cancelled to_thread await does not stop
+                                    # its worker.  Do not begin another date
+                                    # until the pandas analysis worker has
+                                    # observed cancellation and released the
+                                    # process-wide analysis lock.
+                                    analysis_events = _NFL_ANALYSIS_EVENTS
+                                    if analysis_events is not None:
+                                        started_event, done_event = analysis_events
+                                        # If cancellation happened before the
+                                        # worker was submitted, there is no
+                                        # abandoned pandas thread to drain.
+                                        if started_event.is_set():
+                                            await asyncio.to_thread(done_event.wait)
+                                            if _NFL_ANALYSIS_EVENTS is analysis_events:
+                                                _NFL_ANALYSIS_EVENTS = None
                                     results[index] = {
                                         "date": ds, "picks": [], "all": [],
                                         "games": [], "game_predictions": [],
@@ -4825,6 +4908,11 @@ async def api_run(request: Request):
                     # process-global, so daily tasks must never overlap.
                     for index, ds in enumerate(dates):
                         await _run_week_date(index, ds)
+                        # Release DataFrame slices and role/defense aggregates
+                        # before retaining the next daily result.  The global
+                        # base nflverse frame and its performance caches stay
+                        # intact.
+                        await asyncio.to_thread(_nfl_clear_slate_caches)
                     merged = _nfl_merge_week_results(date_str, results)
                     failed_dates = merged.get("failed_dates") or []
                     if failed_dates:
