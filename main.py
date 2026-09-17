@@ -2564,14 +2564,18 @@ def _nfl_posdef_profile(df, defense, pos, stat):
         if len(games)<2: _POSDEF_CACHE[key]=out; return out
         eligible=df[df.position.fillna("").astype(str).str.upper().eq(pos)]
         lg=eligible.groupby(["opponent_team","season","week"])[stat].sum()
-        max_season=int(df["season"].max())
-        max_week=int(df.loc[df.season==max_season,"week"].max())
+        max_season=int(df.attrs.get("nfl_target_season", df["season"].max()))
+        current_weeks = df.loc[df.season == max_season, "week"]
+        max_week = int(current_weeks.max()) if not current_weeks.empty else 1
         elapsed=max(1,min(18,max_week))
         if elapsed<=3: prior_w,current_w,recent_w=.65,.25,.10
         elif elapsed<=7: prior_w,current_w,recent_w=.35,.45,.20
         else: prior_w,current_w,recent_w=.15,.55,.30
         cur_games=games[games.index.get_level_values("season")==max_season]
-        prior_games=games[games.index.get_level_values("season")<max_season]
+        # The prior pool is exactly one season, never every season before the
+        # current one.  The caller has already applied the point-in-time
+        # week cutoff and two-season window.
+        prior_games=games[games.index.get_level_values("season")==max_season-1]
         recent_vals=list(games.head(6))
         cur_mean=float(cur_games.mean()) if len(cur_games) else float(games.mean())
         prior_mean=float(prior_games.mean()) if len(prior_games) else cur_mean
@@ -2579,7 +2583,7 @@ def _nfl_posdef_profile(df, defense, pos, stat):
         # League baseline uses same season/week cutoff rather than arbitrary
         # row ordering, with current season preferred when available.
         league_current=lg[lg.index.get_level_values("season")==max_season]
-        league_prior=lg[lg.index.get_level_values("season")<max_season]
+        league_prior=lg[lg.index.get_level_values("season")==max_season-1]
         baseline=float(league_current.mean() if len(league_current) else league_prior.mean()) if len(league_current) or len(league_prior) else float(games.mean())
         # Blend recent form only against current/prior pools, avoiding a second
         # full duplicate current-season weighting when samples overlap.
@@ -3385,6 +3389,44 @@ def _nfl_stats_before_game(df, target_season=None, target_week=None,
     except Exception:
         try:
             return df.iloc[0:0]
+        except Exception:
+            return df
+
+def _nfl_prop_analysis_frame(df, target_season=None, target_week=None,
+                             target_type: str = "REG"):
+    """Return the point-in-time two-season window used by player props.
+
+    The source frame intentionally retains older seasons for Game Predictor
+    H2H/replay support, but player props should not repeatedly scan or blend
+    every season ever downloaded. The selected season and its immediately
+    preceding season are the complete model window.
+    """
+    try:
+        if df is None or "season" not in df.columns:
+            return df
+        if target_season is None:
+            seasons = df["season"].dropna()
+            if seasons.empty:
+                return df
+            target_season = int(seasons.max())
+        point = _nfl_stats_before_game(
+            df, target_season, target_week, target_type)
+        seasons = point["season"].fillna(0).astype(int)
+        out = point[(seasons == int(target_season)) |
+                    (seasons == int(target_season) - 1)].copy()
+        # Keep the target available to helpers when the current season has no
+        # published rows yet (for example, a replay of Week 1).
+        out.attrs["nfl_target_season"] = int(target_season)
+        out.attrs["nfl_target_week"] = int(target_week or 1)
+        return out
+    except Exception as exc:
+        print(f"[NFL Analysis] two-season point-in-time filter failed closed: {exc}")
+        try:
+            empty = df.iloc[0:0].copy()
+            if target_season is not None:
+                empty.attrs["nfl_target_season"] = int(target_season)
+                empty.attrs["nfl_target_week"] = int(target_week or 1)
+            return empty
         except Exception:
             return df
 
@@ -4348,6 +4390,13 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False,
     target_rows = None
     target_teams = {}
     target_positions = {}
+    # Player props use only the selected season and its immediately previous
+    # season.  Keep the complete df for Game Predictor, whose H2H meeting
+    # lookup intentionally spans historical seasons.
+    prop_target = espn_games[0] if espn_games else {}
+    prop_season = prop_target.get("season")
+    prop_week = prop_target.get("week")
+    prop_type = prop_target.get("season_type", "REG")
     if simulate and espn_games:
         tg = espn_games[0]
         ts, tw, tt = tg.get("season"), tg.get("week"), tg.get("season_type", "REG")
@@ -4394,6 +4443,12 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False,
                 return empty, {}, {}, empty
         target_rows, target_teams, target_positions, analysis_df = await asyncio.to_thread(
             _point_in_time_filter)
+    elif espn_games:
+        analysis_df = await asyncio.to_thread(
+            _nfl_prop_analysis_frame, df, prop_season, prop_week, prop_type)
+    if simulate and espn_games:
+        analysis_df = await asyncio.to_thread(
+            _nfl_prop_analysis_frame, analysis_df, prop_season, prop_week, prop_type)
 
     # 5. Analyze every sportsbook-listed active player in standard offense,
     # defense, and kicking markets. Anytime TD is the only exception: reduce its
@@ -9660,7 +9715,7 @@ function openNflLadder(key){
       <div class="lad-stat"><span class="k">Average</span><span class="v gold">${p.avg}</span></div>
       ${(p.defRank!=null&&p.defAdj!=null)?`<div class="lad-stat"><span class="k">Opp Def Rank Factor (#${p.defRank} ${p.defLbl||'D'})</span><span class="v" style="color:${p.defAdj>0?'#4ade80':(p.defAdj<0?'#f87171':'#9ca3af')}">${p.defAdj>0?'+':''}${p.defAdj}% confidence</span></div>`:''}
       ${p.role?`<div class="lad-stat"><span class="k">Role / opportunity</span><span class="v">${_esc(p.role)}${p.teamOptionRank!=null?' · team receiving option #'+p.teamOptionRank:''} (${Math.round(Number(p.roleConfidence||0)*100)}% confidence)</span></div>`:''}
-      ${(p.baseProjection!=null||p.adjustedProjection!=null)?`<div class="lad-stat"><span class="k">Base → adjusted projection</span><span class="v">${p.baseProjection!=null?Number(p.baseProjection).toFixed(1):'—'} → ${p.adjustedProjection!=null?Number(p.adjustedProjection).toFixed(1):'—'}${p.defAllowed!=null?' · '+p.defAllowed+' allowed / '+(p.defSample||0)+' games':''}</span></div>`:''}
+      ${(p.baseProjection!=null||p.adjustedProjection!=null)?`<div class="lad-stat"><span class="k">Base → adjusted projection</span><span class="v">${p.baseProjection!=null?Number(p.baseProjection).toFixed(1):'—'} → ${p.adjustedProjection!=null?Number(p.adjustedProjection).toFixed(1):'—'}${p.defAllowed!=null?' · '+p.defAllowed+' allowed per game · current + last season ('+(p.defSample||0)+' games)':''}</span></div>`:''}
       ${(p.baseProbability!=null||p.adjustedProbability!=null)?`<div class="lad-stat"><span class="k">Base → adjusted probability</span><span class="v">${p.baseProbability!=null?Number(p.baseProbability).toFixed(1):'—'}% → ${p.adjustedProbability!=null?Number(p.adjustedProbability).toFixed(1):'—'}%</span></div>`:''}
       <div class="lad-stat"><span class="k">Score</span><span class="v" style="color:#f59e0b">${p.dispScore}</span></div>
     </div>`;
@@ -9787,21 +9842,20 @@ function _nflGpCard(g,i){
     +'</div>';
 }
 function _nflGpHistoryRow(m,home,away){
-  var winner=m.winner==='TIE'?'TIE':('Winner '+(m.winner||'—'));
+  var winner=m.winner==='TIE'?'TIE':(m.winner||'—');
   var venueSide=(m.home_abbr===home?home+' HOME':home+' AWAY')+' · '+
     (m.home_abbr===away?away+' HOME':away+' AWAY');
   var score=_esc(m.away_abbr)+' '+m.away_score+' — '+_esc(m.home_abbr)+' '+m.home_score;
   var total=(Number(m.home_score)||0)+(Number(m.away_score)||0);
   var type=m.season_type==='POST'?'PLAYOFF':'REG';
-  return '<div style="padding:10px 0;border-top:1px solid #1e293b">'
-    +'<div style="display:flex;justify-content:space-between;gap:8px;align-items:center">'
-    +'<span style="font-size:.72rem;font-weight:900;color:#e2e8f0">'+_esc(m.date_label||'')+'</span>'
-    +'<span style="font-size:.58rem;font-weight:900;color:#a78bfa;letter-spacing:.05em">'+type+'</span></div>'
-    +'<div style="display:flex;justify-content:space-between;gap:8px;margin-top:4px;font-size:.72rem">'
+  return '<div style="padding:13px 0;border-top:1px solid #1e293b">'
+    +'<div style="display:flex;justify-content:space-between;gap:8px;align-items:center;flex-wrap:wrap">'
+    +'<span style="font-size:.72rem;font-weight:900;color:#e2e8f0">'+_esc(m.date_label||m.date||'—')+'</span>'
+    +'<span style="font-size:.58rem;padding:3px 7px;border-radius:5px;background:'+(type==='PLAYOFF'?'rgba(167,139,250,.18)':'rgba(148,163,184,.12)')+';color:'+(type==='PLAYOFF'?'#c4b5fd':'#94a3b8')+';font-weight:900;letter-spacing:.05em">'+type+'</span></div>'
+    +'<div style="display:flex;justify-content:space-between;gap:8px;margin-top:7px;font-size:.76rem;align-items:center">'
     +'<span style="color:#4ade80;font-weight:900">'+_esc(winner)+'</span>'
-    +'<span style="color:#fbbf24;font-weight:900">Total '+total+'</span></div>'
-    +'<div style="margin-top:4px;color:#cbd5e1;font-size:.74rem;font-weight:800">'+score+'</div>'
-    +'<div style="margin-top:3px;color:#94a3b8;font-size:.64rem">'+_esc(venueSide)+' · '+_esc(m.venue||'Stadium unavailable')
+    +'<span style="color:#fbbf24;font-weight:900;font-family:monospace">'+score+' <small style="color:#94a3b8;font-family:inherit">TOTAL '+total+'</small></span></div>'
+    +'<div style="margin-top:5px;color:#94a3b8;font-size:.64rem">'+_esc(venueSide)+' · '+_esc(m.venue||'Stadium unavailable')
     +(m.city_state?' · '+_esc(m.city_state):'')+'</div>'
     +'</div>';
 }
@@ -9827,8 +9881,19 @@ function _nflGpLoadHistory(g){
         box.innerHTML='<div style="color:#64748b">No completed meetings found in the available schedule history.</div>';
         return;
       }
-      box.innerHTML='<div style="font-size:.68rem;color:#c4b5fd;font-weight:900;letter-spacing:.04em;margin-bottom:2px">SHARED DISPLAY-ONLY DATA · LAST '+games.length+' MEETINGS · VENUE &amp; FINAL SCORE</div>'
-        +games.map(function(m){return _nflGpHistoryRow(m,home,away);}).join('');
+       var winsHome=0,winsAway=0,ties=0,totalSum=0,exactVenue=0;
+       games.forEach(function(m){
+         if(m.winner===home)winsHome++; else if(m.winner===away)winsAway++; else ties++;
+         totalSum+=(Number(m.home_score)||0)+(Number(m.away_score)||0);
+         if(m.home_abbr===home)exactVenue++;
+       });
+       var avgTotal=games.length?(totalSum/games.length).toFixed(1):'—';
+       box.innerHTML='<div style="font-size:.68rem;color:#c4b5fd;font-weight:900;letter-spacing:.08em;margin-bottom:10px;text-transform:uppercase">Last '+games.length+' meetings · display only</div>'
+         +'<div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px;margin-bottom:10px">'
+         +'<div style="background:#111827;border:1px solid #243047;border-radius:8px;padding:9px"><div style="font-size:.58rem;color:#64748b;font-weight:800">SERIES WINS</div><div style="margin-top:3px;color:#e2e8f0;font-weight:900">'+_esc(home)+' '+winsHome+' · '+_esc(away)+' '+winsAway+(ties?' · '+ties+' TIE':'')+'</div></div>'
+         +'<div style="background:#111827;border:1px solid #243047;border-radius:8px;padding:9px"><div style="font-size:.58rem;color:#64748b;font-weight:800">AVG COMBINED</div><div style="margin-top:3px;color:#fbbf24;font-weight:900">'+avgTotal+' PTS</div></div>'
+         +'<div style="background:#111827;border:1px solid #243047;border-radius:8px;padding:9px"><div style="font-size:.58rem;color:#64748b;font-weight:800">VENUE SPLIT</div><div style="margin-top:3px;color:#c4b5fd;font-weight:900">'+exactVenue+' EXACT HOME</div></div></div>'
+         +games.map(function(m){return _nflGpHistoryRow(m,home,away);}).join('');
     })
     .catch(function(){
       _nflUntrackController(requestController);
@@ -9846,56 +9911,50 @@ function _openNflGamePred(i){
     document.body.appendChild(ov);
   }
   ov.style.display='flex';
-  function gpBig(abbr,proj,win,isPick,rankOff,rankDef){
-    return '<div style="flex:1;text-align:center;padding:20px;background:'+(isPick?'rgba(74,222,128,.05)':'rgba(255,255,255,.02)')+';border-radius:12px;border:1px solid '+(isPick?'rgba(74,222,128,.3)':'rgba(255,255,255,.05)')+';position:relative;overflow:hidden">'
-      +(isPick?'<div style="position:absolute;top:0;left:0;right:0;height:3px;background:#4ade80"></div>':'')
-      +'<div style="display:flex;justify-content:center;gap:6px;margin-bottom:8px"><span style="font-size:.55rem;padding:2px 6px;border-radius:4px;background:rgba(147,197,253,.1);color:#93c5fd;font-weight:800">OFF #'+(rankOff||'—')+'</span><span style="font-size:.55rem;padding:2px 6px;border-radius:4px;background:rgba(134,239,172,.1);color:#86efac;font-weight:800">DEF #'+(rankDef||'—')+'</span></div>'
-      +'<div style="font-size:1.4rem;font-weight:900;color:'+(isPick?'#fff':'#cbd5e1')+';line-height:1">'+_esc(abbr)+'</div>'
-      +'<div style="font-size:2.5rem;font-weight:900;color:'+(isPick?'#4ade80':'#f1f5f9');+';margin:12px 0;line-height:1;letter-spacing:-.03em">'+_nflGpFix(proj)+'</div>'
-      +'<div style="font-size:.7rem;color:#94a3b8;text-transform:uppercase;letter-spacing:.08em;font-weight:700">Projected</div>'
-      +'<div style="font-size:1.25rem;font-weight:900;color:'+(isPick?'#4ade80':'#94a3b8')+';margin-top:12px">'+win+'% <span style="font-size:.7rem;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:.05em">Win</span></div>'
-      +'</div>';
+  ov.innerHTML='<div style="margin:auto;background:#09090b;border:1px solid #27272a;border-radius:16px;padding:24px;color:#94a3b8;font-size:.85rem;font-weight:700">Loading game breakdown...</div>';
+  try{
+  function val(v,fix){return v==null||v===''?'—':(fix?_nflGpFix(v):_esc(v));}
+  function team(abbr,sp,proj,win,pick,off,def,ml){
+    var c=pick?'#22c55e':'#ef4444',logo='https://a.espncdn.com/i/teamlogos/nfl/500/'+_logoAbbr(abbr)+'.png';
+    return '<div style="min-width:0;flex:1 1 260px;background:linear-gradient(145deg,'+(pick?'rgba(34,197,94,.12)':'rgba(239,68,68,.07)')+',rgba(15,23,42,.45));border:1px solid '+(pick?'rgba(34,197,94,.45)':'rgba(239,68,68,.3)')+';border-radius:14px;padding:16px;box-sizing:border-box">'
+      +'<div style="display:flex;align-items:center;gap:11px"><img src="'+_esc(logo)+'" style="width:42px;height:42px;object-fit:contain" alt="" onerror="this.style.visibility=&#39;hidden&#39;"/><div style="min-width:0"><div style="font-size:1.25rem;font-weight:950;color:#fff">'+_esc(abbr)+'</div><div style="font-size:.65rem;color:#94a3b8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">'+_esc(sp||'Starter unavailable')+'</div></div><span style="margin-left:auto;font-size:.58rem;color:'+c+';font-weight:900">'+(pick?'MODEL WINNER':'CHALLENGER')+'</span></div>'
+      +'<div style="display:flex;gap:6px;margin-top:13px;flex-wrap:wrap"><span style="padding:4px 7px;border-radius:5px;background:#172033;color:#93c5fd;font-size:.6rem;font-weight:800">OFF #'+val(off)+'</span><span style="padding:4px 7px;border-radius:5px;background:#172033;color:#86efac;font-size:.6rem;font-weight:800">DEF #'+val(def)+'</span><span style="padding:4px 7px;border-radius:5px;background:#172033;color:#fbbf24;font-size:.6rem;font-weight:800">ML '+val(ml)+'</span></div>'
+      +'<div style="display:flex;justify-content:space-between;align-items:end;margin-top:16px"><div><div style="font-size:.58rem;color:#64748b;font-weight:800;letter-spacing:.08em">PROJECTED POINTS</div><div style="font-size:2.25rem;line-height:1;color:#fff;font-weight:950">'+val(proj,true)+'</div></div><div style="text-align:right"><div style="font-size:1.3rem;color:'+c+';font-weight:950">'+val(win)+'%</div><div style="font-size:.58rem;color:#94a3b8;font-weight:800">WIN PROBABILITY</div></div></div>'
+      +'<div style="height:8px;border-radius:5px;background:#172033;overflow:hidden;margin-top:12px"><div style="height:100%;width:'+Math.max(0,Math.min(100,Number(win)||0))+'%;background:'+c+';border-radius:5px"></div></div></div>';
   }
-  var totStr=(gp.total_line!=null?('PROJ <span style="color:#fff">'+_nflGpFix(gp.proj_total)+'</span> &middot; BOOK <span style="color:#fff">'+_nflGpFix(gp.total_line)+'</span>'):'PROJ <span style="color:#fff">'+_nflGpFix(gp.proj_total)+'</span> &middot; NO LINE POSTED');
-  var driversHtml=(gp.drivers||[]).map(function(d){return '<li style="position:relative;padding-left:14px;margin-bottom:8px"><span style="position:absolute;left:0;top:7px;width:5px;height:2px;background:#6366f1"></span>'+_esc(d)+'</li>';}).join('');
-  var h2hBlendLine=gp.h2h_games
-    ?(gp.h2h_games+' RECENCY/VENUE-WEIGHTED H2H MEETINGS: '+gp.h2h_weight_pct+'% ADJUSTMENT ('+(gp.h2h_exact_venue_games||0)+' EXACT VENUE, '+(gp.h2h_reversed_venue_games||0)+' REVERSED)')
-    :'NO COMPLETED H2H MEETINGS AVAILABLE &middot; STATS BASELINE USED WITHOUT MATCHUP ADJUSTMENT';
-  var blendHtml='<div style="background:rgba(255,255,255,.02);border:1px solid #1e293b;border-radius:12px;padding:16px;margin-bottom:16px;font-size:.7rem;color:#94a3b8;line-height:1.6">'
-    +'<div style="color:#a78bfa;font-weight:900;font-size:.65rem;letter-spacing:.08em;text-transform:uppercase;margin-bottom:10px;display:flex;align-items:center;gap:6px"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg> Blended Model Inputs</div>'
-    +'<div>RECENT L5 ADJUSTED: <span style="color:#e2e8f0">'+_esc(gp.away_abbr)+' '+_nflGpFix(gp.recent_away)+'</span> &middot; <span style="color:#e2e8f0">'+_esc(gp.home_abbr)+' '+_nflGpFix(gp.recent_home)+'</span></div>'
-    +'<div style="margin-top:4px">'+_esc((gp.reference_season||'Last season').toUpperCase())+' OFFENSE/DEFENSE: <span style="color:#e2e8f0">'+_esc(gp.away_abbr)+' '+_nflGpFix(gp.last_away)+'</span> &middot; <span style="color:#e2e8f0">'+_esc(gp.home_abbr)+' '+_nflGpFix(gp.last_home)+'</span></div>'
-    +'<div style="margin-top:4px">STATS BASELINE (45% L5 / 55% SEASON): <span style="color:#e2e8f0">'+_esc(gp.away_abbr)+' '+_nflGpFix(gp.stat_away)+'</span> &middot; <span style="color:#e2e8f0">'+_esc(gp.home_abbr)+' '+_nflGpFix(gp.stat_home)+'</span></div>'
-    +'<div style="margin-top:4px">VENUE SPLIT: <span style="color:#e2e8f0">'+_esc(gp.away_abbr)+' AWAY OFFENSE '+_nflGpFix(gp.away_venue_off_pts)+'</span> &middot; <span style="color:#e2e8f0">'+_esc(gp.home_abbr)+' HOME OFFENSE '+_nflGpFix(gp.home_venue_off_pts)+'</span></div>'
-    +'<div style="margin-top:4px;color:#a1a1aa">'+h2hBlendLine+'</div>'
-    +(gp.h2h_games?('<div style="margin-top:4px;color:#cbd5e1">VENUE-AWARE H2H SCORING: <span style="color:#fff">'+_esc(gp.home_abbr)+' '+_nflGpFix(gp.h2h_home_avg)+'</span> &middot; <span style="color:#fff">'+_esc(gp.away_abbr)+' '+_nflGpFix(gp.h2h_away_avg)+'</span></div>'):'')
-    +'</div>';
-  
-  var marketEdgeHtml='';
-  if(gp.mkt_edge!=null){
-    var mktSign=(gp.mkt_edge>0?'+':'');
-    var mktColor=(gp.mkt_edge>0?'#4ade80':gp.mkt_edge<0?'#ef4444':'#64748b');
-    var mktBg=(gp.mkt_edge>0?'rgba(74,222,128,.15)':gp.mkt_edge<0?'rgba(239,68,68,.15)':'rgba(255,255,255,.05)');
-    marketEdgeHtml='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;background:#09090b;border:1px solid #27272a;border-radius:12px;padding:16px">'
-      +'<div><div style="font-size:.75rem;font-weight:800;color:#a78bfa;text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px">Model Pick: '+_esc(gp.pick_abbr)+'</div>'
-      +'<div style="color:#94a3b8;font-size:.85rem;font-weight:600">Model <span style="color:#fff;font-weight:800">'+(gp.pick_home?gp.win_home:gp.win_away)+'%</span> &middot; Market <span style="color:#fff;font-weight:800">'+(gp.pick_home?gp.mkt_home_pct:gp.mkt_away_pct)+'%</span></div></div>'
-      +'<div style="background:'+mktBg+';color:'+mktColor+';font-weight:900;font-size:.85rem;border-radius:8px;padding:6px 14px;box-shadow:inset 0 0 0 1px '+mktColor+'33">'+(gp.value_flag?'VALUE ':'EDGE ')+mktSign+gp.mkt_edge+'%</div>'
-      +'</div>';
-  }
-
-  ov.innerHTML='<div style="background:#09090b;border:1px solid #27272a;border-radius:20px;max-width:860px;width:100%;max-height:calc(100vh - 40px);overflow-y:auto;box-sizing:border-box;margin:auto;padding:28px;box-shadow:0 24px 80px rgba(0,0,0,.8);position:relative">'
-    +'<button onclick="document.getElementById(&#39;nfl-gp-modal&#39;).style.display=&#39;none&#39;" style="position:absolute;top:20px;right:20px;width:32px;height:32px;border-radius:16px;background:rgba(255,255,255,.05);border:none;color:#a1a1aa;font-size:1.1rem;display:flex;align-items:center;justify-content:center;cursor:pointer;transition:background .2s,color .2s" onmouseover="this.style.background=&#39;rgba(255,255,255,.1)&#39;;this.style.color=&#39;#fff&#39;" onmouseout="this.style.background=&#39;rgba(255,255,255,.05)&#39;;this.style.color=&#39;#a1a1aa&#39;">&#10005;</button>'
-    +'<div style="font-size:1.2rem;font-weight:900;color:#fff;letter-spacing:-.02em;margin-bottom:8px">'+_esc(gp.away_abbr)+' @ '+_esc(gp.home_abbr)+'</div>'
-    +'<div style="font-size:.7rem;color:#64748b;margin-bottom:20px;font-weight:600;line-height:1.4;max-width:90%">Winner and total blend recent form, last-season offense/defense, venue-aware H2H history, and home-field advantage</div>'
-    +'<div style="display:flex;gap:16px;margin-bottom:20px">'+gpBig(gp.away_abbr,gp.proj_away,gp.win_away,!gp.pick_home,gp.away_off_rank,gp.away_def_rank)+gpBig(gp.home_abbr,gp.proj_home,gp.win_home,gp.pick_home,gp.home_off_rank,gp.home_def_rank)+'</div>'
-    +'<div style="margin-bottom:20px;color:#94a3b8;font-size:.75rem;font-weight:700;text-align:center;background:rgba(255,255,255,.03);padding:10px;border-radius:8px">'+totStr+'</div>'
-    +blendHtml
-    +marketEdgeHtml
-    +'<div style="background:#09090b;border:1px solid #27272a;border-radius:12px;padding:20px;font-size:.75rem;color:#cbd5e1"><div style="color:#818cf8;font-weight:900;text-transform:uppercase;letter-spacing:.05em;margin-bottom:12px;display:flex;align-items:center;gap:6px"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M12 2v20M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg> Why This Pick</div><ul style="margin:0;padding:0;list-style:none;line-height:1.6">'+driversHtml+'</ul></div>'
-    +'<div id="nfl-gp-history" style="background:rgba(255,255,255,.02);border:1px solid #1e293b;border-radius:12px;padding:16px;margin-top:16px;font-size:.75rem;color:#94a3b8"><div style="color:#64748b;text-align:center;font-weight:600">Loading last 5 meetings…</div></div>'
-    +'<div style="color:#475569;font-size:.65rem;margin-top:20px;text-align:center;text-transform:uppercase;letter-spacing:.05em;font-weight:700">Display only &middot; Not tracked &middot; Blended matchup projection</div>'
-    +'</div>';
+  var pick=_esc(gp.pick_abbr||'—'), modelWin=gp.pick_home?gp.win_home:gp.win_away;
+  var totalLine=gp.total_line!=null?_nflGpFix(gp.total_line):'—',projTotal=val(gp.proj_total,true);
+  var totalCall=gp.total_pick?gp.total_pick+' '+totalLine:'No total call';
+  var totalEdge=gp.total_edge!=null?((gp.total_edge>0?'+':'')+_nflGpFix(gp.total_edge)+' pts'):'—';
+  var market=gp.mkt_edge!=null?((gp.mkt_edge>0?'+':'')+gp.mkt_edge+'% '+(gp.value_flag?'value':'edge')):'No market edge';
+  var marketColor=gp.mkt_edge>0?'#4ade80':gp.mkt_edge<0?'#f87171':'#94a3b8';
+  var tile=function(label,a,b){return '<div style="background:#111827;border:1px solid #243047;border-radius:9px;padding:11px;min-width:0"><div style="font-size:.57rem;color:#64748b;font-weight:900;letter-spacing:.07em;text-transform:uppercase">'+label+'</div><div style="margin-top:5px;color:#e2e8f0;font-size:.72rem;font-weight:800;line-height:1.5">'+a+' <span style="color:#64748b">·</span> '+b+'</div></div>';};
+  var inputs=tile('Recent L5 adjusted',_esc(gp.away_abbr)+' '+val(gp.recent_away,true),_esc(gp.home_abbr)+' '+val(gp.recent_home,true))
+    +tile('Last-season anchor',_esc(String(gp.reference_season||'Last season').toUpperCase()),_esc(gp.away_abbr)+' '+val(gp.last_away,true)+' · '+_esc(gp.home_abbr)+' '+val(gp.last_home,true))
+    +tile('Blended stats baseline','45% L5 / 55% season',_esc(gp.away_abbr)+' '+val(gp.stat_away,true)+' · '+_esc(gp.home_abbr)+' '+val(gp.stat_home,true))
+    +tile('Exact venue split',_esc(gp.away_abbr)+' AWAY '+val(gp.away_venue_off_pts,true),_esc(gp.home_abbr)+' HOME '+val(gp.home_venue_off_pts,true))
+    +tile('H2H blend',val(gp.h2h_weight_pct,true)+'% adjustment',val(gp.h2h_exact_venue_games)+' exact · '+val(gp.h2h_reversed_venue_games)+' reversed');
+  var drivers=(gp.drivers||[]).map(function(d){return '<li style="display:flex;gap:9px;align-items:flex-start;margin:0 0 9px;color:#cbd5e1"><span style="width:6px;height:6px;border-radius:50%;background:#818cf8;margin-top:6px;flex:none"></span><span>'+_esc(d)+'</span></li>';}).join('');
+  if(!drivers)drivers='<li style="color:#64748b;list-style:none">No model drivers were supplied.</li>';
+  var marketBlock=gp.mkt_edge!=null?'<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:8px">'+tile('Model probability',val(modelWin)+'%','on '+pick)+tile('No-vig market',val(gp.pick_home?gp.mkt_home_pct:gp.mkt_away_pct)+'%','derived from book')+tile('Moneyline',val(gp.pick_home?gp.home_ml_odds:gp.away_ml_odds),_esc(gp.pick_home?gp.home_ml_book:gp.away_ml_book))+ '</div>':'<div style="color:#64748b;font-size:.75rem">No moneyline market data was supplied for this game.</div>';
+  ov.innerHTML='<div style="background:#080b12;border:1px solid #26334a;border-radius:20px;max-width:920px;width:100%;max-height:calc(100vh - 28px);overflow-y:auto;overflow-x:hidden;box-sizing:border-box;margin:auto;padding:clamp(16px,3vw,28px);box-shadow:0 28px 100px rgba(0,0,0,.85);position:relative">'
+    +'<button onclick="document.getElementById(&#39;nfl-gp-modal&#39;).style.display=&#39;none&#39;" aria-label="Close" style="position:absolute;top:18px;right:18px;width:34px;height:34px;border-radius:9px;background:#172033;border:1px solid #334155;color:#cbd5e1;font-size:1.1rem;cursor:pointer">X</button>'
+    +'<div style="font-size:.6rem;color:#818cf8;font-weight:900;letter-spacing:.14em">MONEY PICKS ARENA · NFL GAME PREDICTOR</div><div style="display:flex;align-items:start;gap:12px;margin-top:8px;padding-right:42px"><div style="min-width:0"><div style="font-size:clamp(1.5rem,4vw,2.2rem);font-weight:950;color:#fff;letter-spacing:-.04em">'+_esc(gp.away_abbr)+' <span style="color:#64748b">@</span> '+_esc(gp.home_abbr)+'</div><div style="font-size:.72rem;color:#94a3b8;margin-top:5px">'+_esc(gp.slate_date||'Date unavailable')+' · Blended matchup model</div></div><div style="margin-left:auto;white-space:nowrap;background:rgba(34,197,94,.14);border:1px solid rgba(34,197,94,.4);color:#4ade80;border-radius:8px;padding:7px 10px;font-size:.65rem;font-weight:900">'+(gp.value_flag?'VALUE ':'PICK ') +pick+'</div></div>'
+    +'<div style="margin-top:20px;display:flex;flex-wrap:wrap;gap:12px">'+team(gp.away_abbr,gp.away_sp,gp.proj_away,gp.win_away,!gp.pick_home,gp.away_off_rank,gp.away_def_rank,gp.away_ml_odds)+team(gp.home_abbr,gp.home_sp,gp.proj_home,gp.win_home,gp.pick_home,gp.home_off_rank,gp.home_def_rank,gp.home_ml_odds)+'</div>'
+    +'<div style="margin-top:14px;background:linear-gradient(90deg,rgba(129,140,248,.16),rgba(34,197,94,.1));border:1px solid #334155;border-radius:12px;padding:15px"><div style="font-size:.58rem;color:#a5b4fc;font-weight:900;letter-spacing:.1em">MODEL VERDICT</div><div style="display:flex;flex-wrap:wrap;gap:18px;align-items:end;margin-top:7px"><div><div style="font-size:.62rem;color:#94a3b8">PROJECTED FINAL</div><strong style="font-size:1.5rem;color:#fff">'+_esc(gp.away_abbr)+' '+val(gp.proj_away,true)+' — '+_esc(gp.home_abbr)+' '+val(gp.proj_home,true)+'</strong></div><div><div style="font-size:.62rem;color:#94a3b8">WINNER</div><strong style="font-size:1.15rem;color:#4ade80">'+pick+' · '+val(modelWin)+'%</strong></div><div><div style="font-size:.62rem;color:#94a3b8">TOTAL</div><strong style="font-size:1.05rem;color:#fbbf24">'+totalCall+' · '+totalEdge+'</strong><div style="font-size:.62rem;color:#94a3b8">Model '+projTotal+' vs book '+totalLine+'</div></div></div></div>'
+    +'<section style="margin-top:18px"><div style="font-size:.62rem;color:#a78bfa;font-weight:900;letter-spacing:.12em;margin-bottom:9px">MARKET VALUE</div>'+marketBlock+'<div style="margin-top:10px;color:'+marketColor+';font-weight:900;font-size:.82rem">'+market+'</div></section>'
+    +'<section style="margin-top:18px"><div style="font-size:.62rem;color:#a78bfa;font-weight:900;letter-spacing:.12em;margin-bottom:9px">MODEL INPUTS</div><div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:8px">'+inputs+'</div></section>'
+    +'<section style="margin-top:18px;background:#0d1422;border:1px solid #1e2b40;border-radius:12px;padding:15px"><div style="font-size:.62rem;color:#a78bfa;font-weight:900;letter-spacing:.12em;margin-bottom:11px">WHY THIS PICK</div><ul style="padding:0;margin:0;list-style:none">'+drivers+'</ul></section>'
+    +'<div id="nfl-gp-history" style="margin-top:18px;background:#0d1422;border:1px solid #1e2b40;border-radius:12px;padding:15px;font-size:.75rem;color:#94a3b8"><div style="color:#64748b;text-align:center;font-weight:700">Loading last five meetings...</div></div>'
+    +'<div style="color:#475569;font-size:.6rem;margin-top:16px;text-align:center;text-transform:uppercase;letter-spacing:.08em;font-weight:800">Display only · Not tracked · No additional sportsbook requests</div></div>';
   _nflGpLoadHistory(gp);
+  }catch(err){
+    console.error('Game Predictor breakdown failed',err);
+    ov.innerHTML='<div style="margin:auto;background:#09090b;border:1px solid #ef4444;border-radius:16px;max-width:520px;padding:24px;color:#e2e8f0">'
+      +'<div style="font-weight:900;color:#f87171;margin-bottom:8px">Game breakdown could not open</div>'
+      +'<div style="font-size:.82rem;color:#94a3b8">Close this window and try the card again.</div>'
+      +'<button onclick="document.getElementById(&#39;nfl-gp-modal&#39;).style.display=&#39;none&#39;" style="margin-top:16px;background:#1e293b;border:0;border-radius:8px;padding:9px 14px;color:#fff;font-weight:800;cursor:pointer">Close</button></div>';
+  }
 }
 function _nflGpBetForm(key){
   var src=(window.__NFL_GP_BET__||{})[key]; if(!src) return;
