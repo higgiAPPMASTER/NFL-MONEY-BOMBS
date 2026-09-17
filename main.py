@@ -534,12 +534,10 @@ _HA_LOOKUP: dict = {}
 _HA_LOADED = False
 _HA_LOCK   = asyncio.Lock()
 
-_HA_CACHE_FILE = _CACHE_DIR / "nfl_ha_lookup_v4.json"  # v4: ESPN historical seasons use dates=YYYY
+_HA_CACHE_FILE = _CACHE_DIR / "nfl_ha_lookup_v5_nflverse.json"
 
 async def _build_ha_lookup():
-    """Build home/away lookup from ESPN historical schedules (REG + POST).
-    Result is persisted to disk so subsequent requests within the same dyno instance
-    skip the 90-request ESPN fetch entirely."""
+    """Build HOME/AWAY lookup from the single cached nflverse schedule file."""
     global _HA_LOOKUP, _HA_LOADED
     async with _HA_LOCK:
         if _HA_LOADED:
@@ -558,45 +556,11 @@ async def _build_ha_lookup():
         except Exception as e:
             print(f"[H/A] Disk cache load failed: {e}")
 
-        print("[H/A] Building home/away lookup from ESPN schedules (90 requests)…")
-        sem = asyncio.Semaphore(15)
-        async def fetch_week(season, season_type, week):
-            async with sem:
-                try:
-                    async with httpx.AsyncClient(timeout=8) as c:
-                        r = await c.get(
-                            "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard",
-                            # ESPN's scoreboard history selects the season with
-                            # dates=YYYY. The season= parameter is ignored and
-                            # silently returns another season's matching week.
-                            params={"seasontype":season_type,"week":week,"dates":season})
-                        for ev in r.json().get("events",[]):
-                            comp = ev.get("competitions",[{}])[0]
-                            for t in comp.get("competitors",[]):
-                                abbr = t["team"].get("abbreviation","")
-                                ha   = "HOME" if t["homeAway"]=="home" else "AWAY"
-                                if abbr:
-                                    _HA_LOOKUP[(season, "POST" if season_type == 3 else "REG",
-                                                 week, abbr)] = ha
-                except Exception:
-                    pass
-        pairs = ([(s, 2, w) for s in NFL_SEASONS for w in range(1, 19)] +
-                 [(s, 3, w) for s in NFL_SEASONS for w in range(1, 6)])
-        await asyncio.gather(*[fetch_week(s, season_type, w)
-                               for s, season_type, w in pairs])
-        # Render can rate-limit or reject the large ESPN week fan-out. The old
-        # implementation swallowed every request failure and then marked an
-        # empty map as loaded, which erased historical HOME/AWAY labels and
-        # forced every venue-defense adjustment neutral. Merge the nflverse
-        # schedule (one request) as an authoritative fallback for the same
-        # season/week/team identities.
+        print("[H/A] Building HOME/AWAY lookup from nflverse games.csv…")
         try:
-            async with httpx.AsyncClient(timeout=45, follow_redirects=True) as c:
-                games_response = await c.get(_NFL_GAMES_HISTORY_URL)
-                games_response.raise_for_status()
-            added = 0
+            schedule_rows = await _load_nfl_games_history()
             valid_post_types = {"WC", "DIV", "CON", "SB", "POST"}
-            for game_row in csv.DictReader(io.StringIO(games_response.text)):
+            for game_row in schedule_rows:
                 try:
                     season = int(game_row.get("season") or 0)
                     raw_week = int(game_row.get("week") or 0)
@@ -618,15 +582,13 @@ async def _build_ha_lookup():
                     team = _NFLVERSE_TO_ESPN.get(team, team)
                     if not team:
                         continue
-                    key = (season, season_type, lookup_week, team)
-                    if key not in _HA_LOOKUP:
-                        added += 1
-                    _HA_LOOKUP[key] = venue
-            print(f"[H/A] nflverse schedule merged: {added} fallback entries")
+                    _HA_LOOKUP[(season, season_type, lookup_week, team)] = venue
         except Exception as exc:
-            print(f"[H/A] nflverse schedule fallback failed: {exc}")
-        _HA_LOADED = True
+            print(f"[H/A] nflverse schedule lookup failed: {exc}")
+        _HA_LOADED = bool(_HA_LOOKUP)
         print(f"[H/A] Built lookup: {len(_HA_LOOKUP)} entries")
+        if not _HA_LOADED:
+            return
         # Persist to disk so the next request skips this step
         try:
             serializable = {f"{s}|{st}|{w}|{a}": v
@@ -637,7 +599,7 @@ async def _build_ha_lookup():
             print(f"[H/A] Disk cache save failed: {e}")
 
 async def _nfl_gp_ensure_ha(timeout: float = 18.0) -> bool:
-    """Ensure the shared ESPN venue map is ready without duplicate builds."""
+    """Ensure the shared nflverse venue map is ready without duplicate builds."""
     if _HA_LOADED:
         return True
     try:
@@ -3760,7 +3722,7 @@ def _nfl_enrich_cached_result(result, df=None, target_season=None,
     return out
 
 async def _nfl_enrich_cached_response(result, date_str, system="OLD"):
-    """Load only the shared inputs needed to enrich an old saved board."""
+    """Enrich an old saved board without calling ESPN."""
     if not isinstance(result, dict) or result.get("_nflVenueEnrichedV2"):
         return result
     board_stamps = [
@@ -3777,11 +3739,22 @@ async def _nfl_enrich_cached_response(result, date_str, system="OLD"):
     try:
         await _build_ha_lookup()
         df = await get_nfl_stats()
-        games = await get_espn_games(date_str)
-        game = games[0] if games else {}
+        schedule_rows = await _load_nfl_games_history()
+        game_row = next(
+            (row for row in schedule_rows
+             if str(row.get("gameday") or "") == str(date_str)),
+            {})
+        game_type = str(game_row.get("game_type") or "REG").upper()
+        target_type = "REG" if game_type == "REG" else "POST"
+        target_week = game_row.get("week")
+        if target_type == "POST":
+            try:
+                target_week = _espn_ha_week("POST", int(target_week))
+            except (TypeError, ValueError):
+                pass
         enriched = await asyncio.to_thread(
             _nfl_enrich_cached_result, result, df,
-            game.get("season"), game.get("week"), game.get("season_type", "REG"),
+            game_row.get("season"), target_week, target_type,
             system)
     except Exception as exc:
         print(f"[NFL cache enrichment] failed closed: {exc}")
