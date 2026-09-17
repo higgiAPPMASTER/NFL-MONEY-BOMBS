@@ -534,7 +534,7 @@ _HA_LOOKUP: dict = {}
 _HA_LOADED = False
 _HA_LOCK   = asyncio.Lock()
 
-_HA_CACHE_FILE = _CACHE_DIR / "nfl_ha_lookup_v3.json"  # v3: five-season window + postseason
+_HA_CACHE_FILE = _CACHE_DIR / "nfl_ha_lookup_v4.json"  # v4: ESPN historical seasons use dates=YYYY
 
 async def _build_ha_lookup():
     """Build home/away lookup from ESPN historical schedules (REG + POST).
@@ -564,7 +564,10 @@ async def _build_ha_lookup():
                     async with httpx.AsyncClient(timeout=8) as c:
                         r = await c.get(
                             "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard",
-                            params={"seasontype":season_type,"week":week,"season":season})
+                            # ESPN's scoreboard history selects the season with
+                            # dates=YYYY. The season= parameter is ignored and
+                            # silently returns another season's matching week.
+                            params={"seasontype":season_type,"week":week,"dates":season})
                         for ev in r.json().get("events",[]):
                             comp = ev.get("competitions",[{}])[0]
                             for t in comp.get("competitors",[]):
@@ -2769,6 +2772,16 @@ def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str,
     hits_a  = sum(1 for v in vs_vals if v > line)
     tot_a   = len(vs_vals)
     rate_a  = round(hits_a/tot_a*100, 1) if tot_a >= 1 else None
+    opp_under_hits = sum(1 for v in vs_vals if v < line)
+    history_lock = None
+    if market != "player_anytime_td" and tot_a >= 2:
+        if hits_a == tot_a:
+            history_lock = "OVER"
+        elif opp_under_hits == tot_a:
+            history_lock = "UNDER"
+    history_lock_reason = (
+        f"Opponent history {tot_a}/{tot_a} {history_lock} today's line sets the pick side"
+        if history_lock else "")
 
     # Last 10 H/A games (any opponent)
     if is_home is not None and _HA_LOADED:
@@ -2829,6 +2842,11 @@ def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str,
     # (a multi-TD game must not distort side eligibility).
     if market == "player_anytime_td" and tot_b:
         pick = "OVER"
+    elif history_lock:
+        # A perfect record in at least two completed meetings against today's
+        # opponent takes precedence over generic venue form. The restrained
+        # defense adjustment still changes projection/confidence, not this side.
+        pick = history_lock
 
     # Side-aware stats: on an UNDER card every rate + the score describe the
     # UNDER side (times the player stayed BELOW the line). A green 100% must
@@ -2974,6 +2992,8 @@ def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str,
         "combinedFactor": combined_factor, "baseProjection": ref_avg,
         "baseProbability": base_score, "adjustedProjection": adj_avg,
         "adjustedProbability": score,
+        "historyLock": history_lock,
+        "historyLockReason": history_lock_reason,
         "baseProjAvg": base_proj_avg, "injuryAdj": injury_adj,
         "injuryOpportunityFactor": injury_factor,
         "injuryOpportunityReasons": pl.get("injury_opportunity_reasons") or [],
@@ -3196,6 +3216,17 @@ def _analyze_new_prop_raw(pl: Dict, df, home_abbr: str, away_abbr: str,
     opp_rows = opp_rows.sort_values(["season", "week"], ascending=False)
     opp_values = _new_numeric_values(opp_rows, stat_col)
     opp_mean = _new_weighted_mean(opp_values)
+    opp_over_hits = sum(1 for value in opp_values if value > line)
+    opp_under_hits = sum(1 for value in opp_values if value < line)
+    history_lock = None
+    if market != "player_anytime_td" and len(opp_values) >= 2:
+        if opp_over_hits == len(opp_values):
+            history_lock = "OVER"
+        elif opp_under_hits == len(opp_values):
+            history_lock = "UNDER"
+    history_lock_reason = (
+        f"Opponent history {len(opp_values)}/{len(opp_values)} {history_lock} today's line sets the pick side"
+        if history_lock else "")
 
     role = _nfl_role_profile(df, team, position, name, stat_col)
     posdef = _nfl_posdef_profile(df, opp, position, stat_col)
@@ -3275,6 +3306,12 @@ def _analyze_new_prop_raw(pl: Dict, df, home_abbr: str, away_abbr: str,
             pick, side_rate = "OVER", over_rate
         elif gap <= -_new_market_gap(market, line) and (under_rate or 0) >= 55:
             pick, side_rate = "UNDER", under_rate
+        if history_lock:
+            pick = history_lock
+            recent_side_rate = over_rate if history_lock == "OVER" else under_rate
+            side_rate = round(
+                (100.0 + recent_side_rate) / 2.0, 1
+            ) if recent_side_rate is not None else 100.0
     # A confirmed absence is not an Under signal. Suppress the card rather than
     # letting zero participation or a stale historical rate create certainty.
     if injury_status in {"OUT", "DOUBTFUL"} and participation_probability <= 0.25:
@@ -3396,6 +3433,8 @@ def _analyze_new_prop_raw(pl: Dict, df, home_abbr: str, away_abbr: str,
         "combinedFactor": combined_factor, "baseProjection": evidence,
         "baseProbability": side_rate, "adjustedProjection": projection,
         "adjustedProbability": score,
+        "historyLock": history_lock,
+        "historyLockReason": history_lock_reason,
         "projAvg": projection, "baseProjAvg": evidence, "injuryAdj": injury_adj,
         "injuryOpportunityFactor": injury_opportunity_factor,
         "injuryOpportunityReasons": pl.get("injury_opportunity_reasons") or [],
@@ -9800,12 +9839,16 @@ function openNflLadder(key){
   var parlayWhy=p.parlayWhy
     ?'<div style="background:rgba(59,130,246,.08);border:1px solid rgba(59,130,246,.25);border-radius:10px;padding:10px 11px;margin:8px 0 13px;color:#cbd5e1;font-size:.77rem;line-height:1.5"><b style="color:#7dd3fc">Why this parlay leg:</b> '+_esc(p.parlayWhy)+'</div>'
     :'';
+  var historyRule=p.historyLockReason
+    ?'<div style="background:rgba(245,158,11,.10);border:1px solid rgba(245,158,11,.34);border-radius:10px;padding:9px 11px;margin:8px 0 12px;color:#fde68a;font-size:.72rem;line-height:1.45"><b>Pick-side rule:</b> '+_esc(p.historyLockReason)+'. The small defense adjustment cannot reverse this side.</div>'
+    :'';
   var html=`
     <div class="lad-modal" onclick="event.stopPropagation()">
       <button class="lad-close" onclick="closeNflLadder()">✕</button>
       <h3>${p.name}</h3>
       <div class="lad-sub">${p.mkt} · ${p.team} vs ${p.opponent} · Line ${p.dispLine} · ${p.pick||''} · ${_esc(_nflSideBook(p))}</div>
       ${parlayWhy}
+      ${historyRule}
       <div style="font-size:.7rem;color:#6b7280;text-transform:uppercase;letter-spacing:.08em;font-weight:700;margin-bottom:4px">Recent Games (green = ${p.pick==='UNDER'?'under':'over'} line)</div>
       <div class="lad-glog">${chips}</div>
       ${voHtml}
