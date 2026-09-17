@@ -550,9 +550,11 @@ async def _build_ha_lookup():
                 raw = json.loads(_HA_CACHE_FILE.read_text(encoding="utf-8"))
                 _HA_LOOKUP = {tuple(int(x) if x.isdigit() else x for x in k.split("|")): v
                               for k, v in raw.items()}
-                _HA_LOADED = True
-                print(f"[H/A] Loaded from disk cache: {len(_HA_LOOKUP)} entries")
-                return
+                if _HA_LOOKUP:
+                    _HA_LOADED = True
+                    print(f"[H/A] Loaded from disk cache: {len(_HA_LOOKUP)} entries")
+                    return
+                print("[H/A] Ignoring empty disk cache")
         except Exception as e:
             print(f"[H/A] Disk cache load failed: {e}")
 
@@ -582,6 +584,47 @@ async def _build_ha_lookup():
                  [(s, 3, w) for s in NFL_SEASONS for w in range(1, 6)])
         await asyncio.gather(*[fetch_week(s, season_type, w)
                                for s, season_type, w in pairs])
+        # Render can rate-limit or reject the large ESPN week fan-out. The old
+        # implementation swallowed every request failure and then marked an
+        # empty map as loaded, which erased historical HOME/AWAY labels and
+        # forced every venue-defense adjustment neutral. Merge the nflverse
+        # schedule (one request) as an authoritative fallback for the same
+        # season/week/team identities.
+        try:
+            async with httpx.AsyncClient(timeout=45, follow_redirects=True) as c:
+                games_response = await c.get(_NFL_GAMES_HISTORY_URL)
+                games_response.raise_for_status()
+            added = 0
+            valid_post_types = {"WC", "DIV", "CON", "SB", "POST"}
+            for game_row in csv.DictReader(io.StringIO(games_response.text)):
+                try:
+                    season = int(game_row.get("season") or 0)
+                    raw_week = int(game_row.get("week") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if season not in NFL_SEASONS or raw_week < 1:
+                    continue
+                game_type = str(game_row.get("game_type") or "REG").upper()
+                if game_type == "REG":
+                    season_type, lookup_week = "REG", raw_week
+                elif game_type in valid_post_types:
+                    season_type = "POST"
+                    lookup_week = _espn_ha_week("POST", raw_week)
+                else:
+                    continue
+                for column, venue in (("home_team", "HOME"),
+                                      ("away_team", "AWAY")):
+                    team = str(game_row.get(column) or "").strip().upper()
+                    team = _NFLVERSE_TO_ESPN.get(team, team)
+                    if not team:
+                        continue
+                    key = (season, season_type, lookup_week, team)
+                    if key not in _HA_LOOKUP:
+                        added += 1
+                    _HA_LOOKUP[key] = venue
+            print(f"[H/A] nflverse schedule merged: {added} fallback entries")
+        except Exception as exc:
+            print(f"[H/A] nflverse schedule fallback failed: {exc}")
         _HA_LOADED = True
         print(f"[H/A] Built lookup: {len(_HA_LOOKUP)} entries")
         # Persist to disk so the next request skips this step
