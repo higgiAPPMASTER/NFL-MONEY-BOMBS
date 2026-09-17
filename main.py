@@ -163,6 +163,16 @@ _NFL_ALT_LOAD_STAGE_TIMEOUT = 180
 _NFL_ALT_ANALYSIS_STAGE_TIMEOUT = 180
 _NFL_ALT_OVERALL_TIMEOUT = 300
 _NFL_ALT_MIN_ODDS = -1000
+
+def _nfl_alt_fetch_deadline(game_count):
+    """Allow every game a bounded number of semaphore waves, not a fixed
+    deadline that expires halfway through a full Sunday slate."""
+    waves = max(1, math.ceil(max(0, int(game_count)) /
+                             max(1, _NFL_ALT_FETCH_CONCURRENCY)))
+    setup_margin = 15
+    return min(_NFL_ALT_OVERALL_TIMEOUT,
+               max(_NFL_ALT_FETCH_STAGE_TIMEOUT,
+                   setup_margin + waves * _NFL_ALT_GAME_TIMEOUT + 5))
 _BOOK_LABEL = {"bet99":"Bet99","thescore":"theScore","bet365":"Bet365","draftkings":"DK",
                "fanduel":"FanDuel","betmgm":"BetMGM","caesars":"Caesars",
                "williamhill_us":"Caesars","betrivers":"BetRivers","ballybet":"Bally Bet",
@@ -408,9 +418,11 @@ def _alt_coach_raw_cache_get(date_key, allow_stale=False):
 
 def _alt_coach_raw_cache_set(date_key, events):
     try:
-        (_CACHE_DIR / f"nfl_alt_raw_v1_{date_key}.json").write_text(
-            json.dumps({"events": events, "saved_at": datetime.now(
-                timezone.utc).isoformat()}, ensure_ascii=False), encoding="utf-8")
+        target = _CACHE_DIR / f"nfl_alt_raw_v1_{date_key}.json"
+        temp = target.with_suffix(".tmp")
+        temp.write_text(json.dumps({"events": events, "saved_at": datetime.now(
+            timezone.utc).isoformat()}, ensure_ascii=False), encoding="utf-8")
+        temp.replace(target)
     except Exception as e:
         print(f"[AltCoachRawCache] write error: {e}")
 
@@ -499,7 +511,7 @@ def _schedule_alt_coach_warm(date_str: str) -> None:
 # ── nfl_data_py stats loader ───────────────────────────────────────────────────
 _nfl_df = None
 _nfl_df_lock = asyncio.Lock()
-_NFL_PKL      = _CACHE_DIR / "nfl_df_cache_v6.pkl"  # v6: five completed seasons + REG/POST
+_NFL_PKL      = _CACHE_DIR / "nfl_df_cache_v7.pkl"  # v7: validated role-aware schema
 
 # nfl-verse team codes that differ from ESPN's (ESPN is what the schedule,
 # H/A lookup and card display all use). Normalized ONCE at data load so every
@@ -508,6 +520,12 @@ _NFL_PKL      = _CACHE_DIR / "nfl_df_cache_v6.pkl"  # v6: five completed seasons
 # evicted by mislabeled players) and their vs-opponent history comes up empty.
 _NFLVERSE_TO_ESPN = {"LA": "LAR", "WAS": "WSH"}
 _NFL_PKL_TTL  = 20 * 3600  # 20h — refresh once a day
+
+def _nfl_cache_valid(frame):
+    required = {"player_display_name", "recent_team", "opponent_team",
+                "season", "week", "position"}
+    return (frame is not None and hasattr(frame, "columns")
+            and required.issubset(set(frame.columns)) and len(frame) > 0)
 
 # ── ESPN H/A Lookup — (season, week, team_abbr) → 'HOME' or 'AWAY' ───────────
 _HA_LOOKUP: dict = {}
@@ -626,6 +644,11 @@ def _load_nfl_stats_sync():
         if _NFL_PKL.exists() and (time.time() - _NFL_PKL.stat().st_mtime) < _NFL_PKL_TTL:
             import pickle
             _nfl_df = pickle.loads(_NFL_PKL.read_bytes())
+            if not _nfl_cache_valid(_nfl_df):
+                print("[NFL Data] Disk cache schema invalid; rebuilding")
+                _NFL_PKL.unlink(missing_ok=True)
+                _nfl_df = None
+                raise ValueError("invalid NFL cache schema")
             if ("rush_rec_yards" not in _nfl_df.columns
                     and {"rushing_yards", "receiving_yards"}.issubset(_nfl_df.columns)):
                 _nfl_df["rush_rec_yards"] = (
@@ -1768,9 +1791,51 @@ async def get_prop_lines(event_id: str, date_str: str,
                 base = f"{ODDS_BASE}/sports/americanfootball_nfl/events/{event_id}/odds"
                 params = {"apiKey": ODDS_API_KEY, "bookmakers": ODDS_BOOKMAKERS,
                          "markets": ",".join(requested_markets), "oddsFormat": "american"}
-            r = await c.get(base, params=params)
-            if not r.is_success:
-                print(f"[OddsAPI props] {event_id} HTTP {r.status_code}")
+            r = None
+            for attempt in range(3):
+                try:
+                    r = await c.get(base, params=params)
+                except (httpx.TimeoutException, httpx.NetworkError) as exc:
+                    if attempt >= 2:
+                        print(f"[OddsAPI props] {event_id} request failed: {exc}")
+                        return []
+                    await asyncio.sleep((attempt + 1) * .75)
+                    continue
+                if r.status_code in (401, 403):
+                    print(f"[OddsAPI props] {event_id} permanent HTTP {r.status_code}")
+                    return []
+                if r.status_code == 429 or 500 <= r.status_code < 600:
+                    if attempt >= 2:
+                        print(f"[OddsAPI props] {event_id} HTTP {r.status_code}")
+                        return []
+                    retry_after = 0
+                    try:
+                        retry_after = min(4.0, max(0.0, float(
+                            r.headers.get("Retry-After", "0"))))
+                    except (TypeError, ValueError):
+                        pass
+                    await asyncio.sleep(retry_after or (attempt + 1) * .75)
+                    continue
+                if not r.is_success:
+                    print(f"[OddsAPI props] {event_id} HTTP {r.status_code}")
+                    return []
+                try:
+                    probe = r.json()
+                    probe_data = (probe.get("data", probe)
+                                  if isinstance(probe, dict) and "data" in probe
+                                  else probe)
+                    if (isinstance(probe_data, dict)
+                            and isinstance(probe_data.get("bookmakers"), list)):
+                        if probe_data.get("bookmakers") or attempt >= 2:
+                            break
+                        await asyncio.sleep((attempt + 1) * .75)
+                        continue
+                except (ValueError, TypeError):
+                    pass
+                if attempt < 2:
+                    await asyncio.sleep((attempt + 1) * .75)
+                    continue
+                print(f"[OddsAPI props] {event_id} invalid response schema")
                 return []
             raw  = r.json()
             data = raw.get("data", raw) if isinstance(raw, dict) and "data" in raw else raw
@@ -1822,6 +1887,8 @@ async def get_prop_lines(event_id: str, date_str: str,
                 l["quote_fetched_at"] = datetime.now(timezone.utc).isoformat()
                 l["quote_status"] = "ARCHIVED" if is_past else "LIVE"
             _NFL_PROP_FETCH_STATUS[fetch_key] = "success"
+            if not out:
+                _NFL_PROP_FETCH_STATUS[fetch_key] = "empty"
             return out
     except Exception as e:
         print(f"[OddsAPI props] {e}"); return []
@@ -2398,7 +2465,9 @@ def _nfl_role_profile(df, team, pos, name, stat_col=""):
             d["_player_recent_n"]=d.groupby("player_display_name").cumcount()
             recent=d[d["_player_recent_n"]<10]
             agg=recent.groupby("player_display_name",as_index=False).agg(usage=("_usage","sum"),games=("week","nunique")).sort_values("usage",ascending=False).reset_index(drop=True)
-            snap_conf = recent.groupby("player_display_name")["offense_pct"].mean() if "offense_pct" in recent else None
+            if "offense_pct" in recent:
+                snap_conf = recent.groupby("player_display_name")["offense_pct"].mean()
+                agg["snap_mean"] = agg.player_display_name.map(snap_conf)
             # Receiving option rank deliberately spans WR/TE/RB and never uses carries.
             rec=df[df.recent_team.astype(str).str.upper()==str(team).upper()].copy()
             if "position" in rec:
@@ -2434,7 +2503,7 @@ def _nfl_role_profile(df, team, pos, name, stat_col=""):
     except (TypeError, ValueError):
         option_rank = None
     snap_bonus = 0.0
-    try: snap_bonus = min(.12, max(0.0, float(snap_conf.get(str(name), 0)) / 1000.0)) if snap_conf is not None else 0.0
+    try: snap_bonus = min(.12, max(0.0, float(d.iloc[ix].get("snap_mean") or 0) / 1000.0))
     except (TypeError, ValueError): pass
     return {"role":role,"roleRank":ix+1,"option_rank":option_rank,"confidence":round(min(.9,.35+min(float(d.iloc[ix].games),10)*.055+snap_bonus),2),"factor":round(lead if ix==0 else 1+(tail-1)*min(ix,2)/2,3),"reason":"Recent usage ranking; snap participation blended when available"}
 def _nfl_posdef_profile(df, defense, pos, stat):
@@ -4320,7 +4389,9 @@ async def _build_alt_coach(date_str: str, system: str = "OLD") -> dict:
         event_id = str(game.get("id") or "")
         if not event_id:
             return game, None
-        if event_id in raw_events and isinstance(raw_events[event_id], list):
+        if (event_id in raw_events
+                and isinstance(raw_events[event_id], list)
+                and raw_events[event_id]):
             return game, raw_events[event_id]
         async with alt_sem:
             try:
@@ -4334,8 +4405,9 @@ async def _build_alt_coach(date_str: str, system: str = "OLD") -> dict:
                 return game, None
 
     requests = [asyncio.create_task(_one_alt(game)) for game in games]
+    fetch_stage_timeout = _nfl_alt_fetch_deadline(len(games))
     done, pending = await asyncio.wait(
-        requests, timeout=min(_NFL_ALT_FETCH_STAGE_TIMEOUT,
+        requests, timeout=min(fetch_stage_timeout,
                               max(0, overall_deadline - time.monotonic())))
     for task in pending:
         task.cancel()
@@ -4351,7 +4423,7 @@ async def _build_alt_coach(date_str: str, system: str = "OLD") -> dict:
             batches.append((game, []))
         else:
             event_id = str(game.get("id") or "")
-            if event_id:
+            if event_id and (batch or event_id not in raw_events):
                 raw_events[event_id] = batch
             batches.append((game, batch))
     done_ids = {str(game.get("id") or "") for game, _ in batches}
@@ -4420,15 +4492,21 @@ async def _build_alt_coach(date_str: str, system: str = "OLD") -> dict:
         + ", ".join(unique_failures[:4])
         if failed_events else "")
     payload = {
-        "date": date_str, "picks": picks, "lines": len(lines),
+        "date": date_str, "picks": picks if not partial else [], "lines": len(lines),
         "partial": partial, "authoritative": not partial,
         "capture_allowed": not partial,
         "warning": warning,
+        "failed_games": unique_failures,
+        "failed_game_count": len(unique_failures),
     }
     if system == "NEW":
         payload["system"] = "NEW"
         payload = _new_sanitize_json(payload)
-    await asyncio.to_thread(_alt_coach_cache_set, date_str, payload, system)
+    # Never persist a partial board as the current result. The raw per-event
+    # cache above remains useful for the next retry, while the last complete
+    # board stays available through the endpoint fallback.
+    if not partial:
+        await asyncio.to_thread(_alt_coach_cache_set, date_str, payload, system)
     if partial:
         retry_key = f"{system}:{date_str}"
         count = _ALT_COACH_RETRY_COUNT.get(retry_key, 0) + 1
@@ -4456,6 +4534,10 @@ async def api_nfl_coach_alternates(request: Request, date_str: str = "",
             status_code=400,
             detail="Alternate-line Coach scans are available for current and upcoming slates.")
     cached = await asyncio.to_thread(_alt_coach_cache_get, ds, False, system)
+    stale_complete = await asyncio.to_thread(
+        _alt_coach_cache_get, ds, True, system)
+    if stale_complete and stale_complete.get("partial"):
+        stale_complete = None
     if cached and not cached.get("partial"):
         return JSONResponse(cached)
     task, started = _alt_coach_start_task(ds, system)
@@ -4469,25 +4551,31 @@ async def api_nfl_coach_alternates(request: Request, date_str: str = "",
         }
         if system == "NEW":
             body["system"] = "NEW"
-        if cached:
+        if stale_complete:
             body.update({
                 "stale": True, "partial": True,
+                "picks": stale_complete.get("picks", []),
+                "last_complete": True,
+                "authoritative": False, "capture_allowed": False,
                 "warning": cached.get("warning")
-                    or "Showing the last completed partial result while refresh continues.",
+                    or "Showing the last known complete result while refresh continues.",
             })
+        body["failed_games"] = (cached or {}).get("failed_games", [])
+        body["failed_game_count"] = len(body["failed_games"])
         return JSONResponse(body, status_code=202)
     try:
         result = task.result()
     except Exception as exc:
         stale = await asyncio.to_thread(
             _alt_coach_cache_get, ds, True, system)
-        if stale:
+        if stale and not stale.get("partial"):
             payload = dict(stale)
             payload.update({
                 "stale": True, "partial": True, "authoritative": False,
                 "capture_allowed": False,
                 "warning": f"Refresh failed; showing the last completed result: {exc}",
             })
+            payload["last_complete"] = True
             return JSONResponse(payload)
         payload = {
             "pending": False, "date": ds, "partial": True,
@@ -4504,6 +4592,22 @@ async def api_nfl_coach_alternates(request: Request, date_str: str = "",
     }
     if system == "NEW":
         fallback["system"] = "NEW"
+    if isinstance(result, dict) and result.get("partial"):
+        if stale_complete:
+            payload = dict(stale_complete)
+            payload.update({
+                "stale": True, "partial": True, "last_complete": True,
+                "authoritative": False, "capture_allowed": False,
+                "warning": result.get("warning")
+                    or "Refresh incomplete; showing the last known complete result.",
+                "failed_games": result.get("failed_games", []),
+                "failed_game_count": result.get("failed_game_count", 0),
+            })
+            return JSONResponse(payload)
+        result = dict(result)
+        result["picks"] = []
+        result["authoritative"] = False
+        result["capture_allowed"] = False
     return JSONResponse(result if isinstance(result, dict) else fallback)
 
 _ADMIN_EMAILS = {e.strip().lower() for e in os.environ.get("ADMIN_EMAIL", "higgi117711@gmail.com").split(",") if e.strip()}
