@@ -4280,8 +4280,11 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False,
     # Line movement and snapshot helpers use synchronous Supabase/httpx calls.
     # Keep the tracking semantics/order intact, but never run those calls on
     # the ASGI event loop.
-    if system == "OLD":
-        await asyncio.to_thread(_nfl_attach_line_movement, date_str, result)
+    # Capture the scheduled opening baseline first, then attach movement before
+    # any board, Coach, or tracking payload is derived. OLD and NEW use separate
+    # official ledgers, but share the genuine opening-line source.
+    await asyncio.to_thread(_nfl_capture_opening_lines, date_str, result)
+    await asyncio.to_thread(_nfl_attach_line_movement, date_str, result)
     if system == "NEW":
         result = _new_sanitize_json(result)
     # The short-lived /tmp cache is only an accelerator. Persist each game's
@@ -4888,11 +4891,6 @@ async def api_run(request: Request):
                                 }
                                 result = None
                             if result is not None:
-                                if system == "OLD":
-                                    await asyncio.to_thread(
-                                        _nfl_capture_opening_lines, ds, result)
-                                    await asyncio.to_thread(
-                                        _nfl_attach_line_movement, ds, result)
                                 # A full-week run is a valid pre-kickoff
                                 # Game Predictor forecast for each slate.
                                 # Keep player-prop official capture in its
@@ -4932,9 +4930,6 @@ async def api_run(request: Request):
                     system=system,
                     force_refresh=True,
                     progress=lambda m: JOBS.get(job_id, {}).update({"progress": m}))
-                if system == "OLD":
-                    await asyncio.to_thread(
-                        _nfl_attach_line_movement, date_str, result)
                 return result
             result = await asyncio.wait_for(
                 _work(), timeout=_NFL_WEEK_JOB_TIMEOUT if scope == "week" else 300)
@@ -5194,7 +5189,7 @@ async def api_cached(request: Request, target_date: str = "", token: str = "",
                 cached_day.setdefault("system", "NEW")
                 cached_day.setdefault("model_version", "NEW-v1-ewma-blend")
                 cached_day = _new_sanitize_json(cached_day)
-            if cached_day and str(system).upper() == "OLD":
+            if cached_day:
                 _nfl_attach_line_movement(ds, cached_day)
             daily.append(cached_day or {
                 "date": ds, "picks": [], "all": [], "games": [],
@@ -5212,9 +5207,8 @@ async def api_cached(request: Request, target_date: str = "", token: str = "",
         (_new_cache_get(date_str) if str(system).upper() == "NEW" else _cache_get(date_str))
         or _nfl_load_board_snapshots(date_str, system))
     if cached:
-        if str(system).upper() == "OLD":
-            _nfl_attach_line_movement(date_str, cached)
-        else:
+        _nfl_attach_line_movement(date_str, cached)
+        if str(system).upper() == "NEW":
             cached.setdefault("system", "NEW")
             cached.setdefault("model_version", "NEW-v1-ewma-blend")
             cached = _new_sanitize_json(cached)
@@ -5237,8 +5231,6 @@ async def api_picks(request: Request, target_date: str = "", token: str = "",
         if replay_date >= _nfl_today_date():
             raise HTTPException(status_code=400, detail="Historical replays are available only for completed dates")
     result = await run_pipeline(date_str, simulate=simulate, system=system)
-    if not simulate and str(system).upper() == "OLD":
-        _nfl_attach_line_movement(date_str, result)
     return JSONResponse(result)
 
 @app.get("/api/whoami")
@@ -5730,9 +5722,36 @@ def _nfl_sb_lock_coach_cas(saved, graded, summary, app_name=None):
 
 
 def _nfl_line_identity(row: dict) -> str:
+    """Stable player/market identity scoped to one game.
+
+    Player names recur across an NFL slate, so a player+market key alone can
+    incorrectly apply one game's opening number to another game.  Prefer the
+    canonical two-team matchup; when a feed omits one team, infer it from the
+    home/away abbreviations and the row's team.  The normalized kickoff/game
+    string is retained as a final scope guard.
+    """
+    team = str(row.get("team") or row.get("roster_team") or "").strip().upper()
+    opponent = str(row.get("opponent") or row.get("opp") or "").strip().upper()
+    home = str(row.get("home_abbr") or "").strip().upper()
+    away = str(row.get("away_abbr") or "").strip().upper()
+    if team and not opponent and team in (home, away):
+        opponent = away if team == home else home
+    if opponent and not team and opponent in (home, away):
+        team = away if opponent == home else home
+    teams = sorted(set(x for x in (team, opponent) if x))
+    matchup = "-".join(teams)
+    if not matchup:
+        matchup = _norm(str(row.get("game") or row.get("matchup") or "")).replace(" ", "")
+    start = str(row.get("game_start") or row.get("start") or "").strip()
+    if start:
+        # ISO timestamps from ESPN/OddsAPI may differ only by seconds/zone
+        # formatting; the date-hour-minute portion is common to both feeds.
+        start = start.replace("Z", "+00:00")[:16]
+    scope = matchup or start
     return "|".join((
         _norm(str(row.get("name") or row.get("player") or "")),
-        str(row.get("market") or "").strip().lower(),
+        str(row.get("market") or row.get("mkt") or "").strip().lower(),
+        scope,
     ))
 
 
@@ -5798,6 +5817,9 @@ def _nfl_capture_opening_lines(date_str: str, result: dict) -> bool:
             "name": row.get("name", ""),
             "team": row.get("team", ""),
             "opponent": row.get("opponent", ""),
+            "home_abbr": row.get("home_abbr", ""),
+            "away_abbr": row.get("away_abbr", ""),
+            "game": row.get("game", ""),
             "market": row.get("market", ""),
             "market_label": row.get("mkt") or row.get("label") or "",
             "line": line,
@@ -5832,8 +5854,10 @@ def _nfl_attach_line_movement(date_str: str, result: dict) -> dict:
     opening = _nfl_opening_lines(date_str)
     if not opening:
         return result
-    for collection in ("all", "picks", "td_picks"):
+    for collection in ("all", "picks", "td_picks", "coach_candidates"):
         for row in result.get(collection) or []:
+            if row.get("isAlternate") or row.get("alternate"):
+                continue
             saved = opening.get(_nfl_line_identity(row))
             if not saved or saved.get("line") is None or row.get("realLine") is None:
                 continue
@@ -5867,9 +5891,12 @@ _NFL_OVERFLOW_CAT = "__official_overflow__"
 _NFL_HIST_CAT = "__historical_replay__"
 _NFL_TRK_STAKE = 20.0
 _NFL_TRK_TOP   = 10   # picks per market+direction that count in main record
+_NFL_MOVEMENT_CATEGORIES = frozenset((
+    "Biggest Over Line Movement", "Biggest Under Line Movement"))
 _NFL_COACH_TRK_APP = "nfl_coach_track"
 _NFL_COACH_HIST_APP = "nfl_coach_historical"
-_NFL_COACH_CATS = ("app_hit_rate_100", "safest_bets", "coach_edge", "alt_line_edge", "passing",
+_NFL_COACH_CATS = ("app_hit_rate_100", "safest_bets", "coach_edge", "alt_line_edge",
+                   "coach_over_movement", "coach_under_movement", "passing",
                    "rushing", "receiving", "defense", "kicking",
                    "td_scorers", "best_unders")
 _NFL_COACH_CAPTURE_GUARD_SECONDS = 120
@@ -5963,6 +5990,10 @@ def _nfl_coach_hist_candidates(picks):
             "projection": pick.get("projAvg", pick.get("avg")),
             "alternate": bool(pick.get("isAlternate")),
             "source_market": pick.get("sourceMarket", pick.get("source_market", pick.get("market", ""))),
+            "opening_line": pick.get("openingLine"),
+            "current_line": pick.get("currentLine", pick.get("realLine")),
+            "line_move": pick.get("lineMove"),
+            "line_movement_available": bool(pick.get("lineMovementAvailable")),
         }
         row["coach_edge"] = row["model_probability"] - implied
         key = (row["player"], row["market"], side, line, row["odds"])
@@ -6015,6 +6046,21 @@ def _nfl_coach_hist_select(candidates, category, alternate=False):
             continue
         if category == "best_unders" and row["side"] != "UNDER":
             continue
+        if category in ("coach_over_movement", "coach_under_movement"):
+            if row.get("alternate"):
+                continue
+            if not row.get("line_movement_available"):
+                continue
+            try:
+                move = float(row.get("line_move"))
+            except (TypeError, ValueError):
+                continue
+            if (category == "coach_over_movement"
+                    and not (row["side"] == "OVER" and move > 0)):
+                continue
+            if (category == "coach_under_movement"
+                    and not (row["side"] == "UNDER" and move < 0)):
+                continue
         if alternate and (
             row["model_probability"] < 85 or
             row["implied_probability"] < 70 or
@@ -6024,6 +6070,8 @@ def _nfl_coach_hist_select(candidates, category, alternate=False):
         rows.append(dict(row))
     if category == "safest_bets":
         rows.sort(key=lambda x: (x["implied_probability"], x["model_probability"]), reverse=True)
+    elif category in ("coach_over_movement", "coach_under_movement"):
+        rows.sort(key=lambda x: abs(float(x.get("line_move") or 0)), reverse=True)
     else:
         rows.sort(key=lambda x: (x["coach_edge"], x["model_probability"]), reverse=True)
     unique, seen_players = [], set()
@@ -6745,6 +6793,9 @@ def _nfl_grade_date(date_str: str, snap: list, box_override: dict = None) -> dic
                 "category": cat, "side": direction, "market": mk,
                 "line": line_raw, "odds": odds, "rank": rank,
                 "result": result_val, "actual": actual, "profit": profit,
+                "opening_line": p.get("openingLine"),
+                "current_line": p.get("currentLine", p.get("realLine")),
+                "line_move": p.get("lineMove"),
             }
             if p.get("system") == "NEW":
                 row["system"] = "NEW"
@@ -6764,6 +6815,41 @@ def _nfl_grade_date(date_str: str, snap: list, box_override: dict = None) -> dic
                 if lock_key and (prior is None or lock_rank > prior[0]):
                     lock_best[lock_key] = (
                         lock_rank, {**row, "category": "80-100% Locks"})
+    # Movement boards are official, isolated categories built from the same
+    # already-qualified standard-line snapshot. They never use alternate lines.
+    # Keep independent Top-10 lists for Over and Under; the two sections must
+    # not compete for one combined 10-row cap.
+    movement_by_side = {"OVER": {}, "UNDER": {}}
+    for row in main_rows + ovf_rows:
+        try:
+            move = float(row.get("line_move"))
+        except (TypeError, ValueError):
+            continue
+        if row.get("opening_line") is None or row.get("current_line") is None:
+            continue
+        side = str(row.get("side") or "").upper()
+        if side == "OVER" and move > 0:
+            category = "Biggest Over Line Movement"
+        elif side == "UNDER" and move < 0:
+            category = "Biggest Under Line Movement"
+        else:
+            continue
+        key = (
+            str(row.get("name") or "").strip().lower(),
+            str(row.get("market") or "").strip().lower(),
+            row.get("current_line"), side,
+        )
+        movement_by_side[side].setdefault(
+            key, {**row, "category": category})
+    movement = []
+    for side in ("OVER", "UNDER"):
+        rows = sorted(
+            movement_by_side[side].values(),
+            key=lambda x: abs(float(x.get("line_move") or 0)),
+            reverse=True,
+        )
+        movement.extend(rows[:10])
+    main_rows.extend(movement)
 
     lock_rows = [
         rec[1] for rec in sorted(
@@ -6800,6 +6886,7 @@ def _nfl_detail_graded(graded: dict, include_overflow: bool = True,
         out.append({k: row.get(k) for k in (
             "name", "team", "category", "side", "market",
             "line", "odds", "rank", "result", "actual", "profit", "pool",
+            "opening_line", "current_line", "line_move",
         )})
     return out
 
@@ -7206,7 +7293,8 @@ async def nfl_track_record(grade: bool = False, date_str: str = "", system: str 
     result = []
     for d in dates:
         det = detail_by_date[d]
-        decided = [r for r in det if r.get("result") in ("WIN","LOSS")]
+        decided = [r for r in det if r.get("result") in ("WIN","LOSS")
+                   and r.get("category") not in _NFL_MOVEMENT_CATEGORIES]
         wins   = sum(1 for r in decided if r["result"] == "WIN")
         losses = len(decided) - wins
         priced = [r for r in decided if r.get("odds") is not None]
@@ -7214,7 +7302,7 @@ async def nfl_track_record(grade: bool = False, date_str: str = "", system: str 
         staked = len(priced) * _NFL_TRK_STAKE
         roi    = round(net_pl / staked * 100, 1) if staked else None
         cats: dict = {}
-        for r in decided:
+        for r in [r for r in det if r.get("result") in ("WIN","LOSS")]:
             cat = r.get("category","?")
             e = cats.setdefault(cat, {"wins":0,"losses":0,"pl":0.0,"staked":0.0})
             if r["result"] == "WIN": e["wins"] += 1
@@ -8085,6 +8173,8 @@ tr:last-child td{border-bottom:none}
       <button class="nfl-coach-preset" onclick="askNflCoachPreset('Show every play with a 100% App Hit Rate','app_hit_rate_100')" style="border-color:#22c55e;color:#bbf7d0">100% App Hit Rate</button>
       <button class="nfl-coach-preset" onclick="askNflCoachPreset('Show me the safest bets','safest_bets')">Safest bets</button>
       <button class="nfl-coach-preset" onclick="askNflCoachPreset('Show the best positive Coach Edge plays','coach_edge')">Coach Edge</button>
+       <button class="nfl-coach-preset" onclick="askNflMovementCoach('OVER')" style="border-color:#22c55e;color:#bbf7d0">Biggest Over Line Movement</button>
+       <button class="nfl-coach-preset" onclick="askNflMovementCoach('UNDER')" style="border-color:#f87171;color:#fecaca">Biggest Under Line Movement</button>
       <button class="nfl-coach-preset" id="nflAltCoachBtn" onclick="askNflAltCoach()" style="border-color:#f59e0b;color:#fde68a">Best Alt-Line Edge Plays · Top 10</button>
       <button class="nfl-coach-preset" onclick="askNflCoachPreset('Show the best passing plays','passing')">Passing</button>
       <button class="nfl-coach-preset" onclick="askNflCoachPreset('Show the best rushing plays','rushing')">Rushing</button>
@@ -8528,6 +8618,8 @@ var _NFL_PARLAY_COACH_CATS=[
   {key:'kicking',label:'Best Kicker Plays'},
   {key:'td_scorers',label:'TD Scorers'},
   {key:'best_unders',label:'Best Unders'}
+  ,{key:'coach_over_movement',label:'Biggest Over Line Movement'}
+  ,{key:'coach_under_movement',label:'Biggest Under Line Movement'}
 ];
 window.__NFL_PARLAY_FILTERS__={normal:{},coach:{}};
 window.__NFL_PARLAY_ODDS_MODE__='all';
@@ -9115,6 +9207,7 @@ function nflCard(p,i){
      </div>
      <div class="pc-tagrow">${fmtTag(p.tag)}</div>
       <div class="pc-line-row"><span>${lineHtml}</span><span class="od">Odds / Book</span></div>
+      ${p.lineMovementAvailable&&p.openingLine!=null?`<div style="font-size:.68rem;color:#fbbf24;margin-top:5px;font-weight:800">Opening ${p.openingLine} → Current ${p.currentLine} (${Number(p.lineMove)>=0?'+':''}${Number(p.lineMove).toFixed(2)} pts)</div>`:''}
      <div class="pc-stats">
        <div class="pc-stat"><div class="k">${_esc(_nflOppVenueLabel(p))}</div><div class="v">${_rateHtml(p.rateA,p.hitsA,p.totA)}</div></div>
        <div class="pc-stat"><div class="k">${_esc(_nflRecentVenueLabel(p))}</div><div class="v">${_rateHtml(p.rateB,p.hitsB,p.totB)}</div></div>
@@ -9141,6 +9234,20 @@ function _collapseSec(id,title,inner,open){
   return '<div class="sec sec-hdr" onclick="_secToggle(&#39;'+id+'&#39;)"><span>'+title+'</span>'+
          '<span class="sec-caret" id="car_'+id+'">'+car+'</span></div>'+
          '<div id="sec_'+id+'" style="display:'+disp+'">'+inner+'</div>';
+}
+function _nflMovementBoard(picks,side){
+  var rows=(picks||[]).filter(function(p){
+    var move=Number(p.lineMove);
+    return !_nflGameDone(p)&&p.lineMovementAvailable&&p.realLine!=null
+      &&p.pick===side&&isFinite(move)&&((side==='OVER'&&move>0)||(side==='UNDER'&&move<0));
+  });
+  var seen={};
+  rows=rows.filter(function(p){
+    var key=[p.name||p.player,p.market||p.mkt,p.realLine,side].join('|').toLowerCase();
+    if(seen[key])return false;seen[key]=1;return true;
+  }).sort(function(a,b){return Math.abs(Number(b.lineMove))-Math.abs(Number(a.lineMove));}).slice(0,10);
+  if(!rows.length)return '<div class="no-picks" style="padding:24px">No qualifying opening-to-current line moves captured yet.</div>';
+  return '<div style="padding:10px 0 4px;color:#94a3b8;font-size:.76rem;line-height:1.45">A '+side+' line move shows the sportsbook changed the required line after opening. It can reflect market action or a changed expectation, but it is not a guarantee. The current number is the number you must bet.</div>'+nflCardGrid(rows,1);
 }
 function _secToggle(id){
   var el=document.getElementById('sec_'+id); var c=document.getElementById('car_'+id);
@@ -9567,6 +9674,8 @@ function _nflCoachProps(sourceCandidates){
       recentTotal:Number(p.vsLineTotal||p.totB||0),oppRate:Number(p.rateA||0),
       oppHits:Number(p.hitsA||0),oppTotal:Number(p.totA||0),book:side==='UNDER'?(p.under_book||''):(p.over_book||''),
       isAlternate:!!p.isAlternate,game_start:p.game_start||'',
+       openingLine:p.openingLine,currentLine:p.currentLine!=null?p.currentLine:p.realLine,
+       lineMove:p.lineMove,lineMovementAvailable:!!p.lineMovementAvailable,
         slate_date:p.slate_date||'',source:p
     });
   });
@@ -9778,14 +9887,18 @@ function _nflCoachAccordions(p){
 function _nflCoachRender(question,rows,total,mode,isAlternate){
   var el=document.getElementById('nflCoachAnswer');if(!el)return;
   el.style.display='block';
-  var summary=mode==='hundred'
+  var summary=mode==='movement_over'
+    ?'A positive Over line move means the sportsbook raised the required number after opening. That often reflects market action or a higher expectation, but it is not a guarantee—and the higher current number is harder to clear.'
+    :mode==='movement_under'
+    ?'A negative Under line move means the sportsbook lowered the required number after opening. That often reflects market action or a lower expectation, but it is not a guarantee—and the lower current number is harder for an Under.'
+    :mode==='hundred'
     ?'Every displayed Coach-eligible NFL play with an exact 100.0% app hit rate is shown. This category is not capped at 10 and does not remove additional markets from the same player.'
     :mode==='safe'
     ?'I checked the selected sides across '+total+' priced NFL candidates and ranked these by sportsbook-implied win probability. Safer favorites can require substantially more risk for a smaller return.'
     :(isAlternate
       ?'I checked '+total+' genuine alternate-line candidates for the safer-value sweet spot. Every result is priced -1000 or better, has at least 85% app probability, at least 70% sportsbook-implied probability, and positive Coach Edge; each player can appear once per qualifying market, using that player-market’s largest-edge line, with a maximum of 10 plays.'
       :'I checked '+total+' priced NFL board plays and ranked the matching positive Coach Edge results. Coach Edge is probability edge, not guaranteed monetary profit.');
-  if(!rows.length){el.innerHTML='<div class="nfl-coach-question">'+_esc(question)+'</div><div class="nfl-coach-summary">'+(mode==='hundred'?'No loaded Coach-eligible NFL play currently has an exact 100.0% app hit rate.':'No loaded priced NFL prop matched that request.')+'</div>';return;}
+  if(!rows.length){el.innerHTML='<div class="nfl-coach-question">'+_esc(question)+'</div><div class="nfl-coach-summary">'+(mode==='hundred'?'No loaded Coach-eligible NFL play currently has an exact 100.0% app hit rate.':(mode.indexOf('movement_')===0?'No qualifying opening-to-current line moves captured yet.':'No loaded priced NFL prop matched that request.'))+'</div>';return;}
   var cards=rows.map(function(p,i){
     var s=p.source||{},head=_esc(s.head||''),logo='https://a.espncdn.com/i/teamlogos/nfl/500/'+_logoAbbr(p.team)+'.png';
     var venue=s.homeRoad==='H'?'HOME':(s.homeRoad==='R'?'AWAY':'');
@@ -9799,7 +9912,8 @@ function _nflCoachRender(question,rows,total,mode,isAlternate){
       +'<span>'+_esc(p.team)+' vs '+_esc(p.opponent)+'</span>'+(venue?'<span>· '+venue+'</span>':'')+(p.slate_date?'<span>· '+_esc(p.slate_date)+'</span>':'')+'</span></span></span>'
       +'<span class="nfl-coach-pickmeta">'+_esc(p.market)+(p.isAlternate?' · <b style="color:#fbbf24">ALT LINE</b>':'')+'<br><b style="color:'+(p.side==='OVER'?'#4ade80':'#f87171')+'">'+p.side+' '+p.line+' · '+_nflCoachOdds(p.odds)+'</b><br><small style="color:#94a3b8">'+_esc(p.book||'Book unavailable')+'</small></span></summary>'
       +'<div class="nfl-coach-copy">'+(mode==='safe'?'<b style="color:#fbbf24">Safety rank: '+p.implied.toFixed(1)+'% sportsbook-implied.</b> ':'')
-      +'App probability '+p.appProb.toFixed(1)+'% vs '+p.implied.toFixed(1)+'% implied = <b style="color:'+(p.edge>=0?'#4ade80':'#f87171')+'">'+_nflCoachSigned(p.edge)+' Coach Edge points</b>.</div>'
+      +'App probability '+p.appProb.toFixed(1)+'% vs '+p.implied.toFixed(1)+'% implied = <b style="color:'+(p.edge>=0?'#4ade80':'#f87171')+'">'+_nflCoachSigned(p.edge)+' Coach Edge points</b>.'
+      +(mode.indexOf('movement_')===0&&p.lineMove!=null?' <span style="color:#fbbf24">Opening '+p.openingLine+' → current '+p.currentLine+' ('+(p.lineMove>=0?'+':'')+Number(p.lineMove).toFixed(2)+')</span>':'')+'</div>'
      +_nflCoachAccordions(p)+'</details>';
   }).join('');
   el.innerHTML='<div class="nfl-coach-question">'+_esc(question)+'</div><div class="nfl-coach-summary">'+summary+'</div>'+cards;
@@ -9814,7 +9928,7 @@ function _nflCoachCapture(category,rows){
   rows.forEach(function(p){
     var ds=p.slate_date||fallback;
     if(!groups[ds])groups[ds]=[];
-    groups[ds].push({player:p.player,team:p.team,opponent:p.opponent,game:(p.source&&p.source.game)||'',game_start:p.game_start,market:p.market,side:p.side,line:p.line,odds:p.odds,book:p.book,model_probability:p.appProb,implied_probability:p.implied,coach_edge:p.edge,projection:p.projection,alternate:p.isAlternate});
+     groups[ds].push({player:p.player,team:p.team,opponent:p.opponent,game:(p.source&&p.source.game)||'',game_start:p.game_start,market:p.market,side:p.side,line:p.line,odds:p.odds,book:p.book,model_probability:p.appProb,implied_probability:p.implied,coach_edge:p.edge,projection:p.projection,alternate:p.isAlternate,opening_line:p.openingLine,current_line:p.currentLine,line_move:p.lineMove,line_movement_available:p.lineMovementAvailable});
   });
   if(status)status.textContent='Saving displayed snapshot by game date…';
   var filters=_nflCoachFilterPayload();
@@ -9829,6 +9943,19 @@ function askNflCoachPreset(q,category){
   var shown=askNflCoach();
   _nflCoachCapture(category,shown);
   return shown;
+}
+function askNflMovementCoach(side){
+  var category=side==='OVER'?'coach_over_movement':'coach_under_movement';
+  var q=side==='OVER'?'Show the biggest positive Over line movement plays':'Show the biggest negative Under line movement plays';
+  var input=document.getElementById('nflCoachInput');if(input)input.value=q;
+  var selectedSides=_nflCoachSelectedSides();
+  var props=_nflCoachVisibleProps(_nflCoachProps()),rows=props.filter(function(p){
+    return selectedSides.indexOf(p.side)>=0&&_nflGameFilterOn('coach',p.team,p.opponent)
+      &&!p.isAlternate&&!p.alternate&&p.lineMovementAvailable&&p.edge>0&&((side==='OVER'&&p.side==='OVER'&&Number(p.lineMove)>0)||(side==='UNDER'&&p.side==='UNDER'&&Number(p.lineMove)<0));
+  }).sort(function(a,b){return Math.abs(Number(b.lineMove))-Math.abs(Number(a.lineMove));}).slice(0,10);
+  _nflCoachRender(q,rows,props.length,side==='OVER'?'movement_over':'movement_under',false);
+  _nflCoachCapture(category,rows);
+  return rows;
 }
 function askNflTdCoach(){
   var q='Show the best positive Coach Edge Anytime TD scorers';
@@ -10011,7 +10138,8 @@ var _NFL_COACH_TRACK_LABELS={
   app_hit_rate_100:'100% App Hit Rate',safest_bets:'Safest Bets',coach_edge:'Coach Edge',
   alt_line_edge:'Best Alt-Line Edge Plays',passing:'Passing',
   rushing:'Rushing',receiving:'Receiving',defense:'Best Defense Plays',
-  kicking:'Best Kicker Plays',td_scorers:'TD Scorers',best_unders:'Best Unders'
+   kicking:'Best Kicker Plays',td_scorers:'TD Scorers',best_unders:'Best Unders',
+   coach_over_movement:'Biggest Over Line Movement',coach_under_movement:'Biggest Under Line Movement'
 };
 function _nflCoachTrackLabel(category){return _NFL_COACH_TRACK_LABELS[category]||String(category||'Coach').replace(/_/g,' ');}
 function _nflCoachTrkStake(){
@@ -10353,6 +10481,8 @@ function _nflPaint(q){
   // Card grids per market — separate OVER and UNDER boards, each top 10 + overflow.
   // Finished games (kickoff + 4h elapsed) drop off the board.
   var hasCards=false;
+  h+=_collapseSec('biggest_over_movement','⬆ Biggest Over Line Movement',_nflMovementBoard(picks,'OVER'),true);
+  h+=_collapseSec('biggest_under_movement','⬇ Biggest Under Line Movement',_nflMovementBoard(picks,'UNDER'),true);
   _MORDER.forEach(function(m,i){
     var all=(byM[m]||[]).filter(function(p){return !_nflGameDone(p);});
     var overs =all.filter(function(p){return p.pick==='OVER';});
