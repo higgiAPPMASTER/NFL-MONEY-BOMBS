@@ -5,7 +5,7 @@ Historical stats:  nfl_data_py (nfl-verse GitHub data — no rate limits)
 Schedule:          ESPN scoreboard API
 """
 
-import os, re, asyncio, uuid, time, json, pathlib, csv, io, math, gc
+import os, re, asyncio, uuid, time, json, pathlib, csv, io, math, gc, copy
 import threading as _bt_th
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
@@ -3579,8 +3579,6 @@ def _nfl_prop_analysis_frame(df, target_season=None, target_week=None,
         seasons = point["season"].fillna(0).astype(int)
         out = point[(seasons == int(target_season)) |
                     (seasons == int(target_season) - 1)].copy()
-        # Keep the target available to helpers when the current season has no
-        # published rows yet (for example, a replay of Week 1).
         out.attrs["nfl_target_season"] = int(target_season)
         out.attrs["nfl_target_week"] = int(target_week or 1)
         return out
@@ -3595,6 +3593,158 @@ def _nfl_prop_analysis_frame(df, target_season=None, target_week=None,
         except Exception:
             return df
 
+# Response-only compatibility layer for boards written before the venue split.
+# This never writes a cache or tracking ledger and is intentionally keyed by the
+# requested board identity so an old board is enriched at most once per process.
+_NFL_ENRICHED_RESULTS = {}
+
+def _nfl_enrich_cached_result(result, df=None, target_season=None,
+                              target_week=None, target_type="REG",
+                              system="OLD"):
+    if not isinstance(result, dict):
+        return result
+    if result.get("_nflVenueEnrichedV2"):
+        return result
+    out = copy.deepcopy(result)
+    frame = (_nfl_prop_analysis_frame(df, target_season, target_week, target_type)
+             if df is not None and target_season is not None else None)
+    seen = set()
+    for bucket in ("picks", "all", "td_picks"):
+        rows = out.get(bucket) or []
+        for pick in rows:
+            if not isinstance(pick, dict) or id(pick) in seen:
+                continue
+            seen.add(id(pick))
+            opponent = str(pick.get("opponent") or "").upper()
+            team = str(pick.get("team") or "").upper()
+            # Historical opponent logs predate the venue field.  The opponent
+            # is the stable identity across player team changes, so invert its
+            # ESPN venue first; only then fall back to the player's team.
+            for log in pick.get("vsOppLog") or []:
+                if not isinstance(log, dict) or log.get("ha"):
+                    continue
+                m = re.search(r"^\s*(\d{4})\s+W(\d+)", str(log.get("d") or ""))
+                if not m or not _HA_LOADED:
+                    continue
+                season, week = int(m.group(1)), int(m.group(2))
+                stype = "POST" if week >= 19 else "REG"
+                lookup_week = _espn_ha_week(stype, week)
+                venue = _HA_LOOKUP.get((season, stype, lookup_week, opponent))
+                if venue in ("HOME", "AWAY"):
+                    log["ha"] = "AWAY" if venue == "HOME" else "HOME"
+                    continue
+                venue = _HA_LOOKUP.get((season, stype, lookup_week, team))
+                if venue in ("HOME", "AWAY"):
+                    log["ha"] = venue
+
+            # New rows already have these fields; do not double-adjust them.
+            if any(pick.get(k) is not None for k in
+                   ("defenseVenue", "defHomeAllowed", "defAwayAllowed")):
+                continue
+            market = str(pick.get("market") or "")
+            stat = PROP_TO_COL.get(market)
+            venue = ("AWAY" if pick.get("homeRoad") == "H" else "HOME"
+                     if pick.get("homeRoad") == "R" else None)
+            if frame is None or not stat or not opponent or not venue:
+                pick.update({
+                    "defenseVenue": venue, "defHomeAllowed": None,
+                    "defHomeSample": 0, "defAwayAllowed": None,
+                    "defAwaySample": 0, "defAllowed": None, "defSample": 0,
+                    "defFactor": 1.0, "defRawFactor": 1.0,
+                    "defConfidence": .15,
+                    "defUnavailable": "Venue defense split unavailable",
+                })
+                continue
+            pos = _nfl_position_group(
+                pick.get("positionGroup") or pick.get("position")
+                or pick.get("roster_position") or "")
+            profile = _nfl_posdef_profile(frame, opponent, pos, stat, venue)
+            pick.update({
+                "defenseVenue": profile.get("defenseVenue") or venue,
+                "defHomeAllowed": profile.get("defHomeAllowed"),
+                "defHomeSample": profile.get("defHomeSample", 0),
+                "defAwayAllowed": profile.get("defAwayAllowed"),
+                "defAwaySample": profile.get("defAwaySample", 0),
+                "defAllowed": profile.get("allowed"),
+                "defSample": profile.get("sample", 0),
+                "defFactor": profile.get("factor", 1.0),
+                "defRawFactor": profile.get("rawFactor", 1.0),
+                "defRank": profile.get("rank"),
+                "defConfidence": profile.get("confidence", .15),
+                "defAdj": round((profile.get("factor", 1.0) - 1) * 100, 1),
+            })
+            # A saved base probability is sufficient to restore the exact
+            # side-aware venue nudge without reconstructing player history.
+            # A perfect opponent-history record locks only the pick direction;
+            # the selected HOME/AWAY defense still changes confidence.
+            if (pick.get("baseProbability") is not None
+                    and market != "player_anytime_td"):
+                try:
+                    base = float(pick["baseProbability"])
+                    role_factor = float(pick.get("roleFactor") or 1.0)
+                    combined = max(.86, min(
+                        1.14, role_factor * float(profile.get("factor", 1.0))))
+                    side = str(pick.get("pick") or "").upper()
+                    side_factor = (
+                        combined if side == "OVER"
+                        else 2.0 - combined if side == "UNDER"
+                        else 1.0)
+                    if str(system).upper() == "NEW":
+                        adjusted = 50.0 + (base - 50.0) * side_factor
+                    else:
+                        adjusted = base + (side_factor - 1.0) * 35.0
+                        injury_factor = float(
+                            pick.get("injuryOpportunityFactor") or 1.0)
+                        if injury_factor != 1.0:
+                            injury_side_factor = (
+                                injury_factor if side == "OVER"
+                                else 2.0 - injury_factor)
+                            adjusted *= injury_side_factor
+                        injury_status = str(
+                            pick.get("injuryStatus") or "").upper()
+                        if injury_status == "QUESTIONABLE":
+                            adjusted = 50.0 + (adjusted - 50.0) * .80
+                        elif injury_status == "LIMITED":
+                            adjusted = 50.0 + (adjusted - 50.0) * .92
+                    adjusted = max(0.0, min(100.0, adjusted))
+                    pick["adjustedProbability"] = round(adjusted, 1)
+                    pick["score"] = pick["dispScore"] = pick["adjustedProbability"]
+                    pick["combinedFactor"] = round(combined, 3)
+                except (TypeError, ValueError):
+                    pass
+    out.pop("_nflVenueEnrichedV1", None)
+    out["_nflVenueEnrichedV2"] = True
+    return out
+
+async def _nfl_enrich_cached_response(result, date_str, system="OLD"):
+    """Load only the shared inputs needed to enrich an old saved board."""
+    if not isinstance(result, dict) or result.get("_nflVenueEnrichedV2"):
+        return result
+    board_stamps = [
+        str(result.get("saved_board_captured_at") or ""),
+        str(result.get("snapshot_captured_at") or ""),
+        str(len(result.get("all") or result.get("picks") or [])),
+    ]
+    for pick in (result.get("all") or result.get("picks") or [])[:8]:
+        board_stamps.append(str(pick.get("saved_board_captured_at")
+                                or pick.get("snapshot_captured_at") or ""))
+    key = (str(system).upper(), str(date_str), "|".join(board_stamps))
+    if key in _NFL_ENRICHED_RESULTS:
+        return copy.deepcopy(_NFL_ENRICHED_RESULTS[key])
+    try:
+        await _build_ha_lookup()
+        df = await get_nfl_stats()
+        games = await get_espn_games(date_str)
+        game = games[0] if games else {}
+        enriched = await asyncio.to_thread(
+            _nfl_enrich_cached_result, result, df,
+            game.get("season"), game.get("week"), game.get("season_type", "REG"),
+            system)
+    except Exception as exc:
+        print(f"[NFL cache enrichment] failed closed: {exc}")
+        enriched = _nfl_enrich_cached_result(result, system=system)
+    _NFL_ENRICHED_RESULTS[key] = copy.deepcopy(enriched)
+    return enriched
 def _nfl_gp_ha_value(season, season_type, week, team):
     """Resolve nflverse team/week identity against the shared ESPN map."""
     if not _HA_LOADED:
@@ -4328,6 +4478,7 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False,
             cached.setdefault("system", "NEW")
             cached.setdefault("model_version", "NEW-v1-ewma-blend")
             cached = _new_sanitize_json(cached)
+        cached = await _nfl_enrich_cached_response(cached, date_str, system)
         return cached
     # Do not start full Coach analysis here: it shares the analysis lock with
     # the standard board and can consume the foreground job's entire deadline.
@@ -5718,6 +5869,9 @@ async def api_cached(request: Request, target_date: str = "", token: str = "",
                 cached_day.setdefault("model_version", "NEW-v1-ewma-blend")
                 cached_day = _new_sanitize_json(cached_day)
             if cached_day:
+                cached_day = await _nfl_enrich_cached_response(
+                    cached_day, ds, system)
+            if cached_day:
                 _nfl_attach_line_movement(ds, cached_day)
             daily.append(cached_day or {
                 "date": ds, "picks": [], "all": [], "games": [],
@@ -5735,6 +5889,7 @@ async def api_cached(request: Request, target_date: str = "", token: str = "",
         (_new_cache_get(date_str) if str(system).upper() == "NEW" else _cache_get(date_str))
         or _nfl_load_board_snapshots(date_str, system))
     if cached:
+        cached = await _nfl_enrich_cached_response(cached, date_str, system)
         _nfl_attach_line_movement(date_str, cached)
         if str(system).upper() == "NEW":
             cached.setdefault("system", "NEW")
@@ -9701,6 +9856,13 @@ function _nflRecentVenueLabel(p){
   if(p&&p.homeRoad==='H')return side+' · L10 Home';
   return side+' · L10 H/A';
 }
+function _nflDefenseSplitLabel(p){
+  var parts=[],m=_esc(String(p&&p.mkt||'stat').replace(/Yds/gi,'yards').toLowerCase());
+  var o=_esc((p&&p.opponent)||'opponent');
+  if(p&&p.defHomeAllowed!=null)parts.push(o+' HOME: '+p.defHomeAllowed+' '+m+' allowed/game ('+(p.defHomeSample||0)+' games)'+(p.defenseVenue==='HOME'?' [USED TODAY]':''));
+  if(p&&p.defAwayAllowed!=null)parts.push(o+' AWAY: '+p.defAwayAllowed+' '+m+' allowed/game ('+(p.defAwaySample||0)+' games)'+(p.defenseVenue==='AWAY'?' [USED TODAY]':''));
+  return (p&&p.realLine!=null?p.realLine:p.dispLine)+(parts.length?'; '+parts.join('; '):' · Venue defense split unavailable');
+}
 function nflCard(p,i){
   var key=_ladKey(p); window.__NFLLAD__[key]=p;
   var ha=p.homeRoad==='H';
@@ -9908,7 +10070,7 @@ function openNflLadder(key){
       <div class="lad-stat"><span class="k">Average</span><span class="v gold">${p.avg}</span></div>
       ${(p.defRank!=null&&p.defAdj!=null)?`<div class="lad-stat"><span class="k">Opp Def Rank Factor (#${p.defRank} ${p.defLbl||'D'})</span><span class="v" style="color:${p.defAdj>0?'#4ade80':(p.defAdj<0?'#f87171':'#9ca3af')}">${p.defAdj>0?'+':''}${p.defAdj}% projection nudge</span></div>`:''}
       ${p.role?`<div class="lad-stat"><span class="k">Role / opportunity</span><span class="v">${_esc(p.role)}${p.teamOptionRank!=null?' · team receiving option #'+p.teamOptionRank:''} (${Math.round(Number(p.roleConfidence||0)*100)}% confidence)</span></div>`:''}
-      ${(p.realLine!=null||p.dispLine!=null)?`<div class="lad-stat"><span class="k">Sportsbook line</span><span class="v">${p.realLine!=null?p.realLine:p.dispLine}; ${p.defHomeAllowed!=null?_esc(p.opponent||'opponent')+' HOME: '+p.defHomeAllowed+' '+_esc(String(p.mkt||'stat').replace(/Yds/gi,'yards').toLowerCase())+' allowed/game ('+(p.defHomeSample||0)+' games)'+(p.defenseVenue==='HOME'?' [USED TODAY]':''):''}${p.defAwayAllowed!=null?'; '+_esc(p.opponent||'opponent')+' AWAY: '+p.defAwayAllowed+' '+_esc(String(p.mkt||'stat').replace(/Yds/gi,'yards').toLowerCase())+' allowed/game ('+(p.defAwaySample||0)+' games)'+(p.defenseVenue==='AWAY'?' [USED TODAY]':''):''}</span></div>`:''}
+      ${(p.realLine!=null||p.dispLine!=null)?`<div class="lad-stat"><span class="k">Sportsbook line</span><span class="v">${_nflDefenseSplitLabel(p)}</span></div>`:''}
       ${(p.baseProbability!=null||p.adjustedProbability!=null)?`<div class="lad-stat"><span class="k">Base → adjusted probability</span><span class="v">${p.baseProbability!=null?Number(p.baseProbability).toFixed(1):'—'}% → ${p.adjustedProbability!=null?Number(p.adjustedProbability).toFixed(1):'—'}%</span></div>`:''}
       <div class="lad-stat"><span class="k">Score</span><span class="v" style="color:#f59e0b">${p.dispScore}</span></div>
     </div>`;
