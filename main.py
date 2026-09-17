@@ -3570,11 +3570,21 @@ def _nfl_prop_analysis_frame(df, target_season=None, target_week=None,
             target_season = int(seasons.max())
         point = _nfl_stats_before_game(
             df, target_season, target_week, target_type)
+        target_type = str(target_type or "REG").upper()
+        # Regular-season boards must compare regular-season games only. Older
+        # postseason rows otherwise leak into the prior-season window and
+        # distort venue averages, history rates, and recent-form inputs.
+        if target_type == "REG" and "season_type" in point.columns:
+            point = point[
+                point["season_type"].fillna("REG").astype(str).str.upper()
+                .eq("REG")
+            ]
         seasons = point["season"].fillna(0).astype(int)
         out = point[(seasons == int(target_season)) |
                     (seasons == int(target_season) - 1)].copy()
         out.attrs["nfl_target_season"] = int(target_season)
         out.attrs["nfl_target_week"] = int(target_week or 1)
+        out.attrs["nfl_target_type"] = target_type
         return out
     except Exception as exc:
         print(f"[NFL Analysis] two-season point-in-time filter failed closed: {exc}")
@@ -3583,6 +3593,8 @@ def _nfl_prop_analysis_frame(df, target_season=None, target_week=None,
             if target_season is not None:
                 empty.attrs["nfl_target_season"] = int(target_season)
                 empty.attrs["nfl_target_week"] = int(target_week or 1)
+                empty.attrs["nfl_target_type"] = str(
+                    target_type or "REG").upper()
             return empty
         except Exception:
             return df
@@ -3613,7 +3625,7 @@ def _nfl_enrich_cached_result(result, df=None, target_season=None,
             team = str(pick.get("team") or "").upper()
             # Historical opponent logs predate the venue field.  The opponent
             # is the stable identity across player team changes, so invert its
-            # ESPN venue first; only then fall back to the player's team.
+            # nflverse venue first; only then fall back to the player's team.
             for log in pick.get("vsOppLog") or []:
                 if not isinstance(log, dict) or log.get("ha"):
                     continue
@@ -8654,6 +8666,7 @@ tr:last-child td{border-bottom:none}
 .pm-split-val { font-size: 1.4rem; font-weight: 900; color: #fff; line-height: 1; margin-bottom: 4px; font-family: 'Playfair Display', serif; }
 .pm-split-active .pm-split-val { color: #fbbf24; }
 .pm-split-desc { font-size: 0.75rem; color: #94a3b8; line-height: 1.3; }
+.pm-split-context { margin-top: 8px; padding-top: 8px; border-top: 1px solid #2a303a; color: #cbd5e1; font-size: .66rem; font-weight: 700; line-height: 1.45; }
 .pm-split-sample { font-size: 0.65rem; color: #64748b; margin-top: 6px; font-weight: 600; text-transform: uppercase; }
 .pm-split-badge { position: absolute; top: 12px; right: 12px; background: rgba(245,158,11,0.15); color: #fbbf24; font-size: 0.6rem; font-weight: 800; padding: 3px 6px; border-radius: 4px; border: 1px solid rgba(245,158,11,0.3); }
 .pm-split-empty { font-size: 0.8rem; color: #94a3b8; background: #14171d; padding: 12px; border-radius: 8px; border: 1px solid #232832; margin-bottom: 20px; }
@@ -8701,8 +8714,10 @@ tr:last-child td{border-bottom:none}
 .pm-stat { display: flex; align-items: center; justify-content: space-between; padding: 12px 16px; border-bottom: 1px solid #1f232b; }
 .pm-stat:last-child { border-bottom: none; }
 .pm-stat:nth-child(even) { background: rgba(255,255,255,0.01); }
-.pm-stat .k { font-size: 0.8rem; color: #94a3b8; font-weight: 500; }
+.pm-stat .k { font-size: 0.8rem; color: #cbd5e1; font-weight: 700; line-height: 1.35; }
 .pm-stat .v { font-size: 0.85rem; font-weight: 700; color: #f8fafc; text-align: right; max-width: 60%; line-height: 1.3; }
+.pm-stat-note { display: block; margin-top: 3px; color: #64748b; font-size: .66rem; font-weight: 600; line-height: 1.35; }
+.pm-stat .v .pm-stat-note { text-align: right; }
 .pm-score-stat { background: rgba(245,158,11,0.08) !important; }
 .pm-score-stat .k { color: #fbbf24; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; }
 .pm-gold { color: #fbbf24 !important; }
@@ -9965,11 +9980,20 @@ function _nflDefenseSplitHtml(p){
   }
   var hA=p.defenseVenue==='HOME';
   var aA=p.defenseVenue==='AWAY';
+  var isPassTd=String(p&&p.market||'')==='player_pass_tds';
+  var overNeed=isPassTd?Math.floor(Number(line))+1:null;
+  var underMax=isPassTd?Math.ceil(Number(line))-1:null;
+  function tdLineContext(avg){
+    if(!isPassTd||avg==null||!isFinite(Number(avg)))return '';
+    var gap=Math.abs(overNeed-Number(avg)).toFixed(1);
+    var relation=Number(avg)<overNeed?'below':'above';
+    return '<div class="pm-split-context">OVER needs '+overNeed+'+ &middot; UNDER wins at '+underMax+' or fewer<br>Average is '+gap+' '+relation+' the '+overNeed+'-TD OVER requirement</div>';
+  }
   return '<div class="pm-split-container">'
     +'<div class="pm-split-header"><span class="pm-split-title">Sportsbook Line</span><span class="pm-split-line">'+line+'</span></div>'
     +'<div class="pm-split-grid">'
-    +'<div class="pm-split-card '+(hA?'pm-split-active':'')+'"><div class="pm-split-venue">'+o+' HOME</div><div class="pm-split-val">'+(p.defHomeAllowed!=null?p.defHomeAllowed:'—')+'</div><div class="pm-split-desc">'+m+' allowed/game</div><div class="pm-split-sample">'+(p.defHomeSample!=null?p.defHomeSample:0)+' games</div>'+(hA?'<div class="pm-split-badge">USED TODAY</div>':'')+'</div>'
-    +'<div class="pm-split-card '+(aA?'pm-split-active':'')+'"><div class="pm-split-venue">'+o+' AWAY</div><div class="pm-split-val">'+(p.defAwayAllowed!=null?p.defAwayAllowed:'—')+'</div><div class="pm-split-desc">'+m+' allowed/game</div><div class="pm-split-sample">'+(p.defAwaySample!=null?p.defAwaySample:0)+' games</div>'+(aA?'<div class="pm-split-badge">USED TODAY</div>':'')+'</div>'
+    +'<div class="pm-split-card '+(hA?'pm-split-active':'')+'"><div class="pm-split-venue">'+o+' HOME</div><div class="pm-split-val">'+(p.defHomeAllowed!=null?p.defHomeAllowed:'—')+'</div><div class="pm-split-desc">'+m+' allowed/game</div>'+tdLineContext(p.defHomeAllowed)+'<div class="pm-split-sample">'+(p.defHomeSample!=null?p.defHomeSample:0)+' games</div>'+(hA?'<div class="pm-split-badge">USED TODAY</div>':'')+'</div>'
+    +'<div class="pm-split-card '+(aA?'pm-split-active':'')+'"><div class="pm-split-venue">'+o+' AWAY</div><div class="pm-split-val">'+(p.defAwayAllowed!=null?p.defAwayAllowed:'—')+'</div><div class="pm-split-desc">'+m+' allowed/game</div>'+tdLineContext(p.defAwayAllowed)+'<div class="pm-split-sample">'+(p.defAwaySample!=null?p.defAwaySample:0)+' games</div>'+(aA?'<div class="pm-split-badge">USED TODAY</div>':'')+'</div>'
     +'</div></div>';
 }
 function nflCard(p,i){
@@ -10122,6 +10146,16 @@ function _underBox(picks){
 function openNflLadder(key){
   var p=window.__NFLLAD__[key]; if(!p) return;
   var line=p.dispLine;
+  var pickSide=String(p.pick||'PICK').toUpperCase();
+  var venueScope=p.homeRoad==='R'?'away games':(p.homeRoad==='H'?'home games':'games at all venues');
+  var statName=_esc(p.mkt||p.label||'stat');
+  function detailedRate(hits,total,rate,scope,side){
+    var h=Number(hits||0),t=Number(total||0),r=Number(rate);
+    side=String(side||pickSide).toUpperCase();
+    if(!t||!isFinite(r))return '<span class="gray">No qualifying games</span>';
+    return '<span class="'+rateClass(r)+'">'+h+'/'+t+' ('+r.toFixed(1)+'%)'
+      +'<span class="pm-stat-note">'+h+' of '+t+' '+scope+' finished '+side.toLowerCase()+' '+line+'</span></span>';
+  }
   var chips=(p.glog||[]).map(function(g){
     var hit=p.pick==='UNDER'?g.v<line:g.v>line; var cls=hit?'hit':'miss';
     var od=g.o?(' &middot; '+g.o):'';
@@ -10130,7 +10164,7 @@ function openNflLadder(key){
   if(!chips) chips='<span class="pm-gray">No game log available.</span>';
   
   var vslRow=(p.realLine!=null&&p.vsLineTotal)
-    ? '<div class="pm-stat"><span class="k">Hits vs Book Line ('+p.realLine+') L10</span><span class="v '+rateClass(p.vsLineRate)+'">'+p.vsLineHits+'/'+p.vsLineTotal+' ('+p.vsLineRate+'%)</span></div>'
+    ? '<div class="pm-stat"><span class="k">'+pickSide+' '+p.realLine+' &middot; Last 10 all venues<span class="pm-stat-note">Most recent games, regardless of HOME/AWAY</span></span><span class="v">'+detailedRate(p.vsLineHits,p.vsLineTotal,p.vsLineRate,'recent games')+'</span></div>'
     : '';
     
   var vol=(p.vsOppLog||[]);
@@ -10167,20 +10201,19 @@ function openNflLadder(key){
     :'';
 
   var roleHtml = p.role
-    ? '<div class="pm-stat"><span class="k">Role / opportunity</span><span class="v">'+_esc(p.role)+(p.teamOptionRank!=null?' &middot; Option #'+p.teamOptionRank:'')+' ('+Math.round(Number(p.roleConfidence||0)*100)+'% conf)</span></div>'
+    ? '<div class="pm-stat"><span class="k">Role / opportunity<span class="pm-stat-note">Estimated depth-chart opportunity from recent usage</span></span><span class="v">'+_esc(p.role)+(p.teamOptionRank!=null?' &middot; Option #'+p.teamOptionRank:'')+' ('+Math.round(Number(p.roleConfidence||0)*100)+'% conf)</span></div>'
     : '';
     
   var probHtml = (p.baseProbability!=null||p.adjustedProbability!=null)
-    ? '<div class="pm-stat"><span class="k">Base &rarr; adj probability</span><span class="v">'+(p.baseProbability!=null?Number(p.baseProbability).toFixed(1):'—')+'% &rarr; '+(p.adjustedProbability!=null?Number(p.adjustedProbability).toFixed(1):'—')+'%</span></div>'
+    ? '<div class="pm-stat"><span class="k">Base &rarr; adjusted probability<span class="pm-stat-note">Base blends opponent history and recent venue form; adjusted adds role, defense and verified injury effects</span></span><span class="v">'+(p.baseProbability!=null?Number(p.baseProbability).toFixed(1):'—')+'% &rarr; '+(p.adjustedProbability!=null?Number(p.adjustedProbability).toFixed(1):'—')+'%</span></div>'
     : '';
     
   var defHtml = (p.defRank!=null&&p.defAdj!=null)
-    ? '<div class="pm-stat"><span class="k">Opp Def Rank Factor (#'+p.defRank+' '+(p.defLbl||'D')+')</span><span class="v '+(p.defAdj>0?'pm-text-green':(p.defAdj<0?'pm-text-red':'pm-text-gray'))+'">'+(p.defAdj>0?'+':'')+p.defAdj+'% nudge</span></div>'
+    ? '<div class="pm-stat"><span class="k">Opponent defense &middot; #'+p.defRank+' '+_esc(p.defLbl||'D')+'<span class="pm-stat-note">Venue-specific adjustment to the player projection; negative lowers the projected stat</span></span><span class="v '+(p.defAdj>0?'pm-text-green':(p.defAdj<0?'pm-text-red':'pm-text-gray'))+'">'+(p.defAdj>0?'+':'')+p.defAdj+'% nudge</span></div>'
     : '';
 
   var splitHtml = (p.realLine!=null||p.dispLine!=null) ? _nflDefenseSplitHtml(p) : '';
 
-  var pickSide = p.pick || '';
   var pickCls = pickSide === 'UNDER' ? 'pm-pick-under' : 'pm-pick-over';
 
   var html='<div class="pm-modal" onclick="event.stopPropagation()">'
@@ -10205,15 +10238,15 @@ function openNflLadder(key){
     +'<div class="pm-section pm-stats-section">'
     +'<div class="pm-sec-title">Matchup Stats</div>'
     +'<div class="pm-stats-list">'
-    +'<div class="pm-stat"><span class="k">'+_esc(_nflOppVenueLabel(p))+'</span><span class="v">'+_rateHtml(p.rateA,p.hitsA,p.totA)+'</span></div>'
-    +'<div class="pm-stat"><span class="k">'+_esc(_nflRecentVenueLabel(p))+'</span><span class="v">'+_rateHtml(p.rateB,p.hitsB,p.totB)+'</span></div>'
+    +'<div class="pm-stat"><span class="k">'+pickSide+' vs '+_esc(p.opponent)+' &middot; All meetings<span class="pm-stat-note">Every available career meeting, all venues</span></span><span class="v">'+detailedRate(p.hitsA,p.totA,p.rateA,'meetings')+'</span></div>'
+    +'<div class="pm-stat"><span class="k">'+pickSide+' '+line+' &middot; Recent '+venueScope+'<span class="pm-stat-note">Up to 10 '+venueScope+' before today</span></span><span class="v">'+detailedRate(p.hitsB,p.totB,p.rateB,venueScope)+'</span></div>'
     +vslRow
-    +'<div class="pm-stat"><span class="k">Under Line L10</span><span class="v '+rateClass(p.underRate)+'">'+p.underHits+'/'+p.underTotal+' ('+p.underRate+'%)</span></div>'
-    +'<div class="pm-stat"><span class="k">Average</span><span class="v pm-gold">'+p.avg+'</span></div>'
+    +'<div class="pm-stat"><span class="k">UNDER '+line+' &middot; Recent '+venueScope+'<span class="pm-stat-note">Dedicated downside rate for the same venue sample</span></span><span class="v">'+detailedRate(p.underHits,p.underTotal,p.underRate,venueScope,'UNDER')+'</span></div>'
+    +'<div class="pm-stat"><span class="k">Average &middot; Recent '+venueScope+'<span class="pm-stat-note">Arithmetic average across '+Number(p.totB||0)+' available '+venueScope+'</span></span><span class="v pm-gold">'+p.avg+'<span class="pm-stat-note">'+statName+' per game</span></span></div>'
     +defHtml
     +roleHtml
     +probHtml
-    +'<div class="pm-stat pm-score-stat"><span class="k">Score</span><span class="v pm-gold-bright">'+p.dispScore+'</span></div>'
+    +'<div class="pm-stat pm-score-stat"><span class="k">Final model score<span class="pm-stat-note">Confidence for the printed '+pickSide+' pick after all adjustments</span></span><span class="v pm-gold-bright">'+p.dispScore+'</span></div>'
     +'</div>'
     +'</div>'
     +'</div>'
