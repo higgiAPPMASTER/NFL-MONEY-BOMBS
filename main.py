@@ -590,6 +590,18 @@ async def _build_ha_lookup():
         except Exception as e:
             print(f"[H/A] Disk cache save failed: {e}")
 
+async def _nfl_gp_ensure_ha(timeout: float = 18.0) -> bool:
+    """Ensure the shared ESPN venue map is ready without duplicate builds."""
+    if _HA_LOADED:
+        return True
+    try:
+        await asyncio.wait_for(_build_ha_lookup(), timeout=timeout)
+    except asyncio.TimeoutError:
+        print(f"[H/A] Game Predictor venue lookup skipped after {timeout}s")
+    except Exception as exc:
+        print(f"[H/A] Game Predictor venue lookup unavailable: {exc}")
+    return bool(_HA_LOADED)
+
 # Direct nfl-verse CSV URLs (no package needed)
 _NFL_CSV_URL  = "https://github.com/nflverse/nflverse-data/releases/download/player_stats/player_stats_{year}.csv"
 _NFL_DEF_URL  = "https://github.com/nflverse/nflverse-data/releases/download/player_stats/player_stats_def_{year}.csv"
@@ -3344,7 +3356,10 @@ async def _nfl_gp_compute(fn, *args, **kwargs):
 def _nfl_gp_frame(df):
     """All rows/seasons, but only columns actually read by Game Predictor."""
     columns = ["season", "season_type", "week", "recent_team", "opponent_team",
-               "passing_yards", "rushing_yards", "player_display_name", "position"]
+               "passing_yards", "rushing_yards", "player_display_name", "position",
+               # nflverse has these on some releases; retaining them enables
+               # point-in-time venue splits without making them required.
+               "home_team", "away_team"]
     return df.loc[:, [c for c in columns if c in df.columns]]
 
 def _nfl_stats_before_game(df, target_season=None, target_week=None,
@@ -3372,6 +3387,226 @@ def _nfl_stats_before_game(df, target_season=None, target_week=None,
             return df.iloc[0:0]
         except Exception:
             return df
+
+def _nfl_gp_ha_value(season, season_type, week, team):
+    """Resolve nflverse team/week identity against the shared ESPN map."""
+    if not _HA_LOADED:
+        return None
+    try:
+        st = str(season_type or "REG").upper()
+        raw_week = int(week)
+        if st == "POST" and raw_week == 22:
+            candidates = (5, 4)
+        elif st == "POST" and 19 <= raw_week <= 21:
+            candidates = (raw_week - 18,)
+        else:
+            candidates = (_espn_ha_week(st, raw_week),)
+        abbr = _NFLVERSE_TO_ESPN.get(str(team).upper(), str(team).upper())
+        for wk in candidates:
+            value = _HA_LOOKUP.get((int(season), st, int(wk), abbr))
+            if value:
+                return value
+        return None
+    except (TypeError, ValueError):
+        return None
+
+def _nfl_gp_point_profiles(df, target_season, target_week, target_type="REG",
+                           matchup_teams=None):
+    """Compact point-in-time team offense/defense and venue profiles.
+
+    This deliberately uses the same player-yardage game aggregation as the
+    existing model.  It is a single grouped pass for a slate, rather than 32
+    independent full-frame scans, and fails open when venue columns are absent.
+    """
+    out = {}
+    try:
+        off_sources = {}
+        def_sources = {}
+        sdf = _nfl_stats_before_game(df, target_season, target_week, target_type)
+        # Select each team's target-season rows independently.  A team with
+        # no target-season pregame data gets exactly the prior regular season;
+        # older seasons are never mixed into this point-in-time rank pool.
+        if "season" in sdf.columns and "recent_team" in sdf.columns:
+            norm = lambda s: _NFLVERSE_TO_ESPN.get(str(s).upper(), str(s).upper())
+            current = sdf[sdf["season"].astype(int) == int(target_season)]
+            prior = sdf[sdf["season"].astype(int) == int(target_season) - 1]
+            if "season_type" in prior.columns:
+                prior = prior[prior["season_type"].astype(str).str.upper() == "REG"]
+            current = current.copy()
+            prior = prior.copy()
+            for frame in (current, prior):
+                frame["recent_team"] = frame["recent_team"].map(norm)
+                if "opponent_team" in frame.columns:
+                    frame["opponent_team"] = frame["opponent_team"].map(norm)
+                for venue_col in ("home_team", "away_team"):
+                    if venue_col in frame.columns:
+                        frame[venue_col] = frame[venue_col].map(norm)
+            candidates = set(norm(x) for x in current["recent_team"].dropna())
+            if "opponent_team" in current.columns:
+                candidates.update(norm(x) for x in current["opponent_team"].dropna())
+            candidates.update(norm(x) for x in prior["recent_team"].dropna())
+            if "opponent_team" in prior.columns:
+                candidates.update(norm(x) for x in prior["opponent_team"].dropna())
+            candidates.update(norm(x) for x in (matchup_teams or []))
+            selected = []
+            for team in candidates:
+                c_mask = current["recent_team"].map(norm).eq(team)
+                if "opponent_team" in current.columns:
+                    c_mask = c_mask | current["opponent_team"].map(norm).eq(team)
+                if c_mask.any():
+                    selected.append(current[c_mask])
+                else:
+                    p_mask = prior["recent_team"].map(norm).eq(team)
+                    if "opponent_team" in prior.columns:
+                        p_mask = p_mask | prior["opponent_team"].map(norm).eq(team)
+                    if p_mask.any():
+                        selected.append(prior[p_mask])
+            if selected:
+                sdf = pd.concat(selected, ignore_index=True).drop_duplicates()
+            sdf["recent_team"] = sdf["recent_team"].map(norm)
+            if "opponent_team" in sdf.columns:
+                sdf["opponent_team"] = sdf["opponent_team"].map(norm)
+            for venue_col in ("home_team", "away_team"):
+                if venue_col in sdf.columns:
+                    sdf[venue_col] = sdf[venue_col].map(norm)
+            off_sources = {}
+            def_sources = {}
+            for team in candidates:
+                off_now = current[current["recent_team"].eq(team)]
+                off_sources[team] = (off_now if not off_now.empty else
+                                     prior[prior["recent_team"].eq(team)])
+                def_now = (current[current["opponent_team"].eq(team)]
+                           if "opponent_team" in current.columns else current.iloc[0:0])
+                def_sources[team] = (def_now if not def_now.empty else
+                                     (prior[prior["opponent_team"].eq(team)]
+                                      if "opponent_team" in prior.columns else prior.iloc[0:0]))
+        yards = [c for c in ("passing_yards", "rushing_yards") if c in sdf.columns]
+        if not yards or sdf.empty:
+            return out
+        sdf = sdf.copy()
+        sdf["_gp_yards"] = sdf[yards].fillna(0).sum(axis=1)
+        keys = [c for c in ("season", "week") if c in sdf.columns]
+        if "recent_team" not in sdf.columns or not keys:
+            return out
+        venue_columns = (
+            "home_team" in sdf.columns and "away_team" in sdf.columns and
+            sdf["home_team"].notna().any() and sdf["away_team"].notna().any())
+        venue_lookup = bool(_HA_LOADED)
+        if venue_lookup and not venue_columns:
+            # Resolve only unique game/team tuples, not every player row.
+            venue_cols = ["season", "week", "recent_team", "opponent_team"]
+            if "season_type" in sdf.columns:
+                venue_cols.insert(1, "season_type")
+            venue_rows = sdf[venue_cols].drop_duplicates()
+            if "season_type" not in venue_rows.columns:
+                venue_rows["season_type"] = "REG"
+            venue_map = {}
+            for row in venue_rows.itertuples(index=False):
+                rv = _nfl_gp_ha_value(row.season, row.season_type, row.week,
+                                      row.recent_team)
+                ov = _nfl_gp_ha_value(row.season, row.season_type, row.week,
+                                      row.opponent_team)
+                venue_map[(row.season, row.week, row.recent_team,
+                           row.opponent_team)] = (rv, ov)
+            sdf["_gp_recent_venue"] = [
+                venue_map.get((r.season, r.week, r.recent_team,
+                               r.opponent_team), (None, None))[0]
+                for r in sdf.itertuples(index=False)
+            ]
+            sdf["_gp_opp_venue"] = [
+                venue_map.get((r.season, r.week, r.recent_team,
+                               r.opponent_team), (None, None))[1]
+                for r in sdf.itertuples(index=False)
+            ]
+        # Side-specific sources prevent a team's fallback offense from
+        # becoming another team's current-season defense (and vice versa).
+        side_off = {}
+        side_def = {}
+        teams = set(off_sources) | set(def_sources)
+        for team in teams:
+            odf = off_sources.get(team, sdf.iloc[0:0]).copy()
+            ddf = def_sources.get(team, sdf.iloc[0:0]).copy()
+            for frame in (odf, ddf):
+                if not frame.empty:
+                    frame["_gp_yards"] = frame[yards].fillna(0).sum(axis=1)
+            side_off[team] = (odf.groupby(keys)["_gp_yards"].sum()
+                              if not odf.empty else pd.Series(dtype=float))
+            side_def[team] = (ddf.groupby(keys)["_gp_yards"].sum()
+                              if not ddf.empty else pd.Series(dtype=float))
+        off_means = [float(v.mean()) for v in side_off.values() if len(v)]
+        def_means = [float(v.mean()) for v in side_def.values() if len(v)]
+        all_off = sum(off_means) / len(off_means) if off_means else 350.0
+        all_def = sum(def_means) / len(def_means) if def_means else 350.0
+        for team in teams:
+            off_games = side_off[team]
+            def_games = side_def[team]
+            om = float(off_games.mean()) if len(off_games) else all_off
+            dm = float(def_games.mean()) if len(def_games) else all_def
+            # Shrink small samples toward the league pool.
+            on = float(len(off_games))
+            dn = float(len(def_games))
+            os = (om * on + all_off * 4) / (on + 4)
+            ds = (dm * dn + all_def * 4) / (dn + 4)
+            rec = {"off_yards": os, "def_yards_allowed": ds,
+                   "off_pts": max(10.0, min(45.0, os * 23.0 / 350.0)),
+                   "def_factor": max(.86, min(1.14, ds / 350.0)),
+                   "off_games": int(on), "def_games": int(dn),
+                   "venue_data_available": False}
+            # Prefer actual venue columns; otherwise use the bounded ESPN map.
+            if venue_columns or venue_lookup:
+                off_frame = off_sources.get(team, sdf.iloc[0:0]).copy()
+                def_frame = def_sources.get(team, sdf.iloc[0:0]).copy()
+                for frame in (off_frame, def_frame):
+                    if "_gp_yards" not in frame.columns:
+                        frame["_gp_yards"] = frame[yards].fillna(0).sum(axis=1)
+                for frame, column in ((off_frame, "_gp_recent_venue"),
+                                      (def_frame, "_gp_opp_venue")):
+                    if not venue_columns and not frame.empty:
+                        frame[column] = [
+                            _nfl_gp_ha_value(r.season, getattr(r, "season_type", "REG"),
+                                             r.week,
+                                             getattr(r, "recent_team", None)
+                                             if column == "_gp_recent_venue"
+                                             else getattr(r, "opponent_team", None))
+                            for r in frame.itertuples(index=False)]
+                if venue_columns:
+                    home = off_frame[off_frame["home_team"].eq(team)]
+                    away = off_frame[off_frame["away_team"].eq(team)]
+                    dh = def_frame[def_frame["home_team"].eq(team)]
+                    da = def_frame[def_frame["away_team"].eq(team)]
+                else:
+                    home = off_frame[off_frame["_gp_recent_venue"].eq("HOME")]
+                    away = off_frame[off_frame["_gp_recent_venue"].eq("AWAY")]
+                    dh = def_frame[def_frame["_gp_opp_venue"].eq("HOME")]
+                    da = def_frame[def_frame["_gp_opp_venue"].eq("AWAY")]
+                for label, rows in (("home", home), ("away", away)):
+                    if not rows.empty:
+                        grouped = rows.groupby(keys)["_gp_yards"].sum()
+                        n = len(grouped)
+                        val = (float(grouped.mean()) * n + os * 4) / (n + 4)
+                        rec[label + "_off_pts"] = max(10., min(45., val * 23. / 350.))
+                        rec[label + "_off_games"] = n
+                        rec["venue_data_available"] = True
+                # Defensive venue split is where the defense played.
+                for label, rows in (("home", dh), ("away", da)):
+                    if not rows.empty:
+                        grouped = rows.groupby(keys)["_gp_yards"].sum()
+                        n = len(grouped)
+                        val = (float(grouped.mean()) * n + ds * 4) / (n + 4)
+                        rec[label + "_def_factor"] = max(.86, min(1.14, val / 350.))
+                        rec[label + "_def_games"] = n
+                        rec["venue_data_available"] = True
+            out[str(team)] = rec
+        # Rank direction: offense high points is best; defense low allowed is best.
+        op = sorted(out, key=lambda t: (-out[t]["off_pts"], str(t)))
+        dp = sorted(out, key=lambda t: (out[t]["def_factor"], str(t)))
+        for rank, team in enumerate(op, 1):
+            out[team]["off_rank"] = rank
+        for rank, team in enumerate(dp, 1):
+            out[team]["def_rank"] = rank
+    except Exception:
+        return {}
+    return out
 
 def _nfl_team_pts_projection(team_abbr: str, df, n_games: int = 5,
                              target_season=None, target_week=None,
@@ -3532,12 +3767,16 @@ async def _build_nfl_game_predictions(espn_games: list, df, date_str: str,
     Uses cached game lines when available (past-date lines are final) and
     returns (predictions, newly_fetched_lines_by_event_id) so the caller can
     persist them — every skipped historical call saves 10x-priced credits."""
-    HOME_ADJ = 1.05
+    # Venue splits carry most of the home/away signal when available; retain
+    # only a modest league residual so the effect is not counted twice.
+    HOME_ADJ = 1.025
     df = await _nfl_gp_compute(_nfl_gp_frame, df)
     predictions = []
     gl_cache = dict(gl_cache or {})
     fetched: dict = {}
     season_profile_cache = {}
+    point_profile_cache = {}
+    venue_lookup_available = await _nfl_gp_ensure_ha()
     completed_lines = 0
 
     def report(message):
@@ -3626,6 +3865,12 @@ async def _build_nfl_game_predictions(espn_games: list, df, date_str: str,
             season_profile_cache[reference_season] = await _nfl_gp_compute(
                 _nfl_season_team_profiles, df, reference_season)
         season_profiles = season_profile_cache[reference_season]
+        profile_key = (target_season, target_week, target_type)
+        if profile_key not in point_profile_cache:
+            point_profile_cache[profile_key] = await _nfl_gp_compute(
+                _nfl_gp_point_profiles, df, target_season, target_week, target_type,
+                [g.get("home_abbr", ""), g.get("away_abbr", "")])
+        point_profiles = point_profile_cache[profile_key]
         # Offensive projections (L5 team yards → pts)
         # Defensive strength belongs to the opponent being faced: away defense
         # suppresses home scoring and home defense suppresses away.  These four
@@ -3648,20 +3893,40 @@ async def _build_nfl_game_predictions(espn_games: list, df, date_str: str,
                 _nfl_team_def_strength, aa, df,
                 target_season=target_season, target_week=target_week,
                 target_type=target_type)
-        recent_home = home_off * away_def_str * HOME_ADJ
-        recent_away = away_off * home_def_str
+        home_profile = point_profiles.get(ha, {})
+        away_profile = point_profiles.get(aa, {})
+        home_off_split = home_profile.get("home_off_pts")
+        away_off_split = away_profile.get("away_off_pts")
+        home_def_split = home_profile.get("home_def_factor")
+        away_def_split = away_profile.get("away_def_factor")
+        effective_home_off = (0.65 * home_off + 0.35 * home_off_split
+                              if home_off_split is not None else home_off)
+        effective_away_off = (0.65 * away_off + 0.35 * away_off_split
+                              if away_off_split is not None else away_off)
+        effective_away_def = (0.65 * away_def_str + 0.35 * away_def_split
+                              if away_def_split is not None else away_def_str)
+        effective_home_def = (0.65 * home_def_str + 0.35 * home_def_split
+                              if home_def_split is not None else home_def_str)
+        venue_active = any(v is not None for v in (
+            home_off_split, away_off_split, home_def_split, away_def_split))
+        residual_home_adj = HOME_ADJ if venue_active else 1.05
+        recent_home = effective_home_off * effective_away_def * residual_home_adj
+        recent_away = effective_away_off * effective_home_def
         hp = season_profiles.get(ha, {})
         ap = season_profiles.get(aa, {})
-        last_home = float(hp.get("off_pts", 23.0)) * float(ap.get("def_factor", 1.0)) * HOME_ADJ
+        last_home = (float(hp.get("off_pts", 23.0)) *
+                     float(ap.get("def_factor", 1.0)) * residual_home_adj)
         last_away = float(ap.get("off_pts", 23.0)) * float(hp.get("def_factor", 1.0))
         # Last completed season anchors the model while L5 captures current
         # form. A missing team profile falls back to league average.
         stat_home = 0.45 * recent_home + 0.55 * last_home
         stat_away = 0.45 * recent_away + 0.55 * last_away
 
-        # H2H is a matchup adjustment, with venue-specific averages preferred.
+        # H2H is a major but bounded matchup adjustment. Only the five most
+        # recent pre-target meetings are allowed; exact venue orientation is
+        # substantially more informative than a reversed venue.
         h2h = h2h_payloads[game_index] if game_index < len(h2h_payloads) else {}
-        hgames = h2h.get("games", []) if h2h else []
+        hgames = (h2h.get("games", []) if h2h else [])[:5]
         def _weighted_h2h_score(team, target_side):
             total_score = total_weight = 0.0
             for pos, meeting in enumerate(hgames):
@@ -3673,7 +3938,7 @@ async def _build_nfl_game_predictions(espn_games: list, df, date_str: str,
                     continue
                 # Newer meetings matter much more; matching today's venue gets
                 # an additional boost while reverse-venue games still count.
-                weight = (0.72 ** pos) * (1.35 if side == target_side else 1.0)
+                weight = (0.64 ** pos) * (2.20 if side == target_side else 0.72)
                 total_score += float(score) * weight
                 total_weight += weight
             return total_score / total_weight if total_weight else None
@@ -3686,10 +3951,13 @@ async def _build_nfl_game_predictions(espn_games: list, df, date_str: str,
             meeting_age = max(0, target_year - latest_h2h_year)
         except Exception:
             meeting_age = 0
-        # Historical matchup signal is intentionally secondary. Its maximum
-        # influence is 25%, and it fades when the latest meeting is years old.
-        h2h_recency = max(0.35, 1.0 - meeting_age * 0.10)
-        h2h_weight = (min(0.25, 0.08 + len(hgames) * 0.034) * h2h_recency
+        # Reliability grows with sample size and consistency, while old
+        # meetings fade. A single old meeting cannot move the call materially.
+        h2h_recency = max(0.25, 1.0 - meeting_age * 0.12)
+        venue_count = sum(1 for m in hgames if m.get("home_abbr") == ha)
+        sample_reliability = min(1.0, len(hgames) / 4.0)
+        h2h_weight = (min(0.34, (0.06 + len(hgames) * 0.055)
+                          * h2h_recency * (.72 + .28 * sample_reliability))
                       if hgames else 0.0)
         proj_home = round(stat_home * (1 - h2h_weight) +
                           (h2h_home_avg if h2h_home_avg is not None else stat_home) * h2h_weight, 1)
@@ -3736,8 +4004,18 @@ async def _build_nfl_game_predictions(espn_games: list, df, date_str: str,
             drivers.append(f"last {len(hgames)} H2H: {ha} {h2h_winner[0]} wins, "
                            f"{aa} {h2h_winner[1]} wins; recency/venue weight "
                            f"{round(h2h_weight * 100)}%")
+            drivers.append(f"exact venue meetings: {venue_count}/{len(hgames)}; "
+                           f"newest weighted most")
         if reference_season is not None:
             drivers.append(f"{reference_season} full-season offense/defense anchors recent L5 form")
+        if venue_active:
+            drivers.append("team venue splits active: "
+                           f"home O {home_profile.get('home_off_games', 0)} / "
+                           f"home D {home_profile.get('home_def_games', 0)}, "
+                           f"away O {away_profile.get('away_off_games', 0)} / "
+                           f"away D {away_profile.get('away_def_games', 0)} games")
+        else:
+            drivers.append("team-specific venue split unavailable; league home edge fallback used")
         if value_flag and mkt_edge:
             drivers.append(f"model {pick_abbr} {model_pct}% vs market {mkt_pct}% — +{mkt_edge}% value edge")
         elif mkt_edge is not None:
@@ -3778,7 +4056,29 @@ async def _build_nfl_game_predictions(espn_games: list, df, date_str: str,
             "h2h_home_wins": sum(1 for m in hgames if m.get("winner") == ha),
             "h2h_away_wins": sum(1 for m in hgames if m.get("winner") == aa),
             "h2h_weight_pct": round(h2h_weight * 100),
+            "h2h_exact_venue_games": venue_count,
+            "h2h_reversed_venue_games": max(0, len(hgames) - venue_count),
+            "venue_data_available": venue_active,
+            "venue_lookup_available": bool(venue_lookup_available),
+            "venue_sample_counts": {
+                "home_off": point_profiles.get(ha, {}).get("home_off_games", 0),
+                "away_off": point_profiles.get(aa, {}).get("away_off_games", 0),
+                "home_def": point_profiles.get(ha, {}).get("home_def_games", 0),
+                "away_def": point_profiles.get(aa, {}).get("away_def_games", 0),
+            },
             "reference_season": reference_season,
+            "away_off_rank": point_profiles.get(aa, {}).get("off_rank"),
+            "home_off_rank": point_profiles.get(ha, {}).get("off_rank"),
+            "away_def_rank": point_profiles.get(aa, {}).get("def_rank"),
+            "home_def_rank": point_profiles.get(ha, {}).get("def_rank"),
+            "away_off_pts": round(point_profiles.get(aa, {}).get("off_pts", away_off), 1),
+            "home_off_pts": round(point_profiles.get(ha, {}).get("off_pts", home_off), 1),
+            "away_def_factor": point_profiles.get(aa, {}).get("def_factor", away_def_str),
+            "home_def_factor": point_profiles.get(ha, {}).get("def_factor", home_def_str),
+            "home_venue_off_pts": point_profiles.get(ha, {}).get("home_off_pts"),
+            "away_venue_off_pts": point_profiles.get(aa, {}).get("away_off_pts"),
+            "home_venue_def_factor": point_profiles.get(ha, {}).get("home_def_factor"),
+            "away_venue_def_factor": point_profiles.get(aa, {}).get("away_def_factor"),
             "recent_home": round(recent_home, 1), "recent_away": round(recent_away, 1),
             "last_home": round(last_home, 1), "last_away": round(last_away, 1),
             "stat_home": round(stat_home, 1), "stat_away": round(stat_away, 1),
@@ -8024,8 +8324,8 @@ tr:last-child td{border-bottom:none}
  .nfl-gp-filters{display:grid;grid-template-columns:minmax(130px,160px) minmax(110px,140px) minmax(0,1fr);gap:10px;align-items:end;margin-bottom:14px}
  .nfl-gp-filter{display:flex;flex-direction:column;gap:6px;min-width:0;color:#9ca3af;font-size:.72rem;font-weight:800;text-transform:uppercase;letter-spacing:.09em}
  .nfl-gp-filter .date-input{display:block;width:100%;max-width:100%;min-width:0;box-sizing:border-box}
-   .nfl-gp-grid{display:flex;align-items:stretch;justify-content:flex-start;gap:14px;overflow-x:auto;overscroll-behavior-x:contain;scroll-snap-type:x proximity;padding:2px 2px 14px;scrollbar-color:#475569 #0b1220}
-   .nfl-gp-game{position:relative;overflow:hidden;background:linear-gradient(145deg,#111a2d 0%,#090f1c 72%);border:1px solid #334155;border-radius:18px;cursor:pointer;box-shadow:0 14px 30px rgba(0,0,0,.28);transition:transform .18s ease,border-color .18s ease,box-shadow .18s ease;width:460px;max-width:calc(100vw - 54px);flex:0 0 460px;scroll-snap-align:start}
+   .nfl-gp-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));align-items:stretch;gap:12px;padding:2px}
+   .nfl-gp-game{position:relative;overflow:hidden;background:linear-gradient(145deg,#111a2d 0%,#090f1c 72%);border:1px solid #334155;border-radius:14px;cursor:pointer;box-shadow:0 14px 30px rgba(0,0,0,.28);transition:transform .18s ease,border-color .18s ease,box-shadow .18s ease;min-width:0}
   .nfl-gp-game:hover{transform:translateY(-2px);border-color:#8b5cf6;box-shadow:0 18px 38px rgba(76,29,149,.26)}
   .nfl-gp-game:focus-visible{outline:3px solid rgba(167,139,250,.55);outline-offset:3px}
   .nfl-gp-head{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:14px 16px 11px;border-bottom:1px solid rgba(148,163,184,.14)}
@@ -8047,11 +8347,16 @@ tr:last-child td{border-bottom:none}
   .nfl-gp-proj small,.nfl-gp-win small{display:block;color:#64748b;font-size:.5rem;letter-spacing:.08em;text-transform:uppercase;margin-top:2px}
   .nfl-gp-win{text-align:right;color:#94a3b8;font-size:.96rem;font-weight:950}
   .nfl-gp-team.pick .nfl-gp-win{color:#4ade80}
+  .nfl-gp-ranks{display:flex;gap:4px;margin-top:3px;flex-wrap:wrap}
+  .nfl-gp-rank{font-size:.48rem;line-height:1.3;padding:2px 4px;border-radius:4px;background:#172033;color:#a5b4fc;font-weight:900;letter-spacing:.02em}
+  .nfl-gp-rank.def{color:#86efac}
   .nfl-gp-callouts{display:grid;grid-template-columns:1fr 1fr;gap:8px;padding:8px 16px 14px}
   .nfl-gp-callout{min-width:0;border:1px solid rgba(148,163,184,.15);border-radius:10px;background:rgba(3,7,18,.55);padding:9px 10px}
   .nfl-gp-callout .k{color:#64748b;font-size:.54rem;font-weight:900;letter-spacing:.08em;text-transform:uppercase}
   .nfl-gp-callout .v{color:#f8fafc;font-size:.73rem;font-weight:900;margin-top:4px;line-height:1.35}
   .nfl-gp-why{padding:10px 16px;border-top:1px solid rgba(148,163,184,.12);color:#aab8cc;font-size:.66rem;line-height:1.5}
+  @media(max-width:1100px){.nfl-gp-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+  @media(max-width:650px){.nfl-gp-grid{grid-template-columns:1fr}.nfl-gp-game{border-radius:12px}}
   .nfl-gp-track{margin:0;border-top:1px solid #1e293b;background:#070d1a}
   .nfl-gp-track summary{list-style:none;cursor:pointer;padding:8px 12px;color:#a78bfa;font-size:.62rem;font-weight:900;letter-spacing:.07em}
   .nfl-gp-track summary::-webkit-details-marker{display:none}
@@ -9434,13 +9739,14 @@ function _nflGpBetPanel(g,idx){
 }
 function _nflGpCard(g,i){
   var cc=_nflGpConfClr(g.conf);
-  function teamRow(abbr,sp,proj,win,isPick,book){
-    var barClr=isPick?'linear-gradient(90deg,#7c3aed,#4ade80)':'#475569';
+  function teamRow(abbr,sp,proj,win,isPick,book,offRank,defRank){
+    var barClr=isPick?'linear-gradient(90deg,#16a34a,#4ade80)':'#b91c1c';
     var logo='https://a.espncdn.com/i/teamlogos/nfl/500/'+_logoAbbr(abbr)+'.png';
     return '<div class="nfl-gp-team'+(isPick?' pick':'')+'">'
       +'<img class="nfl-gp-logo" src="'+_esc(logo)+'" alt="" onerror="this.style.visibility=\\'hidden\\'"/>'
       +'<div class="nfl-gp-abbr">'+_esc(abbr)+'</div>'
       +'<div style="min-width:0"><div class="nfl-gp-bar"><span style="width:'+win+'%;background:'+barClr+'"></span></div>'
+      +'<div class="nfl-gp-ranks"><span class="nfl-gp-rank">OFF #'+(offRank||'—')+'</span><span class="nfl-gp-rank def">DEF #'+(defRank||'—')+'</span></div>'
       +'<div class="nfl-gp-sp">'+_esc(sp||'Starter TBD')+' · '+_esc(book||'Book unavailable')+'</div></div>'
       +'<div class="nfl-gp-proj">'+_nflGpFix(proj)+'<small>Proj</small></div>'
       +'<div class="nfl-gp-win">'+win+'%<small>Win</small></div>'
@@ -9469,8 +9775,8 @@ function _nflGpCard(g,i){
     +'<span class="nfl-gp-badge" style="background:'+cc+'">'+_esc(g.conf)+'</span>'
     +'<span class="nfl-gp-badge" style="background:#166534">PICK '+_esc(g.pick_abbr)+'</span></div></div>'
     +'<div class="nfl-gp-teams">'
-    +teamRow(g.away_abbr,g.away_sp,g.proj_away,g.win_away,!g.pick_home,g.away_ml_book)
-    +teamRow(g.home_abbr,g.home_sp,g.proj_home,g.win_home,g.pick_home,g.home_ml_book)
+    +teamRow(g.away_abbr,g.away_sp,g.proj_away,g.win_away,!g.pick_home,g.away_ml_book,g.away_off_rank,g.away_def_rank)
+    +teamRow(g.home_abbr,g.home_sp,g.proj_home,g.win_home,g.pick_home,g.home_ml_book,g.home_off_rank,g.home_def_rank)
     +'</div><div class="nfl-gp-callouts"><div class="nfl-gp-callout"><div class="k">Point total</div><div class="v">'+totValue+'</div></div>'
     +'<div class="nfl-gp-callout"><div class="k">Winner value</div><div class="v">'+mktValue+'</div></div></div>'
     +'<div class="nfl-gp-why"><span style="color:#c4b5fd;font-weight:900">WHY THIS PICK</span> · '+drivers+'</div>'
@@ -9546,13 +9852,15 @@ function _openNflGamePred(i){
   var totStr=(gp.total_line!=null?('proj <b>'+_nflGpFix(gp.proj_total)+'</b> · book line <b>'+_nflGpFix(gp.total_line)+'</b>'):'proj <b>'+_nflGpFix(gp.proj_total)+'</b> · no line posted');
   var driversHtml=(gp.drivers||[]).map(function(d){return '<li style="margin-bottom:4px">'+_esc(d)+'</li>';}).join('');
   var h2hBlendLine=gp.h2h_games
-    ?(gp.h2h_games+' recency/venue-weighted H2H meetings: '+gp.h2h_weight_pct+'% adjustment')
+    ?(gp.h2h_games+' recency/venue-weighted H2H meetings: '+gp.h2h_weight_pct+'% adjustment ('+(gp.h2h_exact_venue_games||0)+' exact venue, '+(gp.h2h_reversed_venue_games||0)+' reversed)')
     :'No completed H2H meetings available · stats baseline used without a matchup adjustment';
   var blendHtml='<div style="background:#11162a;border:1px solid #312e81;border-radius:8px;padding:9px 12px;margin-bottom:10px;font-size:.7rem;color:#94a3b8">'
     +'<div style="color:#c4b5fd;font-weight:900;margin-bottom:4px">BLENDED MODEL INPUTS</div>'
     +'<div>Recent L5 adjusted: '+_esc(gp.away_abbr)+' '+_nflGpFix(gp.recent_away)+' · '+_esc(gp.home_abbr)+' '+_nflGpFix(gp.recent_home)+'</div>'
     +'<div style="margin-top:3px">'+_esc(gp.reference_season||'Last season')+' offense/defense: '+_esc(gp.away_abbr)+' '+_nflGpFix(gp.last_away)+' · '+_esc(gp.home_abbr)+' '+_nflGpFix(gp.last_home)+'</div>'
     +'<div style="margin-top:3px">Stats baseline (45% L5 / 55% season): '+_esc(gp.away_abbr)+' '+_nflGpFix(gp.stat_away)+' · '+_esc(gp.home_abbr)+' '+_nflGpFix(gp.stat_home)+'</div>'
+    +'<div style="margin-top:3px">Ranks: '+_esc(gp.away_abbr)+' OFF #'+(gp.away_off_rank||'—')+' / DEF #'+(gp.away_def_rank||'—')+' · '+_esc(gp.home_abbr)+' OFF #'+(gp.home_off_rank||'—')+' / DEF #'+(gp.home_def_rank||'—')+'</div>'
+    +'<div style="margin-top:3px">Venue split: '+_esc(gp.away_abbr)+' away offense '+_nflGpFix(gp.away_venue_off_pts)+' · '+_esc(gp.home_abbr)+' home offense '+_nflGpFix(gp.home_venue_off_pts)+'</div>'
     +'<div style="margin-top:3px">'+h2hBlendLine+'</div>'
     +(gp.h2h_games?('<div style="margin-top:3px;color:#e2e8f0">Venue-aware H2H scoring: '+_esc(gp.home_abbr)+' '+_nflGpFix(gp.h2h_home_avg)+' · '+_esc(gp.away_abbr)+' '+_nflGpFix(gp.h2h_away_avg)+'</div>'):'')
     +'</div>';
