@@ -350,11 +350,13 @@ _NFL_KICK_URL = "https://github.com/nflverse/nflverse-data/releases/download/pla
 # nfl-verse retired the per-type player_stats files after 2024. Seasons 2025+
 # live in ONE combined weekly file (offense + defense + kicking per player-week).
 _NFL_NEW_URL       = "https://github.com/nflverse/nflverse-data/releases/download/stats_player/stats_player_week_{year}.csv"
+_NFL_SNAP_URL      = "https://github.com/nflverse/nflverse-data/releases/download/snap_counts/snap_counts_{year}.csv"
 _NFL_NEW_FMT_START = 2025
 _KEEP_COLS   = ["player_display_name","player_id","headshot_url","recent_team","opponent_team",
                 "season","week","season_type","rushing_yards","receiving_yards","passing_yards",
                 "receptions","targets","passing_tds","rushing_tds","receiving_tds",
-                "completions","attempts","interceptions","carries"]
+                "completions","attempts","interceptions","carries","position"]
+_KEEP_COLS += ["offense_pct","offense_snaps"]
 
 def _dl_csv(url):
     """Download one nfl-verse CSV (regular season + playoffs) as a DataFrame.
@@ -409,7 +411,8 @@ def _load_nfl_stats_sync():
         def_urls  = [(f"def_{y}",  _NFL_DEF_URL.format(year=y))  for y in old_years]
         kick_urls = [(f"kick_{y}", _NFL_KICK_URL.format(year=y)) for y in old_years]
         new_urls  = [(f"new_{y}",  _NFL_NEW_URL.format(year=y))  for y in new_years]
-        all_tasks = off_urls + def_urls + kick_urls + new_urls
+        snap_urls = [(f"snap_{y}", _NFL_SNAP_URL.format(year=y)) for y in NFL_SEASONS]
+        all_tasks = off_urls + def_urls + kick_urls + new_urls + snap_urls
 
         results: dict = {}
         # Keep the full-history download parallel without opening one socket per
@@ -457,6 +460,40 @@ def _load_nfl_stats_sync():
             print("[NFL Data] No offense data downloaded — aborting")
             return None
         off = pd.concat(off_frames, ignore_index=True)
+        # Optional one-file-per-season snap counts.  This is intentionally a
+        # safe enrichment: a missing snap file never blocks offense analysis.
+        snap_frames = []
+        for y in NFL_SEASONS:
+            sd = results.get(f"snap_{y}")
+            if sd is None:
+                continue
+            try:
+                sd = sd.rename(columns={"team":"recent_team","player":"player_display_name","player_name":"player_display_name"})
+                if "offense_pct" in sd.columns:
+                    pct = pd.to_numeric(sd["offense_pct"], errors="coerce")
+                    if pct.max(skipna=True) <= 1.5:
+                        sd["offense_pct"] = pct * 100.0
+                want = ["player_display_name","recent_team","season","week","position","offense_pct","offense_snaps"]
+                snap_frames.append(sd[[c for c in want if c in sd.columns]].copy())
+            except Exception as exc:
+                print(f"[NFL Data] snap_{y} transform failed: {exc}")
+        if snap_frames:
+            snaps = pd.concat(snap_frames, ignore_index=True)
+            if "recent_team" in snaps:
+                snaps["recent_team"] = snaps["recent_team"].replace(_NFLVERSE_TO_ESPN)
+            keys = ["player_display_name","recent_team","season","week"]
+            if all(c in off.columns for c in keys) and all(c in snaps.columns for c in keys):
+                value_cols = [c for c in ["offense_pct","offense_snaps"] if c in snaps.columns]
+                snaps = snaps.groupby(keys, as_index=False)[value_cols].mean()
+                off = off.merge(snaps, on=keys, how="left", suffixes=("","_snap"))
+                for c in value_cols:
+                    sc = c + "_snap"
+                    if sc in off:
+                        off[c] = off[c].fillna(off[sc])
+                        off.drop(columns=[sc], inplace=True)
+                print(f"[NFL Data] snap counts merged: {len(snaps):,} player-weeks")
+        else:
+            print("[NFL Data] snap counts unavailable; role engine uses stats usage only")
 
         # Compute anytime TD (offense only). Anytime-TD props pay when the player
         # SCORES — rushing or receiving TDs only. Passing TDs don't count (and
@@ -1540,6 +1577,144 @@ def _def_factor_map(df, stat_col: str, n_games: int = 8) -> dict:
     _DEFF_CACHE["maps"][stat_col] = out
     return out
 
+# ── Point-in-time role and defense-by-position engine ────────────────────────
+# This deliberately uses the already-loaded nflverse frame: no per-player HTTP
+# calls, no Odds API calls, and the caller's historical frame is respected.
+_ROLE_CACHE = {}
+_POSDEF_CACHE = {}
+
+def _nfl_role_position(pl, stat_col):
+    raw = str(pl.get("roster_position") or pl.get("position") or "").upper()
+    if raw in {"QB", "RB", "FB", "WR", "TE"}:
+        return "RB" if raw == "FB" else raw
+    if stat_col in {"passing_yards", "passing_tds", "completions", "attempts", "interceptions"}:
+        return "QB"
+    if stat_col in {"rushing_yards", "carries"}:
+        return "RB"
+    return "WR"
+
+def _nfl_role_profile(df, team, position, player_name, stat_col=""):
+    """Rank a team's current point-in-time usage into an auditable role.
+    Snap/depth feeds are optional; usage remains a useful explicit fallback."""
+    key = (id(df), str(team), position)
+    if key not in _ROLE_CACHE:
+        cols = ["player_display_name","recent_team","position","targets","receptions",
+                "receiving_yards","carries","rushing_yards","rushing_tds","receiving_tds",
+                "season","week","offense_pct"]
+        have = [c for c in cols if c in df.columns]
+        d = df[have].copy()
+        d = d[d["recent_team"].astype(str).str.upper() == str(team).upper()]
+        if "position" in d.columns:
+            p = d["position"].fillna("").astype(str).str.upper()
+            d = d[p.isin([position, "FB" if position == "RB" else position])]
+        if not d.empty:
+            def _num(c):
+                return d[c].fillna(0) if c in d.columns else 0
+            d["_usage"] = (_num("targets") * (1.0 if position in {"WR","TE"} else .15)
+                           + _num("receptions") * .35
+                           + _num("carries") * (1.0 if position == "RB" else .05)
+                           + _num("receiving_yards") * .025
+                           + _num("rushing_yards") * .02)
+            if "offense_pct" in d.columns:
+                d["_usage"] += d["offense_pct"].fillna(0).clip(0,100) * .015
+            # Latest ten completed team weeks, not a future season aggregate.
+            d = d.sort_values(["season","week"], ascending=False)
+            d["_recency"] = d.groupby("player_display_name").cumcount()
+            d = d[d["_recency"] < 10]
+            agg = d.groupby("player_display_name", as_index=False).agg(
+                usage=("_usage", lambda x: float(x.head(10).sum())),
+                games=("week", "nunique"))
+            agg = agg.sort_values("usage", ascending=False).reset_index(drop=True)
+            rec = df[df["recent_team"].astype(str).str.upper() == str(team).upper()].copy()
+            if "position" in rec:
+                rec = rec[rec["position"].fillna("").astype(str).str.upper().isin(["WR","TE","RB","FB"])]
+            if not rec.empty:
+                def _n(c): return rec[c].fillna(0) if c in rec.columns else 0
+                rec = rec.sort_values(["season","week"], ascending=False)
+                rec["_rn"] = rec.groupby("player_display_name").cumcount()
+                rec = rec[rec["_rn"] < 10]
+                rec["_recv_usage"] = _n("targets") + _n("receptions")*.35 + _n("receiving_yards")*.025
+                recv = rec.groupby("player_display_name")["_recv_usage"].sum().sort_values(ascending=False)
+                agg["team_option_rank"] = agg["player_display_name"].map({n:i+1 for i,n in enumerate(recv.index)})
+        else:
+            agg = d
+        _ROLE_CACHE[key] = agg
+    agg = _ROLE_CACHE[key]
+    if agg is None or len(agg) == 0:
+        return {"role": f"{position}?", "option_rank": None, "confidence": 0.15,
+                "factor": 1.0, "reason": "No point-in-time teammate usage"}
+    names = agg["player_display_name"].fillna("").astype(str).str.lower()
+    ix = next((i for i, n in enumerate(names) if n == str(player_name).lower()), None)
+    # Name mismatch is explicitly low confidence, never an invented starter.
+    if ix is None:
+        return {"role": f"{position}?", "option_rank": None, "confidence": 0.2,
+                "factor": 1.0, "reason": "Player absent from point-in-time usage"}
+    slots = {"WR": ["WR1","WR2","WR3","WR4"], "TE": ["TE1","TE2"],
+             "RB": ["RB1","RB2"], "QB": ["QB1"]}
+    slot = slots.get(position, [position])[min(ix, len(slots.get(position, [position]))-1)]
+    # Opportunity factor is conservative and market-specific.
+    factor = {"WR": (1.08, 0.96), "TE": (1.06, 0.97), "RB": (1.07, 0.95), "QB": (1.04, .98)}.get(position, (1.0,1.0))
+    role_factor = factor[0] if ix == 0 else (1.0 + (factor[1]-1.0) * min(ix, 2) / 2.0)
+    confidence = min(0.9, 0.35 + min(float(agg.iloc[ix]["games"]), 10) * .055)
+    receiving = stat_col in {"receiving_yards","receptions"} or position in {"WR","TE"} and stat_col in {"targets","receiving_yards","receptions"}
+    return {"role": slot, "roleRank": int(ix + 1), "option_rank": (int(agg.iloc[ix].get("team_option_rank")) if receiving and agg.iloc[ix].get("team_option_rank") == agg.iloc[ix].get("team_option_rank") else None), "confidence": round(confidence, 2),
+            "factor": round(role_factor, 3), "reason": "Recent point-in-time usage ranking"}
+
+def _nfl_posdef_profile(df, defense, position, stat_col):
+    """Actual opponent allowed by offensive position and market, with prior/current
+    blend. Rows lacking position use the neutral fallback rather than pretending."""
+    key = (id(df), str(defense), position, stat_col)
+    if key in _POSDEF_CACHE:
+        return _POSDEF_CACHE[key]
+    neutral = {"factor": 1.0, "rank": None, "allowed": None, "sample": 0,
+               "label": f"{position} {stat_col.replace('_',' ')} D", "confidence": .15}
+    try:
+        needed = {"opponent_team","position",stat_col,"season","week"}
+        if not needed.issubset(df.columns):
+            _POSDEF_CACHE[key] = neutral; return neutral
+        d = df[df["opponent_team"].astype(str).str.upper() == str(defense).upper()].copy()
+        p = d["position"].fillna("").astype(str).str.upper()
+        d = d[p.isin([position, "FB" if position == "RB" else position])]
+        d = d.dropna(subset=[stat_col])
+        if d.empty:
+            _POSDEF_CACHE[key] = neutral; return neutral
+        # Aggregate each opponent game, so teams with extra players don't count extra games.
+        games = d.groupby(["season","week"])[stat_col].sum().sort_index(ascending=False)
+        vals = games.astype(float).tolist()
+        if len(vals) < 2:
+            _POSDEF_CACHE[key] = neutral; return neutral
+        current = vals[:8]
+        prior = vals[8:24]
+        league = df[df["position"].fillna("").astype(str).str.upper().eq(position)]
+        league_games = league.groupby(["opponent_team","season","week"])[stat_col].sum().dropna()
+        max_season = int(df["season"].max()); max_week = int(df.loc[df["season"] == max_season, "week"].max())
+        elapsed = max(1, min(18, max_week))
+        pw,cw,rw = (.65,.25,.10) if elapsed <= 3 else ((.35,.45,.20) if elapsed <= 7 else (.15,.55,.30))
+        lg_cur = league_games[league_games.index.get_level_values("season") == max_season]
+        lg_prior = league_games[league_games.index.get_level_values("season") < max_season]
+        baseline = float(lg_cur.mean() if len(lg_cur) else lg_prior.mean()) if len(lg_cur) or len(lg_prior) else float(sum(vals)/len(vals))
+        # More current season information gradually displaces prior-season evidence.
+        cur_games = games[games.index.get_level_values("season") == max_season]
+        prior_games = games[games.index.get_level_values("season") < max_season]
+        cur_mean = float(cur_games.mean()) if len(cur_games) else float(sum(vals)/len(vals))
+        prior_mean = float(prior_games.mean()) if len(prior_games) else cur_mean
+        recent_mean = float(sum(vals[:6])/len(vals[:6]))
+        allowed = prior_mean * pw + cur_mean * cw + recent_mean * rw
+        factor = max(.90, min(1.10, allowed / baseline if baseline else 1.0))
+        all_team = {}
+        for tm, grp in df[df["position"].fillna("").astype(str).str.upper().eq(position)].groupby("opponent_team"):
+            gg = grp.groupby(["season","week"])[stat_col].sum()
+            if len(gg) >= 2: all_team[str(tm)] = float(gg.tail(8).mean())
+        rank = 1 + sum(v < allowed for v in all_team.values())
+        out = {"factor": round(factor, 3), "rank": rank, "allowed": round(allowed, 1),
+               "sample": len(games), "label": f"{position} {stat_col.replace('_',' ')} D",
+               "confidence": round(min(.95, .25 + len(games)*.035), 2)}
+    except Exception as exc:
+        print(f"[PosDef] {position}/{stat_col} failed: {exc}")
+        out = neutral
+    _POSDEF_CACHE[key] = out
+    return out
+
 def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str) -> Optional[Dict]:
     """Emit the shared NORMALIZED pick-field contract (same keys as the NHL app)
     so the card grid, ladder modal, special boxes and parlay are market-agnostic.
@@ -1625,13 +1800,21 @@ def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str) -> Optional[Dict
 
     ref_avg = avg_b if avg_b is not None else avg_a
 
-    # Opponent-defense adjustment: project vs THIS defense, not a neutral one.
-    def_factor = 1.0; def_rank = None; def_lbl = _OPP_ADJ_COLS.get(stat_col, "")
-    if opp_abbr and stat_col in _OPP_ADJ_COLS:
-        _fr = _def_factor_map(df, stat_col).get(opp_abbr)
-        if _fr:
-            def_factor, def_rank = _fr
-    adj_avg = round(ref_avg * def_factor, 1) if ref_avg is not None else None
+    # Actual market-specific role + opponent positional defense factors feed the
+    # projection. The legacy all-position factor is retained only as a fallback.
+    position = _nfl_role_position(pl, stat_col)
+    role = _nfl_role_profile(df, game_team, position, name, stat_col)
+    posdef = _nfl_posdef_profile(df, opp_abbr, position, stat_col) if opp_abbr else {}
+    def_factor = float(posdef.get("factor", 1.0))
+    def_rank = posdef.get("rank")
+    def_lbl = posdef.get("label") or _OPP_ADJ_COLS.get(stat_col, "")
+    if posdef.get("sample", 0) < 2 and opp_abbr and stat_col in _OPP_ADJ_COLS:
+        legacy = _def_factor_map(df, stat_col).get(opp_abbr)
+        if legacy:
+            def_factor, def_rank = legacy
+    role_factor = float(role.get("factor", 1.0))
+    combined_factor = max(.86, min(1.14, role_factor * def_factor))
+    adj_avg = round(ref_avg * combined_factor, 1) if ref_avg is not None else None
     def_adj = round((def_factor - 1) * 100)
 
     gap     = round(adj_avg - line, 1) if adj_avg is not None else None
@@ -1653,7 +1836,11 @@ def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str) -> Optional[Dict
         vsl_rate = round(vsl_hits/vsl_tot*100, 1) if vsl_tot >= 1 else None
 
     rates = [r for r in [rate_a, rate_b] if r is not None]
-    score = round(sum(rates)/len(rates), 1) if rates else 0
+    base_score = round(sum(rates)/len(rates), 1) if rates else 0
+    # Convert the model's actual projection change into a bounded side signal;
+    # do not turn a thin sample into an unbounded 90% pick.
+    signed_factor = combined_factor if pick == "OVER" else (2.0 - combined_factor if pick == "UNDER" else 1.0)
+    score = round(max(0, min(100, base_score + (signed_factor - 1.0) * 35)), 1)
     tag     = _book_tag_nfl(pick, score, gap, under_rate)
     # Anytime TD is a binary, price-sensitive market. A raw historical hit
     # rate is not enough: a 44% TD rate loses at +100 and only starts to clear
@@ -1741,6 +1928,14 @@ def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str) -> Optional[Dict
         "underHits": under_hits, "underTotal": tot_b, "underRate": under_rate or 0, "underLine": line,
         # opponent-defense adjustment
         "defAdj": def_adj, "defRank": def_rank, "defLbl": def_lbl,
+        "role": role.get("role"), "teamOptionRank": role.get("option_rank"),
+        "roleConfidence": role.get("confidence"), "roleFactor": role_factor,
+        "roleReason": role.get("reason"), "position": position,
+        "defAllowed": posdef.get("allowed"), "defSample": posdef.get("sample", 0),
+        "defConfidence": posdef.get("confidence", .15),
+        "defFactor": def_factor, "combinedFactor": combined_factor,
+        "baseProjection": ref_avg, "baseProbability": base_score,
+        "adjustedProjection": adj_avg, "adjustedProbability": score,
         "projAvg": adj_avg,
         # score / pick
         "score": score, "dispScore": score, "gap": gap, "pick": pick, "tag": tag,
