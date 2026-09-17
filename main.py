@@ -2620,28 +2620,16 @@ def _nfl_posdef_profile(df, defense, pos, stat, defense_venue=None):
             {"HOME":"AWAY","AWAY":"HOME"}).fillna("")
         eligible=df[df.position.fillna("").astype(str).str.upper().eq(pos)]
         max_season=int(df.attrs.get("nfl_target_season", df["season"].max()))
-        current_weeks = df.loc[df.season == max_season, "week"]
-        max_week = int(current_weeks.max()) if not current_weeks.empty else 1
-        elapsed=max(1,min(18,max_week))
-        if elapsed<=3: prior_w,current_w,recent_w=.65,.25,.10
-        elif elapsed<=7: prior_w,current_w,recent_w=.35,.45,.20
-        else: prior_w,current_w,recent_w=.15,.55,.30
         def _venue_games(frame, venue):
             rows=frame[frame["_def_venue"].eq(venue)]
             return rows.groupby(["season","week"])[stat].sum().sort_index(ascending=False)
         def _summary(venue):
             games=_venue_games(d,venue)
             if len(games):
-                allowed=games.mean()
-                if len(games) >= 2:
-                    cur_games=games[games.index.get_level_values("season")==max_season]
-                    prior_games=games[games.index.get_level_values("season")==max_season-1]
-                    recent_vals=list(games.head(6))
-                    cur_mean=float(cur_games.mean()) if len(cur_games) else float(games.mean())
-                    prior_mean=float(prior_games.mean()) if len(prior_games) else cur_mean
-                    recent_mean=float(sum(recent_vals)/len(recent_vals)) if recent_vals else cur_mean
-                    allowed=prior_mean*prior_w+cur_mean*current_w+recent_mean*recent_w
-                return round(float(allowed),1),len(games)
+                # The UI says allowed per game, so expose and model the actual
+                # arithmetic mean of the selected venue games. Do not relabel a
+                # prior/current/recent weighted blend as a venue average.
+                return round(float(games.mean()),1),len(games)
             return None,0
         home_allowed,home_sample=_summary("HOME")
         away_allowed,away_sample=_summary("AWAY")
@@ -2658,15 +2646,16 @@ def _nfl_posdef_profile(df, defense, pos, stat, defense_venue=None):
         e["_def_venue"]=e["_off_venue"].map({"HOME":"AWAY","AWAY":"HOME"}).fillna("")
         league_games=e[e["_def_venue"].eq(defense_venue)].groupby(
             ["opponent_team","season","week"])[stat].sum()
-        league_current=league_games[league_games.index.get_level_values("season")==max_season]
-        league_prior=league_games[league_games.index.get_level_values("season")==max_season-1]
-        baseline=float(league_current.mean() if len(league_current) else league_prior.mean()) if len(league_current) or len(league_prior) else float(games.mean())
+        # Compare the defense with the same two-season, point-in-time,
+        # venue-specific sample used by its displayed allowed/game figure.
+        baseline=(float(league_games.mean()) if len(league_games)
+                  else float(games.mean()))
         allowed=float(selected_allowed) if selected_allowed is not None else float(games.mean())
         factor=max(.9,min(1.1,allowed/baseline if baseline else 1))
         vals={}
         for tm,g in e.groupby("opponent_team"):
             gg=g[g["_def_venue"].eq(defense_venue)].groupby(["season","week"])[stat].sum()
-            if len(gg)>=2: vals[str(tm)]=float(gg.tail(8).mean())
+            if len(gg)>=2: vals[str(tm)]=float(gg.mean())
         raw_factor = max(.90, min(1.10, float(factor)))
         out={"factor":_nfl_restrained_def_factor(raw_factor),
              "rawFactor":round(raw_factor,3),
@@ -3608,7 +3597,7 @@ def _nfl_enrich_cached_result(result, df=None, target_season=None,
                               system="OLD"):
     if not isinstance(result, dict):
         return result
-    if result.get("_nflVenueEnrichedV2"):
+    if result.get("_nflVenueEnrichedV3"):
         return result
     out = copy.deepcopy(result)
     frame = (_nfl_prop_analysis_frame(df, target_season, target_week, target_type)
@@ -3642,10 +3631,10 @@ def _nfl_enrich_cached_result(result, df=None, target_season=None,
                 if venue in ("HOME", "AWAY"):
                     log["ha"] = venue
 
-            # New rows already have these fields; do not double-adjust them.
-            if any(pick.get(k) is not None for k in
-                   ("defenseVenue", "defHomeAllowed", "defAwayAllowed")):
-                continue
+            # Recompute every cached row from the current point-in-time frame.
+            # Older snapshots can already contain the retired weighted values,
+            # so field presence alone does not prove the venue averages are
+            # current or correctly calculated.
             market = str(pick.get("market") or "")
             stat = PROP_TO_COL.get(market)
             venue = ("AWAY" if pick.get("homeRoad") == "H" else "HOME"
@@ -3718,12 +3707,13 @@ def _nfl_enrich_cached_result(result, df=None, target_season=None,
                 except (TypeError, ValueError):
                     pass
     out.pop("_nflVenueEnrichedV1", None)
-    out["_nflVenueEnrichedV2"] = True
+    out.pop("_nflVenueEnrichedV2", None)
+    out["_nflVenueEnrichedV3"] = True
     return out
 
 async def _nfl_enrich_cached_response(result, date_str, system="OLD"):
     """Enrich an old saved board without calling ESPN."""
-    if not isinstance(result, dict) or result.get("_nflVenueEnrichedV2"):
+    if not isinstance(result, dict) or result.get("_nflVenueEnrichedV3"):
         return result
     board_stamps = [
         str(result.get("saved_board_captured_at") or ""),
@@ -8629,6 +8619,100 @@ tr:last-child td{border-bottom:none}
 .nfl-coach-game.hit{border-color:rgba(74,222,128,.45)}.nfl-coach-game.miss{border-color:rgba(248,113,113,.4)}
 .nfl-coach-game .d{color:#64748b;font-size:.52rem}.nfl-coach-game .v{font-weight:950;margin-top:2px}.nfl-coach-game.hit .v{color:#4ade80}.nfl-coach-game.miss .v{color:#f87171}
 @media(max-width:620px){.nfl-coach-row{display:block}.nfl-coach-send{width:100%;padding:11px;margin-top:8px}.nfl-coach-stats{grid-template-columns:repeat(2,minmax(0,1fr))}.nfl-coach-play>summary{align-items:flex-start}.nfl-coach-pickmeta{white-space:normal;text-align:left}.nfl-coach-play>summary:after{display:none}}
+.pm-ov { background: rgba(0,0,0,0.85); backdrop-filter: blur(4px); padding: 16px; display: flex; align-items: center; justify-content: center; position: fixed; inset: 0; z-index: 200; }
+.pm-modal { background: #0f1115; border: 1px solid #2a2e37; border-radius: 16px; max-width: 640px; width: 100%; max-height: 90vh; overflow-y: auto; padding: 0; box-shadow: 0 20px 40px rgba(0,0,0,0.6); position: relative; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; cursor: default; }
+.pm-modal::-webkit-scrollbar { width: 6px; }
+.pm-modal::-webkit-scrollbar-thumb { background: #333; border-radius: 3px; }
+.pm-close { position: absolute; top: 16px; right: 16px; width: 32px; height: 32px; border-radius: 50%; background: #1a1d24; border: 1px solid #333842; color: #9ca3af; display: flex; align-items: center; justify-content: center; cursor: pointer; font-size: 14px; transition: all 0.2s; z-index: 10; padding: 0; }
+.pm-close:hover { background: #2a2e37; color: #fff; }
+.pm-header { padding: 24px 24px 20px; border-bottom: 1px solid #1f232b; background: linear-gradient(180deg, #161920 0%, #0f1115 100%); border-radius: 16px 16px 0 0; }
+.pm-name { font-family: 'Playfair Display', serif; font-size: 1.6rem; font-weight: 800; color: #f8fafc; margin: 0 0 4px; padding-right: 30px; line-height: 1.2; }
+.pm-sub { color: #94a3b8; font-size: 0.85rem; font-weight: 500; margin-bottom: 16px; letter-spacing: 0.02em; }
+.pm-pick-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.pm-pick-badge { padding: 6px 12px; border-radius: 8px; font-size: 0.9rem; font-weight: 800; letter-spacing: 0.05em; text-transform: uppercase; }
+.pm-pick-over { background: rgba(74,222,128,0.15); color: #4ade80; border: 1px solid rgba(74,222,128,0.3); }
+.pm-pick-under { background: rgba(248,113,113,0.15); color: #f87171; border: 1px solid rgba(248,113,113,0.3); }
+.pm-pick-book { color: #cbd5e1; font-size: 0.8rem; font-weight: 600; background: #1e222a; padding: 6px 10px; border-radius: 6px; border: 1px solid #2a2e37; }
+.pm-body { padding: 20px 24px 24px; }
+.pm-callout { border-radius: 10px; padding: 12px 14px; margin-bottom: 16px; }
+.pm-callout-blue { background: rgba(56,189,248,0.06); border: 1px solid rgba(56,189,248,0.2); }
+.pm-callout-amber { background: rgba(245,158,11,0.06); border: 1px solid rgba(245,158,11,0.2); }
+.pm-co-title { font-size: 0.7rem; font-weight: 800; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 4px; }
+.pm-callout-blue .pm-co-title { color: #38bdf8; }
+.pm-callout-amber .pm-co-title { color: #fbbf24; }
+.pm-co-body { font-size: 0.8rem; color: #e2e8f0; line-height: 1.5; }
+.pm-split-container { background: #14171d; border: 1px solid #232832; border-radius: 12px; margin-bottom: 20px; overflow: hidden; }
+.pm-split-header { display: flex; align-items: center; justify-content: space-between; padding: 10px 14px; background: #1a1d24; border-bottom: 1px solid #232832; }
+.pm-split-title { font-size: 0.75rem; font-weight: 700; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.05em; }
+.pm-split-line { font-size: 0.95rem; font-weight: 800; color: #f8fafc; }
+.pm-split-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1px; background: #232832; }
+.pm-split-card { background: #14171d; padding: 14px; position: relative; }
+.pm-split-active { background: rgba(245,158,11,0.05); }
+.pm-split-active::before { content: ''; position: absolute; top: 0; left: 0; right: 0; bottom: 0; border: 1px solid rgba(245,158,11,0.4); border-radius: inherit; pointer-events: none; }
+.pm-split-venue { font-size: 0.7rem; font-weight: 800; color: #cbd5e1; margin-bottom: 6px; }
+.pm-split-active .pm-split-venue { color: #fbbf24; }
+.pm-split-val { font-size: 1.4rem; font-weight: 900; color: #fff; line-height: 1; margin-bottom: 4px; font-family: 'Playfair Display', serif; }
+.pm-split-active .pm-split-val { color: #fbbf24; }
+.pm-split-desc { font-size: 0.75rem; color: #94a3b8; line-height: 1.3; }
+.pm-split-sample { font-size: 0.65rem; color: #64748b; margin-top: 6px; font-weight: 600; text-transform: uppercase; }
+.pm-split-badge { position: absolute; top: 12px; right: 12px; background: rgba(245,158,11,0.15); color: #fbbf24; font-size: 0.6rem; font-weight: 800; padding: 3px 6px; border-radius: 4px; border: 1px solid rgba(245,158,11,0.3); }
+.pm-split-empty { font-size: 0.8rem; color: #94a3b8; background: #14171d; padding: 12px; border-radius: 8px; border: 1px solid #232832; margin-bottom: 20px; }
+.pm-section { margin-bottom: 24px; }
+.pm-sec-title { font-size: 0.75rem; font-weight: 800; color: #f8fafc; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 12px; display: flex; align-items: center; justify-content: space-between; }
+.pm-sec-hl { color: #64748b; font-size: 0.65rem; font-weight: 600; text-transform: none; letter-spacing: 0; }
+.pm-sec-count { color: #94a3b8; font-weight: 600; }
+.pm-sec-desc { font-size: 0.75rem; color: #94a3b8; margin: -6px 0 12px; }
+.pm-glog { display: flex; flex-wrap: wrap; gap: 8px; }
+.pm-glchip { background: #1a1d24; border: 1px solid #2a2e37; border-radius: 8px; padding: 8px 10px; text-align: center; min-width: 48px; transition: transform 0.1s; }
+.pm-glchip:hover { transform: translateY(-1px); }
+.pm-glchip .d { font-size: 0.6rem; color: #64748b; font-weight: 600; margin-bottom: 3px; }
+.pm-glchip .v { font-weight: 800; font-size: 1.05rem; color: #e2e8f0; }
+.pm-glchip.hit { border-color: rgba(74,222,128,0.4); background: rgba(74,222,128,0.05); }
+.pm-glchip.hit .v { color: #4ade80; }
+.pm-glchip.miss { border-color: rgba(248,113,113,0.3); background: rgba(248,113,113,0.05); }
+.pm-glchip.miss .v { color: #f87171; }
+.pm-gray { color: #64748b; font-size: 0.8rem; font-style: italic; }
+.pm-vsopp-section { background: #12141a; border: 1px solid #232832; border-radius: 12px; padding: 16px; }
+.pm-vsopp-section .pm-sec-title { margin-bottom: 8px; }
+.pm-vsopp-summary { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 14px; }
+.pm-vo-card { padding: 10px; border-radius: 8px; text-align: center; }
+.pm-vo-over { background: rgba(74,222,128,0.08); border: 1px solid rgba(74,222,128,0.25); }
+.pm-vo-under { background: rgba(248,113,113,0.08); border: 1px solid rgba(248,113,113,0.25); }
+.pm-vo-push { background: rgba(148,163,184,0.08); border: 1px solid rgba(148,163,184,0.25); }
+.pm-vo-lbl { font-size: 0.65rem; font-weight: 800; margin-bottom: 4px; }
+.pm-vo-over .pm-vo-lbl { color: #86efac; }
+.pm-vo-under .pm-vo-lbl { color: #fca5a5; }
+.pm-vo-push .pm-vo-lbl { color: #cbd5e1; }
+.pm-vo-val { font-size: 1.1rem; font-weight: 900; }
+.pm-vo-over .pm-vo-val { color: #4ade80; }
+.pm-vo-under .pm-vo-val { color: #f87171; }
+.pm-vo-push .pm-vo-val { color: #f8fafc; }
+.pm-vo-val span { font-size: 0.7rem; font-weight: 600; opacity: 0.8; margin-left: 2px; }
+.pm-vsopp-list { display: flex; flex-direction: column; }
+.pm-vsopp-row { display: flex; align-items: center; justify-content: space-between; padding: 8px 4px; border-bottom: 1px solid #1f232b; }
+.pm-vsopp-row:last-child { border-bottom: none; padding-bottom: 0; }
+.pm-vo-date { font-size: 0.8rem; color: #94a3b8; }
+.pm-vo-res { font-size: 0.85rem; font-weight: 800; }
+.pm-res-over { color: #4ade80; }
+.pm-res-under { color: #f87171; }
+.pm-res-push { color: #cbd5e1; }
+.pm-stats-section { margin-bottom: 0; }
+.pm-stats-list { background: #12141a; border: 1px solid #232832; border-radius: 12px; overflow: hidden; }
+.pm-stat { display: flex; align-items: center; justify-content: space-between; padding: 12px 16px; border-bottom: 1px solid #1f232b; }
+.pm-stat:last-child { border-bottom: none; }
+.pm-stat:nth-child(even) { background: rgba(255,255,255,0.01); }
+.pm-stat .k { font-size: 0.8rem; color: #94a3b8; font-weight: 500; }
+.pm-stat .v { font-size: 0.85rem; font-weight: 700; color: #f8fafc; text-align: right; max-width: 60%; line-height: 1.3; }
+.pm-score-stat { background: rgba(245,158,11,0.08) !important; }
+.pm-score-stat .k { color: #fbbf24; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; }
+.pm-gold { color: #fbbf24 !important; }
+.pm-gold-bright { color: #f59e0b !important; font-size: 1.1rem !important; font-weight: 900 !important; }
+.pm-text-green { color: #4ade80 !important; }
+.pm-text-red { color: #f87171 !important; }
+.pm-text-gray { color: #94a3b8 !important; }
+@media (max-width: 480px) { .pm-header { padding: 20px 16px 16px; } .pm-body { padding: 16px 16px 20px; } .pm-split-card { padding: 12px 10px; } .pm-split-val { font-size: 1.25rem; } .pm-stat { padding: 10px 12px; } .pm-pick-badge { font-size: 0.8rem; padding: 5px 10px; } }
+@media (max-width: 360px) { .pm-ov { padding: 8px; } .pm-split-grid { grid-template-columns: 1fr; } .pm-split-card { min-height: 92px; } }
+
 </style>
 </head>
 <body>
@@ -9872,12 +9956,21 @@ function _nflRecentVenueLabel(p){
   if(p&&p.homeRoad==='H')return side+' · L10 Home';
   return side+' · L10 H/A';
 }
-function _nflDefenseSplitLabel(p){
-  var parts=[],m=_esc(String(p&&p.mkt||'stat').replace(/Yds/gi,'yards').toLowerCase());
-  var o=_esc((p&&p.opponent)||'opponent');
-  if(p&&p.defHomeAllowed!=null)parts.push(o+' HOME: '+p.defHomeAllowed+' '+m+' allowed/game ('+(p.defHomeSample||0)+' games)'+(p.defenseVenue==='HOME'?' [USED TODAY]':''));
-  if(p&&p.defAwayAllowed!=null)parts.push(o+' AWAY: '+p.defAwayAllowed+' '+m+' allowed/game ('+(p.defAwaySample||0)+' games)'+(p.defenseVenue==='AWAY'?' [USED TODAY]':''));
-  return (p&&p.realLine!=null?p.realLine:p.dispLine)+(parts.length?'; '+parts.join('; '):' · Venue defense split unavailable');
+function _nflDefenseSplitHtml(p){
+  var m=_esc(String(p&&p.mkt||'stat').replace(/Yds/gi,'yards').toLowerCase());
+  var o=_esc((p&&p.opponent)||'Opponent');
+  var line=p&&p.realLine!=null?p.realLine:p.dispLine;
+  if(!p||(p.defHomeAllowed==null&&p.defAwayAllowed==null)){
+    return '<div class="pm-split-empty">Sportsbook line: <strong style="color:#f8fafc">'+line+'</strong> &middot; Venue defense split unavailable</div>';
+  }
+  var hA=p.defenseVenue==='HOME';
+  var aA=p.defenseVenue==='AWAY';
+  return '<div class="pm-split-container">'
+    +'<div class="pm-split-header"><span class="pm-split-title">Sportsbook Line</span><span class="pm-split-line">'+line+'</span></div>'
+    +'<div class="pm-split-grid">'
+    +'<div class="pm-split-card '+(hA?'pm-split-active':'')+'"><div class="pm-split-venue">'+o+' HOME</div><div class="pm-split-val">'+(p.defHomeAllowed!=null?p.defHomeAllowed:'—')+'</div><div class="pm-split-desc">'+m+' allowed/game</div><div class="pm-split-sample">'+(p.defHomeSample!=null?p.defHomeSample:0)+' games</div>'+(hA?'<div class="pm-split-badge">USED TODAY</div>':'')+'</div>'
+    +'<div class="pm-split-card '+(aA?'pm-split-active':'')+'"><div class="pm-split-venue">'+o+' AWAY</div><div class="pm-split-val">'+(p.defAwayAllowed!=null?p.defAwayAllowed:'—')+'</div><div class="pm-split-desc">'+m+' allowed/game</div><div class="pm-split-sample">'+(p.defAwaySample!=null?p.defAwaySample:0)+' games</div>'+(aA?'<div class="pm-split-badge">USED TODAY</div>':'')+'</div>'
+    +'</div></div>';
 }
 function nflCard(p,i){
   var key=_ladKey(p); window.__NFLLAD__[key]=p;
@@ -10031,14 +10124,15 @@ function openNflLadder(key){
   var line=p.dispLine;
   var chips=(p.glog||[]).map(function(g){
     var hit=p.pick==='UNDER'?g.v<line:g.v>line; var cls=hit?'hit':'miss';
-    var od=g.o?(' · '+g.o):'';
-    return `<div class="glchip ${cls}"><div class="d">${g.d}${od}</div><div class="v">${g.v}</div></div>`;
+    var od=g.o?(' &middot; '+g.o):'';
+    return '<div class="pm-glchip '+cls+'"><div class="d">'+g.d+od+'</div><div class="v">'+g.v+'</div></div>';
   }).join('');
-  if(!chips) chips='<span class="gray">No game log available.</span>';
+  if(!chips) chips='<span class="pm-gray">No game log available.</span>';
+  
   var vslRow=(p.realLine!=null&&p.vsLineTotal)
-    ? `<div class="lad-stat"><span class="k">Hits vs Book Line (${p.realLine}) L10</span><span class="v ${rateClass(p.vsLineRate)}">${p.vsLineHits}/${p.vsLineTotal} (${p.vsLineRate}%)</span></div>`
+    ? '<div class="pm-stat"><span class="k">Hits vs Book Line ('+p.realLine+') L10</span><span class="v '+rateClass(p.vsLineRate)+'">'+p.vsLineHits+'/'+p.vsLineTotal+' ('+p.vsLineRate+'%)</span></div>'
     : '';
-  var hasHA=(p.homeRoad==='H'||p.homeRoad==='R');
+    
   var vol=(p.vsOppLog||[]);
   var voHtml='';
   if(vol.length){
@@ -10048,50 +10142,85 @@ function openNflLadder(key){
       if(v>line)oppOver++;else if(v<line)oppUnder++;else oppPush++;
     });
     var oppPct=function(n){return vol.length?(n/vol.length*100).toFixed(1):'0.0';};
-    voHtml='<div style="margin:14px 0 10px;background:#0d1422;border:1px solid #25324a;border-radius:12px;padding:13px">'
-      +'<div style="font-size:.72rem;color:#e2e8f0;text-transform:uppercase;letter-spacing:.08em;font-weight:900">History vs '+_esc(p.opponent)+' · all '+vol.length+' meetings</div>'
-      +'<div style="font-size:.67rem;color:#94a3b8;line-height:1.45;margin-top:5px">Each past '+_esc(p.mkt)+' result below is compared with today’s sportsbook line of <b style="color:#f8fafc">'+line+'</b>. These are not the old lines from those games.</div>'
-      +'<div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px;margin-top:10px">'
-      +'<div style="background:rgba(34,197,94,.09);border:1px solid rgba(34,197,94,.28);border-radius:8px;padding:9px"><div style="font-size:.58rem;color:#86efac;font-weight:900">OVER '+line+'</div><div style="font-size:1rem;color:#4ade80;font-weight:900;margin-top:3px">'+oppOver+'/'+vol.length+' <small style="font-size:.62rem">('+oppPct(oppOver)+'%)</small></div></div>'
-      +'<div style="background:rgba(248,113,113,.08);border:1px solid rgba(248,113,113,.25);border-radius:8px;padding:9px"><div style="font-size:.58rem;color:#fca5a5;font-weight:900">UNDER '+line+'</div><div style="font-size:1rem;color:#f87171;font-weight:900;margin-top:3px">'+oppUnder+'/'+vol.length+' <small style="font-size:.62rem">('+oppPct(oppUnder)+'%)</small></div></div>'
-      +'<div style="background:rgba(148,163,184,.08);border:1px solid rgba(148,163,184,.22);border-radius:8px;padding:9px"><div style="font-size:.58rem;color:#cbd5e1;font-weight:900">EXACT / PUSH</div><div style="font-size:1rem;color:#cbd5e1;font-weight:900;margin-top:3px">'+oppPush+'/'+vol.length+'</div></div></div>'
-      +'<div style="margin-top:10px">';
+    voHtml='<div class="pm-section pm-vsopp-section">'
+      +'<div class="pm-sec-title">History vs '+_esc(p.opponent)+' <span class="pm-sec-count">('+vol.length+' meetings)</span></div>'
+      +'<div class="pm-sec-desc">Past results compared against today&rsquo;s line of <strong style="color:#f8fafc">'+line+'</strong>.</div>'
+      +'<div class="pm-vsopp-summary">'
+      +'<div class="pm-vo-card pm-vo-over"><div class="pm-vo-lbl">OVER '+line+'</div><div class="pm-vo-val">'+oppOver+'/'+vol.length+' <span>'+oppPct(oppOver)+'%</span></div></div>'
+      +'<div class="pm-vo-card pm-vo-under"><div class="pm-vo-lbl">UNDER '+line+'</div><div class="pm-vo-val">'+oppUnder+'/'+vol.length+' <span>'+oppPct(oppUnder)+'%</span></div></div>'
+      +'<div class="pm-vo-card pm-vo-push"><div class="pm-vo-lbl">PUSH</div><div class="pm-vo-val">'+oppPush+'/'+vol.length+'</div></div>'
+      +'</div><div class="pm-vsopp-list">';
     voHtml+=vol.map(function(g){
       var v=Number(g.v),result=v>line?'OVER':(v<line?'UNDER':'PUSH');
-      var color=result==='OVER'?'#4ade80':(result==='UNDER'?'#f87171':'#cbd5e1');
-      var venue=g.ha?(' · '+_esc(g.ha)):'';
-      return '<div class="vsopp-row"><span style="color:#9ca3af">'+_esc(g.d)+venue+'</span><span style="font-weight:800;color:'+color+'">'+g.v+' · '+result+'</span></div>';
+      var cls=result==='OVER'?'pm-res-over':(result==='UNDER'?'pm-res-under':'pm-res-push');
+      var venue=g.ha?(' &middot; '+_esc(g.ha)):'';
+      return '<div class="pm-vsopp-row"><span class="pm-vo-date">'+_esc(g.d)+venue+'</span><span class="pm-vo-res '+cls+'">'+g.v+' &middot; '+result+'</span></div>';
     }).join('');
     voHtml+='</div></div>';
   }
+
   var parlayWhy=p.parlayWhy
-    ?'<div style="background:rgba(59,130,246,.08);border:1px solid rgba(59,130,246,.25);border-radius:10px;padding:10px 11px;margin:8px 0 13px;color:#cbd5e1;font-size:.77rem;line-height:1.5"><b style="color:#7dd3fc">Why this parlay leg:</b> '+_esc(p.parlayWhy)+'</div>'
+    ?'<div class="pm-callout pm-callout-blue"><div class="pm-co-title">Why this parlay leg</div><div class="pm-co-body">'+_esc(p.parlayWhy)+'</div></div>'
     :'';
   var historyRule=p.historyLockReason
-    ?'<div style="background:rgba(245,158,11,.10);border:1px solid rgba(245,158,11,.34);border-radius:10px;padding:9px 11px;margin:8px 0 12px;color:#fde68a;font-size:.72rem;line-height:1.45"><b>Pick-side rule:</b> '+_esc(p.historyLockReason)+'. The small defense adjustment cannot reverse this side.</div>'
+    ?'<div class="pm-callout pm-callout-amber"><div class="pm-co-title">Pick-side rule</div><div class="pm-co-body">'+_esc(p.historyLockReason)+'. The small defense adjustment cannot reverse this side.</div></div>'
     :'';
-  var html=`
-    <div class="lad-modal" onclick="event.stopPropagation()">
-      <button class="lad-close" onclick="closeNflLadder()">✕</button>
-      <h3>${p.name}</h3>
-      <div class="lad-sub">${p.mkt} · ${p.team} vs ${p.opponent} · Line ${p.dispLine} · ${p.pick||''} · ${_esc(_nflSideBook(p))}</div>
-      ${parlayWhy}
-      ${historyRule}
-      <div style="font-size:.7rem;color:#6b7280;text-transform:uppercase;letter-spacing:.08em;font-weight:700;margin-bottom:4px">Recent Games (green = ${p.pick==='UNDER'?'under':'over'} line)</div>
-      <div class="lad-glog">${chips}</div>
-      ${voHtml}
-      <div class="lad-stat"><span class="k">${_esc(_nflRecentVenueLabel(p))}</span><span class="v">${_rateHtml(p.rateB,p.hitsB,p.totB)}</span></div>
-      ${vslRow}
-      <div class="lad-stat"><span class="k">Under Line L10</span><span class="v ${rateClass(p.underRate)}">${p.underHits}/${p.underTotal} (${p.underRate}%)</span></div>
-      <div class="lad-stat"><span class="k">Average</span><span class="v gold">${p.avg}</span></div>
-      ${(p.defRank!=null&&p.defAdj!=null)?`<div class="lad-stat"><span class="k">Opp Def Rank Factor (#${p.defRank} ${p.defLbl||'D'})</span><span class="v" style="color:${p.defAdj>0?'#4ade80':(p.defAdj<0?'#f87171':'#9ca3af')}">${p.defAdj>0?'+':''}${p.defAdj}% projection nudge</span></div>`:''}
-      ${p.role?`<div class="lad-stat"><span class="k">Role / opportunity</span><span class="v">${_esc(p.role)}${p.teamOptionRank!=null?' · team receiving option #'+p.teamOptionRank:''} (${Math.round(Number(p.roleConfidence||0)*100)}% confidence)</span></div>`:''}
-      ${(p.realLine!=null||p.dispLine!=null)?`<div class="lad-stat"><span class="k">Sportsbook line</span><span class="v">${_nflDefenseSplitLabel(p)}</span></div>`:''}
-      ${(p.baseProbability!=null||p.adjustedProbability!=null)?`<div class="lad-stat"><span class="k">Base → adjusted probability</span><span class="v">${p.baseProbability!=null?Number(p.baseProbability).toFixed(1):'—'}% → ${p.adjustedProbability!=null?Number(p.adjustedProbability).toFixed(1):'—'}%</span></div>`:''}
-      <div class="lad-stat"><span class="k">Score</span><span class="v" style="color:#f59e0b">${p.dispScore}</span></div>
-    </div>`;
+
+  var roleHtml = p.role
+    ? '<div class="pm-stat"><span class="k">Role / opportunity</span><span class="v">'+_esc(p.role)+(p.teamOptionRank!=null?' &middot; Option #'+p.teamOptionRank:'')+' ('+Math.round(Number(p.roleConfidence||0)*100)+'% conf)</span></div>'
+    : '';
+    
+  var probHtml = (p.baseProbability!=null||p.adjustedProbability!=null)
+    ? '<div class="pm-stat"><span class="k">Base &rarr; adj probability</span><span class="v">'+(p.baseProbability!=null?Number(p.baseProbability).toFixed(1):'—')+'% &rarr; '+(p.adjustedProbability!=null?Number(p.adjustedProbability).toFixed(1):'—')+'%</span></div>'
+    : '';
+    
+  var defHtml = (p.defRank!=null&&p.defAdj!=null)
+    ? '<div class="pm-stat"><span class="k">Opp Def Rank Factor (#'+p.defRank+' '+(p.defLbl||'D')+')</span><span class="v '+(p.defAdj>0?'pm-text-green':(p.defAdj<0?'pm-text-red':'pm-text-gray'))+'">'+(p.defAdj>0?'+':'')+p.defAdj+'% nudge</span></div>'
+    : '';
+
+  var splitHtml = (p.realLine!=null||p.dispLine!=null) ? _nflDefenseSplitHtml(p) : '';
+
+  var pickSide = p.pick || '';
+  var pickCls = pickSide === 'UNDER' ? 'pm-pick-under' : 'pm-pick-over';
+
+  var html='<div class="pm-modal" onclick="event.stopPropagation()">'
+    +'<button class="pm-close" onclick="closeNflLadder()"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg></button>'
+    +'<div class="pm-header">'
+    +'<h3 class="pm-name">'+p.name+'</h3>'
+    +'<div class="pm-sub">'+p.mkt+' &middot; '+p.team+' vs '+p.opponent+'</div>'
+    +'<div class="pm-pick-row">'
+    +'<div class="pm-pick-badge '+pickCls+'">'+pickSide+' '+line+'</div>'
+    +'<div class="pm-pick-book">'+_esc(_nflSideBook(p))+'</div>'
+    +'</div>'
+    +'</div>'
+    +'<div class="pm-body">'
+    +parlayWhy
+    +historyRule
+    +splitHtml
+    +'<div class="pm-section">'
+    +'<div class="pm-sec-title">Recent Games <span class="pm-sec-hl">(Green = '+(pickSide==='UNDER'?'under':'over')+' line)</span></div>'
+    +'<div class="pm-glog">'+chips+'</div>'
+    +'</div>'
+    +voHtml
+    +'<div class="pm-section pm-stats-section">'
+    +'<div class="pm-sec-title">Matchup Stats</div>'
+    +'<div class="pm-stats-list">'
+    +'<div class="pm-stat"><span class="k">'+_esc(_nflOppVenueLabel(p))+'</span><span class="v">'+_rateHtml(p.rateA,p.hitsA,p.totA)+'</span></div>'
+    +'<div class="pm-stat"><span class="k">'+_esc(_nflRecentVenueLabel(p))+'</span><span class="v">'+_rateHtml(p.rateB,p.hitsB,p.totB)+'</span></div>'
+    +vslRow
+    +'<div class="pm-stat"><span class="k">Under Line L10</span><span class="v '+rateClass(p.underRate)+'">'+p.underHits+'/'+p.underTotal+' ('+p.underRate+'%)</span></div>'
+    +'<div class="pm-stat"><span class="k">Average</span><span class="v pm-gold">'+p.avg+'</span></div>'
+    +defHtml
+    +roleHtml
+    +probHtml
+    +'<div class="pm-stat pm-score-stat"><span class="k">Score</span><span class="v pm-gold-bright">'+p.dispScore+'</span></div>'
+    +'</div>'
+    +'</div>'
+    +'</div>'
+    +'</div>';
+    
   var ov=document.createElement('div');
-  ov.className='lad-ov'; ov.id='nflLadOv'; ov.onclick=closeNflLadder;
+  ov.className='pm-ov'; ov.id='nflLadOv'; ov.onclick=closeNflLadder;
   ov.innerHTML=html;
   document.body.appendChild(ov);
 }
