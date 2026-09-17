@@ -2583,22 +2583,37 @@ def _nfl_role_profile(df, team, pos, name, stat_col=""):
     try: snap_bonus = min(.12, max(0.0, float(d.iloc[ix].get("snap_mean") or 0) / 1000.0))
     except (TypeError, ValueError): pass
     return {"role":role,"roleRank":ix+1,"option_rank":option_rank,"confidence":round(min(.9,.35+min(float(d.iloc[ix].games),10)*.055+snap_bonus),2),"factor":round(lead if ix==0 else 1+(tail-1)*min(ix,2)/2,3),"reason":"Recent usage ranking; snap participation blended when available"}
-def _nfl_posdef_profile(df, defense, pos, stat):
-    key=(id(df),str(defense),pos,stat)
+def _nfl_posdef_profile(df, defense, pos, stat, defense_venue=None):
+    """Point-in-time positional defense profile split by the defense's venue.
+
+    nflverse player rows carry the offense venue.  A HOME offense row is an
+    AWAY game for its opponent's defense, and vice versa.  Rows without an
+    authoritative ESPN venue are deliberately excluded rather than guessed.
+    """
+    defense_venue = str(defense_venue or "").upper() or None
+    key=(id(df),str(defense),pos,stat,defense_venue)
     if key in _POSDEF_CACHE:return _POSDEF_CACHE[key]
-    out={"factor":1.0,"rank":None,"allowed":None,"sample":0,"label":f"{pos} {stat.replace('_',' ')} D","confidence":.15}
+    out={"factor":1.0,"rank":None,"allowed":None,"sample":0,
+         "defenseVenue":defense_venue,
+         "defHomeAllowed":None,"defHomeSample":0,
+         "defAwayAllowed":None,"defAwaySample":0,
+         "label":f"{pos} {stat.replace('_',' ')} D","confidence":.15}
     try:
         need={"opponent_team","position",stat,"season","week"}
         if not need.issubset(df.columns): _POSDEF_CACHE[key]=out; return out
         d=df[df.opponent_team.astype(str).str.upper()==str(defense).upper()]
         pp=d.position.fillna("").astype(str).str.upper()
         d=d[pp.isin([pos,"FB" if pos=="RB" else pos])].dropna(subset=[stat])
-        # One game is one observation.  The input may already be historical
-        # point-in-time filtered; never reintroduce future rows here.
-        games=d.groupby(["season","week"])[stat].sum().sort_index(ascending=False)
-        if len(games)<2: _POSDEF_CACHE[key]=out; return out
+        if d.empty: _POSDEF_CACHE[key]=out; return out
+        # Add defense venue from the authoritative ESPN lookup.  Missing venue
+        # entries are not inferred from team order or the current schedule.
+        if not _HA_LOADED:
+            _POSDEF_CACHE[key]=out; return out
+        d=d.copy()
+        d["_off_venue"]=d.apply(_nfl_history_venue,axis=1)
+        d["_def_venue"]=d["_off_venue"].map(
+            {"HOME":"AWAY","AWAY":"HOME"}).fillna("")
         eligible=df[df.position.fillna("").astype(str).str.upper().eq(pos)]
-        lg=eligible.groupby(["opponent_team","season","week"])[stat].sum()
         max_season=int(df.attrs.get("nfl_target_season", df["season"].max()))
         current_weeks = df.loc[df.season == max_season, "week"]
         max_week = int(current_weeks.max()) if not current_weeks.empty else 1
@@ -2606,33 +2621,55 @@ def _nfl_posdef_profile(df, defense, pos, stat):
         if elapsed<=3: prior_w,current_w,recent_w=.65,.25,.10
         elif elapsed<=7: prior_w,current_w,recent_w=.35,.45,.20
         else: prior_w,current_w,recent_w=.15,.55,.30
-        cur_games=games[games.index.get_level_values("season")==max_season]
-        # The prior pool is exactly one season, never every season before the
-        # current one.  The caller has already applied the point-in-time
-        # week cutoff and two-season window.
-        prior_games=games[games.index.get_level_values("season")==max_season-1]
-        recent_vals=list(games.head(6))
-        cur_mean=float(cur_games.mean()) if len(cur_games) else float(games.mean())
-        prior_mean=float(prior_games.mean()) if len(prior_games) else cur_mean
-        recent_mean=float(sum(recent_vals)/len(recent_vals)) if recent_vals else cur_mean
-        # League baseline uses same season/week cutoff rather than arbitrary
-        # row ordering, with current season preferred when available.
-        league_current=lg[lg.index.get_level_values("season")==max_season]
-        league_prior=lg[lg.index.get_level_values("season")==max_season-1]
+        def _venue_games(frame, venue):
+            rows=frame[frame["_def_venue"].eq(venue)]
+            return rows.groupby(["season","week"])[stat].sum().sort_index(ascending=False)
+        def _summary(venue):
+            games=_venue_games(d,venue)
+            if len(games):
+                allowed=games.mean()
+                if len(games) >= 2:
+                    cur_games=games[games.index.get_level_values("season")==max_season]
+                    prior_games=games[games.index.get_level_values("season")==max_season-1]
+                    recent_vals=list(games.head(6))
+                    cur_mean=float(cur_games.mean()) if len(cur_games) else float(games.mean())
+                    prior_mean=float(prior_games.mean()) if len(prior_games) else cur_mean
+                    recent_mean=float(sum(recent_vals)/len(recent_vals)) if recent_vals else cur_mean
+                    allowed=prior_mean*prior_w+cur_mean*current_w+recent_mean*recent_w
+                return round(float(allowed),1),len(games)
+            return None,0
+        home_allowed,home_sample=_summary("HOME")
+        away_allowed,away_sample=_summary("AWAY")
+        out.update({"defHomeAllowed":home_allowed,"defHomeSample":home_sample,
+                    "defAwayAllowed":away_allowed,"defAwaySample":away_sample})
+        selected_allowed, selected_sample = _summary(defense_venue) if defense_venue else (None, 0)
+        games=_venue_games(d,defense_venue) if defense_venue else d.iloc[0:0]
+        if len(games)<2:
+            _POSDEF_CACHE[key]=out; return out
+        # League baseline is venue-specific and uses the same point-in-time
+        # season/week frame. Never substitute the combined defense sample.
+        e=eligible.copy()
+        e["_off_venue"]=e.apply(_nfl_history_venue,axis=1)
+        e["_def_venue"]=e["_off_venue"].map({"HOME":"AWAY","AWAY":"HOME"}).fillna("")
+        league_games=e[e["_def_venue"].eq(defense_venue)].groupby(
+            ["opponent_team","season","week"])[stat].sum()
+        league_current=league_games[league_games.index.get_level_values("season")==max_season]
+        league_prior=league_games[league_games.index.get_level_values("season")==max_season-1]
         baseline=float(league_current.mean() if len(league_current) else league_prior.mean()) if len(league_current) or len(league_prior) else float(games.mean())
-        # Blend recent form only against current/prior pools, avoiding a second
-        # full duplicate current-season weighting when samples overlap.
-        allowed=prior_mean*prior_w+cur_mean*current_w+recent_mean*recent_w
+        allowed=float(selected_allowed) if selected_allowed is not None else float(games.mean())
         factor=max(.9,min(1.1,allowed/baseline if baseline else 1))
         vals={}
-        for tm,g in df[df.position.fillna("").astype(str).str.upper().eq(pos)].groupby("opponent_team"):
-            gg=g.groupby(["season","week"])[stat].sum()
+        for tm,g in e.groupby("opponent_team"):
+            gg=g[g["_def_venue"].eq(defense_venue)].groupby(["season","week"])[stat].sum()
             if len(gg)>=2: vals[str(tm)]=float(gg.tail(8).mean())
         raw_factor = max(.90, min(1.10, float(factor)))
         out={"factor":_nfl_restrained_def_factor(raw_factor),
              "rawFactor":round(raw_factor,3),
              "rank":1+sum(v<allowed for v in vals.values()),
              "allowed":round(float(allowed),1),"sample":len(games),
+             "defenseVenue":defense_venue,
+             "defHomeAllowed":home_allowed,"defHomeSample":home_sample,
+             "defAwayAllowed":away_allowed,"defAwaySample":away_sample,
              "label":f"{pos} {stat.replace('_',' ')} D",
              "confidence":round(min(.95,.25+len(games)*.035),2)}
     except Exception as exc: print(f"[PosDef] {pos}/{stat} failed: {exc}")
@@ -2813,13 +2850,15 @@ def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str,
     # Market-specific opponent positional defense and current offensive role
     # change the projection itself; generic defense remains a low-data fallback.
     role = _nfl_role_profile(df, game_team, effective_position, name, stat_col)
-    posdef = _nfl_posdef_profile(df, opp_abbr, effective_position, stat_col) if opp_abbr else {}
+    defense_venue = ("AWAY" if is_home else "HOME") if is_home is not None else None
+    posdef = (_nfl_posdef_profile(df, opp_abbr, effective_position, stat_col,
+                                  defense_venue)
+              if opp_abbr else {})
     def_factor = float(posdef.get("factor", 1.0))
     def_rank = posdef.get("rank")
     def_lbl = posdef.get("label") or _OPP_ADJ_COLS.get(stat_col, "")
-    if posdef.get("sample", 0) < 2 and opp_abbr and stat_col in _OPP_ADJ_COLS:
-        _fr = _def_factor_map(df, stat_col).get(opp_abbr)
-        if _fr: def_factor, def_rank = _fr
+    # A missing selected venue is intentionally neutral; never fall back to a
+    # combined home+away or league defense factor.
     role_factor = float(role.get("factor", 1.0))
     combined_factor = max(.86, min(1.14, role_factor * def_factor))
     def_rank_factor = 1.0 + max(-0.05, min(0.05, (def_factor - 1) * 0.5))
@@ -2986,6 +3025,11 @@ def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str,
         "roleConfidence": role.get("confidence"), "roleFactor": role_factor,
         "roleReason": role.get("reason"), "positionGroup": effective_position,
         "defAllowed": posdef.get("allowed"), "defSample": posdef.get("sample", 0),
+        "defenseVenue": posdef.get("defenseVenue"),
+        "defHomeAllowed": posdef.get("defHomeAllowed"),
+        "defHomeSample": posdef.get("defHomeSample", 0),
+        "defAwayAllowed": posdef.get("defAwayAllowed"),
+        "defAwaySample": posdef.get("defAwaySample", 0),
         "defConfidence": posdef.get("confidence", .15),
         "defRawFactor": posdef.get("rawFactor"),
         "defFactor": def_factor,
@@ -3229,7 +3273,8 @@ def _analyze_new_prop_raw(pl: Dict, df, home_abbr: str, away_abbr: str,
         if history_lock else "")
 
     role = _nfl_role_profile(df, team, position, name, stat_col)
-    posdef = _nfl_posdef_profile(df, opp, position, stat_col)
+    defense_venue = "AWAY" if home_road == "H" else "HOME"
+    posdef = _nfl_posdef_profile(df, opp, position, stat_col, defense_venue)
     def_factor, def_rank = float(posdef.get("factor",1.0)), posdef.get("rank")
     def_lbl = posdef.get("label") or _OPP_ADJ_COLS.get(stat_col, "")
     role_factor=float(role.get("factor",1.0))
@@ -3428,6 +3473,11 @@ def _analyze_new_prop_raw(pl: Dict, df, home_abbr: str, away_abbr: str,
         "teamOptionRank": role.get("option_rank"), "roleConfidence": role.get("confidence"),
         "roleFactor": role_factor, "roleReason": role.get("reason"),
         "defAllowed": posdef.get("allowed"), "defSample": posdef.get("sample",0),
+        "defenseVenue": posdef.get("defenseVenue"),
+        "defHomeAllowed": posdef.get("defHomeAllowed"),
+        "defHomeSample": posdef.get("defHomeSample",0),
+        "defAwayAllowed": posdef.get("defAwayAllowed"),
+        "defAwaySample": posdef.get("defAwaySample",0),
         "defConfidence": posdef.get("confidence",.15),
         "defRawFactor": posdef.get("rawFactor"), "defFactor": def_factor,
         "combinedFactor": combined_factor, "baseProjection": evidence,
@@ -9858,7 +9908,7 @@ function openNflLadder(key){
       <div class="lad-stat"><span class="k">Average</span><span class="v gold">${p.avg}</span></div>
       ${(p.defRank!=null&&p.defAdj!=null)?`<div class="lad-stat"><span class="k">Opp Def Rank Factor (#${p.defRank} ${p.defLbl||'D'})</span><span class="v" style="color:${p.defAdj>0?'#4ade80':(p.defAdj<0?'#f87171':'#9ca3af')}">${p.defAdj>0?'+':''}${p.defAdj}% projection nudge</span></div>`:''}
       ${p.role?`<div class="lad-stat"><span class="k">Role / opportunity</span><span class="v">${_esc(p.role)}${p.teamOptionRank!=null?' · team receiving option #'+p.teamOptionRank:''} (${Math.round(Number(p.roleConfidence||0)*100)}% confidence)</span></div>`:''}
-      ${(p.realLine!=null||p.dispLine!=null)?`<div class="lad-stat"><span class="k">Sportsbook line</span><span class="v">${p.realLine!=null?p.realLine:p.dispLine}${p.defAllowed!=null?' · '+p.defAllowed+' '+_esc(String(p.mkt||'stat').replace(/Yds/gi,'yards').toLowerCase())+' allowed by '+_esc(p.opponent||'opponent')+' per game over its last '+(p.defSample||0)+' games':''}</span></div>`:''}
+      ${(p.realLine!=null||p.dispLine!=null)?`<div class="lad-stat"><span class="k">Sportsbook line</span><span class="v">${p.realLine!=null?p.realLine:p.dispLine}; ${p.defHomeAllowed!=null?_esc(p.opponent||'opponent')+' HOME: '+p.defHomeAllowed+' '+_esc(String(p.mkt||'stat').replace(/Yds/gi,'yards').toLowerCase())+' allowed/game ('+(p.defHomeSample||0)+' games)'+(p.defenseVenue==='HOME'?' [USED TODAY]':''):''}${p.defAwayAllowed!=null?'; '+_esc(p.opponent||'opponent')+' AWAY: '+p.defAwayAllowed+' '+_esc(String(p.mkt||'stat').replace(/Yds/gi,'yards').toLowerCase())+' allowed/game ('+(p.defAwaySample||0)+' games)'+(p.defenseVenue==='AWAY'?' [USED TODAY]':''):''}</span></div>`:''}
       ${(p.baseProbability!=null||p.adjustedProbability!=null)?`<div class="lad-stat"><span class="k">Base → adjusted probability</span><span class="v">${p.baseProbability!=null?Number(p.baseProbability).toFixed(1):'—'}% → ${p.adjustedProbability!=null?Number(p.adjustedProbability).toFixed(1):'—'}%</span></div>`:''}
       <div class="lad-stat"><span class="k">Score</span><span class="v" style="color:#f59e0b">${p.dispScore}</span></div>
     </div>`;
