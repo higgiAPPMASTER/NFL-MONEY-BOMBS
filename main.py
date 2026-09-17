@@ -8324,39 +8324,45 @@ tr:last-child td{border-bottom:none}
  .nfl-gp-filters{display:grid;grid-template-columns:minmax(130px,160px) minmax(110px,140px) minmax(0,1fr);gap:10px;align-items:end;margin-bottom:14px}
  .nfl-gp-filter{display:flex;flex-direction:column;gap:6px;min-width:0;color:#9ca3af;font-size:.72rem;font-weight:800;text-transform:uppercase;letter-spacing:.09em}
  .nfl-gp-filter .date-input{display:block;width:100%;max-width:100%;min-width:0;box-sizing:border-box}
-   .nfl-gp-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));align-items:stretch;gap:12px;padding:2px}
-   .nfl-gp-game{position:relative;overflow:hidden;background:linear-gradient(145deg,#111a2d 0%,#090f1c 72%);border:1px solid #334155;border-radius:14px;cursor:pointer;box-shadow:0 14px 30px rgba(0,0,0,.28);transition:transform .18s ease,border-color .18s ease,box-shadow .18s ease;min-width:0}
-  .nfl-gp-game:hover{transform:translateY(-2px);border-color:#8b5cf6;box-shadow:0 18px 38px rgba(76,29,149,.26)}
-  .nfl-gp-game:focus-visible{outline:3px solid rgba(167,139,250,.55);outline-offset:3px}
-  .nfl-gp-head{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:14px 16px 11px;border-bottom:1px solid rgba(148,163,184,.14)}
-  .nfl-gp-matchup{color:#f8fafc;font-size:.88rem;font-weight:950;letter-spacing:.04em}
-  .nfl-gp-date{display:block;color:#94a3b8;font-size:.62rem;margin-top:3px;font-weight:750}
-  .nfl-gp-badges{display:flex;align-items:center;justify-content:flex-end;gap:5px;flex-wrap:wrap}
-  .nfl-gp-badge{border-radius:999px;padding:4px 8px;color:#fff;font-size:.58rem;font-weight:950;letter-spacing:.05em;white-space:nowrap}
-  .nfl-gp-teams{padding:8px 16px 4px}
-  .nfl-gp-team{display:grid;grid-template-columns:38px 42px minmax(0,1fr) 54px 52px;gap:9px;align-items:center;padding:9px 0}
-  .nfl-gp-team+.nfl-gp-team{border-top:1px solid rgba(148,163,184,.1)}
-  .nfl-gp-team.pick{margin:0 -8px;padding:10px 8px;border-radius:12px;background:linear-gradient(90deg,rgba(124,58,237,.18),rgba(34,197,94,.06))}
-  .nfl-gp-logo{width:36px;height:36px;object-fit:contain;filter:drop-shadow(0 3px 5px rgba(0,0,0,.45))}
-  .nfl-gp-abbr{color:#cbd5e1;font-size:.9rem;font-weight:950}
+   .nfl-gp-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));align-items:stretch;gap:16px;padding:4px 0}
+   .nfl-gp-game{position:relative;display:flex;flex-direction:column;overflow:hidden;background:linear-gradient(180deg,#13161f 0%,#0b0e14 100%);border:1px solid #1e293b;border-radius:12px;cursor:pointer;box-shadow:0 8px 24px rgba(0,0,0,.4);transition:transform .2s ease,border-color .2s ease,box-shadow .2s ease;min-width:0}
+  .nfl-gp-game:hover{transform:translateY(-2px);border-color:#3b82f6;box-shadow:0 12px 32px rgba(0,0,0,.5)}
+  .nfl-gp-game:focus-visible{outline:2px solid #8b5cf6;outline-offset:2px}
+  .nfl-gp-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;padding:14px 16px;border-bottom:1px solid rgba(255,255,255,.04);background:rgba(255,255,255,.02)}
+  .nfl-gp-matchup{color:#f8fafc;font-size:1.05rem;font-weight:900;letter-spacing:-.02em}
+  .nfl-gp-date{display:block;color:#94a3b8;font-size:.65rem;margin-top:4px;font-weight:700;text-transform:uppercase;letter-spacing:.04em}
+  .nfl-gp-badges{display:flex;flex-direction:column;align-items:flex-end;gap:5px}
+  .nfl-gp-badge{border-radius:4px;padding:3px 7px;color:#fff;font-size:.58rem;font-weight:800;letter-spacing:.04em;white-space:nowrap;box-shadow:0 2px 4px rgba(0,0,0,.25)}
+  .nfl-gp-teams{display:flex;flex-direction:column;gap:12px;padding:16px}
+  .nfl-gp-team{position:relative;display:grid;grid-template-columns:40px minmax(0,1fr) 60px;grid-template-rows:auto auto auto;gap:4px 10px;align-items:center}
+  .nfl-gp-logo{width:40px;height:40px;object-fit:contain;grid-row:1/3;filter:drop-shadow(0 2px 4px rgba(0,0,0,.4))}
+  .nfl-gp-abbr{color:#cbd5e1;font-size:1rem;font-weight:800;line-height:1.1;grid-column:2;grid-row:1}
   .nfl-gp-team.pick .nfl-gp-abbr{color:#fff}
-  .nfl-gp-bar{height:9px;border-radius:999px;background:#07101f;overflow:hidden;box-shadow:inset 0 0 0 1px rgba(148,163,184,.08)}
-  .nfl-gp-bar>span{display:block;height:100%;border-radius:inherit}
-  .nfl-gp-sp{margin-top:4px;color:#94a3b8;font-size:.59rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-  .nfl-gp-proj{text-align:center;color:#e2e8f0;font-size:.94rem;font-weight:950}
-  .nfl-gp-proj small,.nfl-gp-win small{display:block;color:#64748b;font-size:.5rem;letter-spacing:.08em;text-transform:uppercase;margin-top:2px}
-  .nfl-gp-win{text-align:right;color:#94a3b8;font-size:.96rem;font-weight:950}
+  .nfl-gp-sp{color:#64748b;font-size:.62rem;grid-column:2;grid-row:2;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-weight:600;margin-top:2px}
+  .nfl-gp-ranks{display:flex;gap:4px;align-items:center}
+  .nfl-gp-rank{font-size:.55rem;padding:2px 5px;border-radius:4px;background:#0f172a;color:#94a3b8;font-weight:800;letter-spacing:.03em;border:1px solid #1e293b}
+  .nfl-gp-rank.off{color:#93c5fd;background:rgba(59,130,246,.1);border-color:rgba(59,130,246,.2)}
+  .nfl-gp-rank.def{color:#86efac;background:rgba(34,197,94,.1);border-color:rgba(34,197,94,.2)}
+  .nfl-gp-win-box{grid-column:3;grid-row:1/3;display:flex;flex-direction:column;align-items:flex-end;justify-content:center}
+  .nfl-gp-win{color:#cbd5e1;font-size:1.1rem;font-weight:900;line-height:1}
+  .nfl-gp-win small{display:block;color:#64748b;font-size:.52rem;letter-spacing:.05em;text-transform:uppercase;margin-top:4px;font-weight:800;text-align:right}
   .nfl-gp-team.pick .nfl-gp-win{color:#4ade80}
-  .nfl-gp-ranks{display:flex;gap:4px;margin-top:3px;flex-wrap:wrap}
-  .nfl-gp-rank{font-size:.48rem;line-height:1.3;padding:2px 4px;border-radius:4px;background:#172033;color:#a5b4fc;font-weight:900;letter-spacing:.02em}
-  .nfl-gp-rank.def{color:#86efac}
-  .nfl-gp-callouts{display:grid;grid-template-columns:1fr 1fr;gap:8px;padding:8px 16px 14px}
-  .nfl-gp-callout{min-width:0;border:1px solid rgba(148,163,184,.15);border-radius:10px;background:rgba(3,7,18,.55);padding:9px 10px}
-  .nfl-gp-callout .k{color:#64748b;font-size:.54rem;font-weight:900;letter-spacing:.08em;text-transform:uppercase}
-  .nfl-gp-callout .v{color:#f8fafc;font-size:.73rem;font-weight:900;margin-top:4px;line-height:1.35}
-  .nfl-gp-why{padding:10px 16px;border-top:1px solid rgba(148,163,184,.12);color:#aab8cc;font-size:.66rem;line-height:1.5}
+  .nfl-gp-team.pick .nfl-gp-win small{color:#22c55e}
+  .nfl-gp-barline{grid-column:1/-1;grid-row:3;width:100%;min-width:0;margin-top:6px}
+  .nfl-gp-bar{height:8px;width:100%;border-radius:4px;background:#0f172a;overflow:hidden;box-shadow:inset 0 1px 2px rgba(0,0,0,.6)}
+  .nfl-gp-bar>span{display:block;height:100%;border-radius:4px;transition:width .4s ease}
+  .nfl-gp-callouts{display:grid;grid-template-columns:1fr 1fr;gap:12px;padding:0 16px 16px;margin-top:auto}
+  .nfl-gp-callout{min-width:0;border-left:2px solid #334155;padding-left:10px}
+  .nfl-gp-callout .k{color:#64748b;font-size:.56rem;font-weight:800;letter-spacing:.06em;text-transform:uppercase}
+  .nfl-gp-callout .v{color:#e2e8f0;font-size:.76rem;font-weight:700;margin-top:5px;line-height:1.4}
+  .nfl-gp-why{padding:14px 16px;background:rgba(0,0,0,.2);border-top:1px solid #1e293b;color:#94a3b8;font-size:.7rem;line-height:1.5}
+  .nfl-gp-why-title{display:flex;align-items:center;gap:6px;color:#818cf8;font-weight:900;font-size:.62rem;letter-spacing:.06em;text-transform:uppercase;margin-bottom:8px}
+  .nfl-gp-why-title::before{content:'';display:block;width:4px;height:4px;background:#818cf8;border-radius:50%}
+  .nfl-gp-why ul{margin:0;padding-left:0;list-style:none;display:flex;flex-direction:column;gap:6px}
+  .nfl-gp-why li{position:relative;padding-left:12px}
+  .nfl-gp-why li::before{content:'';position:absolute;left:0;top:6px;width:4px;height:1px;background:#475569}
   @media(max-width:1100px){.nfl-gp-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
-  @media(max-width:650px){.nfl-gp-grid{grid-template-columns:1fr}.nfl-gp-game{border-radius:12px}}
+  @media(max-width:650px){.nfl-gp-grid{grid-template-columns:1fr}.nfl-gp-game{border-radius:10px}}
   .nfl-gp-track{margin:0;border-top:1px solid #1e293b;background:#070d1a}
   .nfl-gp-track summary{list-style:none;cursor:pointer;padding:8px 12px;color:#a78bfa;font-size:.62rem;font-weight:900;letter-spacing:.07em}
   .nfl-gp-track summary::-webkit-details-marker{display:none}
@@ -8383,7 +8389,7 @@ tr:last-child td{border-bottom:none}
   .nfl-game-group-body{border-top:1px solid #263244;padding:5px 12px 10px}
  @media(max-width:620px){.nfl-parlay-filters{grid-template-columns:1fr}}
  @media(max-width:680px){
-    .nfl-gp-game{width:calc(100vw - 54px);max-width:calc(100vw - 54px);flex-basis:calc(100vw - 54px);border-radius:14px}.nfl-gp-head{align-items:flex-start}.nfl-gp-team{grid-template-columns:34px 38px minmax(0,1fr) 46px 46px;gap:6px}.nfl-gp-logo{width:32px;height:32px}.nfl-gp-callouts{grid-template-columns:1fr}.nfl-game-group summary{align-items:flex-start}.nfl-game-group-meta{flex-direction:column;align-items:flex-end}
+    .nfl-gp-game{width:100%;max-width:100%;min-width:0;border-radius:12px}.nfl-gp-head{align-items:flex-start}.nfl-gp-team{grid-template-columns:36px minmax(0,1fr) 52px;gap:4px 8px}.nfl-gp-logo{width:36px;height:36px}.nfl-gp-callouts{grid-template-columns:1fr}.nfl-game-group summary{align-items:flex-start}.nfl-game-group-meta{flex-direction:column;align-items:flex-end}
    .nfl-gp-filters{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}
    .nfl-gp-filter-date{grid-column:1/-1}
    .nfl-trk-group-head{padding:14px}.nfl-trk-group-name{font-size:1.02rem}.nfl-trk-tbl{font-size:.88rem}.nfl-trk-tbl th{font-size:.68rem;padding:11px}.nfl-trk-tbl td{padding:11px 12px}
@@ -8556,7 +8562,7 @@ tr:last-child td{border-bottom:none}
     <div id="nflCoachTrackBody"></div>
   </div>
   <div id="nfl-gp-card" style="display:none;max-width:1500px;margin:18px auto 0;padding:0 16px">
-    <div style="font-size:1rem;font-weight:900;color:#a78bfa;margin-bottom:6px">&#128302; Game Predictor &#8212; Today&#39;s Winners</div>
+    <div style="display:flex;align-items:center;gap:8px;font-size:1.05rem;font-weight:900;color:#a78bfa;margin-bottom:6px;letter-spacing:0.02em"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:#a78bfa"><path d="M21.54 15H17a2 2 0 0 0-2 2v4.54"/><path d="M7 3.34V5a3 3 0 0 0 3 3v0a2 2 0 0 1 2 2v0c0 1.1.9 2 2 2v0a2 2 0 0 0 2-2c0-1.1.9-2 2-2h3.17"/><path d="M11 21.95V18a2 2 0 0 0-2-2v0a2 2 0 0 1-2-2v-1a2 2 0 0 0-2-2H2.05"/><circle cx="12" cy="12" r="10"/></svg> GAME PREDICTOR &#8212; TODAY&#39;S WINNERS</div>
     <div style="font-size:.72rem;color:#64748b;margin-bottom:14px">Model blends recent L5 form, last completed season offense/defense, home-field advantage, and venue-aware results from the last five head-to-head meetings. Tap a game for the full breakdown.</div>
     <div id="nfl-gp-body"></div>
   </div>
@@ -8579,7 +8585,7 @@ tr:last-child td{border-bottom:none}
   <div id="nfl-gp-record-section" class="card" style="padding:20px 22px;border-color:#4c1d95">
     <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap;margin-bottom:12px">
       <div>
-        <h2 style="font-family:'Playfair Display',serif;font-size:1.4rem;font-weight:700;color:#fff">&#128302; NFL Game Predictor Record <span style="color:#fbbf24;font-size:.7rem">SYSTEM: SELECTED</span></h2>
+        <h2 style="font-family:'Playfair Display',serif;font-size:1.4rem;font-weight:700;color:#fff;display:flex;align-items:center;gap:8px"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:#a78bfa"><path d="M21.54 15H17a2 2 0 0 0-2 2v4.54"/><path d="M7 3.34V5a3 3 0 0 0 3 3v0a2 2 0 0 1 2 2v0c0 1.1.9 2 2 2v0a2 2 0 0 0 2-2c0-1.1.9-2 2-2h3.17"/><path d="M11 21.95V18a2 2 0 0 0-2-2v0a2 2 0 0 1-2-2v-1a2 2 0 0 0-2-2H2.05"/><circle cx="12" cy="12" r="10"/></svg> NFL Game Predictor Record <span style="color:#fbbf24;font-size:.7rem;font-family:sans-serif">SYSTEM: SELECTED</span></h2>
         <div style="color:#7c8aa0;font-size:.76rem;margin-top:4px">Official pre-game forecasts tracked separately for game winners and point totals.</div>
       </div>
       <button onclick="loadNflGpRecord()" style="background:#6d28d9;color:#fff;border:none;border-radius:8px;padding:8px 14px;font-weight:700;cursor:pointer;font-size:.82rem">&#8635; Get Results</button>
@@ -9740,46 +9746,43 @@ function _nflGpBetPanel(g,idx){
 function _nflGpCard(g,i){
   var cc=_nflGpConfClr(g.conf);
   function teamRow(abbr,sp,proj,win,isPick,book,offRank,defRank){
-    var barClr=isPick?'linear-gradient(90deg,#16a34a,#4ade80)':'#b91c1c';
+    var barClr=isPick?'#22c55e':'#ef4444';
     var logo='https://a.espncdn.com/i/teamlogos/nfl/500/'+_logoAbbr(abbr)+'.png';
     return '<div class="nfl-gp-team'+(isPick?' pick':'')+'">'
       +'<img class="nfl-gp-logo" src="'+_esc(logo)+'" alt="" onerror="this.style.visibility=\\'hidden\\'"/>'
       +'<div class="nfl-gp-abbr">'+_esc(abbr)+'</div>'
-      +'<div style="min-width:0"><div class="nfl-gp-bar"><span style="width:'+win+'%;background:'+barClr+'"></span></div>'
-      +'<div class="nfl-gp-ranks"><span class="nfl-gp-rank">OFF #'+(offRank||'—')+'</span><span class="nfl-gp-rank def">DEF #'+(defRank||'—')+'</span></div>'
-      +'<div class="nfl-gp-sp">'+_esc(sp||'Starter TBD')+' · '+_esc(book||'Book unavailable')+'</div></div>'
-      +'<div class="nfl-gp-proj">'+_nflGpFix(proj)+'<small>Proj</small></div>'
-      +'<div class="nfl-gp-win">'+win+'%<small>Win</small></div>'
+      +'<div class="nfl-gp-sp">'+_esc(sp||'Starter TBD')+' &middot; '+_esc(book||'N/A')+'<div class="nfl-gp-ranks"><span class="nfl-gp-rank off">OFF #'+(offRank||'—')+'</span><span class="nfl-gp-rank def">DEF #'+(defRank||'—')+'</span></div></div>'
+      +'<div class="nfl-gp-win-box"><div class="nfl-gp-win">'+win+'%<small>Win</small></div></div>'
+      +'<div class="nfl-gp-barline"><div class="nfl-gp-bar"><span style="width:'+win+'%;background:'+barClr+'"></span></div></div>'
       +'</div>';
   }
-  var drivers=(g.drivers||[]).map(function(d){return _esc(d);}).join(' &#183; ');
-  var vb=g.value_flag?('<span style="background:#166534;color:#fff;font-weight:900;font-size:.62rem;border-radius:6px;padding:2px 7px;letter-spacing:.04em">VALUE +'+g.mkt_edge+'%</span>'):'';
-  var bdr=g.value_flag?'#166534':'#1e293b';
+  var drivers=(g.drivers||[]).slice(0,3).map(function(d){return '<li>'+_esc(d)+'</li>';}).join('');
+  var vb=g.value_flag?('<span class="nfl-gp-badge" style="background:#166534;color:#4ade80">VALUE +'+g.mkt_edge+'%</span>'):'';
   var totValue='',totalBook='';
   if(g.total_line==null){
-    totValue='Proj '+_nflGpFix(g.proj_total)+' · no book line';
+    totValue='Proj '+_nflGpFix(g.proj_total)+' &middot; no book line';
   } else {
     var ov=g.total_pick==='OVER'; var ec=(g.total_edge>0?'+':'')+_nflGpFix(g.total_edge);
     totalBook=ov?g.total_over_book:g.total_under_book;
-    totValue='<span style="color:'+(ov?'#4ade80':'#fca5a5')+'">'+g.total_pick+' '+_nflGpFix(g.total_line)+'</span> · proj '+_nflGpFix(g.proj_total)+' · '+ec+' pts<br><span style="color:#94a3b8;font-size:.6rem">'+_esc(totalBook||'Book unavailable')+'</span>';
+    totValue='<span style="color:'+(ov?'#4ade80':'#fca5a5')+'">'+g.total_pick+' '+_nflGpFix(g.total_line)+'</span> &middot; proj '+_nflGpFix(g.proj_total)+' &middot; '+ec+' pts<br><span style="color:#64748b;font-size:.65rem;font-weight:600">'+_esc(totalBook||'Book unavailable')+'</span>';
   }
-  var mktValue='No moneyline edge available';
+  var mktValue='No moneyline edge';
   if(g.mkt_edge!=null){
     var mp=(g.pick_home?g.mkt_home_pct:g.mkt_away_pct), md=(g.pick_home?g.win_home:g.win_away);
     var sign=(g.mkt_edge>0?'+':'');
-    mktValue='<span style="color:#c4b5fd">'+_esc(g.pick_abbr)+' '+md+'%</span> vs market '+mp+'% · <span style="color:'+(g.mkt_edge>0?'#4ade80':g.mkt_edge<0?'#f87171':'#cbd5e1')+'">'+sign+g.mkt_edge+'% edge</span>';
+    mktValue='<span style="color:#818cf8">'+_esc(g.pick_abbr)+' '+md+'%</span> vs mkt '+mp+'%<br><span style="color:'+(g.mkt_edge>0?'#4ade80':g.mkt_edge<0?'#f87171':'#64748b')+';font-size:.65rem;font-weight:600">'+sign+g.mkt_edge+'% edge</span>';
   }
   return '<div class="nfl-gp-game" role="button" tabindex="0" onclick="_openNflGamePred('+i+')" onkeydown="if(event.key===\\'Enter\\'||event.key===\\' \\'){event.preventDefault();_openNflGamePred('+i+')}">'
-    +'<div class="nfl-gp-head"><div><div class="nfl-gp-matchup">'+_esc(g.away_abbr)+' @ '+_esc(g.home_abbr)+'</div><span class="nfl-gp-date">'+_esc(g.slate_date||'Today')+' · tap for full breakdown</span></div>'
+    +'<div class="nfl-gp-head"><div><div class="nfl-gp-matchup">'+_esc(g.away_abbr)+' @ '+_esc(g.home_abbr)+'</div><span class="nfl-gp-date">'+_esc(g.slate_date||'Today')+'</span></div>'
     +'<div class="nfl-gp-badges">'+vb
     +'<span class="nfl-gp-badge" style="background:'+cc+'">'+_esc(g.conf)+'</span>'
-    +'<span class="nfl-gp-badge" style="background:#166534">PICK '+_esc(g.pick_abbr)+'</span></div></div>'
+    +'<span class="nfl-gp-badge" style="background:#4f46e5">PICK '+_esc(g.pick_abbr)+'</span></div></div>'
     +'<div class="nfl-gp-teams">'
     +teamRow(g.away_abbr,g.away_sp,g.proj_away,g.win_away,!g.pick_home,g.away_ml_book,g.away_off_rank,g.away_def_rank)
     +teamRow(g.home_abbr,g.home_sp,g.proj_home,g.win_home,g.pick_home,g.home_ml_book,g.home_off_rank,g.home_def_rank)
     +'</div><div class="nfl-gp-callouts"><div class="nfl-gp-callout"><div class="k">Point total</div><div class="v">'+totValue+'</div></div>'
     +'<div class="nfl-gp-callout"><div class="k">Winner value</div><div class="v">'+mktValue+'</div></div></div>'
-    +'<div class="nfl-gp-why"><span style="color:#c4b5fd;font-weight:900">WHY THIS PICK</span> · '+drivers+'</div>'
+    +'<div class="nfl-gp-why"><div class="nfl-gp-why-title">Why This Pick</div><ul>'+drivers+'</ul></div>'
     +_nflGpBetPanel(g,i)
     +'</div>';
 }
@@ -9836,50 +9839,61 @@ function _nflGpLoadHistory(g){
 function _openNflGamePred(i){
   var gp=(window.__NFL_GP__||[])[i]; if(!gp) return;
   var ov=document.getElementById('nfl-gp-modal');
-  if(!ov){ov=document.createElement('div');ov.id='nfl-gp-modal';
-    ov.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.85);z-index:10000;display:flex;align-items:flex-start;justify-content:center;padding:16px;overflow:hidden;box-sizing:border-box';
+  if(!ov){
+    ov=document.createElement('div');ov.id='nfl-gp-modal';
+    ov.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.85);backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);z-index:10000;display:flex;align-items:center;justify-content:center;padding:20px;overflow:hidden;box-sizing:border-box';
     ov.onclick=function(e){if(e.target===ov)ov.style.display='none';};
-    document.body.appendChild(ov);}
+    document.body.appendChild(ov);
+  }
   ov.style.display='flex';
-  function gpBig(abbr,proj,win,isPick){
-    return '<div style="flex:1;text-align:center;padding:12px 16px;background:#0f172a;border-radius:10px;border:1px solid '+(isPick?'#7c3aed':'#1e293b')+'">'
-      +'<div style="font-size:1.3rem;font-weight:900;color:'+(isPick?'#e9d5ff':'#94a3b8')+'">'+_esc(abbr)+'</div>'
-      +'<div style="font-size:2rem;font-weight:900;color:'+(isPick?'#4ade80':'#e2e8f0');+';margin:4px 0">'+_nflGpFix(proj)+'</div>'
-      +'<div style="font-size:.8rem;color:#94a3b8">proj pts</div>'
-      +'<div style="font-size:1.1rem;font-weight:800;color:'+(isPick?'#4ade80':'#94a3b8')+';margin-top:4px">'+win+'%</div>'
+  function gpBig(abbr,proj,win,isPick,rankOff,rankDef){
+    return '<div style="flex:1;text-align:center;padding:20px;background:'+(isPick?'rgba(74,222,128,.05)':'rgba(255,255,255,.02)')+';border-radius:12px;border:1px solid '+(isPick?'rgba(74,222,128,.3)':'rgba(255,255,255,.05)')+';position:relative;overflow:hidden">'
+      +(isPick?'<div style="position:absolute;top:0;left:0;right:0;height:3px;background:#4ade80"></div>':'')
+      +'<div style="display:flex;justify-content:center;gap:6px;margin-bottom:8px"><span style="font-size:.55rem;padding:2px 6px;border-radius:4px;background:rgba(147,197,253,.1);color:#93c5fd;font-weight:800">OFF #'+(rankOff||'—')+'</span><span style="font-size:.55rem;padding:2px 6px;border-radius:4px;background:rgba(134,239,172,.1);color:#86efac;font-weight:800">DEF #'+(rankDef||'—')+'</span></div>'
+      +'<div style="font-size:1.4rem;font-weight:900;color:'+(isPick?'#fff':'#cbd5e1')+';line-height:1">'+_esc(abbr)+'</div>'
+      +'<div style="font-size:2.5rem;font-weight:900;color:'+(isPick?'#4ade80':'#f1f5f9');+';margin:12px 0;line-height:1;letter-spacing:-.03em">'+_nflGpFix(proj)+'</div>'
+      +'<div style="font-size:.7rem;color:#94a3b8;text-transform:uppercase;letter-spacing:.08em;font-weight:700">Projected</div>'
+      +'<div style="font-size:1.25rem;font-weight:900;color:'+(isPick?'#4ade80':'#94a3b8')+';margin-top:12px">'+win+'% <span style="font-size:.7rem;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:.05em">Win</span></div>'
       +'</div>';
   }
-  var totStr=(gp.total_line!=null?('proj <b>'+_nflGpFix(gp.proj_total)+'</b> · book line <b>'+_nflGpFix(gp.total_line)+'</b>'):'proj <b>'+_nflGpFix(gp.proj_total)+'</b> · no line posted');
-  var driversHtml=(gp.drivers||[]).map(function(d){return '<li style="margin-bottom:4px">'+_esc(d)+'</li>';}).join('');
+  var totStr=(gp.total_line!=null?('PROJ <span style="color:#fff">'+_nflGpFix(gp.proj_total)+'</span> &middot; BOOK <span style="color:#fff">'+_nflGpFix(gp.total_line)+'</span>'):'PROJ <span style="color:#fff">'+_nflGpFix(gp.proj_total)+'</span> &middot; NO LINE POSTED');
+  var driversHtml=(gp.drivers||[]).map(function(d){return '<li style="position:relative;padding-left:14px;margin-bottom:8px"><span style="position:absolute;left:0;top:7px;width:5px;height:2px;background:#6366f1"></span>'+_esc(d)+'</li>';}).join('');
   var h2hBlendLine=gp.h2h_games
-    ?(gp.h2h_games+' recency/venue-weighted H2H meetings: '+gp.h2h_weight_pct+'% adjustment ('+(gp.h2h_exact_venue_games||0)+' exact venue, '+(gp.h2h_reversed_venue_games||0)+' reversed)')
-    :'No completed H2H meetings available · stats baseline used without a matchup adjustment';
-  var blendHtml='<div style="background:#11162a;border:1px solid #312e81;border-radius:8px;padding:9px 12px;margin-bottom:10px;font-size:.7rem;color:#94a3b8">'
-    +'<div style="color:#c4b5fd;font-weight:900;margin-bottom:4px">BLENDED MODEL INPUTS</div>'
-    +'<div>Recent L5 adjusted: '+_esc(gp.away_abbr)+' '+_nflGpFix(gp.recent_away)+' · '+_esc(gp.home_abbr)+' '+_nflGpFix(gp.recent_home)+'</div>'
-    +'<div style="margin-top:3px">'+_esc(gp.reference_season||'Last season')+' offense/defense: '+_esc(gp.away_abbr)+' '+_nflGpFix(gp.last_away)+' · '+_esc(gp.home_abbr)+' '+_nflGpFix(gp.last_home)+'</div>'
-    +'<div style="margin-top:3px">Stats baseline (45% L5 / 55% season): '+_esc(gp.away_abbr)+' '+_nflGpFix(gp.stat_away)+' · '+_esc(gp.home_abbr)+' '+_nflGpFix(gp.stat_home)+'</div>'
-    +'<div style="margin-top:3px">Ranks: '+_esc(gp.away_abbr)+' OFF #'+(gp.away_off_rank||'—')+' / DEF #'+(gp.away_def_rank||'—')+' · '+_esc(gp.home_abbr)+' OFF #'+(gp.home_off_rank||'—')+' / DEF #'+(gp.home_def_rank||'—')+'</div>'
-    +'<div style="margin-top:3px">Venue split: '+_esc(gp.away_abbr)+' away offense '+_nflGpFix(gp.away_venue_off_pts)+' · '+_esc(gp.home_abbr)+' home offense '+_nflGpFix(gp.home_venue_off_pts)+'</div>'
-    +'<div style="margin-top:3px">'+h2hBlendLine+'</div>'
-    +(gp.h2h_games?('<div style="margin-top:3px;color:#e2e8f0">Venue-aware H2H scoring: '+_esc(gp.home_abbr)+' '+_nflGpFix(gp.h2h_home_avg)+' · '+_esc(gp.away_abbr)+' '+_nflGpFix(gp.h2h_away_avg)+'</div>'):'')
+    ?(gp.h2h_games+' RECENCY/VENUE-WEIGHTED H2H MEETINGS: '+gp.h2h_weight_pct+'% ADJUSTMENT ('+(gp.h2h_exact_venue_games||0)+' EXACT VENUE, '+(gp.h2h_reversed_venue_games||0)+' REVERSED)')
+    :'NO COMPLETED H2H MEETINGS AVAILABLE &middot; STATS BASELINE USED WITHOUT MATCHUP ADJUSTMENT';
+  var blendHtml='<div style="background:rgba(255,255,255,.02);border:1px solid #1e293b;border-radius:12px;padding:16px;margin-bottom:16px;font-size:.7rem;color:#94a3b8;line-height:1.6">'
+    +'<div style="color:#a78bfa;font-weight:900;font-size:.65rem;letter-spacing:.08em;text-transform:uppercase;margin-bottom:10px;display:flex;align-items:center;gap:6px"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg> Blended Model Inputs</div>'
+    +'<div>RECENT L5 ADJUSTED: <span style="color:#e2e8f0">'+_esc(gp.away_abbr)+' '+_nflGpFix(gp.recent_away)+'</span> &middot; <span style="color:#e2e8f0">'+_esc(gp.home_abbr)+' '+_nflGpFix(gp.recent_home)+'</span></div>'
+    +'<div style="margin-top:4px">'+_esc((gp.reference_season||'Last season').toUpperCase())+' OFFENSE/DEFENSE: <span style="color:#e2e8f0">'+_esc(gp.away_abbr)+' '+_nflGpFix(gp.last_away)+'</span> &middot; <span style="color:#e2e8f0">'+_esc(gp.home_abbr)+' '+_nflGpFix(gp.last_home)+'</span></div>'
+    +'<div style="margin-top:4px">STATS BASELINE (45% L5 / 55% SEASON): <span style="color:#e2e8f0">'+_esc(gp.away_abbr)+' '+_nflGpFix(gp.stat_away)+'</span> &middot; <span style="color:#e2e8f0">'+_esc(gp.home_abbr)+' '+_nflGpFix(gp.stat_home)+'</span></div>'
+    +'<div style="margin-top:4px">VENUE SPLIT: <span style="color:#e2e8f0">'+_esc(gp.away_abbr)+' AWAY OFFENSE '+_nflGpFix(gp.away_venue_off_pts)+'</span> &middot; <span style="color:#e2e8f0">'+_esc(gp.home_abbr)+' HOME OFFENSE '+_nflGpFix(gp.home_venue_off_pts)+'</span></div>'
+    +'<div style="margin-top:4px;color:#a1a1aa">'+h2hBlendLine+'</div>'
+    +(gp.h2h_games?('<div style="margin-top:4px;color:#cbd5e1">VENUE-AWARE H2H SCORING: <span style="color:#fff">'+_esc(gp.home_abbr)+' '+_nflGpFix(gp.h2h_home_avg)+'</span> &middot; <span style="color:#fff">'+_esc(gp.away_abbr)+' '+_nflGpFix(gp.h2h_away_avg)+'</span></div>'):'')
     +'</div>';
-  ov.innerHTML='<div style="background:#0d1117;border:1px solid #7c3aed;border-radius:18px;max-width:820px;width:100%;max-height:calc(100vh - 32px);overflow-y:auto;box-sizing:border-box;margin:auto;padding:22px;box-shadow:0 20px 60px rgba(0,0,0,.7)">'
-    +'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">'
-    +'<div style="font-size:1rem;font-weight:900;color:#c4b5fd">'+_esc(gp.away_abbr)+' @ '+_esc(gp.home_abbr)+'</div>'
-    +'<button onclick="document.getElementById(&#39;nfl-gp-modal&#39;).style.display=&#39;none&#39;" style="background:none;border:none;color:#64748b;font-size:1.2rem;cursor:pointer">&#10005;</button></div>'
-    +'<div style="font-size:.68rem;color:#64748b;margin-bottom:12px">Winner and total blend recent form, last-season offense/defense, venue-aware H2H history, and home-field advantage</div>'
-    +'<div style="display:flex;gap:10px;margin-bottom:14px">'+gpBig(gp.away_abbr,gp.proj_away,gp.win_away,!gp.pick_home)+gpBig(gp.home_abbr,gp.proj_home,gp.win_home,gp.pick_home)+'</div>'
-    +'<div style="margin-bottom:10px;color:#94a3b8;font-size:.76rem">'+totStr+'</div>'
+  
+  var marketEdgeHtml='';
+  if(gp.mkt_edge!=null){
+    var mktSign=(gp.mkt_edge>0?'+':'');
+    var mktColor=(gp.mkt_edge>0?'#4ade80':gp.mkt_edge<0?'#ef4444':'#64748b');
+    var mktBg=(gp.mkt_edge>0?'rgba(74,222,128,.15)':gp.mkt_edge<0?'rgba(239,68,68,.15)':'rgba(255,255,255,.05)');
+    marketEdgeHtml='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;background:#09090b;border:1px solid #27272a;border-radius:12px;padding:16px">'
+      +'<div><div style="font-size:.75rem;font-weight:800;color:#a78bfa;text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px">Model Pick: '+_esc(gp.pick_abbr)+'</div>'
+      +'<div style="color:#94a3b8;font-size:.85rem;font-weight:600">Model <span style="color:#fff;font-weight:800">'+(gp.pick_home?gp.win_home:gp.win_away)+'%</span> &middot; Market <span style="color:#fff;font-weight:800">'+(gp.pick_home?gp.mkt_home_pct:gp.mkt_away_pct)+'%</span></div></div>'
+      +'<div style="background:'+mktBg+';color:'+mktColor+';font-weight:900;font-size:.85rem;border-radius:8px;padding:6px 14px;box-shadow:inset 0 0 0 1px '+mktColor+'33">'+(gp.value_flag?'VALUE ':'EDGE ')+mktSign+gp.mkt_edge+'%</div>'
+      +'</div>';
+  }
+
+  ov.innerHTML='<div style="background:#09090b;border:1px solid #27272a;border-radius:20px;max-width:860px;width:100%;max-height:calc(100vh - 40px);overflow-y:auto;box-sizing:border-box;margin:auto;padding:28px;box-shadow:0 24px 80px rgba(0,0,0,.8);position:relative">'
+    +'<button onclick="document.getElementById(&#39;nfl-gp-modal&#39;).style.display=&#39;none&#39;" style="position:absolute;top:20px;right:20px;width:32px;height:32px;border-radius:16px;background:rgba(255,255,255,.05);border:none;color:#a1a1aa;font-size:1.1rem;display:flex;align-items:center;justify-content:center;cursor:pointer;transition:background .2s,color .2s" onmouseover="this.style.background=&#39;rgba(255,255,255,.1)&#39;;this.style.color=&#39;#fff&#39;" onmouseout="this.style.background=&#39;rgba(255,255,255,.05)&#39;;this.style.color=&#39;#a1a1aa&#39;">&#10005;</button>'
+    +'<div style="font-size:1.2rem;font-weight:900;color:#fff;letter-spacing:-.02em;margin-bottom:8px">'+_esc(gp.away_abbr)+' @ '+_esc(gp.home_abbr)+'</div>'
+    +'<div style="font-size:.7rem;color:#64748b;margin-bottom:20px;font-weight:600;line-height:1.4;max-width:90%">Winner and total blend recent form, last-season offense/defense, venue-aware H2H history, and home-field advantage</div>'
+    +'<div style="display:flex;gap:16px;margin-bottom:20px">'+gpBig(gp.away_abbr,gp.proj_away,gp.win_away,!gp.pick_home,gp.away_off_rank,gp.away_def_rank)+gpBig(gp.home_abbr,gp.proj_home,gp.win_home,gp.pick_home,gp.home_off_rank,gp.home_def_rank)+'</div>'
+    +'<div style="margin-bottom:20px;color:#94a3b8;font-size:.75rem;font-weight:700;text-align:center;background:rgba(255,255,255,.03);padding:10px;border-radius:8px">'+totStr+'</div>'
     +blendHtml
-    +(gp.mkt_edge!=null?('<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;background:#0a1120;border-radius:8px;padding:8px 12px">'
-      +'<div><div style="font-size:.7rem;font-weight:800;color:#c4b5fd">Model pick: '+_esc(gp.pick_abbr)+'</div>'
-      +'<div style="color:#e2e8f0;font-size:.8rem;margin-top:2px">model <b>'+(gp.pick_home?gp.win_home:gp.win_away)+'%</b> · market <b>'+(gp.pick_home?gp.mkt_home_pct:gp.mkt_away_pct)+'%</b></div></div>'
-      +'<span style="background:'+(gp.mkt_edge>0?'#166534':(gp.mkt_edge<0?'#7f1d1d':'#334155'))+';color:#fff;font-weight:900;font-size:.74rem;border-radius:8px;padding:4px 11px">'+(gp.value_flag?'VALUE ':'EDGE ')+(gp.mkt_edge>0?'+':'')+gp.mkt_edge+'%</span>'
-      +'</div>'):'')
-    +'<div style="background:#0a1120;border-radius:8px;padding:10px 14px;font-size:.72rem;color:#94a3b8"><span style="color:#7c3aed;font-weight:800">Key factors:</span><ul style="margin:6px 0 0;padding-left:18px;line-height:1.7">'+driversHtml+'</ul></div>'
-     +'<div id="nfl-gp-history" style="background:#0a1120;border-radius:8px;padding:11px 14px;margin-top:10px;font-size:.72rem;color:#94a3b8"><div style="color:#64748b">Loading last 5 meetings…</div></div>'
-    +'<div style="color:#64748b;font-size:.62rem;margin-top:10px;text-align:center">Display only · not tracked · blended matchup projection</div>'
+    +marketEdgeHtml
+    +'<div style="background:#09090b;border:1px solid #27272a;border-radius:12px;padding:20px;font-size:.75rem;color:#cbd5e1"><div style="color:#818cf8;font-weight:900;text-transform:uppercase;letter-spacing:.05em;margin-bottom:12px;display:flex;align-items:center;gap:6px"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M12 2v20M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg> Why This Pick</div><ul style="margin:0;padding:0;list-style:none;line-height:1.6">'+driversHtml+'</ul></div>'
+    +'<div id="nfl-gp-history" style="background:rgba(255,255,255,.02);border:1px solid #1e293b;border-radius:12px;padding:16px;margin-top:16px;font-size:.75rem;color:#94a3b8"><div style="color:#64748b;text-align:center;font-weight:600">Loading last 5 meetings…</div></div>'
+    +'<div style="color:#475569;font-size:.65rem;margin-top:20px;text-align:center;text-transform:uppercase;letter-spacing:.05em;font-weight:700">Display only &middot; Not tracked &middot; Blended matchup projection</div>'
     +'</div>';
   _nflGpLoadHistory(gp);
 }
