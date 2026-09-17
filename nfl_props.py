@@ -5,7 +5,7 @@ Historical stats:  nfl_data_py (nfl-verse GitHub data — no rate limits)
 Schedule:          ESPN scoreboard API
 """
 
-import os, re, asyncio, uuid, time, json, pathlib, csv, io
+import os, re, asyncio, uuid, time, json, pathlib, csv, io, math
 import threading as _bt_th
 from typing import Dict, List, Optional
 from datetime import datetime, timedelta, timezone
@@ -272,7 +272,7 @@ def _schedule_alt_coach_warm(date_str: str) -> None:
 # ── nfl_data_py stats loader ───────────────────────────────────────────────────
 _nfl_df = None
 _nfl_df_lock = asyncio.Lock()
-_NFL_PKL      = _CACHE_DIR / "nfl_df_cache_v6.pkl"  # v6: five completed seasons + REG/POST
+_NFL_PKL      = _CACHE_DIR / "nfl_df_cache_v7.pkl"  # v7: validated role-aware schema
 
 # nfl-verse team codes that differ from ESPN's (ESPN is what the schedule,
 # H/A lookup and card display all use). Normalized ONCE at data load so every
@@ -281,6 +281,12 @@ _NFL_PKL      = _CACHE_DIR / "nfl_df_cache_v6.pkl"  # v6: five completed seasons
 # evicted by mislabeled players) and their vs-opponent history comes up empty.
 _NFLVERSE_TO_ESPN = {"LA": "LAR", "WAS": "WSH"}
 _NFL_PKL_TTL  = 20 * 3600  # 20h — refresh once a day
+
+def _nfl_cache_valid(frame):
+    required = {"player_display_name", "recent_team", "opponent_team",
+                "season", "week", "position"}
+    return (frame is not None and hasattr(frame, "columns")
+            and required.issubset(set(frame.columns)) and len(frame) > 0)
 
 # ── ESPN H/A Lookup — (season, week, team_abbr) → 'HOME' or 'AWAY' ───────────
 _HA_LOOKUP: dict = {}
@@ -393,6 +399,11 @@ def _load_nfl_stats_sync():
         if _NFL_PKL.exists() and (time.time() - _NFL_PKL.stat().st_mtime) < _NFL_PKL_TTL:
             import pickle
             _nfl_df = pickle.loads(_NFL_PKL.read_bytes())
+            if not _nfl_cache_valid(_nfl_df):
+                print("[NFL Data] Disk cache schema invalid; rebuilding")
+                _NFL_PKL.unlink(missing_ok=True)
+                _nfl_df = None
+                raise ValueError("invalid NFL cache schema")
             print(f"[NFL Data] Loaded from disk cache: {len(_nfl_df):,} rows")
             return _nfl_df
     except Exception as e:
@@ -1290,6 +1301,8 @@ async def get_odds_events(date_str: str, espn_games: List[Dict]) -> List[Dict]:
     except Exception as e:
         print(f"[OddsAPI events] {e}"); return espn_games
 
+_NFL_PROP_FETCH_STATUS = {}
+
 async def get_prop_lines(event_id: str, date_str: str,
                          alternate_only: bool = False) -> List[Dict]:
     """Fetch player prop lines for one NFL game. Returns a list of prop dicts.
@@ -1310,10 +1323,46 @@ async def get_prop_lines(event_id: str, date_str: str,
                 base = f"{ODDS_BASE}/sports/americanfootball_nfl/events/{event_id}/odds"
                 params = {"apiKey": ODDS_API_KEY, "bookmakers": ODDS_BOOKMAKERS,
                          "markets": ",".join(requested_markets), "oddsFormat": "american"}
-            r = await c.get(base, params=params)
-            if not r.is_success:
-                print(f"[OddsAPI props] {event_id} HTTP {r.status_code}")
-                return []
+            r = None
+            for attempt in range(3):
+                try:
+                    r = await c.get(base, params=params)
+                except (httpx.TimeoutException, httpx.NetworkError):
+                    if attempt >= 2:
+                        return []
+                    await asyncio.sleep((attempt + 1) * .75)
+                    continue
+                if r.status_code in (401, 403):
+                    return []
+                if r.status_code == 429 or 500 <= r.status_code < 600:
+                    if attempt >= 2:
+                        return []
+                    try:
+                        wait = min(4.0, max(0.0, float(
+                            r.headers.get("Retry-After", "0"))))
+                    except (TypeError, ValueError):
+                        wait = 0
+                    await asyncio.sleep(wait or (attempt + 1) * .75)
+                    continue
+                if not r.is_success:
+                    print(f"[OddsAPI props] {event_id} HTTP {r.status_code}")
+                    return []
+                try:
+                    probe = r.json()
+                    probe_data = (probe.get("data", probe)
+                                  if isinstance(probe, dict) and "data" in probe
+                                  else probe)
+                    if (isinstance(probe_data, dict)
+                            and isinstance(probe_data.get("bookmakers"), list)):
+                        if probe_data.get("bookmakers") or attempt >= 2:
+                            break
+                        await asyncio.sleep((attempt + 1) * .75)
+                        continue
+                except (ValueError, TypeError):
+                    pass
+                if attempt >= 2:
+                    return []
+                await asyncio.sleep((attempt + 1) * .75)
             raw  = r.json()
             data = raw.get("data", raw) if isinstance(raw, dict) and "data" in raw else raw
             if not isinstance(data, dict): return []
@@ -1361,6 +1410,10 @@ async def get_prop_lines(event_id: str, date_str: str,
             for l in out:
                 l["over_book"]  = _book_label(l["over_book"])  if l.get("over_book")  else ""
                 l["under_book"] = _book_label(l["under_book"]) if l.get("under_book") else ""
+            global _NFL_PROP_FETCH_STATUS
+            _NFL_PROP_FETCH_STATUS[(str(event_id), str(date_str),
+                                    bool(alternate_only))] = (
+                "success" if out else "empty")
             return out
     except Exception as e:
         print(f"[OddsAPI props] {e}"); return []
@@ -2631,17 +2684,34 @@ async def _build_alt_coach(date_str: str) -> dict:
         return {"date": date_str, "picks": [], "error": "No NFL games found for this date."}
     games = await get_odds_events(date_str, games)
     roster_map = await get_espn_roster_map(games, date_str)
-    requests = [
-        get_prop_lines(game.get("id", ""), date_str, alternate_only=True)
-        if game.get("id") else asyncio.sleep(0, result=[])
-        for game in games
-    ]
-    batches = await asyncio.gather(*requests)
+    concurrency = 3
+    game_timeout = 24
+    fetch_deadline = min(300, max(90, 15 + math.ceil(
+        len(games) / concurrency) * game_timeout + 5))
+    sem = asyncio.Semaphore(concurrency)
+    async def _one(game):
+        async with sem:
+            try:
+                return await asyncio.wait_for(
+                    get_prop_lines(game.get("id", ""), date_str,
+                                   alternate_only=True), game_timeout)
+            except Exception:
+                return None
+    tasks = [asyncio.create_task(_one(game)) for game in games]
+    done, pending = await asyncio.wait(tasks, timeout=fetch_deadline)
+    for task in pending:
+        task.cancel()
+    await asyncio.gather(*pending, return_exceptions=True)
+    batches = [task.result() if task in done and not task.cancelled()
+               and task.exception() is None else None for task in tasks]
+    failed_games = [game.get("game") or game.get("id") or "game"
+                    for game, batch in zip(games, batches)
+                    if not isinstance(batch, list) or not batch]
     lines = []
     for game, batch in zip(games, batches):
         home = game.get("home_abbr", "") or _name_to_abbr(game.get("home_team", ""))
         away = game.get("away_abbr", "") or _name_to_abbr(game.get("away_team", ""))
-        for line in batch:
+        for line in (batch or []):
             info = roster_map.get(_norm(line.get("name", ""))) if roster_map else None
             if info and not info.get("eligible", True):
                 continue
@@ -2664,8 +2734,16 @@ async def _build_alt_coach(date_str: str) -> dict:
         if result and (result.get("realOdds") is not None
                        or result.get("realUnderOdds") is not None):
             picks.append(result)
-    payload = {"date": date_str, "picks": picks, "lines": len(lines)}
-    _alt_coach_cache_set(date_str, payload)
+    partial = bool(failed_games)
+    payload = {"date": date_str, "picks": picks if not partial else [],
+               "lines": len(lines), "partial": partial,
+               "authoritative": not partial, "capture_allowed": not partial,
+               "failed_games": failed_games,
+               "failed_game_count": len(failed_games),
+               "warning": ("Some games did not complete: " +
+                           ", ".join(failed_games[:4])) if partial else ""}
+    if not partial:
+        _alt_coach_cache_set(date_str, payload)
     return payload
 
 @app.get("/api/nfl/coach-alternates")
