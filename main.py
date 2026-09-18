@@ -4997,6 +4997,8 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False,
     if official_capture:
         await asyncio.to_thread(_nfl_save_picks_snapshot, date_str, result, system)
         await asyncio.to_thread(_nfl_save_gp_snapshot, date_str, result, system)
+        await asyncio.to_thread(
+            _nfl_auto_capture_coach_categories, date_str, result, system)
     else:
         print(f"[nfl_track] official snapshot skipped for {date_str}: "
               + ("weekly opening-line mode"
@@ -6975,6 +6977,25 @@ def _nfl_coach_grade_snapshot(date_str, detail, box=None):
         elif complete and not stat:
             row.update(result="VOID", actual=None, units=0.0,
                        settled_at=datetime.now(timezone.utc).isoformat())
+        elif (stat and stat.get("final") and actual is None
+              and row.get("market") in _NFL_BET_STAT_KEYS):
+            # ESPN omits zero-value stat groups. If this player appears in any
+            # final box-score group, a missing supported counting stat is zero.
+            actual = 0.0
+            try:
+                line = float(row["line"])
+                result = ("PUSH" if actual == line else
+                          ("WIN" if actual > line else "LOSS")
+                          if row.get("side") == "OVER"
+                          else ("WIN" if actual < line else "LOSS"))
+                row.update(
+                    result=result, actual=actual,
+                    units=round(_nfl_american_profit(
+                        row.get("odds"), _NFL_TRK_STAKE, result
+                    ) / _NFL_TRK_STAKE, 4),
+                    settled_at=datetime.now(timezone.utc).isoformat())
+            except (TypeError, ValueError, KeyError):
+                row.setdefault("result", "PENDING")
         elif stat and stat.get("final") and actual is not None:
             try:
                 line = float(row["line"])
@@ -7014,6 +7035,61 @@ def _nfl_coach_summary(rows):
     totals["rate"] = round(totals["wins"] / denom * 100, 1) if denom else None
     totals["units"] = round(totals["units"], 2)
     return totals
+
+
+def _nfl_auto_capture_coach_categories(
+        date_str: str, result: dict, system: str = "OLD") -> dict:
+    """Bank every non-empty standard Coach preset from a complete pregame run."""
+    if not _nfl_official_capture_allowed(date_str, result):
+        return {}
+    source = (
+        result.get("coach_candidates") or result.get("all")
+        or result.get("picks") or [])
+    candidates = _nfl_coach_hist_candidates(source)
+    if not candidates:
+        return {}
+    cfg = _nfl_store_config(system)
+    now = datetime.now(timezone.utc)
+    statuses = {}
+    for category in _NFL_COACH_CATS:
+        # Alternate ladders finish asynchronously and retain their dedicated
+        # capture path after that scan becomes complete and authoritative.
+        if category == "alt_line_edge":
+            continue
+        selected = _nfl_coach_hist_select(candidates, category)
+        if not selected:
+            statuses[category] = "empty"
+            continue
+        frozen, kickoffs = [], []
+        for raw in selected:
+            kickoff = _nfl_coach_kickoff(raw.get("game_start"))
+            if not kickoff or kickoff <= now:
+                frozen = []
+                break
+            kickoffs.append(kickoff)
+            frozen.append({
+                **dict(raw),
+                "captured_at": now.isoformat(),
+                "result": "PENDING",
+                "actual": None,
+                "units": None,
+            })
+        if not frozen:
+            statuses[category] = "invalid"
+            continue
+        deadline = min(kickoffs).isoformat()
+        for row in frozen:
+            row["snapshot_deadline"] = deadline
+        statuses[category] = _nfl_sb_save_latest_unlocked(
+            "mpa_track_ledger", {
+                "app": cfg["coach"], "date": date_str,
+                "category": category, "side": "ALL",
+                "wins": 0, "losses": 0, "locked": False,
+                "locked_at": deadline, "detail": frozen,
+            }, now.isoformat())
+    print("[nfl_coach_track] automatic preset capture "
+          f"{date_str} {system}: {statuses}")
+    return statuses
 
 def _nfl_official_capture_allowed(date_str: str, result: dict) -> bool:
     """Official records require a slate captured before every kickoff.
