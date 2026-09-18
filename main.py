@@ -4479,6 +4479,7 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False,
                        force_refresh: bool = False,
                        capture_official: bool = True, system: str = "OLD") -> Dict:
     system = "NEW" if str(system or "OLD").upper() == "NEW" else "OLD"
+    opening_captured_early = False
     def _p(msg):
         print(f"[Pipeline] {msg}")
         if progress:
@@ -4724,6 +4725,13 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False,
     }
     prop_coverage_complete = bool(expected_prop_games) and expected_prop_games.issubset(
         covered_prop_games)
+    # Friday's Sunday opening odds are valuable even if the heavier player
+    # history analysis later runs out of time or the host restarts.  Persist the
+    # complete raw standard-line board now, before loading/analyzing nflverse.
+    # The helper's weekday/target guard makes this a no-op on other dates.
+    if not simulate:
+        opening_captured_early = await asyncio.to_thread(
+            _nfl_capture_opening_lines, date_str, {"all": raw_cached_lines})
 
     # 4. Load NFL stats (nfl_data_py — downloads once, cached in memory)
     _p(f"Loading player stats ({len(all_lines)} props to analyze) — first run after deploy downloads ~20s…")
@@ -4998,7 +5006,11 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False,
     # Capture the scheduled opening baseline first, then attach movement before
     # any board, Coach, or tracking payload is derived. OLD and NEW use separate
     # official ledgers, but share the genuine opening-line source.
-    await asyncio.to_thread(_nfl_capture_opening_lines, date_str, result)
+    if not opening_captured_early:
+        # Retry at the established final stage if the early durable write was
+        # unavailable.  Never replace the complete raw opening board with the
+        # smaller subset that survived player-history qualification.
+        await asyncio.to_thread(_nfl_capture_opening_lines, date_str, result)
     await asyncio.to_thread(_nfl_attach_line_movement, date_str, result)
     if system == "NEW":
         result = _new_sanitize_json(result)
@@ -5623,10 +5635,29 @@ async def api_run(request: Request):
                     # process-global, so daily tasks must never overlap.
                     for index, ds in enumerate(dates):
                         await _run_week_date(index, ds)
+                        # A completed Sunday payload can be hundreds of
+                        # thousands of fields.  Keeping it in RAM while Monday
+                        # starts makes weekly mode exceed the service memory
+                        # limit even though either date succeeds by itself.
+                        # Spool each completed date before analyzing the next.
+                        daily_payload = results[index]
+                        if daily_payload is not None:
+                            try:
+                                spool_path = await asyncio.to_thread(
+                                    _nfl_week_spool_write,
+                                    job_id, index, daily_payload)
+                                results[index] = {
+                                    "_nfl_week_spool": str(spool_path)}
+                                daily_payload = None
+                            except Exception as exc:
+                                # A spool failure must not discard a completed
+                                # board.  Retain it and continue with the older,
+                                # higher-memory behavior for this date only.
+                                print(
+                                    f"[NFLWeek] Could not spool {ds}: {exc}")
                         # Release DataFrame slices and role/defense aggregates
-                        # before retaining the next daily result.  The global
-                        # base nflverse frame and its performance caches stay
-                        # intact.
+                        # before starting the next date.  The global base
+                        # nflverse frame and performance caches stay intact.
                         await asyncio.to_thread(_nfl_clear_slate_caches)
                     # Consume the seven daily payloads while merging.  Keeping
                     # every full board and then copying every row into a second
@@ -5694,6 +5725,16 @@ def _nfl_week_dates(anchor_date: str) -> list:
     return [(start + timedelta(days=offset)).isoformat() for offset in range(7)]
 
 
+def _nfl_week_spool_write(job_id: str, index: int, payload: dict) -> pathlib.Path:
+    """Atomically park one completed daily board outside process memory."""
+    target = _CACHE_DIR / f"nfl_week_{job_id}_{index}.json"
+    temp = target.with_suffix(".tmp")
+    temp.write_text(
+        json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    temp.replace(target)
+    return target
+
+
 def _nfl_merge_week_results(anchor_date: str, daily_results: list,
                             consume: bool = False) -> dict:
     """Merge daily boards without merging their tracking identity.
@@ -5715,9 +5756,13 @@ def _nfl_merge_week_results(anchor_date: str, daily_results: list,
         "skipped_matchups": [],
         "daily_status": [],
     }
-    notes, warnings, successful, failed_dates = [], [], [], []
-    for ds, result in zip(dates, daily_results):
-        result = result or {}
+    notes, warnings, successful_tracking, failed_dates = [], [], [], []
+    for ds, result_ref in zip(dates, daily_results):
+        spool_path = None
+        result = result_ref or {}
+        if isinstance(result, dict) and result.get("_nfl_week_spool"):
+            spool_path = pathlib.Path(result["_nfl_week_spool"])
+            result = json.loads(spool_path.read_text(encoding="utf-8"))
         error = str(result.get("error") or "")
         merged["daily_status"].append({
             "date": ds, "error": error,
@@ -5732,7 +5777,8 @@ def _nfl_merge_week_results(anchor_date: str, daily_results: list,
             if "No NFL games found" not in error:
                 failed_dates.append(ds)
         else:
-            successful.append(result)
+            successful_tracking.append(
+                result.get("official_tracking") is True)
         for key in ("all", "picks", "td_picks"):
             source_rows = result.get(key) or []
             for row in source_rows:
@@ -5761,6 +5807,11 @@ def _nfl_merge_week_results(anchor_date: str, daily_results: list,
             warnings.append(result["data_warning"])
         if result.get("data_note") and result["data_note"] not in warnings:
             warnings.append(result["data_note"])
+        if consume and spool_path is not None:
+            try:
+                spool_path.unlink(missing_ok=True)
+            except Exception:
+                pass
     merged["qualified"] = len(merged["picks"])
     merged["data_warning"] = " · ".join(
         w for w in warnings if str(w).startswith("⚠"))
@@ -5778,9 +5829,10 @@ def _nfl_merge_week_results(anchor_date: str, daily_results: list,
         + (f" {len(notes)} date(s) had no usable saved/live board."
            if notes and not failed_dates else "")
     )
-    merged["official_tracking"] = (not failed_dates) and bool(successful) and all(
-        result.get("official_tracking") is True for result in successful)
-    if not successful and not merged["all"]:
+    merged["official_tracking"] = (
+        (not failed_dates) and bool(successful_tracking)
+        and all(successful_tracking))
+    if not successful_tracking and not merged["all"]:
         merged["error"] = "No saved or live NFL boards were available for this week."
     return merged
 
@@ -6568,12 +6620,14 @@ def _nfl_capture_opening_lines(date_str: str, result: dict) -> bool:
     for row in result.get("all") or []:
         key = _nfl_line_identity(row)
         line = row.get("realLine")
+        if line is None:
+            line = row.get("line")
         if not key or key == "|" or key in seen or line is None:
             continue
         seen.add(key)
         lines.append({
             "name": row.get("name", ""),
-            "team": row.get("team", ""),
+            "team": row.get("team") or row.get("roster_team", ""),
             "opponent": row.get("opponent", ""),
             "home_abbr": row.get("home_abbr", ""),
             "away_abbr": row.get("away_abbr", ""),
@@ -6581,8 +6635,12 @@ def _nfl_capture_opening_lines(date_str: str, result: dict) -> bool:
             "market": row.get("market", ""),
             "market_label": row.get("mkt") or row.get("label") or "",
             "line": line,
-            "over_odds": row.get("realOdds"),
-            "under_odds": row.get("realUnderOdds"),
+            "over_odds": (
+                row.get("realOdds")
+                if row.get("realOdds") is not None else row.get("over_odds")),
+            "under_odds": (
+                row.get("realUnderOdds")
+                if row.get("realUnderOdds") is not None else row.get("under_odds")),
             "over_book": row.get("over_book", ""),
             "under_book": row.get("under_book", ""),
             "game_start": row.get("game_start", ""),
