@@ -269,6 +269,10 @@ SEASON_JOBS: Dict[str, Dict] = {}
 # waiting for the first one, especially on the large Sunday board.
 _NFL_WEEK_DAY_TIMEOUT = 720
 _NFL_WEEK_JOB_TIMEOUT = 3600
+# A selected Sunday can contain 700+ standard/TD candidates. It uses the same
+# memory-safe serial analyzer as weekly mode, so give it the same full two-window
+# allowance instead of cancelling a healthy run at the old five-minute mark.
+_NFL_SINGLE_DAY_TIMEOUT = _NFL_WEEK_DAY_TIMEOUT * 2
 
 # ── File cache ─────────────────────────────────────────────────────────────────
 _CACHE_DIR = pathlib.Path("/tmp/mpa_cache")
@@ -4822,9 +4826,14 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False,
         try:
             analysis_started.set()
             with _NFL_ANALYSIS_LOCK:
-                for pl in all_lines:
+                total_props = len(all_lines)
+                for prop_index, pl in enumerate(all_lines, 1):
                     if analysis_cancelled.is_set():
                         break
+                    if prop_index == 1 or prop_index % 50 == 0:
+                        _p(
+                            f"Analyzing player props… "
+                            f"{prop_index}/{total_props} complete")
                     analyzer = _analyze_new_prop if system == "NEW" else _analyze_prop
                     result = analyzer(
                         pl, analysis_df,
@@ -5630,14 +5639,19 @@ async def api_run(request: Request):
                     progress=lambda m: JOBS.get(job_id, {}).update({"progress": m}))
                 return result
             result = await asyncio.wait_for(
-                _work(), timeout=_NFL_WEEK_JOB_TIMEOUT if scope == "week" else 300)
+                _work(),
+                timeout=(
+                    _NFL_WEEK_JOB_TIMEOUT
+                    if scope == "week" else _NFL_SINGLE_DAY_TIMEOUT))
             JOBS[job_id].update({"status":"done","result":result})
         except asyncio.TimeoutError:
             last_stage = JOBS.get(job_id, {}).get("progress", "starting the run")
             print(f"[Pipeline] Job timed out during: {last_stage}")
             JOBS[job_id].update({"status":"error",
                 "error":("Weekly run timed out after 60 minutes"
-                         if scope == "week" else "Run timed out after 5 minutes")
+                         if scope == "week"
+                         else f"Run timed out after "
+                              f"{_NFL_SINGLE_DAY_TIMEOUT // 60} minutes")
                         + " during: " + last_stage
                         + ". No completed board was returned."})
         except Exception as e:
