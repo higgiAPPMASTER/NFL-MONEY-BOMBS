@@ -274,6 +274,20 @@ _NFL_WEEK_JOB_TIMEOUT = 3600
 # allowance instead of cancelling a healthy run at the old five-minute mark.
 _NFL_SINGLE_DAY_TIMEOUT = _NFL_WEEK_DAY_TIMEOUT * 2
 
+def _nfl_prune_completed_jobs(max_age_seconds: int = 30) -> None:
+    """Release completed board payloads after the browser has had time to poll."""
+    now = time.time()
+    for stale_id, stale_job in list(JOBS.items()):
+        if stale_job.get("status") == "running":
+            continue
+        finished = stale_job.get("finished_at")
+        # Jobs created before timestamps were added are necessarily from an
+        # older request and can be released before starting new analysis.
+        if (stale_job.get("delivered_at") is not None
+                or finished is None
+                or now - float(finished) >= max_age_seconds):
+            JOBS.pop(stale_id, None)
+
 # ── File cache ─────────────────────────────────────────────────────────────────
 _CACHE_DIR = pathlib.Path("/tmp/mpa_cache")
 _CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -4659,6 +4673,10 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False,
         if all_lines:
             await asyncio.to_thread(
                 _odds_cache_set, date_str, all_lines, {}, skipped_matchups)
+        # Completed asyncio Tasks retain their return values and request frames.
+        # They are no longer needed after the normalized rows enter all_lines.
+        tasks.clear()
+        fetched_games.clear()
 
     if not all_lines:
         today = _nfl_today()
@@ -4809,8 +4827,14 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False,
     # role, positional defense, projections, and probabilities use only the
     # selected season plus its predecessor; vs-opponent uses all available
     # prior seasons, still cut off before the selected game.
-    opponent_history_df = await asyncio.to_thread(
-        _nfl_stats_before_game, df, prop_season, prop_week, prop_type)
+    if simulate:
+        opponent_history_df = await asyncio.to_thread(
+            _nfl_stats_before_game, df, prop_season, prop_week, prop_type)
+    else:
+        # Live/future boards cannot see future nflverse rows: the source contains
+        # completed games only. Reuse the base frame instead of allocating a
+        # second near-full multi-season copy for every Sunday/Monday slate.
+        opponent_history_df = df
 
     # 5. Analyze every sportsbook-listed active player in standard offense,
     # defense, and kicking markets. Anytime TD is the only exception: reduce its
@@ -5491,8 +5515,12 @@ async def api_run(request: Request):
     scope = str(body.get("scope") or "day").lower()
     if scope not in ("day", "week"):
         raise HTTPException(status_code=400, detail="Run scope must be day or week")
+    _nfl_prune_completed_jobs()
     job_id   = str(uuid.uuid4())[:8]
-    JOBS[job_id] = {"status":"running","result":None,"error":None,"progress":"Starting…"}
+    JOBS[job_id] = {
+        "status":"running","result":None,"error":None,"progress":"Starting…",
+        "created_at": time.time(),
+    }
     if system == "NEW":
         JOBS[job_id]["system"] = "NEW"
     async def _run():
@@ -5502,6 +5530,11 @@ async def api_run(request: Request):
             # preserve seven independent daily caches/snapshots.
             async def _work():
                 if scope == "week":
+                    # Response compatibility copies can contain entire prior
+                    # boards. They are accelerators only and must not compete
+                    # with a fresh multi-date analysis for memory.
+                    _NFL_ENRICHED_RESULTS.clear()
+                    gc.collect()
                     dates = _nfl_week_dates(date_str)
                     results = [None] * len(dates)
                     today = _nfl_today()
@@ -5692,11 +5725,12 @@ async def api_run(request: Request):
                 timeout=(
                     _NFL_WEEK_JOB_TIMEOUT
                     if scope == "week" else _NFL_SINGLE_DAY_TIMEOUT))
-            JOBS[job_id].update({"status":"done","result":result})
+            JOBS[job_id].update({
+                "status":"done","result":result,"finished_at":time.time()})
         except asyncio.TimeoutError:
             last_stage = JOBS.get(job_id, {}).get("progress", "starting the run")
             print(f"[Pipeline] Job timed out during: {last_stage}")
-            JOBS[job_id].update({"status":"error",
+            JOBS[job_id].update({"status":"error","finished_at":time.time(),
                 "error":("Weekly run timed out after 60 minutes"
                          if scope == "week"
                          else f"Run timed out after "
@@ -5704,7 +5738,8 @@ async def api_run(request: Request):
                         + " during: " + last_stage
                         + ". No completed board was returned."})
         except Exception as e:
-            JOBS[job_id].update({"status":"error","error":str(e)})
+            JOBS[job_id].update({
+                "status":"error","error":str(e),"finished_at":time.time()})
     asyncio.create_task(_run())
     return {"job_id": job_id}
 
@@ -5712,6 +5747,11 @@ async def api_run(request: Request):
 async def api_poll(job_id: str):
     job = JOBS.get(job_id)
     if not job: raise HTTPException(404, "Job not found")
+    if job.get("status") in ("done", "error"):
+        # Keep the payload available for this response. The next Run Picks
+        # request can then release it immediately instead of retaining a whole
+        # completed slate alongside fresh analysis.
+        job.setdefault("delivered_at", time.time())
     return job
 
 
