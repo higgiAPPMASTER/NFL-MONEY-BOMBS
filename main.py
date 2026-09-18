@@ -5628,7 +5628,15 @@ async def api_run(request: Request):
                         # base nflverse frame and its performance caches stay
                         # intact.
                         await asyncio.to_thread(_nfl_clear_slate_caches)
-                    merged = _nfl_merge_week_results(date_str, results)
+                    # Consume the seven daily payloads while merging.  Keeping
+                    # every full board and then copying every row into a second
+                    # weekly payload briefly doubles peak memory — enough to
+                    # restart the service on a large Sunday slate.  The merged
+                    # result is the only payload this interactive job needs.
+                    merged = _nfl_merge_week_results(
+                        date_str, results, consume=True)
+                    results.clear()
+                    gc.collect()
                     failed_dates = merged.get("failed_dates") or []
                     if failed_dates:
                         JOBS.get(job_id, {}).update({
@@ -5686,8 +5694,14 @@ def _nfl_week_dates(anchor_date: str) -> list:
     return [(start + timedelta(days=offset)).isoformat() for offset in range(7)]
 
 
-def _nfl_merge_week_results(anchor_date: str, daily_results: list) -> dict:
-    """Merge daily boards for display without merging their tracking identity."""
+def _nfl_merge_week_results(anchor_date: str, daily_results: list,
+                            consume: bool = False) -> dict:
+    """Merge daily boards without merging their tracking identity.
+
+    Interactive full-week jobs may consume source lists as they merge to avoid
+    retaining duplicate copies of a large Sunday board.  Other callers keep the
+    original non-consuming behavior.
+    """
     dates = _nfl_week_dates(anchor_date)
     merged = {
         "date": f"{dates[0]} through {dates[-1]}",
@@ -5720,18 +5734,27 @@ def _nfl_merge_week_results(anchor_date: str, daily_results: list) -> dict:
         else:
             successful.append(result)
         for key in ("all", "picks", "td_picks"):
-            for row in result.get(key) or []:
-                copy = dict(row)
-                copy["slate_date"] = ds
-                merged[key].append(copy)
-        for game in result.get("games") or []:
-            copy = dict(game)
-            copy["slate_date"] = ds
-            merged["games"].append(copy)
-        for game in result.get("game_predictions") or []:
-            copy = dict(game)
-            copy["slate_date"] = ds
-            merged["game_predictions"].append(copy)
+            source_rows = result.get(key) or []
+            for row in source_rows:
+                target = row if consume else dict(row)
+                target["slate_date"] = ds
+                merged[key].append(target)
+            if consume and source_rows:
+                result[key] = []
+        source_games = result.get("games") or []
+        for game in source_games:
+            target = game if consume else dict(game)
+            target["slate_date"] = ds
+            merged["games"].append(target)
+        if consume and source_games:
+            result["games"] = []
+        source_predictions = result.get("game_predictions") or []
+        for game in source_predictions:
+            target = game if consume else dict(game)
+            target["slate_date"] = ds
+            merged["game_predictions"].append(target)
+        if consume and source_predictions:
+            result["game_predictions"] = []
         for matchup in result.get("skipped_matchups") or []:
             merged["skipped_matchups"].append(f"{ds}: {matchup}")
         if result.get("data_warning") and result["data_warning"] not in warnings:
