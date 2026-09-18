@@ -659,6 +659,41 @@ _KEEP_COLS   = ["player_display_name","player_id","headshot_url","position","rec
                 "red_zone_carries","redzone_carries","carries_inside_10",
                 "end_zone_targets","endzone_targets"]
 
+_NFL_SOURCE_COLS = set(_KEEP_COLS) | {
+    # Alternate source names used by the combined, defense, kicking, and snap
+    # releases before they are normalized into the model schema.
+    "team", "player", "player_name", "passing_interceptions",
+    "def_tackles", "def_tackles_solo", "def_tackle_assists",
+    "def_interceptions", "def_sacks", "fg_made", "pat_made",
+    "offense_snaps",
+}
+
+def _compact_nfl_stats_frame(df):
+    """Shrink the retained nflverse frame without changing model values."""
+    if df is None:
+        return df
+    try:
+        import pandas as pd
+        # IDs and headshots repeat across player-weeks but are never grouping
+        # dimensions. Keep player/team/position fields as ordinary strings:
+        # pandas categorical groupby can materialize unobserved combinations.
+        for col in ("player_id", "headshot_url"):
+            if col in df.columns and str(df[col].dtype) == "object":
+                values = df[col].fillna("").astype(str)
+                df[col] = pd.Categorical(values)
+        # nflverse numeric releases commonly arrive as float64 even for small
+        # counts. float32 is far more precise than any displayed/model input and
+        # halves those columns' resident memory.
+        for col in df.columns:
+            dtype = df[col].dtype
+            if pd.api.types.is_float_dtype(dtype) and dtype.itemsize > 4:
+                df[col] = pd.to_numeric(df[col], downcast="float")
+            elif pd.api.types.is_integer_dtype(dtype) and dtype.itemsize > 4:
+                df[col] = pd.to_numeric(df[col], downcast="integer")
+    except Exception as exc:
+        print(f"[NFL Data] memory compaction skipped: {exc}")
+    return df
+
 def _dl_csv(url):
     """Download one nfl-verse CSV (regular season + playoffs) as a DataFrame.
     Uses httpx with a hard 60-second total timeout so a stalled download
@@ -676,7 +711,12 @@ def _dl_csv(url):
             time.sleep(2 * (attempt + 1))
     else:
         raise last_err
-    d = pd.read_csv(io.BytesIO(r.content), low_memory=False)
+    # Reading every column and trimming afterward creates the largest cold-start
+    # memory spike. Select at parse time so parallel downloads never coexist as
+    # several full-width nflverse DataFrames.
+    d = pd.read_csv(
+        io.BytesIO(r.content), low_memory=False,
+        usecols=lambda name: name in _NFL_SOURCE_COLS)
     if "season_type" in d.columns:
         d = d[d["season_type"].isin(["REG", "POST"])]
     return d
@@ -704,6 +744,7 @@ def _load_nfl_stats_sync():
                 _nfl_df["rush_rec_yards"] = (
                     _nfl_df["rushing_yards"].fillna(0)
                     + _nfl_df["receiving_yards"].fillna(0))
+            _nfl_df = _compact_nfl_stats_frame(_nfl_df)
             print(f"[NFL Data] Loaded from disk cache: {len(_nfl_df):,} rows")
             return _nfl_df
     except Exception as e:
@@ -869,6 +910,7 @@ def _load_nfl_stats_sync():
         for _c in ("recent_team", "opponent_team"):
             if _c in _nfl_df.columns:
                 _nfl_df[_c] = _nfl_df[_c].replace(_NFLVERSE_TO_ESPN)
+        _nfl_df = _compact_nfl_stats_frame(_nfl_df)
         print(f"[NFL Data] Total: {len(_nfl_df):,} rows "
               f"(off {len(off):,}"
               + (f", def {len(deff):,}" if deff is not None else "")
