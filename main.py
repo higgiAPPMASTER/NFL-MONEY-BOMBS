@@ -386,6 +386,7 @@ _ALT_COACH_TTL = 15 * 60
 _ALT_COACH_CACHE_VERSION = 4
 _ALT_COACH_RAW_TTL = 15 * 60
 _ALT_COACH_INFLIGHT: Dict[str, asyncio.Task] = {}
+_ALT_COACH_DEFERRED: set = set()
 _ALT_COACH_NEXT_RETRY: Dict[str, float] = {}
 _ALT_COACH_RETRY_COUNT: Dict[str, int] = {}
 _ALT_COACH_RETRY_BASE = 30
@@ -504,13 +505,22 @@ async def _warm_alt_coach(date_str: str) -> dict:
             return stale
         raise
 
+async def _deferred_alt_coach_warm(date_str: str) -> None:
+    """Warm alternates only after foreground Run Picks work is idle."""
+    await asyncio.sleep(60)
+    while any(job.get("status") == "running" for job in JOBS.values()):
+        await asyncio.sleep(15)
+    _alt_coach_start_task(date_str)
+
 def _schedule_alt_coach_warm(date_str: str) -> None:
-    """Start the dedicated alternate cache without delaying standard boards."""
+    """Schedule alternate cache work behind foreground standard boards."""
     try:
         if date_str >= _nfl_today():
-            # Keep the task alive after the foreground pipeline returns. A
-            # browser disconnect must not cancel shared alternate work.
-            _alt_coach_start_task(date_str)
+            # Give the user time to launch another day/full-week foreground run,
+            # then remain deferred while any Run Picks job is active.
+            task = asyncio.create_task(_deferred_alt_coach_warm(date_str))
+            _ALT_COACH_DEFERRED.add(task)
+            task.add_done_callback(_ALT_COACH_DEFERRED.discard)
     except Exception as e:
         print(f"[AltCoachCache] warm schedule error: {e}")
 
@@ -9893,15 +9903,14 @@ async function pollJob(){
     if(requestSeq!==_nflPollSeq||!_nflRequestCurrent(requestGeneration,requestedSystem)){
       _nflRestoreRunButton();return;
     }
-    // Network error — retry up to 5 times before giving up
+    // A long full-week job can briefly miss status requests while the service
+    // is under load. Never abandon the known server job on a transient network
+    // error; only a confirmed 404 above means the job was lost to a restart.
     _pollFails++;
-    if(_pollFails>=5){
-      clearInterval(pollTimer);
-      document.getElementById('statusMsg').textContent='Status connection lost. The server job may still be running; check Get Picks before starting another run.';
-      document.getElementById('runBtn').disabled=false;
-      document.getElementById('runBtn').textContent='Run Picks';
-    }else{
+    if(_pollFails<5){
       document.getElementById('statusMsg').textContent='Waiting for server status — retry '+_pollFails+'/5. The last progress update may be stale.';
+    }else{
+      document.getElementById('statusMsg').innerHTML='<span class="spinner"></span>Reconnecting to the same server job… attempt '+_pollFails+'. Do not start another run.';
     }
   }finally{
     clearTimeout(requestTimer);
