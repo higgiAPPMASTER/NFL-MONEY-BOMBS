@@ -6108,6 +6108,14 @@ def _nfl_market_from_groups(groups: dict, market: str):
 _NFL_BOX_CACHE: dict = {}
 _NFL_BOX_TTL = 120
 
+def _nfl_player_name_key(value) -> str:
+    """Normalize sportsbook/ESPN player names, including trailing suffixes."""
+    name = re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
+    parts = name.split()
+    if parts and parts[-1] in {"jr", "sr", "ii", "iii", "iv", "v"}:
+        parts.pop()
+    return " ".join(parts)
+
 def _nfl_box_lookup(date_str: str) -> dict:
     """Cached wrapper (see NBA): final dates cached permanently, in-progress dates
     for _NFL_BOX_TTL seconds, to avoid repeat ESPN hits / HTTP 429 during settlement."""
@@ -6177,14 +6185,14 @@ def _nfl_box_lookup_raw(date_str: str):
                     v = _nfl_market_from_groups(groups, mk)
                     if v is not None:
                         ps[mk] = v
-                results[name] = ps
+                results[_nfl_player_name_key(name)] = ps
     return results, complete
 
 
 def _nfl_settle_cached(bet: dict, name_stats: dict) -> bool:
     if bet.get("result") in ("WIN", "LOSS", "PUSH"):
         return False
-    st = name_stats.get((bet.get("name") or "").lower().strip())
+    st = name_stats.get(_nfl_player_name_key(bet.get("name")))
     if not st or not st.get("final"):
         return False
     market = bet.get("market") or ""
@@ -6732,18 +6740,24 @@ def _nfl_coach_hist_select(candidates, category, alternate=False):
             abs(float(row.get("model_probability", -1)) - 100.0) < 0.05
         ]
         rows.sort(key=lambda x: (
-            str(x.get("market_label") or ""),
-            str(x.get("player") or ""),
-            str(x.get("side") or ""),
-        ))
-        return rows
+            float(x.get("coach_edge") or 0),
+            -float(x.get("implied_probability") or 0),
+        ), reverse=True)
+        unique, seen_players = [], set()
+        for row in rows:
+            player_key = _nfl_player_name_key(row.get("player"))
+            if not player_key or player_key in seen_players:
+                continue
+            seen_players.add(player_key)
+            unique.append(row)
+        return unique
     family = {
         "passing": "pass", "rushing": "rush", "receiving": "rec",
         "defense": "def", "kicking": "kick", "td_scorers": "td",
     }.get(category)
     rows = []
     for row in candidates:
-        if category != "safest_bets" and row["coach_edge"] <= 0:
+        if category not in ("safest_bets", "td_scorers") and row["coach_edge"] <= 0:
             continue
         if family and _nfl_coach_hist_family(row["market_label"]) != family:
             continue
@@ -6773,6 +6787,10 @@ def _nfl_coach_hist_select(candidates, category, alternate=False):
         rows.append(dict(row))
     if category == "safest_bets":
         rows.sort(key=lambda x: (x["implied_probability"], x["model_probability"]), reverse=True)
+    elif category == "td_scorers":
+        rows.sort(
+            key=lambda x: (x["model_probability"], x["coach_edge"]),
+            reverse=True)
     elif category in ("coach_over_movement", "coach_under_movement"):
         rows.sort(key=lambda x: abs(float(x.get("line_move") or 0)), reverse=True)
     else:
@@ -6968,7 +6986,7 @@ def _nfl_coach_grade_snapshot(date_str, detail, box=None):
     for saved in detail or []:
         row = dict(saved or {})
         primary_terminal = row.get("result") in ("WIN", "LOSS", "PUSH", "VOID")
-        stat = (box or {}).get(str(row.get("player") or "").lower().strip())
+        stat = (box or {}).get(_nfl_player_name_key(row.get("player")))
         actual = stat.get(row.get("market")) if stat else None
         # A completed ESPN box where the frozen participant is absent is a
         # confirmed DNP/absent participant, not an artificial 0-stat loss.
@@ -9461,11 +9479,13 @@ function _nflCoachParlayCandidates(){
       if(!key||seen[key])return false;seen[key]=1;return true;
     }).slice(0,limit||5);
   }
-  var positive=_nflCoachSafest(_nflCoachProps()).filter(function(p){
-    return p.edge>0&&_nflGameFilterOn('parlay',p.team,p.opponent);
+  var allCoach=_nflCoachSafest(_nflCoachProps()).filter(function(p){
+    return _nflGameFilterOn('parlay',p.team,p.opponent);
   });
+  var positive=allCoach.filter(function(p){return p.edge>0;});
   var byEdge=function(a,b){return b.edge-a.edge||b.appProb-a.appProb;};
   var bySafe=function(a,b){return b.implied-a.implied||b.appProb-a.appProb;};
+  var byProbability=function(a,b){return b.appProb-a.appProb||b.edge-a.edge;};
   var pools={
     safest_bets:select(positive,bySafe,5),
     coach_edge:select(positive,byEdge,5),
@@ -9474,7 +9494,7 @@ function _nflCoachParlayCandidates(){
     receiving:select(positive.filter(function(p){return _nflCoachFamily(p.market)==='rec';}),byEdge,5),
     defense:select(positive.filter(function(p){return _nflCoachFamily(p.market)==='def';}),byEdge,5),
     kicking:select(positive.filter(function(p){return _nflCoachFamily(p.market)==='kick';}),byEdge,5),
-    td_scorers:select(positive.filter(function(p){return _nflCoachFamily(p.market)==='td'&&p.side==='OVER';}),byEdge,5),
+    td_scorers:select(allCoach.filter(function(p){return _nflCoachFamily(p.market)==='td'&&p.side==='OVER';}),byProbability,10),
     best_unders:select(positive.filter(function(p){return p.side==='UNDER';}),byEdge,5),
     alt_line_edge:((window.__NFL_ALT_PARLAY_DATE__===((document.getElementById('datePicker')||{}).value||window.__NFL_DATE__||''))
       ?(window.__NFL_ALT_PARLAY_CANDIDATES__||[]):[]).filter(function(p){
@@ -10885,6 +10905,8 @@ function _nflCoachRender(question,rows,total,mode,isAlternate){
     ?'A negative Under line move means the sportsbook lowered the required number after opening. That often reflects market action or a lower expectation, but it is not a guarantee—and the lower current number is harder for an Under.'
     :mode==='hundred'
     ?'Every displayed Coach-eligible NFL play with an exact 100.0% app hit rate is shown. This category is not capped at 10 and does not remove additional markets from the same player.'
+    :mode==='td_probability'
+    ?'I ranked every genuine Anytime TD OVER price from the complete analyzed slate by app touchdown probability and kept the Top 10. Positive Coach Edge is not required; implied probability and Coach Edge remain visible for context.'
     :mode==='safe'
     ?'I checked the selected sides across '+total+' priced NFL candidates and ranked these by sportsbook-implied win probability. Safer favorites can require substantially more risk for a smaller return.'
     :(isAlternate
@@ -10950,9 +10972,22 @@ function askNflMovementCoach(side){
   return rows;
 }
 function askNflTdCoach(){
-  var q='Show the best positive Coach Edge Anytime TD scorers';
+  var q='Show the Top 10 Anytime TD scorers by app probability';
   var input=document.getElementById('nflCoachInput');if(input)input.value=q;
-  var shown=askNflCoach();
+  var props=_nflCoachVisibleProps(_nflCoachProps());
+  var selectedSides=_nflCoachSelectedSides(),seen={};
+  var shown=props.filter(function(p){
+    return p.side==='OVER'&&selectedSides.indexOf('OVER')>=0
+      &&_nflCoachFamily(p.market)==='td'
+      &&_nflGameFilterOn('coach',p.team,p.opponent);
+  }).sort(function(a,b){
+    return b.appProb-a.appProb||b.edge-a.edge;
+  }).filter(function(p){
+    var key=String(p.player||'').trim().toLowerCase();
+    if(!key||seen[key])return false;
+    seen[key]=1;return true;
+  }).slice(0,10);
+  _nflCoachRender(q,shown,props.length,'td_probability',false);
   _nflCoachCapture('td_scorers',shown);
   return shown;
 }
@@ -11101,7 +11136,13 @@ function askNflCoach(options){
       ?function(a,b){return b.implied-a.implied||b.appProb-a.appProb;}
       :function(a,b){return b.edge-a.edge||b.appProb-a.appProb;}));
   if(exactHundred){
-    rows.sort(function(a,b){return String(a.market||'').localeCompare(String(b.market||''))||String(a.player||'').localeCompare(String(b.player||''))||String(a.side||'').localeCompare(String(b.side||''));});
+    rows.sort(function(a,b){return b.edge-a.edge||b.appProb-a.appProb||String(a.market||'').localeCompare(String(b.market||''));});
+    var hundredSeen={};
+    rows=rows.filter(function(p){
+      var key=String(p.player||'').trim().toLowerCase();
+      if(!key||hundredSeen[key])return false;
+      hundredSeen[key]=1;return true;
+    });
     _nflCoachRender(question,rows,candidates.length,'hundred',false);
     return rows;
   }
