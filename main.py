@@ -15,7 +15,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
 from jose import jwt as jose_jwt
 
 # ── Config ─────────────────────────────────────────────────────────────────────
@@ -274,7 +274,7 @@ _NFL_WEEK_JOB_TIMEOUT = 3600
 # allowance instead of cancelling a healthy run at the old five-minute mark.
 _NFL_SINGLE_DAY_TIMEOUT = _NFL_WEEK_DAY_TIMEOUT * 2
 
-def _nfl_prune_completed_jobs(max_age_seconds: int = 30) -> None:
+def _nfl_prune_completed_jobs(max_age_seconds: int = 86400) -> None:
     """Release completed board payloads after the browser has had time to poll."""
     now = time.time()
     for stale_id, stale_job in list(JOBS.items()):
@@ -283,9 +283,11 @@ def _nfl_prune_completed_jobs(max_age_seconds: int = 30) -> None:
         finished = stale_job.get("finished_at")
         # Jobs created before timestamps were added are necessarily from an
         # older request and can be released before starting new analysis.
-        if (stale_job.get("delivered_at") is not None
-                or finished is None
+        if (finished is None
                 or now - float(finished) >= max_age_seconds):
+            response_path = stale_job.get("response_path")
+            if response_path:
+                pathlib.Path(response_path).unlink(missing_ok=True)
             JOBS.pop(stale_id, None)
 
 # ── File cache ─────────────────────────────────────────────────────────────────
@@ -3148,11 +3150,30 @@ def _new_weighted_mean(values, decay=0.16):
 
 def _new_sanitize_json(value):
     """Remove non-finite numeric values from NEW payloads before JSON output."""
+    if hasattr(value, "item") and not isinstance(value, (dict, list, tuple)):
+        return _new_sanitize_json(value.item())
     if isinstance(value, dict):
         return {key: _new_sanitize_json(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
         return [_new_sanitize_json(item) for item in value]
     if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
+
+
+def _nfl_json_ready(value):
+    """Normalize model scalars in place; do not duplicate a full weekly board."""
+    if isinstance(value, dict):
+        for key in value:
+            value[key] = _nfl_json_ready(value[key])
+    elif isinstance(value, list):
+        for index in range(len(value)):
+            value[index] = _nfl_json_ready(value[index])
+    elif isinstance(value, tuple):
+        return [_nfl_json_ready(item) for item in value]
+    elif hasattr(value, "item"):
+        return _nfl_json_ready(value.item())
+    elif isinstance(value, float) and not math.isfinite(value):
         return None
     return value
 
@@ -3791,7 +3812,7 @@ def _nfl_enrich_cached_result(result, df=None, target_season=None,
     out.pop("_nflVenueEnrichedV1", None)
     out.pop("_nflVenueEnrichedV2", None)
     out["_nflVenueEnrichedV3"] = True
-    return out
+    return _nfl_json_ready(out)
 
 async def _nfl_enrich_cached_response(result, date_str, system="OLD"):
     """Enrich an old saved board without calling ESPN."""
@@ -5023,6 +5044,7 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False,
                    "bins": td_calibration,
                },
                "game_predictions": game_predictions}
+    await asyncio.to_thread(_nfl_json_ready, result)
     if system == "NEW":
         result["system"] = "NEW"
         result["model_version"] = "NEW-v1-ewma-blend"
@@ -5078,8 +5100,7 @@ async def run_pipeline(date_str: str, progress=None, simulate: bool = False,
         # smaller subset that survived player-history qualification.
         await asyncio.to_thread(_nfl_capture_opening_lines, date_str, result)
     await asyncio.to_thread(_nfl_attach_line_movement, date_str, result)
-    if system == "NEW":
-        result = _new_sanitize_json(result)
+    await asyncio.to_thread(_nfl_json_ready, result)
     # The short-lived /tmp cache is only an accelerator. Persist each game's
     # latest completed pre-kickoff board independently so a service restart or
     # an early kickoff cannot erase/block the still-bettable late-game slate.
@@ -5558,10 +5579,16 @@ async def api_run(request: Request):
     if scope not in ("day", "week"):
         raise HTTPException(status_code=400, detail="Run scope must be day or week")
     _nfl_prune_completed_jobs()
+    # A reconnect or second tab must not launch another copy of the same slate.
+    for existing_id, existing in JOBS.items():
+        if (existing.get("status") == "running"
+                and existing.get("request_key") == [date_str, system, scope]):
+            return {"job_id": existing_id}
     job_id   = str(uuid.uuid4())[:8]
     JOBS[job_id] = {
         "status":"running","result":None,"error":None,"progress":"Starting…",
         "created_at": time.time(),
+        "request_key": [date_str, system, scope],
     }
     if system == "NEW":
         JOBS[job_id]["system"] = "NEW"
@@ -5739,8 +5766,8 @@ async def api_run(request: Request):
                     # weekly payload briefly doubles peak memory — enough to
                     # restart the service on a large Sunday slate.  The merged
                     # result is the only payload this interactive job needs.
-                    merged = _nfl_merge_week_results(
-                        date_str, results, consume=True)
+                    merged = await asyncio.to_thread(
+                        _nfl_merge_week_results, date_str, results, consume=True)
                     results.clear()
                     gc.collect()
                     failed_dates = merged.get("failed_dates") or []
@@ -5767,8 +5794,14 @@ async def api_run(request: Request):
                 timeout=(
                     _NFL_WEEK_JOB_TIMEOUT
                     if scope == "week" else _NFL_SINGLE_DAY_TIMEOUT))
+            JOBS[job_id]["progress"] = "Preparing completed board for download…"
+            response_path = await asyncio.to_thread(
+                _nfl_write_job_response, job_id, result)
+            # Retain only metadata in RAM. Polling never re-encodes the board.
+            del result
             JOBS[job_id].update({
-                "status":"done","result":result,"finished_at":time.time()})
+                "status":"done","response_path":str(response_path),
+                "finished_at":time.time()})
         except asyncio.TimeoutError:
             last_stage = JOBS.get(job_id, {}).get("progress", "starting the run")
             print(f"[Pipeline] Job timed out during: {last_stage}")
@@ -5780,13 +5813,15 @@ async def api_run(request: Request):
                         + " during: " + last_stage
                         + ". No completed board was returned."})
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             JOBS[job_id].update({
                 "status":"error","error":str(e),"finished_at":time.time()})
     asyncio.create_task(_run())
     return {"job_id": job_id}
 
 @app.get("/api/run/{job_id}")
-async def api_poll(job_id: str):
+async def api_poll(job_id: str, status_only: bool = False):
     job = JOBS.get(job_id)
     if not job: raise HTTPException(404, "Job not found")
     if job.get("status") in ("done", "error"):
@@ -5794,7 +5829,28 @@ async def api_poll(job_id: str):
         # request can then release it immediately instead of retaining a whole
         # completed slate alongside fresh analysis.
         job.setdefault("delivered_at", time.time())
-    return job
+    if job.get("status") == "done" and not status_only:
+        response_path = job.get("response_path")
+        if not response_path or not pathlib.Path(response_path).is_file():
+            raise HTTPException(410, "Completed job file is unavailable. Use Get Picks to load saved boards.")
+        return FileResponse(response_path, media_type="application/json",
+                            headers={"Cache-Control": "no-store"})
+    return {key: value for key, value in job.items()
+            if key not in ("response_path", "request_key", "result")}
+
+
+def _nfl_write_job_response(job_id: str, result: dict) -> pathlib.Path:
+    """Prepare strict JSON once, off the HTTP loop, without a second board copy."""
+    target = _CACHE_DIR / f"nfl_job_response_{job_id}.json"
+    temp = target.with_suffix(".tmp")
+    try:
+        with temp.open("w", encoding="utf-8") as stream:
+            json.dump({"status": "done", "result": _nfl_json_ready(result)}, stream,
+                      ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+        temp.replace(target)
+    finally:
+        temp.unlink(missing_ok=True)
+    return target
 
 
 def _nfl_week_dates(anchor_date: str) -> list:
@@ -10005,9 +10061,10 @@ async function pollJob(){
       requestSeq=++_nflPollSeq;
   const controller=new AbortController();
   _nflTrackController(controller);
-  const requestTimer=setTimeout(()=>controller.abort(),15000);
+  let requestTimer=setTimeout(()=>controller.abort(),15000);
+  var pollPhase='status';
   try{
-    const r=await fetch('/api/run/'+jobId,{signal:controller.signal,cache:'no-store'});
+    const r=await fetch('/api/run/'+jobId+'?status_only=true',{signal:controller.signal,cache:'no-store'});
     if(requestSeq!==_nflPollSeq||!_nflRequestCurrent(requestGeneration,requestedSystem)){
       _nflRestoreRunButton();return;
     }
@@ -10022,13 +10079,23 @@ async function pollJob(){
       }
       throw new Error('Status request failed: HTTP '+r.status);
     }
-    const d=await r.json();
+    let d=await r.json();
+    if(d.status==='done'){
+      pollPhase='download';
+      clearTimeout(requestTimer);
+      requestTimer=setTimeout(()=>controller.abort(),60000);
+      document.getElementById('statusMsg').textContent='Analysis complete — downloading saved results…';
+      const resultResponse=await fetch('/api/run/'+jobId,{signal:controller.signal,cache:'no-store'});
+      if(!resultResponse.ok)throw new Error('Completed results: HTTP '+resultResponse.status);
+      d=await resultResponse.json();
+    }
     if(requestSeq!==_nflPollSeq||!_nflRequestCurrent(requestGeneration,requestedSystem)
        ||(d.result&&String(d.result.system||'OLD')!==requestedSystem)){
       _nflRestoreRunButton();return;
     }
     _pollFails=0;
     if(d.status==='done'){
+      pollPhase='display';
       clearInterval(pollTimer);
       renderResults(d.result);
       if(d.result&&d.result.historicalTrackRecord){
@@ -10066,6 +10133,13 @@ async function pollJob(){
     if(requestSeq!==_nflPollSeq||!_nflRequestCurrent(requestGeneration,requestedSystem)){
       _nflRestoreRunButton();return;
     }
+    if(pollPhase==='display'){
+      clearInterval(pollTimer);pollTimer=null;
+      _nflRestoreRunButton();
+      document.getElementById('statusMsg').textContent='Analysis completed, but displaying the board failed: '+(e.message||String(e))+'. Results remain saved; use Get Picks.';
+      console.error('NFL result display failed',e);
+      return;
+    }
     // A long full-week job can briefly miss status requests while the service
     // is under load. Never abandon the known server job on a transient network
     // error; only a confirmed 404 above means the job was lost to a restart.
@@ -10073,7 +10147,7 @@ async function pollJob(){
     if(_pollFails<5){
       document.getElementById('statusMsg').textContent='Waiting for server status — retry '+_pollFails+'/5. The last progress update may be stale.';
     }else{
-      document.getElementById('statusMsg').innerHTML='<span class="spinner"></span>Reconnecting to the same server job… attempt '+_pollFails+'. Do not start another run.';
+      document.getElementById('statusMsg').textContent='Retrying '+pollPhase+' for the same job — attempt '+_pollFails+'. '+(e.name==='AbortError'?'Request timed out.':(e.message||String(e)))+' No new analysis has been started.';
     }
   }finally{
     clearTimeout(requestTimer);
