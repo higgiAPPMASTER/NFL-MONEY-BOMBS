@@ -3965,21 +3965,33 @@ def _nfl_prop_analysis_frame(df, target_season=None, target_week=None,
             if seasons.empty:
                 return df
             target_season = int(seasons.max())
-        point = _nfl_stats_before_game(
-            df, target_season, target_week, target_type)
         target_type = str(target_type or "REG").upper()
+        seasons = df["season"].fillna(0).astype(int)
+        weeks = df["week"].fillna(0).astype(int)
+        target_week = _nflverse_week(target_type, target_week or 1)
+        target_season = int(target_season)
+        # Build one final mask against the compact process-wide frame. The old
+        # path first materialized every pre-game season and then copied the
+        # two-season subset, briefly holding two large derived DataFrames.
+        mask = seasons.eq(target_season - 1)
+        same_season = seasons.eq(target_season)
+        if "season_type" in df.columns:
+            types = df["season_type"].fillna("REG").astype(str).str.upper()
+            if target_type == "POST":
+                prior_same = types.eq("REG") | (
+                    types.eq("POST") & weeks.lt(target_week))
+            else:
+                prior_same = types.eq("REG") & weeks.lt(target_week)
+        else:
+            prior_same = weeks.lt(target_week)
+        mask = mask | (same_season & prior_same)
         # Regular-season boards must compare regular-season games only. Older
         # postseason rows otherwise leak into the prior-season window and
         # distort venue averages, history rates, and recent-form inputs.
-        if target_type == "REG" and "season_type" in point.columns:
-            point = point[
-                point["season_type"].fillna("REG").astype(str).str.upper()
-                .eq("REG")
-            ]
-        seasons = point["season"].fillna(0).astype(int)
-        out = point[(seasons == int(target_season)) |
-                    (seasons == int(target_season) - 1)].copy()
-        out.attrs["nfl_target_season"] = int(target_season)
+        if target_type == "REG" and "season_type" in df.columns:
+            mask = mask & types.eq("REG")
+        out = df.loc[mask].copy()
+        out.attrs["nfl_target_season"] = target_season
         out.attrs["nfl_target_week"] = int(target_week or 1)
         out.attrs["nfl_target_type"] = target_type
         return out
@@ -5327,6 +5339,14 @@ async def _run_pipeline_unlocked(date_str: str, progress=None, simulate: bool = 
         key=lambda x: (float(x.get("score") or x.get("dispScore") or 0),
                        float(x.get("valueEdge") or 0)),
         reverse=True)
+    if not simulate:
+        # Player analysis is complete. Release the two-season frame and every
+        # slate-derived lookup before Game Predictor and durable snapshot JSON
+        # are built. The compact process-wide frame remains available for GP.
+        analysis_df = None
+        opponent_history_df = None
+        target_rows = None
+        await asyncio.to_thread(_nfl_release_analysis_memory)
     games_out = [{"home_team":g.get("home_team",""), "away_team":g.get("away_team",""),
                   "home_abbr":g.get("home_abbr",""), "away_abbr":g.get("away_abbr",""),
                    "game":g.get("game",""), "game_start":g.get("start","")}
@@ -5814,7 +5834,7 @@ async def api_nfl_coach_alternates(request: Request, date_str: str = "",
                 "picks": stale_complete.get("picks", []),
                 "last_complete": True,
                 "authoritative": False, "capture_allowed": False,
-                "warning": cached.get("warning")
+                "warning": (cached or {}).get("warning")
                     or "Showing the last known complete result while refresh continues.",
             })
         body["failed_games"] = (cached or {}).get("failed_games", [])
@@ -5966,12 +5986,13 @@ async def api_run(request: Request):
             # resolves to done/error. Weekly runs get extra time because they
             # preserve seven independent daily caches/snapshots.
             async def _work():
+                # Single-day NEW runs need the same clean starting point as
+                # weekly runs. Compatibility responses and prior slate lookups
+                # are optional accelerators; retaining them can push a large
+                # Sunday board over a small Render instance's memory limit.
+                _NFL_ENRICHED_RESULTS.clear()
+                await asyncio.to_thread(_nfl_clear_slate_caches)
                 if scope == "week":
-                    # Response compatibility copies can contain entire prior
-                    # boards. They are accelerators only and must not compete
-                    # with a fresh multi-date analysis for memory.
-                    _NFL_ENRICHED_RESULTS.clear()
-                    gc.collect()
                     dates = _nfl_week_dates(date_str)
                     results = [None] * len(dates)
                     today = _nfl_today()
