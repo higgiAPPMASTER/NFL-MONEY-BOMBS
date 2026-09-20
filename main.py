@@ -314,10 +314,218 @@ def _is_past_date(date_key) -> bool:
     except Exception:
         return False
 
+# ── NFL game weather ─────────────────────────────────────────────────────────
+# Coordinates are stadium coordinates (not city-centre estimates).  Keeping the
+# map in-code makes the weather input deterministic and avoids a second
+# geocoder, whose nearest result can be wrong for shared-city teams.
+_NFL_STADIUM_COORDS = {
+    "ARI": (33.5276, -112.2626), "ATL": (33.7554, -84.4008),
+    "BAL": (39.2780, -76.6227), "BUF": (42.7738, -78.7870),
+    "CAR": (35.2258, -80.8528), "CHI": (41.8623, -87.6167),
+    "CIN": (39.0954, -84.5160), "CLE": (41.5061, -81.6995),
+    "DAL": (32.7473, -97.0945), "DEN": (39.7439, -105.0201),
+    "DET": (42.3400, -83.0456), "GB": (44.5013, -88.0622),
+    "HOU": (29.6847, -95.4107), "IND": (39.7601, -86.1639),
+    "JAX": (30.3239, -81.6373), "KC": (39.0489, -94.4839),
+    "LV": (36.0908, -115.1830), "LAC": (33.9535, -118.3392),
+    "LAR": (33.9535, -118.3392), "MIA": (25.9580, -80.2389),
+    "MIN": (44.9736, -93.2575), "NE": (42.0909, -71.2643),
+    "NO": (29.9511, -90.0812), "NYG": (40.8135, -74.0745),
+    "NYJ": (40.8135, -74.0745), "PHI": (39.9008, -75.1675),
+    "PIT": (40.4468, -80.0158), "SEA": (47.5952, -122.3316),
+    "SF": (37.4030, -121.9700), "TB": (27.9759, -82.5033),
+    "TEN": (36.1665, -86.7713), "WSH": (38.9076, -76.8645),
+}
+_NFL_WEATHER_TTL = 30 * 60
+_NFL_WEATHER_TIMEOUT = 10
+_NFL_WEATHER_CONCURRENCY = 6
+_NFL_WEATHER_CACHE_PREFIX = "nfl_weather_v1_"
+_NFL_PROTECTED_VENUES = frozenset(("sofi stadium",))
+
+def _nfl_weather_empty(game=None, status="UNAVAILABLE", reason=""):
+    game = game or {}
+    return {
+        "status": status, "provider": "Open-Meteo",
+        "venue": game.get("venue_full_name", ""),
+        "venue_city": game.get("venue_city", ""),
+        "venue_state": game.get("venue_state", ""),
+        "venue_country": game.get("venue_country", ""),
+        "indoor": bool(game.get("indoor")),
+        "protected": bool(game.get("indoor")),
+        "kickoff": None, "severity": 0, "label": "",
+        "summary": reason, "reason": reason, "factors": {},
+    }
+
+def _nfl_weather_cache_get(date_str):
+    if _is_past_date(date_str):
+        return None
+    path = _CACHE_DIR / f"{_NFL_WEATHER_CACHE_PREFIX}{date_str}.json"
+    try:
+        if path.exists() and time.time() - path.stat().st_mtime < _NFL_WEATHER_TTL:
+            value = json.loads(path.read_text(encoding="utf-8"))
+            return value if isinstance(value, dict) else None
+    except Exception as exc:
+        print(f"[NFL weather cache] read error: {exc}")
+    return None
+
+def _nfl_weather_cache_set(date_str, value):
+    if _is_past_date(date_str):
+        return
+    try:
+        path = _CACHE_DIR / f"{_NFL_WEATHER_CACHE_PREFIX}{date_str}.json"
+        temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
+        temporary.write_text(json.dumps(value, ensure_ascii=False, allow_nan=False),
+                             encoding="utf-8")
+        temporary.replace(path)
+    except Exception as exc:
+        print(f"[NFL weather cache] write error: {exc}")
+
+def _nfl_weather_severity(wind, gust, rain, snow, precip, temp):
+    wind_score = min(1.0, max(0.0, (max(wind or 0, (gust or 0) * .78) - 10) / 25))
+    precip_score = min(1.0, max(0.0, (max(rain or 0, precip or 0) - .01) / .24))
+    snow_score = min(1.0, max(0.0, (snow or 0) / .20))
+    cold_score = min(1.0, max(0.0, (32 - (temp if temp is not None else 50)) / 35))
+    return int(round(min(100, 100 * (.52 * wind_score + .30 * max(precip_score, snow_score)
+                                      + .18 * cold_score))))
+
+def _nfl_weather_factors(snapshot, market, position=""):
+    """Return one bounded market factor; unavailable weather is exactly neutral."""
+    if not snapshot or snapshot.get("status") != "OK" or snapshot.get("protected"):
+        return 1.0
+    factors = snapshot.get("factors") or {}
+    key = str(market or "")
+    if key == "player_anytime_td":
+        group = str(position or "").upper()
+        return float(factors.get("td_rb" if group == "RB" else
+                                 "td_qb" if group == "QB" else
+                                 "td_te" if group == "TE" else
+                                 "td_wr" if group == "WR" else "player_anytime_td", 1.0))
+    factor = factors.get(key, 1.0)
+    try:
+        return max(.82, min(1.12, float(factor)))
+    except (TypeError, ValueError):
+        return 1.0
+
+def _nfl_weather_snapshot(game, hourly):
+    if not hourly:
+        return _nfl_weather_empty(game, reason="Weather forecast unavailable")
+    try:
+        kickoff = datetime.fromisoformat(str(game.get("start", "")).replace("Z", "+00:00"))
+        if kickoff.tzinfo is None:
+            kickoff = kickoff.replace(tzinfo=timezone.utc)
+        kickoff = kickoff.astimezone(timezone.utc)
+        times = []
+        for value in (hourly.get("time") or []):
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            times.append(parsed.replace(tzinfo=timezone.utc)
+                         if parsed.tzinfo is None else parsed.astimezone(timezone.utc))
+        if not times:
+            raise ValueError("no hourly forecast")
+        idx = min(range(len(times)), key=lambda i: abs(times[i] - kickoff))
+        def val(key):
+            values = hourly.get(key) or []
+            return values[idx] if idx < len(values) else None
+        temp, prob, rain, snow = val("temperature_2m"), val("precipitation_probability"), val("rain"), val("snowfall")
+        precip, wind, gust, code = val("precipitation"), val("wind_speed_10m"), val("wind_gusts_10m"), val("weather_code")
+        temp = float(temp) if temp is not None else None
+        prob = float(prob) if prob is not None else None
+        rain = float(rain or 0); snow = float(snow or 0); precip = float(precip or 0)
+        wind = float(wind or 0); gust = float(gust or 0)
+        severity = _nfl_weather_severity(wind, gust, rain, snow, precip, temp)
+        if severity < 20: label = "MINOR"
+        elif severity < 45: label = "NOTABLE"
+        elif severity < 70: label = "HIGH"
+        else: label = "EXTREME"
+        weather_load = severity / 100.0
+        pass_yds = 1 - min(.18, .18 * weather_load)
+        pass_att = 1 - min(.12, .12 * weather_load)
+        rush_att = 1 + min(.12, .12 * weather_load)
+        rush_yds = 1 + min(.06, .06 * weather_load)
+        kick = 1 - min(.18, .18 * weather_load)
+        factors = {
+            "player_pass_yds": pass_yds, "player_pass_tds": 1 - .15 * weather_load,
+            "player_pass_completions": 1 - .14 * weather_load,
+            "player_pass_attempts": pass_att, "player_pass_interceptions": 1 + .12 * weather_load,
+            "player_reception_yds": 1 - .16 * weather_load,
+            "player_receptions": 1 - .12 * weather_load,
+            "player_rush_yds": rush_yds, "player_rush_attempts": rush_att,
+            "player_rush_reception_yds": 1 + .025 * weather_load,
+            "player_kicking_points": kick, "player_field_goals": kick,
+            "player_anytime_td": 1.0,
+        }
+        # Store positional TD factors separately; the analyzer chooses one.
+        factors["td_rb"] = 1 + .045 * weather_load
+        factors["td_qb"] = 1 + .025 * weather_load
+        factors["td_wr"] = 1 - .075 * weather_load
+        factors["td_te"] = 1 - .075 * weather_load
+        precipitation_text = (f"{prob:.0f}% precip, {precip:.2f} in" if prob is not None
+                              else f"{precip:.2f} in precip")
+        summary = (f"{label.title()} weather: {temp:.0f}°F, {precipitation_text}, "
+                   f"{wind:.0f} mph wind / {gust:.0f} mph gusts")
+        return {
+            "status": "OK", "provider": "Open-Meteo",
+            "venue": game.get("venue_full_name", ""),
+            "venue_city": game.get("venue_city", ""), "venue_state": game.get("venue_state", ""),
+            "venue_country": game.get("venue_country", ""), "indoor": False, "protected": False,
+            "kickoff": {"time": kickoff.isoformat(), "temperature_f": temp,
+                        "precipitation_probability": prob, "precipitation_in": precip,
+                        "rain_in": rain, "snowfall_in": snow, "wind_mph": wind,
+                        "gust_mph": gust, "weather_code": code},
+            "severity": severity, "label": label, "summary": summary, "reason": summary,
+            "factors": factors,
+        }
+    except Exception as exc:
+        return _nfl_weather_empty(game, reason=f"Weather forecast unavailable: {exc}")
+
+async def _nfl_fetch_weather(date_str, games):
+    if _is_past_date(date_str):
+        return {}
+    cached = await asyncio.to_thread(_nfl_weather_cache_get, date_str)
+    if cached is not None:
+        return cached
+    results = {}
+    semaphore = asyncio.Semaphore(_NFL_WEATHER_CONCURRENCY)
+    async with httpx.AsyncClient(timeout=_NFL_WEATHER_TIMEOUT) as client:
+        async def one(game):
+            key = str(game.get("id") or f"{game.get('away_abbr')}@{game.get('home_abbr')}")
+            venue = str(game.get("venue_full_name") or "").strip().lower()
+            country = str(game.get("venue_country") or "").upper()
+            home = str(game.get("home_abbr") or "").upper()
+            protected = bool(game.get("indoor")) or venue in _NFL_PROTECTED_VENUES
+            if country not in ("", "USA") or home not in _NFL_STADIUM_COORDS:
+                results[key] = _nfl_weather_empty(game, reason="Unsupported or international venue")
+                return
+            if protected:
+                item = _nfl_weather_empty(game, status="PROTECTED",
+                    reason="Indoor or weather-protected stadium; outdoor weather neutral")
+                item["protected"] = True
+                results[key] = item
+                return
+            lat, lon = _NFL_STADIUM_COORDS[home]
+            try:
+                start = datetime.fromisoformat(str(game.get("start", "")).replace("Z", "+00:00"))
+                date = start.astimezone(timezone.utc).date().isoformat()
+                async with semaphore:
+                    response = await client.get("https://api.open-meteo.com/v1/forecast", params={
+                        "latitude": lat, "longitude": lon, "hourly": ",".join((
+                            "temperature_2m", "precipitation_probability", "precipitation",
+                            "rain", "snowfall", "wind_speed_10m", "wind_gusts_10m", "weather_code")),
+                        "temperature_unit": "fahrenheit", "wind_speed_unit": "mph",
+                        "precipitation_unit": "inch", "timezone": "UTC",
+                        "start_date": date, "end_date": date,
+                    })
+                    response.raise_for_status()
+                    results[key] = _nfl_weather_snapshot(game, response.json().get("hourly"))
+            except Exception as exc:
+                results[key] = _nfl_weather_empty(game, reason=f"Weather provider unavailable: {exc}")
+        await asyncio.gather(*(one(game) for game in games))
+    await asyncio.to_thread(_nfl_weather_cache_set, date_str, results)
+    return results
+
 def _cache_get(date_key, allow_stale=False):
-    # v2 invalidates pre-blend Game Predictor results without invalidating the
+    # v4 invalidates pre-weather results without invalidating the
     # separate raw-odds cache (so recalculation does not re-buy sportsbook data).
-    p = _CACHE_DIR / f"nfl_v3_{date_key}.json"
+    p = _CACHE_DIR / f"nfl_v4_weather_{date_key}.json"
     try:
         if p.exists() and (allow_stale or _is_past_date(date_key)
                            or (time.time() - p.stat().st_mtime) < _CACHE_TTL):
@@ -327,7 +535,8 @@ def _cache_get(date_key, allow_stale=False):
 
 def _cache_set(date_key, result):
     try:
-        _nfl_write_board_cache(_CACHE_DIR / f"nfl_v3_{date_key}.json", result)
+        _nfl_write_board_cache(
+            _CACHE_DIR / f"nfl_v4_weather_{date_key}.json", result)
     except Exception as exc:
         print(f"[NFL cache] Could not save OLD board for {date_key}: {exc}")
 
@@ -345,7 +554,7 @@ def _nfl_write_board_cache(path, result):
 # NEW is deliberately stored outside the legacy short-lived result cache.  The
 # raw sportsbook cache remains shared (it is an input, not a model result), but
 # a NEW board can never be served as an OLD board.
-_NEW_CACHE_PREFIX = "nfl_new_v1_"
+_NEW_CACHE_PREFIX = "nfl_new_v2_weather_"
 def _new_cache_get(date_key, allow_stale=False):
     p = _CACHE_DIR / f"{_NEW_CACHE_PREFIX}{date_key}.json"
     try:
@@ -1069,6 +1278,8 @@ async def get_espn_games(date_str: str) -> List[Dict]:
                 away  = teams.get("away", {})
                 home_row = team_rows.get("home", {})
                 away_row = team_rows.get("away", {})
+                venue = comp.get("venue") or {}
+                address = venue.get("address") or {}
                 season_obj = ev.get("season") or {}
                 season_type_num = season_obj.get("type")
                 week_obj = ev.get("week") or {}
@@ -1087,6 +1298,11 @@ async def get_espn_games(date_str: str) -> List[Dict]:
                     "home_score": home_row.get("score"),
                     "away_score": away_row.get("score"),
                     "completed": ev.get("status", {}).get("type", {}).get("completed", False),
+                    "venue_full_name": venue.get("fullName", ""),
+                    "venue_city": address.get("city", ""),
+                    "venue_state": address.get("state", ""),
+                    "venue_country": address.get("country", "USA"),
+                    "indoor": bool(venue.get("indoor")),
                 })
             except Exception as exc:
                 print(f"[ESPN] skipped malformed event: {exc}")
@@ -1806,6 +2022,13 @@ def _apply_nfl_injury_context(lines: list, roster_map: dict) -> None:
         line["injury_updated_at"] = (info or {}).get("injury_updated_at")
         line["participation_probability"] = (info or {}).get(
             "participation_probability")
+        line["roster_experience_years"] = (info or {}).get(
+            "experience_years")
+        line["rookie_verified"] = bool(
+            info and info.get("rookie_verified"))
+        line["is_rookie"] = bool(
+            info and info.get("rookie_verified")
+            and info.get("is_rookie"))
         position = _nfl_position_group((info or {}).get("position"))
         factor, reasons = 1.0, []
         if info and line.get("market") in market_ok and position in base_share:
@@ -1861,6 +2084,14 @@ async def get_espn_roster_map(espn_games: List[Dict], date_str: str) -> dict:
                         status_type = str(status.get("type") or "").lower()
                         injury_status, injury_note, participation = (
                             _nfl_injury_status(athlete))
+                        experience = athlete.get("experience") or {}
+                        experience_years = experience.get("years")
+                        try:
+                            experience_years = int(experience_years)
+                            rookie_verified = experience_years >= 0
+                        except (TypeError, ValueError):
+                            experience_years = None
+                            rookie_verified = False
                         eligible = (bucket in ("offense", "defense", "specialTeam")
                                     and status_type not in
                                     ("injuredreserve", "out", "suspended", "practicesquad")
@@ -1873,6 +2104,10 @@ async def get_espn_roster_map(espn_games: List[Dict], date_str: str) -> dict:
                             "injury_status": injury_status,
                             "injury_note": injury_note,
                             "participation_probability": participation,
+                            "experience_years": experience_years,
+                            "rookie_verified": rookie_verified,
+                            "is_rookie": bool(
+                                rookie_verified and experience_years == 0),
                             "injury_updated_at": datetime.now(
                                 timezone.utc).isoformat(),
                         }
@@ -3227,6 +3462,12 @@ def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str,
     injury_factor = float(pl.get("injury_opportunity_factor") or 1.0)
     adj_avg = (round(ref_avg * combined_factor * injury_factor, 1)
                if ref_avg is not None else None)
+    weather_snapshot = pl.get("weather") if isinstance(pl.get("weather"), dict) else {}
+    weather_factor = _nfl_weather_factors(
+        weather_snapshot, market, effective_position)
+    weather_base_projection = adj_avg
+    if adj_avg is not None and weather_snapshot.get("status") == "OK":
+        adj_avg = round(adj_avg * weather_factor, 1)
     injury_adj = (round(adj_avg - ref_avg, 1)
                   if ref_avg is not None and adj_avg is not None else 0.0)
     def_adj = round((def_factor - 1) * 100)
@@ -3277,6 +3518,12 @@ def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str,
         # TD model already includes opportunity and defense; role is intentionally
         # a small nudge only, avoiding a second volume count.
         score = round(max(0.0, min(100.0, score + (role_factor - 1.0) * 20.0)), 1)
+    weather_base_probability = score
+    if weather_snapshot.get("status") == "OK" and weather_factor != 1.0:
+        probability_factor = (
+            2.0 - weather_factor if pick == "UNDER" else weather_factor)
+        score = round(max(0.0, min(100.0,
+            50.0 + (score - 50.0) * probability_factor)), 1)
     # Apply teammate opportunity and player-status uncertainty to the final
     # probability, including the separately calibrated anytime-TD probability.
     if pick and injury_factor != 1.0:
@@ -3408,6 +3655,20 @@ def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str,
         "historyLock": history_lock,
         "historyLockReason": history_lock_reason,
         "baseProjAvg": base_proj_avg, "injuryAdj": injury_adj,
+        "weatherApplied": bool(weather_snapshot.get("status") == "OK"
+                               and weather_factor != 1.0),
+        "weatherFactor": weather_factor,
+        "weatherBaseProjection": weather_base_projection,
+        "weatherAdjustment": (round(adj_avg - weather_base_projection, 1)
+                              if adj_avg is not None and weather_base_projection is not None else 0),
+        "weatherBaseProbability": weather_base_probability,
+        "weatherSeverity": weather_snapshot.get("severity", 0),
+        "weatherLabel": weather_snapshot.get("label", ""),
+        "weatherSummary": weather_snapshot.get("summary", ""),
+        "weatherStatus": weather_snapshot.get("status", "UNAVAILABLE"),
+        "isRookie": bool(pl.get("rookie_verified") and pl.get("is_rookie")),
+        "rookieVerified": bool(pl.get("rookie_verified")),
+        "rosterExperienceYears": pl.get("roster_experience_years"),
         "injuryOpportunityFactor": injury_factor,
         "injuryOpportunityReasons": pl.get("injury_opportunity_reasons") or [],
         "injuryStatus": player_injury_status,
@@ -3699,6 +3960,11 @@ def _analyze_new_prop_raw(pl: Dict, df, home_abbr: str, away_abbr: str,
     else:
         evidence, projection, evidence_weight = None, line, 0.0
     projection = round(float(projection), 1)
+    weather_snapshot = pl.get("weather") if isinstance(pl.get("weather"), dict) else {}
+    weather_factor = _nfl_weather_factors(weather_snapshot, market, position)
+    weather_base_projection = projection
+    if weather_snapshot.get("status") == "OK":
+        projection = round(projection * weather_factor, 1)
     gap = round(projection - line, 1)
 
     # Side-aware, recency-weighted hit rate.  Missing history is not a hit or
@@ -3718,11 +3984,18 @@ def _analyze_new_prop_raw(pl: Dict, df, home_abbr: str, away_abbr: str,
         return sum(w for v, w in pairs if (v > line if over else v < line)) / sum(w for _, w in pairs) * 100
     over_rate = weighted_rate(recent, True)
     under_rate = weighted_rate(recent, False)
+    weather_base_over = over_rate
+    weather_base_under = under_rate
+    if weather_snapshot.get("status") == "OK" and weather_factor != 1.0:
+        over_rate = (round(50.0 + (over_rate - 50.0) * weather_factor, 1)
+                     if over_rate is not None else None)
+        under_factor = 2.0 - weather_factor
+        under_rate = (round(50.0 + (under_rate - 50.0) * under_factor, 1)
+                      if under_rate is not None else None)
     side_rate = None
     pick = None
     value_edge = None
     if market == "player_anytime_td":
-        over_rate = weighted_rate(recent, True)
         implied = _nfl_implied_prob(pl.get("over_odds"))
         value_edge = round((over_rate or 0) - implied, 1) if implied is not None and over_rate is not None else None
         if (over_rate is not None and over_rate >= 55 and value_edge is not None
@@ -3879,6 +4152,20 @@ def _analyze_new_prop_raw(pl: Dict, df, home_abbr: str, away_abbr: str,
         "projAvg": projection, "baseProjAvg": evidence, "injuryAdj": injury_adj,
         "injuryOpportunityFactor": injury_opportunity_factor,
         "injuryOpportunityReasons": pl.get("injury_opportunity_reasons") or [],
+        "weatherApplied": bool(weather_snapshot.get("status") == "OK"
+                               and weather_factor != 1.0),
+        "weatherFactor": weather_factor,
+        "weatherBaseProjection": weather_base_projection,
+        "weatherAdjustment": round(projection - weather_base_projection, 1),
+        "weatherBaseProbability": (weather_base_under if pick == "UNDER"
+                                   else weather_base_over),
+        "weatherSeverity": weather_snapshot.get("severity", 0),
+        "weatherLabel": weather_snapshot.get("label", ""),
+        "weatherSummary": weather_snapshot.get("summary", ""),
+        "weatherStatus": weather_snapshot.get("status", "UNAVAILABLE"),
+        "isRookie": bool(pl.get("rookie_verified") and pl.get("is_rookie")),
+        "rookieVerified": bool(pl.get("rookie_verified")),
+        "rosterExperienceYears": pl.get("roster_experience_years"),
         "injuryStatus": injury_status,
         "injuryNote": pl.get("injury_note", ""), "injuryUpdatedAt": pl.get("injury_updated_at"),
         "participationProbability": participation_probability,
@@ -3889,7 +4176,7 @@ def _analyze_new_prop_raw(pl: Dict, df, home_abbr: str, away_abbr: str,
         "valueReason": "" if pick else ("Sparse history / no meaningful projection gap"
                                         if sparse else "No meaningful model gap"),
         "glog": glog, "vsOppLog": vs_opp_log, "sparseHistory": sparse,
-        "sparseStatus": sparse_status, "model_version": "NEW-v1-ewma-blend",
+        "sparseStatus": sparse_status, "model_version": "NEW-v2-ewma-weather",
         "opp": opp, "vs_opp_avg": round(opp_mean, 1) if opp_mean is not None else None,
         "vs_opp_games": opp_total, "vs_opp_hits": opp_hits,
         "vs_opp_rate": opp_rate, "l10_avg": avg,
@@ -4564,7 +4851,7 @@ def _nfl_starter_name(team_abbr: str, df, col: str = "passing_yards",
 async def _build_nfl_game_predictions(espn_games: list, df, date_str: str,
                                       gl_cache: dict = None,
                                       roster_map: dict = None,
-                                      progress=None) -> tuple:
+                                      progress=None, weather_by_game: dict = None) -> tuple:
     """Build Game Predictor payload for every game on today's slate.
     Fetches h2h + totals for all games concurrently via get_nfl_game_lines.
     Uses cached game lines when available (past-date lines are final) and
@@ -4766,6 +5053,13 @@ async def _build_nfl_game_predictions(espn_games: list, df, date_str: str,
                           (h2h_home_avg if h2h_home_avg is not None else stat_home) * h2h_weight, 1)
         proj_away = round(stat_away * (1 - h2h_weight) +
                           (h2h_away_avg if h2h_away_avg is not None else stat_away) * h2h_weight, 1)
+        weather_key = f"{aa}@{ha}"
+        weather = (weather_by_game or {}).get(weather_key) or g.get("weather") or {}
+        weather_base_home, weather_base_away = proj_home, proj_away
+        weather_severity = int(weather.get("severity") or 0) if weather.get("status") == "OK" else 0
+        weather_score_factor = 1 - min(.12, .12 * weather_severity / 100.0)
+        proj_home = round(proj_home * weather_score_factor, 1)
+        proj_away = round(proj_away * weather_score_factor, 1)
         proj_total = round(proj_home + proj_away, 1)
         win_home, win_away = _nfl_pythagorean(proj_home, proj_away)
         pick_home = win_home >= win_away
@@ -4809,6 +5103,10 @@ async def _build_nfl_game_predictions(espn_games: list, df, date_str: str,
                            f"{round(h2h_weight * 100)}%")
             drivers.append(f"exact venue meetings: {venue_count}/{len(hgames)}; "
                            f"newest weighted most")
+        if weather.get("status") == "OK" and weather_severity:
+            drivers.append(f"{weather.get('summary','Weather')} — model scoring factor "
+                           f"{weather_score_factor:.3f}; passing/kicking risk and "
+                           f"run tendency are reflected in player props")
         if reference_season is not None:
             drivers.append(f"{reference_season} full-season offense/defense anchors recent L5 form")
         if venue_active:
@@ -4839,6 +5137,15 @@ async def _build_nfl_game_predictions(espn_games: list, df, date_str: str,
             "away_abbr": aa, "home_abbr": ha,
             "away_sp": away_sp, "home_sp": home_sp,
             "proj_away": proj_away, "proj_home": proj_home, "proj_total": proj_total,
+            "weather": weather, "weather_applied": bool(weather_severity),
+            "weather_base_home": weather_base_home, "weather_base_away": weather_base_away,
+            "weather_score_factor": weather_score_factor,
+            "weather_adjustment_home": round(proj_home - weather_base_home, 1),
+            "weather_adjustment_away": round(proj_away - weather_base_away, 1),
+            "weather_severity": weather_severity,
+            "weather_label": weather.get("label", ""),
+            "weather_summary": weather.get("summary", ""),
+            "weather_status": weather.get("status", "UNAVAILABLE"),
             "win_away": win_away, "win_home": win_home,
             "pick_home": pick_home, "pick_abbr": pick_abbr, "conf": conf,
             "away_ml_odds": away_ml, "home_ml_odds": home_ml,
@@ -4925,7 +5232,7 @@ async def _run_pipeline_unlocked(date_str: str, progress=None, simulate: bool = 
     def _error_result(payload):
         if system == "NEW":
             payload.setdefault("system", "NEW")
-            payload.setdefault("model_version", "NEW-v1-ewma-blend")
+            payload.setdefault("model_version", "NEW-v2-ewma-weather")
             return _new_sanitize_json(payload)
         return payload
 
@@ -4946,7 +5253,7 @@ async def _run_pipeline_unlocked(date_str: str, progress=None, simulate: bool = 
     if cached:
         if system == "NEW" and isinstance(cached, dict):
             cached.setdefault("system", "NEW")
-            cached.setdefault("model_version", "NEW-v1-ewma-blend")
+            cached.setdefault("model_version", "NEW-v2-ewma-weather")
             cached = _new_sanitize_json(cached)
         cached = await _nfl_enrich_cached_response(cached, date_str, system)
         return cached
@@ -4968,6 +5275,18 @@ async def _run_pipeline_unlocked(date_str: str, progress=None, simulate: bool = 
         })
     if not espn_games:
         return _error_result({"picks":[],"all":[],"error":f"No NFL games found for {date_str} — NFL season runs Sept–Feb. (Note: check the exact date — e.g. Championship Sunday was Jan 26, not Jan 25.)"})
+    weather_by_game = {}
+    if not simulate:
+        _p("Fetching game weather…")
+        try:
+            weather_by_game = await _nfl_fetch_weather(date_str, espn_games)
+        except Exception as exc:
+            print(f"[NFL weather] slate fetch failed open: {exc}")
+            weather_by_game = {}
+        for game in espn_games:
+            key = str(game.get("id") or f"{game.get('away_abbr')}@{game.get('home_abbr')}")
+            game["weather"] = weather_by_game.get(
+                key, _nfl_weather_empty(game, reason="Weather unavailable"))
     if simulate:
         # Historical replays use the players listed by the archived sportsbook
         # board. Current ESPN rosters would incorrectly remove traded/retired
@@ -5092,14 +5411,36 @@ async def _run_pipeline_unlocked(date_str: str, progress=None, simulate: bool = 
                 l["target_season"] = ev.get("season")
                 l["target_week"] = ev.get("week")
                 l["target_type"] = ev.get("season_type", "REG")
+                key = f"{away_abbr}@{home_abbr}"
+                # Attach after the raw odds cache is read as well as after a
+                # fresh fetch; weather is not sportsbook input.
+                l["weather"] = weather_by_game.get(
+                    key, _nfl_weather_empty(ev, reason="Weather unavailable")
+                ) if not simulate else l.get("weather")
             all_lines.extend(lines)
         if all_lines:
             await asyncio.to_thread(
-                _odds_cache_set, date_str, all_lines, {}, skipped_matchups)
+                _odds_cache_set, date_str,
+                [{k: v for k, v in line.items() if k != "weather"}
+                 for line in all_lines], {}, skipped_matchups)
         # Completed asyncio Tasks retain their return values and request frames.
         # They are no longer needed after the normalized rows enter all_lines.
         tasks.clear()
         fetched_games.clear()
+
+    if not simulate and weather_by_game:
+        for line in all_lines:
+            home = line.get("home_abbr", "")
+            away = line.get("away_abbr", "")
+            key = f"{away}@{home}"
+            line["weather"] = weather_by_game.get(
+                key, _nfl_weather_empty(line, reason="Weather unavailable"))
+    elif simulate:
+        # Raw odds caches are not point-in-time weather snapshots.  Historical
+        # replays remain weather-neutral unless a previously persisted board
+        # already supplied weather directly to its player rows.
+        for line in all_lines:
+            line.pop("weather", None)
 
     if not all_lines:
         today = _nfl_today()
@@ -5349,13 +5690,18 @@ async def _run_pipeline_unlocked(date_str: str, progress=None, simulate: bool = 
         await asyncio.to_thread(_nfl_release_analysis_memory)
     games_out = [{"home_team":g.get("home_team",""), "away_team":g.get("away_team",""),
                   "home_abbr":g.get("home_abbr",""), "away_abbr":g.get("away_abbr",""),
-                   "game":g.get("game",""), "game_start":g.get("start","")}
+                   "game":g.get("game",""), "game_start":g.get("start",""),
+                   "venue_full_name":g.get("venue_full_name",""),
+                   "venue_city":g.get("venue_city",""), "venue_state":g.get("venue_state",""),
+                   "venue_country":g.get("venue_country",""), "indoor":bool(g.get("indoor")),
+                   "weather":g.get("weather")}
                   for g in espn_games]
     # 7. Game Predictor — fetches h2h + totals concurrently (separate calls from props
     #    so player-prop market quota is never shared with game-level markets)
     _p("Building game predictions…")
     game_predictions, new_gl = await _build_nfl_game_predictions(
-        espn_games, df, date_str, game_lines_by_id, roster_map, progress=_p)
+        espn_games, df, date_str, game_lines_by_id, roster_map, progress=_p,
+        weather_by_game=weather_by_game)
     if new_gl:
         # Persist freshly-bought game lines so re-runs never re-buy them
         merged_gl = {**(game_lines_by_id or {}), **new_gl}
@@ -5416,7 +5762,7 @@ async def _run_pipeline_unlocked(date_str: str, progress=None, simulate: bool = 
     await asyncio.to_thread(_nfl_json_ready, result)
     if system == "NEW":
         result["system"] = "NEW"
-        result["model_version"] = "NEW-v1-ewma-blend"
+        result["model_version"] = "NEW-v2-ewma-weather"
         result = _new_sanitize_json(result)
     if simulate:
         result["simulation"] = True
@@ -5451,7 +5797,7 @@ async def _run_pipeline_unlocked(date_str: str, progress=None, simulate: bool = 
         )
         result["system"] = system
         if system == "NEW":
-            result["model_version"] = "NEW-v1-ewma-blend"
+            result["model_version"] = "NEW-v2-ewma-weather"
             result["simulationNotice"] = (
                 "NEW historical replay is view-only and isolated from OLD and "
                 "NEW official records.")
@@ -5638,6 +5984,13 @@ async def _build_alt_coach_unlocked(date_str: str, system: str = "OLD") -> dict:
         games = await _alt_stage(get_espn_games(date_str), 30)
         if not games:
             raise RuntimeError("No NFL games found for this date.")
+        weather_by_game = {}
+        if date_str >= _nfl_today():
+            try:
+                weather_by_game = await _alt_stage(
+                    _nfl_fetch_weather(date_str, games), 30)
+            except Exception as exc:
+                print(f"[NFL weather] alternate scan failed open: {exc}")
         games = await _alt_stage(get_odds_events(date_str, games), 30)
         roster_map = (
             {}
@@ -5717,6 +6070,10 @@ async def _build_alt_coach_unlocked(date_str: str, system: str = "OLD") -> dict:
                 "game": game.get("game", ""), "game_start": game.get("start", ""),
                 "roster_team": (info or {}).get("team", ""),
                 "roster_position": (info or {}).get("position", ""),
+                "weather": (weather_by_game or {}).get(
+                    f"{away}@{home}",
+                    _nfl_weather_empty(game, reason="Weather unavailable")
+                ) if date_str >= _nfl_today() else None,
             })
             lines.append(line)
     lines = _nfl_dedupe_alt_lines(lines)
@@ -6170,7 +6527,7 @@ async def api_run(request: Request):
                             "progress": "Full week complete"})
                     if system == "NEW":
                         merged["system"] = "NEW"
-                        merged["model_version"] = "NEW-v1-ewma-blend"
+                        merged["model_version"] = "NEW-v2-ewma-weather"
                     return merged
                 result = await run_pipeline(
                     date_str,
@@ -6515,7 +6872,7 @@ def _nfl_read_saved_board(date_str, system):
                 "Legacy saved board: defensive venue/context metrics are unverified "
                 "and were not recomputed.")
         if system == "NEW":
-            saved.setdefault("model_version", "NEW-v1-ewma-blend")
+            saved.setdefault("model_version", "NEW-v2-ewma-weather")
     return saved
 
 def _nfl_saved_response_file(date_str, scope, system):
@@ -6538,7 +6895,7 @@ def _nfl_saved_response_file(date_str, scope, system):
     result["system"] = system
     result["saved_board"] = True
     if system == "NEW":
-        result.setdefault("model_version", "NEW-v1-ewma-blend")
+        result.setdefault("model_version", "NEW-v2-ewma-weather")
     path = _CACHE_DIR / ("nfl_saved_response_" + uuid.uuid4().hex + ".json")
     _nfl_write_board_cache(path, result)
     return path
@@ -7279,7 +7636,7 @@ _NFL_COACH_HIST_APP = "nfl_coach_historical"
 _NFL_COACH_CATS = ("app_hit_rate_100", "safest_bets", "coach_edge", "alt_line_edge",
                    "coach_over_movement", "coach_under_movement", "passing",
                    "rushing", "receiving", "defense", "kicking",
-                   "td_scorers", "best_unders")
+                   "td_scorers", "best_unders", "rookie_plays")
 _NFL_COACH_CAPTURE_GUARD_SECONDS = 120
 
 # NEW namespaces are intentionally separate PostgREST app values and category
@@ -7375,6 +7732,18 @@ def _nfl_coach_hist_candidates(picks):
             "current_line": pick.get("currentLine", pick.get("realLine")),
             "line_move": pick.get("lineMove"),
             "line_movement_available": bool(pick.get("lineMovementAvailable")),
+            "is_rookie": bool(pick.get("rookieVerified")
+                              and pick.get("isRookie")),
+            "rookie_verified": bool(pick.get("rookieVerified")),
+            "weather": dict(pick.get("weather") or {}),
+            "weather_applied": bool(pick.get("weatherApplied")),
+            "weather_factor": pick.get("weatherFactor"),
+            "weather_base_projection": pick.get("weatherBaseProjection"),
+            "weather_adjustment": pick.get("weatherAdjustment"),
+            "weather_severity": pick.get("weatherSeverity"),
+            "weather_label": pick.get("weatherLabel", ""),
+            "weather_summary": pick.get("weatherSummary", ""),
+            "weather_status": pick.get("weatherStatus", "UNAVAILABLE"),
         }
         row["coach_edge"] = row["model_probability"] - implied
         key = (row["player"], row["market"], side, line, row["odds"])
@@ -7427,6 +7796,9 @@ def _nfl_coach_hist_select(candidates, category, alternate=False):
     }.get(category)
     rows = []
     for row in candidates:
+        if category == "rookie_plays" and not (
+                row.get("rookie_verified") and row.get("is_rookie")):
+            continue
         if category not in ("safest_bets", "td_scorers") and row["coach_edge"] <= 0:
             continue
         if family and _nfl_coach_hist_family(row["market_label"]) != family:
@@ -7489,6 +7861,7 @@ def _nfl_coach_filter_candidates(candidates, filters):
     sides = set(filters["sides"]) if isinstance(filters.get("sides"), list) else None
     markets = set(filters["markets"]) if isinstance(filters.get("markets"), list) else None
     games = set(filters["games"]) if isinstance(filters.get("games"), list) else None
+    rookie_only = filters.get("rookie_only") is True
     out = []
     for row in candidates or []:
         if sides is not None and str(row.get("side") or "").upper() not in sides:
@@ -7500,6 +7873,9 @@ def _nfl_coach_filter_candidates(candidates, filters):
             continue
         if games is not None and _nfl_coach_game_key(
                 row.get("team"), row.get("opponent")) not in games:
+            continue
+        if rookie_only and not (
+                row.get("rookie_verified") and row.get("is_rookie")):
             continue
         out.append(row)
     return out
@@ -8053,6 +8429,17 @@ def _nfl_save_gp_snapshot(date_str: str, result: dict, system: str = "OLD"):
             "total_over_book": p.get("total_over_book", ""),
             "total_under_book": p.get("total_under_book", ""),
             "game_start": p.get("game_start", ""),
+            "weather": dict(p.get("weather") or {}),
+            "weather_applied": bool(p.get("weather_applied")),
+            "weather_base_home": p.get("weather_base_home"),
+            "weather_base_away": p.get("weather_base_away"),
+            "weather_score_factor": p.get("weather_score_factor"),
+            "weather_adjustment_home": p.get("weather_adjustment_home"),
+            "weather_adjustment_away": p.get("weather_adjustment_away"),
+            "weather_severity": p.get("weather_severity"),
+            "weather_label": p.get("weather_label", ""),
+            "weather_summary": p.get("weather_summary", ""),
+            "weather_status": p.get("weather_status", "UNAVAILABLE"),
         })
     ok = _nfl_sb_insert_ignore("mpa_track_ledger", [{
         "app": cfg["app"], "date": date_str, "category": cfg["gp"],
@@ -8264,7 +8651,7 @@ def _nfl_grade_date(date_str: str, snap: list, box_override: dict = None) -> dic
             }
             if p.get("system") == "NEW":
                 row["system"] = "NEW"
-                row["model_version"] = p.get("model_version", "NEW-v1-ewma-blend")
+                row["model_version"] = p.get("model_version", "NEW-v2-ewma-weather")
             if rank <= _NFL_TRK_TOP:
                 main_rows.append(row)
             else:
@@ -8980,6 +9367,9 @@ async def nfl_coach_track_capture(request: Request, token: str = ""):
             if not isinstance(filters.get(key), list):
                 raise HTTPException(
                     400, f"Coach capture filters.{key} must be an array.")
+        if not isinstance(filters.get("rookie_only", False), bool):
+            raise HTTPException(
+                400, "Coach capture filters.rookie_only must be true or false.")
         if (any(str(side).upper() not in allowed_sides
                 for side in filters["sides"])
                 or any(str(market) not in allowed_markets
@@ -8993,6 +9383,7 @@ async def nfl_coach_track_capture(request: Request, token: str = ""):
             "markets": list(filters["markets"]),
             "games": [_nfl_coach_game_key(
                 *str(game).upper().split("|", 1)) for game in filters["games"]],
+            "rookie_only": bool(filters.get("rookie_only")),
         }
     if category not in _NFL_COACH_CATS or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date_str) or not isinstance(rows, list) or not rows:
         raise HTTPException(400, "Invalid preset capture; no snapshot was saved.")
@@ -9047,6 +9438,17 @@ async def nfl_coach_track_capture(request: Request, token: str = ""):
                 "projection":(float(raw["projection"])
                               if raw.get("projection") not in (None, "") else None),
                 "alternate":bool(raw.get("alternate")),
+                "is_rookie":bool(trusted_primary.get("is_rookie")),
+                "rookie_verified":bool(trusted_primary.get("rookie_verified")),
+                "weather":dict(trusted_primary.get("weather") or {}),
+                "weather_applied":bool(trusted_primary.get("weather_applied")),
+                "weather_factor":trusted_primary.get("weather_factor"),
+                "weather_base_projection":trusted_primary.get("weather_base_projection"),
+                "weather_adjustment":trusted_primary.get("weather_adjustment"),
+                "weather_severity":trusted_primary.get("weather_severity"),
+                "weather_label":trusted_primary.get("weather_label", ""),
+                "weather_summary":trusted_primary.get("weather_summary", ""),
+                "weather_status":trusted_primary.get("weather_status", "UNAVAILABLE"),
                 "captured_at":now.isoformat(),"result":"PENDING","actual":None,"units":None})
         except (TypeError, ValueError): raise HTTPException(400, "Coach capture rejected: invalid displayed play values.")
     # Recheck immediately before writing so a slow request cannot replace the
@@ -9759,14 +10161,15 @@ tr:last-child td{border-bottom:none}
     </div>
      <div class="nfl-coach-filter-box" id="nflCoachFilterBox">
        <div class="nfl-coach-filter-head">
-         <div><div class="nfl-coach-filter-title">Coach sides &amp; market categories</div>
-         <div class="nfl-coach-filter-help">These visible selections apply before Coach ranking, distinct-player dedupe, and the Top 10 cap. Genuine sportsbook quotes only.</div></div>
+         <div><div class="nfl-coach-filter-title">Coach sides, rookies &amp; market categories</div>
+         <div class="nfl-coach-filter-help">Rookie combines with any selected category—for example Rookie + Receptions—and applies before Coach ranking, distinct-player dedupe, and the Top 10 cap. Rookie status uses ESPN roster experience. Genuine sportsbook quotes only.</div></div>
          <div class="nfl-coach-filter-actions"><button type="button" onclick="_nflCoachSetSides(true)">All sides</button><button type="button" onclick="_nflCoachSetSides(false)">No sides</button></div>
        </div>
        <div class="nfl-coach-filter-row" aria-label="Coach sides">
          <span style="color:#64748b;font-size:.62rem;font-weight:900;text-transform:uppercase;letter-spacing:.08em">Sides</span>
          <label class="nfl-coach-filter-label side-over"><input type="checkbox" class="nfl-coach-side-choice" data-side="OVER" checked onchange="_nflCoachSelectionChanged()"> OVER</label>
          <label class="nfl-coach-filter-label side-under"><input type="checkbox" class="nfl-coach-side-choice" data-side="UNDER" checked onchange="_nflCoachSelectionChanged()"> UNDER</label>
+         <label class="nfl-coach-filter-label" style="border-color:#a78bfa;color:#ddd6fe"><input type="checkbox" id="nflCoachRookieOnly" class="nfl-coach-rookie-choice" onchange="_nflCoachSelectionChanged()"> ROOKIE</label>
        </div>
        <div class="nfl-coach-filter-row">
          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;width:100%">
@@ -10023,20 +10426,21 @@ function _nflGameFilterSummary(scope){
   else if(selected===0)el.textContent='None selected';
   else el.textContent=selected+' of '+games.length+' selected';
 }
-var _NFL_COACH_FILTER_STORAGE='nfl_coach_ui_filters_v2';
+var _NFL_COACH_FILTER_STORAGE='nfl_coach_ui_filters_v3';
 function _nflCoachReadFilterPrefs(){
   try{
     var raw=localStorage.getItem(_NFL_COACH_FILTER_STORAGE),saved=raw?JSON.parse(raw):null;
     if(saved&&Array.isArray(saved.sides)&&Array.isArray(saved.markets))return saved;
   }catch(e){}
-  return {sides:['OVER','UNDER'],markets:null};
+  return {sides:['OVER','UNDER'],markets:null,rookieOnly:false};
 }
 window.__NFL_COACH_FILTER_PREFS__=_nflCoachReadFilterPrefs();
 function _nflCoachSaveFilterPrefs(){
   var sides=[],markets=[],sideNodes=document.querySelectorAll('.nfl-coach-side-choice'),marketNodes=document.querySelectorAll('.nfl-coach-market-choice');
   sideNodes.forEach(function(cb){if(cb.checked)sides.push(String(cb.getAttribute('data-side')||'').toUpperCase());});
   marketNodes.forEach(function(cb){if(cb.checked)markets.push(decodeURIComponent(cb.getAttribute('data-market')||''));});
-  window.__NFL_COACH_FILTER_PREFS__={sides:sides,markets:markets};
+  var rookie=document.getElementById('nflCoachRookieOnly');
+  window.__NFL_COACH_FILTER_PREFS__={sides:sides,markets:markets,rookieOnly:!!(rookie&&rookie.checked)};
   try{localStorage.setItem(_NFL_COACH_FILTER_STORAGE,JSON.stringify(window.__NFL_COACH_FILTER_PREFS__));}catch(e){}
 }
 function _nflCoachSelectionChanged(){_nflCoachSaveFilterPrefs();}
@@ -10069,6 +10473,8 @@ function _nflCoachRenderMarketFilters(){
   document.querySelectorAll('.nfl-coach-side-choice').forEach(function(cb){
     cb.checked=savedSides===null||savedSides.indexOf(String(cb.getAttribute('data-side')||'').toUpperCase())>=0;
   });
+  var rookie=document.getElementById('nflCoachRookieOnly');
+  if(rookie)rookie.checked=prefs.rookieOnly===true;
   box.innerHTML=labels.map(function(label){
     var checked=savedMarkets===null||savedMarkets.indexOf(label)>=0;
     return '<label class="nfl-coach-filter-label"><input type="checkbox" class="nfl-coach-market-choice" data-market="'+encodeURIComponent(label)+'"'+(checked?' checked':'')+' onchange="_nflCoachSelectionChanged()"> '+_esc(label)+'</label>';
@@ -10096,8 +10502,9 @@ function _nflCoachSelectedMarkets(){
 }
 function _nflCoachVisibleProps(props){
   var markets=_nflCoachSelectedMarkets();
+  var rookie=document.getElementById('nflCoachRookieOnly'),rookieOnly=!!(rookie&&rookie.checked);
   return (props||[]).filter(function(p){
-    return markets.indexOf(String(p.market||''))>=0;
+    return markets.indexOf(String(p.market||''))>=0&&(!rookieOnly||p.isRookie===true);
   });
 }
 function _nflCoachFilterPayload(){
@@ -10105,7 +10512,8 @@ function _nflCoachFilterPayload(){
   var games=_nflLoadedGames(),selected=games.filter(function(g){
     return _nflGameFilterOn('coach',g.key.split('|')[0],g.key.split('|')[1]);
   }).map(function(g){return g.key;});
-  return {sides:_nflCoachSelectedSides(),markets:_nflCoachSelectedMarkets(),games:selected};
+  var rookie=document.getElementById('nflCoachRookieOnly');
+  return {sides:_nflCoachSelectedSides(),markets:_nflCoachSelectedMarkets(),games:selected,rookie_only:!!(rookie&&rookie.checked)};
 }
 function _nflGameFilterHtml(scope){
   var games=_nflLoadedGames(),group=(window.__NFL_GAME_FILTERS__||{})[scope]||{};
@@ -10924,6 +11332,20 @@ function _openModal(title,sub,body){
   ov.onclick=_closeModal; ov.innerHTML=html; document.body.appendChild(ov);
 }
 function _closeModal(){var o=document.getElementById('nflModalOv'); if(o)o.remove();}
+function _nflWeatherHtml(w){
+  if(!w||w.status!=='OK')return '';
+  var k=w.kickoff||{}, rain=k.precipitation_probability!=null?String(Math.round(k.precipitation_probability))+'% precip':'';
+  var amt=k.precipitation_in!=null?Number(k.precipitation_in).toFixed(2)+' in':'';
+  var wind=k.wind_mph!=null?Math.round(k.wind_mph)+' mph wind':'';
+  var gust=k.gust_mph!=null?Math.round(k.gust_mph)+' mph gusts':'';
+  var vals=[w.label||'Weather',k.temperature_f!=null?Math.round(k.temperature_f)+'°F':'',rain,amt,wind,gust].filter(Boolean).join(' · ');
+  return '<div style="margin:10px 0;padding:9px 11px;border:1px solid rgba(251,191,36,.28);border-radius:9px;background:rgba(120,80,0,.12);color:#fde68a;font-size:.68rem;font-weight:800">⚠ WEATHER · '+_esc(vals)+'<span style="display:block;color:#cbd5e1;font-weight:600;margin-top:3px">'+_esc(w.summary||'')+'</span></div>';
+}
+function _nflPlayerWeatherHtml(p){
+  if(!p||p.weatherStatus!=='OK'||!p.weatherApplied)return '';
+  var effect=Number(p.weatherAdjustment||0), sign=effect>0?'+':'';
+  return '<div style="margin:9px 0;padding:8px 10px;border:1px solid rgba(251,191,36,.22);border-radius:8px;background:rgba(120,80,0,.1);color:#fde68a;font-size:.68rem;font-weight:800">Weather model · '+_esc(p.weatherLabel||'')+' · '+sign+effect+' projection'+(p.weatherSummary?'<span style="display:block;color:#cbd5e1;font-weight:600;margin-top:3px">'+_esc(p.weatherSummary)+'</span>':'')+'</div>';
+}
 function _gameModal(gi){
   var st=window._nflState||{}; var g=((st.d||{}).games||[])[gi]; if(!g) return;
   var gk=g.game; var mu=(g.away_abbr||g.away_team||'?')+' @ '+(g.home_abbr||g.home_team||'?');
@@ -10935,7 +11357,7 @@ function _gameModal(gi){
     body+='<div class="mk-hdr">'+_mIcon(m)+' '+m+'</div>'+mp.map(_playRow).join('');
   });
   if(!body) body='<div class="mt" style="color:#6b7280;padding:10px">No plays for this game.</div>';
-  _openModal(mu, ((st.d||{}).date||'')+' · tap any play for its game log', body);
+  _openModal(mu, ((st.d||{}).date||'')+' · tap any play for its game log', _nflWeatherHtml(g.weather)+body);
 }
 function _marketModal(m){
   var st=window._nflState||{};
@@ -11050,6 +11472,7 @@ function openNflLadder(key){
     +'</div>'
     +'</div>'
     +'<div class="pm-body">'
+    +_nflPlayerWeatherHtml(p)
     +parlayWhy
     +historyRule
     +splitHtml
@@ -11296,7 +11719,8 @@ function _openNflGamePred(i){
   ov.innerHTML='<div style="background:#080b12;border:1px solid #26334a;border-radius:20px;max-width:920px;width:100%;max-height:calc(100vh - 28px);overflow-y:auto;overflow-x:hidden;box-sizing:border-box;margin:auto;padding:clamp(16px,3vw,28px);box-shadow:0 28px 100px rgba(0,0,0,.85);position:relative">'
     +'<button onclick="document.getElementById(&#39;nfl-gp-modal&#39;).style.display=&#39;none&#39;" aria-label="Close" style="position:absolute;top:18px;right:18px;width:34px;height:34px;border-radius:9px;background:#172033;border:1px solid #334155;color:#cbd5e1;font-size:1.1rem;cursor:pointer">X</button>'
     +'<div style="font-size:.6rem;color:#818cf8;font-weight:900;letter-spacing:.14em">MONEY PICKS ARENA · NFL GAME PREDICTOR</div><div style="display:flex;align-items:start;gap:12px;margin-top:8px;padding-right:42px"><div style="min-width:0"><div style="font-size:clamp(1.5rem,4vw,2.2rem);font-weight:950;color:#fff;letter-spacing:-.04em">'+_esc(gp.away_abbr)+' <span style="color:#64748b">@</span> '+_esc(gp.home_abbr)+'</div><div style="font-size:.72rem;color:#94a3b8;margin-top:5px">'+_esc(gp.slate_date||'Date unavailable')+' · Blended matchup model</div></div><div style="margin-left:auto;white-space:nowrap;background:rgba(34,197,94,.14);border:1px solid rgba(34,197,94,.4);color:#4ade80;border-radius:8px;padding:7px 10px;font-size:.65rem;font-weight:900">'+(gp.value_flag?'VALUE ':'PICK ') +pick+'</div></div>'
-    +'<div style="margin-top:20px;display:flex;flex-wrap:wrap;gap:12px">'+team(gp.away_abbr,gp.away_sp,gp.proj_away,gp.win_away,!gp.pick_home,gp.away_off_rank,gp.away_def_rank,gp.away_ml_odds)+team(gp.home_abbr,gp.home_sp,gp.proj_home,gp.win_home,gp.pick_home,gp.home_off_rank,gp.home_def_rank,gp.home_ml_odds)+'</div>'
+     +_nflWeatherHtml(gp.weather)
+     +'<div style="margin-top:20px;display:flex;flex-wrap:wrap;gap:12px">'+team(gp.away_abbr,gp.away_sp,gp.proj_away,gp.win_away,!gp.pick_home,gp.away_off_rank,gp.away_def_rank,gp.away_ml_odds)+team(gp.home_abbr,gp.home_sp,gp.proj_home,gp.win_home,gp.pick_home,gp.home_off_rank,gp.home_def_rank,gp.home_ml_odds)+'</div>'
     +'<div style="margin-top:14px;background:linear-gradient(90deg,rgba(129,140,248,.16),rgba(34,197,94,.1));border:1px solid #334155;border-radius:12px;padding:15px"><div style="font-size:.58rem;color:#a5b4fc;font-weight:900;letter-spacing:.1em">MODEL VERDICT</div><div style="display:flex;flex-wrap:wrap;gap:18px;align-items:end;margin-top:7px"><div><div style="font-size:.62rem;color:#94a3b8">PROJECTED FINAL</div><strong style="font-size:1.5rem;color:#fff">'+_esc(gp.away_abbr)+' '+val(gp.proj_away,true)+' — '+_esc(gp.home_abbr)+' '+val(gp.proj_home,true)+'</strong></div><div><div style="font-size:.62rem;color:#94a3b8">WINNER</div><strong style="font-size:1.15rem;color:#4ade80">'+pick+' · '+val(modelWin)+'%</strong></div><div><div style="font-size:.62rem;color:#94a3b8">TOTAL</div><strong style="font-size:1.05rem;color:#fbbf24">'+totalCall+' · '+totalEdge+'</strong><div style="font-size:.62rem;color:#94a3b8">Model '+projTotal+' vs book '+totalLine+'</div></div></div></div>'
     +'<section style="margin-top:18px"><div style="font-size:.62rem;color:#a78bfa;font-weight:900;letter-spacing:.12em;margin-bottom:9px">MARKET VALUE</div>'+marketBlock+'<div style="margin-top:10px;color:'+marketColor+';font-weight:900;font-size:.82rem">'+market+'</div></section>'
     +'<section style="margin-top:18px"><div style="font-size:.62rem;color:#a78bfa;font-weight:900;letter-spacing:.12em;margin-bottom:9px">MODEL INPUTS</div><div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:8px">'+inputs+'</div></section>'
@@ -11411,6 +11835,7 @@ function _nflCoachProps(sourceCandidates){
       recentTotal:Number(p.vsLineTotal||p.totB||0),oppRate:Number(p.rateA||0),
       oppHits:Number(p.hitsA||0),oppTotal:Number(p.totA||0),book:side==='UNDER'?(p.under_book||''):(p.over_book||''),
       isAlternate:!!p.isAlternate,game_start:p.game_start||'',
+      isRookie:p.isRookie===true,rookieVerified:p.rookieVerified===true,
        openingLine:p.openingLine,currentLine:p.currentLine!=null?p.currentLine:p.realLine,
        lineMove:p.lineMove,lineMovementAvailable:!!p.lineMovementAvailable,
         slate_date:p.slate_date||'',source:p
@@ -11811,6 +12236,7 @@ function _nflCoachRender(question,rows,total,mode,isAlternate){
       +'<img class="team-logo" src="'+_esc(logo)+'" alt="" onerror="this.style.display=\\'none\\'"/></span>'
       +'<span><span class="nfl-coach-name">'+(i+1)+'. '+_esc(p.player)+'</span><span class="nfl-coach-meta">'
       +(p.position?'<span class="nfl-coach-pos">'+_esc(p.position)+'</span>':'')
+      +(p.isRookie?'<span style="color:#ddd6fe;border:1px solid #7c3aed;border-radius:999px;padding:1px 5px;font-weight:900">ROOKIE</span>':'')
       +'<span style="color:'+statusColor+';font-weight:800">'+_esc(status)+'</span>'
       +'<span>'+_esc(p.team)+' vs '+_esc(p.opponent)+'</span>'+(venue?'<span>· '+venue+'</span>':'')+(p.slate_date?'<span>· '+_esc(p.slate_date)+'</span>':'')+'</span></span></span>'
       +'<span class="nfl-coach-pickmeta">'+_esc(p.market)+(p.isAlternate?' · <b style="color:#fbbf24">ALT LINE</b>':'')+'<br><b style="color:'+(p.side==='OVER'?'#4ade80':'#f87171')+'">'+p.side+' '+p.line+' · '+_nflCoachOdds(p.odds)+'</b><br><small style="color:#94a3b8">'+_esc(p.book||'Book unavailable')+'</small></span></summary>'
@@ -11841,10 +12267,14 @@ function _nflCoachCapture(category,rows){
   });
   Promise.all(requests).then(function(results){if(status&&window.__NFL_COACH_CAPTURE_SEQ__===captureSeq&&_nflRequestCurrent(requestGeneration,requestedSystem)){var changed=results.filter(function(x){return x.status==='saved'||x.status==='updated';}).length,refused=results.length-changed,updated=results.some(function(x){return x.status==='updated';});status.style.color=refused?'#fbbf24':'#86efac';status.textContent=changed?((updated?'Updated latest pregame':'Saved')+' '+changed+' game-date snapshot'+(changed===1?'':'s')+'. The final run before kickoff is banked.'+(refused?' '+refused+' date was already frozen or newer.':'')):('No snapshot changed: '+results.map(function(x){return x.message||x.status;}).join(' '));}}).catch(function(e){if(status&&window.__NFL_COACH_CAPTURE_SEQ__===captureSeq&&_nflRequestCurrent(requestGeneration,requestedSystem)){status.style.color='#f87171';status.textContent='Not saved: '+e.message;}});
 }
+function _nflCoachTrackedCategory(category){
+  var rookie=document.getElementById('nflCoachRookieOnly');
+  return rookie&&rookie.checked?'rookie_plays':category;
+}
 function askNflCoachPreset(q,category){
   var input=document.getElementById('nflCoachInput');if(input)input.value=q;
   var shown=askNflCoach();
-  _nflCoachCapture(category,shown);
+  _nflCoachCapture(_nflCoachTrackedCategory(category),shown);
   return shown;
 }
 function askNflMovementCoach(side){
@@ -11857,7 +12287,7 @@ function askNflMovementCoach(side){
       &&!p.isAlternate&&!p.alternate&&p.lineMovementAvailable&&p.edge>0&&((side==='OVER'&&p.side==='OVER'&&Number(p.lineMove)>0)||(side==='UNDER'&&p.side==='UNDER'&&Number(p.lineMove)<0));
   }).sort(function(a,b){return Math.abs(Number(b.lineMove))-Math.abs(Number(a.lineMove));}).slice(0,10);
   _nflCoachRender(q,rows,props.length,side==='OVER'?'movement_over':'movement_under',false);
-  _nflCoachCapture(category,rows);
+  _nflCoachCapture(_nflCoachTrackedCategory(category),rows);
   return rows;
 }
 function askNflTdCoach(){
@@ -11877,7 +12307,7 @@ function askNflTdCoach(){
     seen[key]=1;return true;
   }).slice(0,10);
   _nflCoachRender(q,shown,props.length,'td_probability',false);
-  _nflCoachCapture('td_scorers',shown);
+  _nflCoachCapture(_nflCoachTrackedCategory('td_scorers'),shown);
   return shown;
 }
 async function askNflAltCoach(){
@@ -11965,7 +12395,7 @@ async function askNflAltCoach(){
     if(partial){
       if(captureStatus){captureStatus.textContent='Warning: '+(data.warning||'This alternate result is stale or partial.')+' Nothing was captured.';captureStatus.style.color='#fbbf24';}
     }else{
-      _nflCoachCapture('alt_line_edge',shown);
+      _nflCoachCapture(_nflCoachTrackedCategory('alt_line_edge'),shown);
     }
   }catch(e){
     var kind=e&&e.kind||'',msg=kind==='cancelled'
@@ -12061,6 +12491,7 @@ var _NFL_COACH_TRACK_LABELS={
   alt_line_edge:'Best Alt-Line Edge Plays',passing:'Passing',
   rushing:'Rushing',receiving:'Receiving',defense:'Best Defense Plays',
    kicking:'Best Kicker Plays',td_scorers:'TD Scorers',best_unders:'Best Unders',
+   rookie_plays:'Rookie Plays',
    coach_over_movement:'Biggest Over Line Movement',coach_under_movement:'Biggest Under Line Movement'
 };
 function _nflCoachTrackLabel(category){return _NFL_COACH_TRACK_LABELS[category]||String(category||'Coach').replace(/_/g,' ');}
@@ -12242,8 +12673,9 @@ function _renderNflTdPredictor(d){
   }
   var selectedGame=gameSelect?gameSelect.value:'';
   var source=((d&&d.all)||[]).filter(function(p){
+    var isNew=String(p.system||'').toUpperCase()==='NEW'||p.model_version==='NEW-v2-ewma-weather';
     return p.market==='player_anytime_td'&&p.pick==='OVER'
-      &&p.realOdds!=null&&Number(p.vsLineTotal||p.totB||0)>=5
+      &&p.realOdds!=null&&(isNew||Number(p.vsLineTotal||p.totB||0)>=5)
       &&p.coachEligible!==false&&p.availabilityVerified!==false;
   });
   var available=source.filter(function(p){
@@ -13010,7 +13442,8 @@ function renderNflGpRecord(){
         ?(g.pick_home?g.home_ml_book:g.away_ml_book)
         :(g.total_pick==='OVER'?g.total_over_book:g.total_under_book);
       return '<tr><td class="trk-date" data-label="Date" style="color:#94a3b8">'+_esc(g.record_date||'')+'</td>'
-        +'<td data-label="Matchup" style="color:#fff;font-weight:800">'+_esc(g.away_abbr)+' @ '+_esc(g.home_abbr)+'</td>'
+        +'<td data-label="Matchup" style="color:#fff;font-weight:800">'+_esc(g.away_abbr)+' @ '+_esc(g.home_abbr)
+        +(g.weather_applied?'<br><small style="color:#fde68a">'+_esc(g.weather_label||'Weather')+' · '+_esc(g.weather_summary||'weather adjustment saved')+'</small>':'')+'</td>'
         +'<td data-label="Pick" style="color:'+accent+';font-weight:900">'+_esc(pick)+'<br><small style="color:#94a3b8">'+_esc(book||'Book unavailable')+'</small></td>'
         +'<td data-label="Actual" style="color:#cbd5e1">'+actual+'</td>'
         +'<td data-label="Result">'+badge(g[key])+'</td></tr>';
