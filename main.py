@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfo
 import httpx
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
+from starlette.background import BackgroundTask
 from jose import jwt as jose_jwt
 
 # ── Config ─────────────────────────────────────────────────────────────────────
@@ -313,12 +314,12 @@ def _is_past_date(date_key) -> bool:
     except Exception:
         return False
 
-def _cache_get(date_key):
+def _cache_get(date_key, allow_stale=False):
     # v2 invalidates pre-blend Game Predictor results without invalidating the
     # separate raw-odds cache (so recalculation does not re-buy sportsbook data).
     p = _CACHE_DIR / f"nfl_v3_{date_key}.json"
     try:
-        if p.exists() and (_is_past_date(date_key)
+        if p.exists() and (allow_stale or _is_past_date(date_key)
                            or (time.time() - p.stat().st_mtime) < _CACHE_TTL):
             return json.loads(p.read_text(encoding="utf-8"))
     except: pass
@@ -326,18 +327,29 @@ def _cache_get(date_key):
 
 def _cache_set(date_key, result):
     try:
-        (_CACHE_DIR / f"nfl_v3_{date_key}.json").write_text(
-            json.dumps(result, ensure_ascii=False), encoding="utf-8")
-    except: pass
+        _nfl_write_board_cache(_CACHE_DIR / f"nfl_v3_{date_key}.json", result)
+    except Exception as exc:
+        print(f"[NFL cache] Could not save OLD board for {date_key}: {exc}")
+
+def _nfl_write_board_cache(path, result):
+    """Stream to a private file, then atomically replace the completed board."""
+    temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
+    try:
+        _nfl_json_ready(result)
+        with temporary.open("w", encoding="utf-8") as handle:
+            json.dump(result, handle, ensure_ascii=False, allow_nan=False)
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 # NEW is deliberately stored outside the legacy short-lived result cache.  The
 # raw sportsbook cache remains shared (it is an input, not a model result), but
 # a NEW board can never be served as an OLD board.
 _NEW_CACHE_PREFIX = "nfl_new_v1_"
-def _new_cache_get(date_key):
+def _new_cache_get(date_key, allow_stale=False):
     p = _CACHE_DIR / f"{_NEW_CACHE_PREFIX}{date_key}.json"
     try:
-        if p.exists() and (_is_past_date(date_key)
+        if p.exists() and (allow_stale or _is_past_date(date_key)
                            or (time.time() - p.stat().st_mtime) < _CACHE_TTL):
             value = json.loads(p.read_text(encoding="utf-8"))
             return value if isinstance(value, dict) else None
@@ -347,10 +359,10 @@ def _new_cache_get(date_key):
 
 def _new_cache_set(date_key, result):
     try:
-        (_CACHE_DIR / f"{_NEW_CACHE_PREFIX}{date_key}.json").write_text(
-            json.dumps(result, ensure_ascii=False), encoding="utf-8")
-    except Exception:
-        pass
+        _nfl_write_board_cache(
+            _CACHE_DIR / f"{_NEW_CACHE_PREFIX}{date_key}.json", result)
+    except Exception as exc:
+        print(f"[NFL cache] Could not save NEW board for {date_key}: {exc}")
 
 # Odds-layer cache: stores the raw Odds API prop lines per date so re-runs
 # (forced re-rank, runs after the result cache expires) reuse the odds already
@@ -543,6 +555,7 @@ def _schedule_alt_coach_warm(date_str: str) -> None:
 # ── nfl_data_py stats loader ───────────────────────────────────────────────────
 _nfl_df = None
 _nfl_df_lock = asyncio.Lock()
+_nfl_stats_load_task = None
 _NFL_PKL      = _CACHE_DIR / "nfl_df_cache_v7.pkl"  # v7: validated role-aware schema
 
 # nfl-verse team codes that differ from ESPN's (ESPN is what the schedule,
@@ -700,28 +713,34 @@ def _dl_csv(url):
     """Download one nfl-verse CSV (regular season + playoffs) as a DataFrame.
     Uses httpx with a hard 60-second total timeout so a stalled download
     fails fast instead of hanging forever."""
-    import pandas as pd, io
+    import pandas as pd
+    import tempfile
     last_err = None
     for attempt in range(3):   # retry — a single flaky download must not silently
         try:                   # drop a whole season of stats from every pick
-            r = httpx.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=60, follow_redirects=True)
-            r.raise_for_status()
-            break
+            # Keep bounded parallel downloads, but spool their bytes to disk
+            # rather than retaining response.content plus BytesIO copies.
+            with tempfile.TemporaryFile() as source:
+                with httpx.stream("GET", url, headers={"User-Agent": "Mozilla/5.0"},
+                                  timeout=60, follow_redirects=True) as r:
+                    r.raise_for_status()
+                    deadline = time.monotonic() + 60
+                    for chunk in r.iter_bytes(chunk_size=65536):
+                        if time.monotonic() > deadline:
+                            raise TimeoutError("NFL CSV download exceeded 60 seconds")
+                        source.write(chunk)
+                source.seek(0)
+                d = pd.read_csv(source, low_memory=False,
+                                usecols=lambda name: name in _NFL_SOURCE_COLS)
+            if "season_type" in d.columns:
+                d = d[d["season_type"].isin(["REG", "POST"])]
+            return _compact_nfl_stats_frame(d)
         except Exception as e:
             last_err = e
             print(f"[NFL Data] download attempt {attempt+1}/3 failed for {url}: {e}")
             time.sleep(2 * (attempt + 1))
     else:
         raise last_err
-    # Reading every column and trimming afterward creates the largest cold-start
-    # memory spike. Select at parse time so parallel downloads never coexist as
-    # several full-width nflverse DataFrames.
-    d = pd.read_csv(
-        io.BytesIO(r.content), low_memory=False,
-        usecols=lambda name: name in _NFL_SOURCE_COLS)
-    if "season_type" in d.columns:
-        d = d[d["season_type"].isin(["REG", "POST"])]
-    return d
 
 def _load_nfl_stats_sync():
     """Download offense + defense + kicking CSVs from nfl-verse GitHub.
@@ -735,7 +754,8 @@ def _load_nfl_stats_sync():
     try:
         if _NFL_PKL.exists() and (time.time() - _NFL_PKL.stat().st_mtime) < _NFL_PKL_TTL:
             import pickle
-            _nfl_df = pickle.loads(_NFL_PKL.read_bytes())
+            with _NFL_PKL.open("rb") as handle:
+                _nfl_df = pickle.load(handle)
             if not _nfl_cache_valid(_nfl_df):
                 print("[NFL Data] Disk cache schema invalid; rebuilding")
                 _NFL_PKL.unlink(missing_ok=True)
@@ -925,7 +945,10 @@ def _load_nfl_stats_sync():
             required_seasons = [y for y in NFL_SEASONS if y != _cur_season]
             if all(y in got_seasons for y in required_seasons):
                 import pickle
-                _NFL_PKL.write_bytes(pickle.dumps(_nfl_df))
+                temporary = _NFL_PKL.with_suffix(".tmp")
+                with temporary.open("wb") as handle:
+                    pickle.dump(_nfl_df, handle, protocol=pickle.HIGHEST_PROTOCOL)
+                temporary.replace(_NFL_PKL)
                 print(f"[NFL Data] Saved to disk cache ({_NFL_PKL})")
             else:
                 print(f"[NFL Data] NOT caching — missing completed seasons "
@@ -939,21 +962,26 @@ def _load_nfl_stats_sync():
     return _nfl_df
 
 async def get_nfl_stats():
+    global _nfl_stats_load_task
     # Fire H/A lookup in background — analysis falls back gracefully when not ready
     if not _HA_LOADED:
         asyncio.create_task(_build_ha_lookup())
     async with _nfl_df_lock:
-        if _nfl_df is not None:
+        if _nfl_df is not None and (
+                _nfl_stats_load_task is None or _nfl_stats_load_task.done()):
             return _nfl_df
-        try:
-            # Hard wall-clock deadline: even a pathological slow-drip download
-            # can't hold the job in "running" forever — after 150s we give up
-            # and the pipeline returns a clean error the user can retry.
-            return await asyncio.wait_for(
-                asyncio.to_thread(_load_nfl_stats_sync), timeout=150)
-        except asyncio.TimeoutError:
-            print("[NFL Data] Stats load exceeded 150s deadline — giving up this run")
-            return None
+        if _nfl_stats_load_task is None or _nfl_stats_load_task.done():
+            _nfl_stats_load_task = asyncio.create_task(
+                asyncio.to_thread(_load_nfl_stats_sync))
+        task = _nfl_stats_load_task
+    try:
+        # The caller times out, but the shared worker remains the only loader.
+        return await asyncio.wait_for(asyncio.shield(task), timeout=150)
+    except asyncio.TimeoutError:
+        # Cancellation cannot stop a running thread. Share that same loader
+        # with the next caller instead of starting a second full pandas build.
+        print("[NFL Data] Stats load still running; no duplicate loader started")
+        return None
 
 @app.on_event("startup")
 async def _startup_preload():
@@ -2600,8 +2628,7 @@ def _nfl_role_profile(df, team, pos, name, stat_col=""):
         cols=[c for c in ["player_display_name","recent_team","position","targets","receptions",
                           "receiving_yards","carries","rushing_yards","season","week"] if c in df.columns]
         if "offense_pct" in df.columns: cols.append("offense_pct")
-        d=df[cols].copy()
-        d=d[d.recent_team.astype(str).str.upper()==str(team).upper()]
+        d=df.loc[df.recent_team.astype(str).str.upper()==str(team).upper(), cols].copy()
         if "position" in d:
             pp=d.position.fillna("").astype(str).str.upper()
             typed=d[pp.isin([pos,"FB" if pos=="RB" else pos])]
@@ -3149,16 +3176,8 @@ def _new_weighted_mean(values, decay=0.16):
 
 
 def _new_sanitize_json(value):
-    """Remove non-finite numeric values from NEW payloads before JSON output."""
-    if hasattr(value, "item") and not isinstance(value, (dict, list, tuple)):
-        return _new_sanitize_json(value.item())
-    if isinstance(value, dict):
-        return {key: _new_sanitize_json(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_new_sanitize_json(item) for item in value]
-    if isinstance(value, float) and not math.isfinite(value):
-        return None
-    return value
+    """Normalize NEW payloads without allocating a second complete board."""
+    return _nfl_json_ready(value)
 
 
 def _nfl_json_ready(value):
@@ -3692,7 +3711,7 @@ def _nfl_prop_analysis_frame(df, target_season=None, target_week=None,
 
 # Response-only compatibility layer for boards written before the venue split.
 # This never writes a cache or tracking ledger and is intentionally keyed by the
-# requested board identity so an old board is enriched at most once per process.
+# requested board identity. Do not retain complete enriched boards in RAM.
 _NFL_ENRICHED_RESULTS = {}
 
 def _nfl_enrich_cached_result(result, df=None, target_season=None,
@@ -3702,7 +3721,8 @@ def _nfl_enrich_cached_result(result, df=None, target_season=None,
         return result
     if result.get("_nflVenueEnrichedV3"):
         return result
-    out = copy.deepcopy(result)
+    # Callers own freshly decoded disk/Supabase payloads, not shared objects.
+    out = result
     frame = (_nfl_prop_analysis_frame(df, target_season, target_week, target_type)
              if df is not None and target_season is not None else None)
     seen = set()
@@ -3818,17 +3838,6 @@ async def _nfl_enrich_cached_response(result, date_str, system="OLD"):
     """Enrich an old saved board without calling ESPN."""
     if not isinstance(result, dict) or result.get("_nflVenueEnrichedV3"):
         return result
-    board_stamps = [
-        str(result.get("saved_board_captured_at") or ""),
-        str(result.get("snapshot_captured_at") or ""),
-        str(len(result.get("all") or result.get("picks") or [])),
-    ]
-    for pick in (result.get("all") or result.get("picks") or [])[:8]:
-        board_stamps.append(str(pick.get("saved_board_captured_at")
-                                or pick.get("snapshot_captured_at") or ""))
-    key = (str(system).upper(), str(date_str), "|".join(board_stamps))
-    if key in _NFL_ENRICHED_RESULTS:
-        return copy.deepcopy(_NFL_ENRICHED_RESULTS[key])
     try:
         await _build_ha_lookup()
         df = await get_nfl_stats()
@@ -3852,7 +3861,6 @@ async def _nfl_enrich_cached_response(result, date_str, system="OLD"):
     except Exception as exc:
         print(f"[NFL cache enrichment] failed closed: {exc}")
         enriched = _nfl_enrich_cached_result(result, system=system)
-    _NFL_ENRICHED_RESULTS[key] = copy.deepcopy(enriched)
     return enriched
 def _nfl_gp_ha_value(season, season_type, week, team):
     """Resolve nflverse team/week identity against the shared ESPN map."""
@@ -4552,9 +4560,32 @@ async def _build_nfl_game_predictions(espn_games: list, df, date_str: str,
     return predictions, fetched
 
 # ── Pipeline ───────────────────────────────────────────────────────────────────
+_NFL_PIPELINE_MEMORY_LOCK = asyncio.Lock()
+
+def _nfl_release_analysis_memory():
+    # A cancelled asyncio worker can still be finishing its current player.
+    # Wait for it (or a Coach analysis) before touching shared derived caches.
+    with _NFL_ANALYSIS_LOCK:
+        _nfl_clear_slate_caches()
+
 async def run_pipeline(date_str: str, progress=None, simulate: bool = False,
                        force_refresh: bool = False,
                        capture_official: bool = True, system: str = "OLD") -> Dict:
+    """Serialize full analyses across OLD/NEW, cron, and replay callers."""
+    if _NFL_PIPELINE_MEMORY_LOCK.locked() and progress:
+        progress("Waiting for the active NFL analysis to release memory…")
+    async with _NFL_PIPELINE_MEMORY_LOCK:
+        try:
+            return await _run_pipeline_unlocked(
+                date_str, progress=progress, simulate=simulate,
+                force_refresh=force_refresh,
+                capture_official=capture_official, system=system)
+        finally:
+            await asyncio.to_thread(_nfl_release_analysis_memory)
+
+async def _run_pipeline_unlocked(date_str: str, progress=None, simulate: bool = False,
+                                 force_refresh: bool = False,
+                                 capture_official: bool = True, system: str = "OLD") -> Dict:
     system = "NEW" if str(system or "OLD").upper() == "NEW" else "OLD"
     opening_captured_early = False
     def _p(msg):
@@ -5243,6 +5274,14 @@ def _nfl_alt_result_eligible(result):
     return False
 
 async def _build_alt_coach(date_str: str, system: str = "OLD") -> dict:
+    # Alternate warmups must not allocate a second analysis alongside NEW.
+    async with _NFL_PIPELINE_MEMORY_LOCK:
+        try:
+            return await _build_alt_coach_unlocked(date_str, system)
+        finally:
+            await asyncio.to_thread(_nfl_release_analysis_memory)
+
+async def _build_alt_coach_unlocked(date_str: str, system: str = "OLD") -> dict:
     system = "NEW" if str(system).upper() == "NEW" else "OLD"
     started = time.monotonic()
     overall_deadline = started + _NFL_ALT_OVERALL_TIMEOUT
@@ -6106,6 +6145,44 @@ async def api_historical_season_poll(request: Request, job_id: str,
         payload.pop("system", None)
     return payload
 
+def _nfl_read_saved_board(date_str, system):
+    """Read a completed board, not a freshness check for a new analysis."""
+    getter = _new_cache_get if system == "NEW" else _cache_get
+    saved = getter(date_str, allow_stale=True) or _nfl_load_board_snapshots(date_str, system)
+    if isinstance(saved, dict):
+        saved["system"] = system
+        saved["saved_board"] = True
+        if system == "NEW":
+            saved.setdefault("model_version", "NEW-v1-ewma-blend")
+    return saved
+
+def _nfl_saved_response_file(date_str, scope, system):
+    """Load one day at a time and stream JSON without FastAPI's deep copy."""
+    if scope == "week":
+        def days():
+            for ds in _nfl_week_dates(date_str):
+                yield _nfl_read_saved_board(ds, system) or {
+                    "date": ds, "picks": [], "all": [], "games": [],
+                    "game_predictions": [], "td_picks": [],
+                    "error": "No saved board for this date.",
+                }
+        result = _nfl_merge_week_results(date_str, days(), consume=True)
+        if not (result.get("all") or result.get("picks") or result.get("games")):
+            raise HTTPException(status_code=404, detail="No saved picks for this NFL week.")
+    else:
+        result = _nfl_read_saved_board(date_str, system)
+        if not result:
+            raise HTTPException(status_code=404, detail="No saved picks for this date.")
+    result["system"] = system
+    result["saved_board"] = True
+    if system == "NEW":
+        result.setdefault("model_version", "NEW-v1-ewma-blend")
+    path = _CACHE_DIR / ("nfl_saved_response_" + uuid.uuid4().hex + ".json")
+    _nfl_write_board_cache(path, result)
+    return path
+
+_NFL_SAVED_RESPONSE_LOCK = asyncio.Lock()
+
 @app.get("/api/cached")
 async def api_cached(request: Request, target_date: str = "", token: str = "",
                      scope: str = "day", system: str = "OLD"):
@@ -6115,45 +6192,33 @@ async def api_cached(request: Request, target_date: str = "", token: str = "",
     if not _verify_hub_token(tok):
         raise HTTPException(status_code=401, detail="Subscription required — please log in via moneypicksarena.com")
     date_str = target_date or _nfl_today()
-    if str(scope).lower() == "week":
-        daily = []
-        for ds in _nfl_week_dates(date_str):
-            cached_day = (
-                (_new_cache_get(ds) if str(system).upper() == "NEW" else _cache_get(ds))
-                or _nfl_load_board_snapshots(ds, system))
-            if str(system).upper() == "NEW" and isinstance(cached_day, dict):
-                cached_day.setdefault("system", "NEW")
-                cached_day.setdefault("model_version", "NEW-v1-ewma-blend")
-                cached_day = _new_sanitize_json(cached_day)
-            if cached_day:
-                cached_day = await _nfl_enrich_cached_response(
-                    cached_day, ds, system)
-            if cached_day:
-                _nfl_attach_line_movement(ds, cached_day)
-            daily.append(cached_day or {
-                "date": ds, "picks": [], "all": [], "games": [],
-                "game_predictions": [], "td_picks": [],
-                "error": "No saved board for this date.",
-            })
-        result = _nfl_merge_week_results(date_str, daily)
-        if str(system).upper() == "NEW":
-            result["system"] = "NEW"
-            result["model_version"] = "NEW-v1-ewma-blend"
-        if result.get("all") or result.get("games"):
-            return result
-        raise HTTPException(status_code=404, detail="No saved picks for this NFL week.")
-    cached = (
-        (_new_cache_get(date_str) if str(system).upper() == "NEW" else _cache_get(date_str))
-        or _nfl_load_board_snapshots(date_str, system))
-    if cached:
-        cached = await _nfl_enrich_cached_response(cached, date_str, system)
-        _nfl_attach_line_movement(date_str, cached)
-        if str(system).upper() == "NEW":
-            cached.setdefault("system", "NEW")
-            cached.setdefault("model_version", "NEW-v1-ewma-blend")
-            cached = _new_sanitize_json(cached)
-        return cached
-    raise HTTPException(status_code=404, detail="No saved picks for this date.")
+    try:
+        date_str = datetime.strptime(date_str, "%Y-%m-%d").date().isoformat()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid NFL date.")
+    scope = str(scope).lower()
+    if scope not in ("day", "week"):
+        raise HTTPException(status_code=400, detail="Run scope must be day or week")
+    system = "NEW" if str(system).upper() == "NEW" else "OLD"
+    # No stats download, model enrichment, fresh odds, or new tracking writes.
+    # Synchronous disk/Supabase work must not block the ASGI event loop.
+    async with _NFL_SAVED_RESPONSE_LOCK:
+        response_task = asyncio.create_task(asyncio.to_thread(
+            _nfl_saved_response_file, date_str, scope, system))
+        try:
+            path = await asyncio.shield(response_task)
+        except asyncio.CancelledError:
+            # The worker still owns memory/the temporary file after a client
+            # disconnect. Wait for it before admitting another response build.
+            try:
+                path = await response_task
+                path.unlink(missing_ok=True)
+            finally:
+                raise
+    return FileResponse(
+        path, media_type="application/json",
+        headers={"Cache-Control": "no-store"},
+        background=BackgroundTask(path.unlink, missing_ok=True))
 
 @app.get("/api/picks")
 async def api_picks(request: Request, target_date: str = "", token: str = "",
@@ -10181,7 +10246,11 @@ async function getPicks(){
        :'/api/cached?target_date='+encodeURIComponent(date)+'&scope='+encodeURIComponent(scope)+'&system='+encodeURIComponent(requestedSystem)+'&token='+encodeURIComponent(_nflTok);
     var r=await fetch(url,{signal:requestController.signal,cache:'no-store'});
     if(requestSeq!==_nflPicksSeq||!_nflRequestCurrent(requestGeneration,requestedSystem))return;
-    if(r.status===404){ status.textContent=''; alert("Today's picks aren't ready yet -- check back a little later."); return; }
+    if(r.status===404){
+      var missing=await r.json().catch(function(){return{};});
+      status.textContent=missing.detail||('No saved '+requestedSystem+' picks for '+date+'.');
+      return;
+    }
     if(!r.ok){
       var er=await r.json().catch(function(){return{};});
       throw new Error(er.detail||('Server error '+r.status));
@@ -10205,7 +10274,7 @@ async function getPicks(){
     }
     status.textContent=isHistorical
       ?'HISTORICAL REPLAY — picks and results reconstructed for '+date+'; not added to the official record'
-      :'';
+       :(d.saved_board?'Loaded saved '+requestedSystem+' picks for '+date+' — saved prices, not a fresh odds update.':'');
   }catch(e){
     if(requestSeq!==_nflPicksSeq||!_nflRequestCurrent(requestGeneration,requestedSystem))return;
     status.textContent='Error: '+e.message;
