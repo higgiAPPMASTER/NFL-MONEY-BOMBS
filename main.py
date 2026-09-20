@@ -579,6 +579,41 @@ _HA_LOCK   = asyncio.Lock()
 
 _HA_CACHE_FILE = _CACHE_DIR / "nfl_ha_lookup_v5_nflverse.json"
 
+def _nfl_ha_cache_valid(lookup, cache_path=None) -> bool:
+    """Validate useful schedule coverage without requiring an unpublished season."""
+    try:
+        if not isinstance(lookup, dict) or not lookup:
+            return False
+        seasons, teams_by_season = set(), {}
+        for key, venue in lookup.items():
+            if (not isinstance(key, tuple) or len(key) != 4
+                    or venue not in {"HOME", "AWAY"}):
+                return False
+            season, season_type, week, team = key
+            season, week = int(season), int(week)
+            if (season < min(NFL_SEASONS) or season > _cur_season
+                    or str(season_type) not in {"REG", "POST"}
+                    or week < 1 or not str(team).strip()):
+                return False
+            seasons.add(season)
+            teams_by_season.setdefault(season, set()).add(str(team))
+        # A current-season schedule is optional before publication.  The latest
+        # completed season must still have broad league coverage so a truncated
+        # or stale partial write cannot silently become authoritative.
+        latest_required = _cur_season - 1
+        if latest_required not in seasons or len(
+                teams_by_season.get(latest_required, set())) < 20:
+            return False
+        # Refresh on age even when the optional current schedule was not yet
+        # published; otherwise a historical-only cache could live forever and
+        # never discover the newly released season.
+        if (cache_path is not None
+                and time.time() - cache_path.stat().st_mtime > 7 * 86400):
+            return False
+        return True
+    except Exception:
+        return False
+
 async def _build_ha_lookup():
     """Build HOME/AWAY lookup from the single cached nflverse schedule file."""
     global _HA_LOOKUP, _HA_LOADED
@@ -589,13 +624,23 @@ async def _build_ha_lookup():
         try:
             if _HA_CACHE_FILE.exists():
                 raw = json.loads(_HA_CACHE_FILE.read_text(encoding="utf-8"))
-                _HA_LOOKUP = {tuple(int(x) if x.isdigit() else x for x in k.split("|")): v
-                              for k, v in raw.items()}
-                if _HA_LOOKUP:
+                disk_lookup = {
+                    tuple(int(x) if x.isdigit() else x for x in k.split("|")): v
+                    for k, v in raw.items()
+                }
+                if _nfl_ha_cache_valid(disk_lookup, _HA_CACHE_FILE):
+                    _HA_LOOKUP = disk_lookup
                     _HA_LOADED = True
                     print(f"[H/A] Loaded from disk cache: {len(_HA_LOOKUP)} entries")
                     return
-                print("[H/A] Ignoring empty disk cache")
+                if _nfl_ha_cache_valid(disk_lookup):
+                    # Keep a structurally complete stale map as a fallback while
+                    # refreshing. A transient schedule outage must not erase
+                    # authoritative historical venue coverage.
+                    _HA_LOOKUP = disk_lookup
+                    print(f"[H/A] Refreshing aged disk cache: {len(_HA_LOOKUP)} entries")
+                else:
+                    print("[H/A] Ignoring partial or invalid disk cache")
         except Exception as e:
             print(f"[H/A] Disk cache load failed: {e}")
 
@@ -2268,7 +2313,7 @@ def _first_str(series):
 _OPP_ADJ_COLS = {
     "passing_yards": "pass D", "passing_tds": "pass D", "completions": "pass D",
     "attempts": "pass D", "interceptions": "INT D",
-    "rushing_yards": "rush D", "carries": "rush D",
+    "rushing_yards": "rush D", "rush_rec_yards": "RB total D", "carries": "rush D",
     "receiving_yards": "pass D", "receptions": "pass D",
     "anytime_td": "TD D",
 }
@@ -2617,11 +2662,104 @@ def _nfl_restrained_def_factor(raw_factor: float) -> float:
 # future weeks and no auxiliary feed can blank the board.
 _ROLE_CACHE = {}
 _POSDEF_CACHE = {}
+_POSDEF_PANEL_CACHE = {"df_ref": None, "panels": {}}
+
+_NFL_POSDEF_OFFENSIVE_STATS = {
+    "passing_yards", "passing_tds", "completions", "attempts",
+    "interceptions", "rushing_yards", "carries", "receiving_yards",
+    "receptions", "rush_rec_yards", "anytime_td",
+}
+_NFL_POSDEF_FRAME_LOCAL = _bt_th.local()
+
+def _nfl_posdef_panel(df, pos, stat):
+    """Return a compact zero-complete position/stat/venue game panel."""
+    global _POSDEF_PANEL_CACHE
+    import pandas as pd
+    pos = _nfl_position_group(pos)
+    cache = _POSDEF_PANEL_CACHE
+    if cache.get("df_ref") is not df:
+        cache = {"df_ref": df, "panels": {}}
+        _POSDEF_PANEL_CACHE = cache
+    key = (pos, stat)
+    if key in cache["panels"]:
+        return cache["panels"][key]
+    panel = pd.DataFrame()
+    try:
+        required = {
+            "recent_team", "opponent_team", "position", "season", "week", stat,
+        }
+        if _HA_LOADED and required.issubset(df.columns):
+            cols = ["recent_team", "opponent_team", "position", "season",
+                    "week", stat]
+            if "season_type" in df.columns:
+                cols.append("season_type")
+            compact = df.loc[:, cols]
+            if "season_type" in compact.columns:
+                season_type = compact["season_type"].fillna("REG").astype(
+                    str).str.upper()
+            else:
+                season_type = pd.Series("REG", index=compact.index)
+            season_type = season_type.where(
+                season_type.isin(["REG", "POST"]), "REG")
+            normalized = pd.DataFrame({
+                "season": pd.to_numeric(compact["season"], errors="coerce"),
+                "season_type": season_type,
+                "week": pd.to_numeric(compact["week"], errors="coerce"),
+                "offense": compact["recent_team"].fillna("").astype(
+                    str).str.upper(),
+                "defense": compact["opponent_team"].fillna("").astype(
+                    str).str.upper(),
+                "value": pd.to_numeric(compact[stat], errors="coerce"),
+                "position": compact["position"].fillna("").astype(
+                    str).str.upper().replace({"HB": "RB", "FB": "RB"}),
+            })
+            normalized = normalized[
+                normalized["season"].notna() & normalized["week"].notna()
+                & normalized["offense"].ne("") & normalized["defense"].ne("")
+            ].copy()
+            normalized["season"] = normalized["season"].astype(int)
+            normalized["week"] = normalized["week"].astype(int)
+            game_keys = [
+                "defense", "offense", "season", "season_type", "week",
+            ]
+            # Coverage is established before position filtering. Wholly missing
+            # stat games are excluded; genuine games with no matching position
+            # contribution are retained and left-filled with an authentic zero.
+            coverage = normalized.assign(
+                covered=normalized["value"].notna()).groupby(
+                    game_keys, as_index=False, sort=False)["covered"].any()
+            coverage = coverage[coverage["covered"]].drop(columns="covered")
+            contributions = normalized[
+                normalized["position"].eq(pos) & normalized["value"].notna()
+            ].groupby(game_keys, as_index=False, sort=False)["value"].sum()
+            panel = coverage.merge(contributions, how="left", on=game_keys)
+            panel["value"] = panel["value"].fillna(0.0)
+            # Only compact unique team/game metadata touches the schedule map;
+            # no per-prop full-frame copy or player-row DataFrame.apply.
+            offense_sides = []
+            for season, stype, week, offense in panel[
+                    ["season", "season_type", "week", "offense"]].itertuples(
+                        index=False, name=None):
+                offense_sides.append(_HA_LOOKUP.get((
+                    int(season), stype, _espn_ha_week(stype, week), offense)))
+            panel["defenseVenue"] = pd.Series(
+                offense_sides, index=panel.index).map(
+                    {"HOME": "AWAY", "AWAY": "HOME"})
+            panel = panel[
+                panel["defenseVenue"].isin(["HOME", "AWAY"])
+            ][game_keys + ["defenseVenue", "value"]]
+    except Exception as exc:
+        print(f"[PosDef panel] {pos}/{stat} failed: {exc}")
+        panel = pd.DataFrame()
+    if len(cache["panels"]) >= 32:
+        cache["panels"].pop(next(iter(cache["panels"])))
+    cache["panels"][key] = panel
+    return panel
 def _nfl_role_position(pl, stat_col):
     p = str(pl.get("roster_position") or pl.get("position") or "").upper()
     if p in {"QB","RB","FB","WR","TE"}: return "RB" if p == "FB" else p
     return ("QB" if stat_col in {"passing_yards","passing_tds","completions","attempts","interceptions"}
-            else "RB" if stat_col in {"rushing_yards","carries"} else "WR")
+            else "RB" if stat_col in {"rushing_yards","rush_rec_yards","carries"} else "WR")
 def _nfl_role_profile(df, team, pos, name, stat_col=""):
     key=(id(df),str(team),pos)
     if key not in _ROLE_CACHE:
@@ -2695,33 +2833,48 @@ def _nfl_posdef_profile(df, defense, pos, stat, defense_venue=None):
     authoritative ESPN venue are deliberately excluded rather than guessed.
     """
     defense_venue = str(defense_venue or "").upper() or None
-    key=(id(df),str(defense),pos,stat,defense_venue)
+    # Alternate Coach intentionally keeps its full history frame for unrelated
+    # player evidence. Its worker supplies a thread-local two-season pregame
+    # defense frame so only this profile is scoped, once per alternate slate.
+    defense_df = getattr(_NFL_POSDEF_FRAME_LOCAL, "frame", None)
+    if defense_df is None:
+        defense_df = df
+    pos = _nfl_position_group(pos)
+    key=(id(defense_df),str(defense),pos,stat,defense_venue)
     if key in _POSDEF_CACHE:return _POSDEF_CACHE[key]
     out={"factor":1.0,"rank":None,"allowed":None,"sample":0,
          "defenseVenue":defense_venue,
          "defHomeAllowed":None,"defHomeSample":0,
          "defAwayAllowed":None,"defAwaySample":0,
-         "label":f"{pos} {stat.replace('_',' ')} D","confidence":.15}
+         "label":f"vs {pos} · {stat.replace('_',' ')} allowed/game",
+         "confidence":.15, "defSchemaVersion":2,
+         "defPositionGroup":pos, "defStat":stat,
+         "defMetric":"team positional total per completed game",
+         "defSourceSeasons":[], "defSourceWindow":"",
+         "defUnavailable":None}
     try:
-        need={"opponent_team","position",stat,"season","week"}
-        if not need.issubset(df.columns): _POSDEF_CACHE[key]=out; return out
-        d=df[df.opponent_team.astype(str).str.upper()==str(defense).upper()]
-        pp=d.position.fillna("").astype(str).str.upper()
-        d=d[pp.isin([pos,"FB" if pos=="RB" else pos])].dropna(subset=[stat])
-        if d.empty: _POSDEF_CACHE[key]=out; return out
-        # Add defense venue from the authoritative ESPN lookup.  Missing venue
-        # entries are not inferred from team order or the current schedule.
-        if not _HA_LOADED:
+        if stat not in _NFL_POSDEF_OFFENSIVE_STATS:
+            out["defUnavailable"] = (
+                "Neutral: no sensible opponent offensive-position allowance "
+                "for this defensive/kicking player market")
             _POSDEF_CACHE[key]=out; return out
-        d=d.copy()
-        d["_off_venue"]=d.apply(_nfl_history_venue,axis=1)
-        d["_def_venue"]=d["_off_venue"].map(
-            {"HOME":"AWAY","AWAY":"HOME"}).fillna("")
-        eligible=df[df.position.fillna("").astype(str).str.upper().eq(pos)]
-        max_season=int(df.attrs.get("nfl_target_season", df["season"].max()))
+        panel = _nfl_posdef_panel(defense_df, pos, stat)
+        if panel is None or panel.empty:
+            out["defUnavailable"] = (
+                "Exact position/stat venue allowance unavailable")
+            _POSDEF_CACHE[key]=out; return out
+        d=panel[panel["defense"].astype(str).str.upper().eq(
+            str(defense).upper())]
+        source_seasons=sorted(int(x) for x in panel["season"].unique())
+        out["defSourceSeasons"]=source_seasons
+        out["defSourceWindow"]=(
+            f"{source_seasons[0]}–{source_seasons[-1]} point-in-time"
+            if source_seasons else "point-in-time")
         def _venue_games(frame, venue):
-            rows=frame[frame["_def_venue"].eq(venue)]
-            return rows.groupby(["season","week"])[stat].sum().sort_index(ascending=False)
+            rows=frame[frame["defenseVenue"].eq(venue)]
+            return rows.set_index(
+                ["season","season_type","week","offense"])["value"].sort_index(
+                    ascending=False)
         def _summary(venue):
             games=_venue_games(d,venue)
             if len(games):
@@ -2740,11 +2893,8 @@ def _nfl_posdef_profile(df, defense, pos, stat, defense_venue=None):
             _POSDEF_CACHE[key]=out; return out
         # League baseline is venue-specific and uses the same point-in-time
         # season/week frame. Never substitute the combined defense sample.
-        e=eligible.copy()
-        e["_off_venue"]=e.apply(_nfl_history_venue,axis=1)
-        e["_def_venue"]=e["_off_venue"].map({"HOME":"AWAY","AWAY":"HOME"}).fillna("")
-        league_games=e[e["_def_venue"].eq(defense_venue)].groupby(
-            ["opponent_team","season","week"])[stat].sum()
+        e=panel
+        league_games=e[e["defenseVenue"].eq(defense_venue)]["value"]
         # Compare the defense with the same two-season, point-in-time,
         # venue-specific sample used by its displayed allowed/game figure.
         baseline=(float(league_games.mean()) if len(league_games)
@@ -2752,8 +2902,8 @@ def _nfl_posdef_profile(df, defense, pos, stat, defense_venue=None):
         allowed=float(selected_allowed) if selected_allowed is not None else float(games.mean())
         factor=max(.9,min(1.1,allowed/baseline if baseline else 1))
         vals={}
-        for tm,g in e.groupby("opponent_team"):
-            gg=g[g["_def_venue"].eq(defense_venue)].groupby(["season","week"])[stat].sum()
+        for tm,g in e.groupby("defense"):
+            gg=g[g["defenseVenue"].eq(defense_venue)]["value"]
             if len(gg)>=2: vals[str(tm)]=float(gg.mean())
         raw_factor = max(.90, min(1.10, float(factor)))
         out={"factor":_nfl_restrained_def_factor(raw_factor),
@@ -2763,8 +2913,14 @@ def _nfl_posdef_profile(df, defense, pos, stat, defense_venue=None):
              "defenseVenue":defense_venue,
              "defHomeAllowed":home_allowed,"defHomeSample":home_sample,
              "defAwayAllowed":away_allowed,"defAwaySample":away_sample,
-             "label":f"{pos} {stat.replace('_',' ')} D",
-             "confidence":round(min(.95,.25+len(games)*.035),2)}
+              "label":f"vs {pos} · {stat.replace('_',' ')} allowed/game",
+              "confidence":round(min(.95,.25+len(games)*.035),2),
+              "defSchemaVersion":2,
+              "defPositionGroup":pos,"defStat":stat,
+              "defMetric":"team positional total per completed game",
+              "defSourceSeasons":source_seasons,
+              "defSourceWindow":out["defSourceWindow"],
+              "defUnavailable":None}
     except Exception as exc: print(f"[PosDef] {pos}/{stat} failed: {exc}")
     _POSDEF_CACHE[key]=out; return out
 
@@ -2810,9 +2966,10 @@ def _nfl_clear_slate_caches():
     compact DataFrames derived from a replay slate and otherwise accumulate
     across the seven sequential dates of a full-week run.
     """
-    global _NFL_PLAYER_LOOKUP, _NFL_OPP_PLAYER_LOOKUP
+    global _NFL_PLAYER_LOOKUP, _NFL_OPP_PLAYER_LOOKUP, _POSDEF_PANEL_CACHE
     _ROLE_CACHE.clear()
     _POSDEF_CACHE.clear()
+    _POSDEF_PANEL_CACHE = {"df_ref": None, "panels": {}}
     _NFL_PLAYER_LOOKUP = {
         "df_ref": None, "groups": {}, "matches": {}
     }
@@ -3126,6 +3283,13 @@ def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str,
         "defConfidence": posdef.get("confidence", .15),
         "defRawFactor": posdef.get("rawFactor"),
         "defFactor": def_factor,
+        "defSchemaVersion": posdef.get("defSchemaVersion", 2),
+        "defPositionGroup": posdef.get("defPositionGroup", effective_position),
+        "defStat": posdef.get("defStat", stat_col),
+        "defMetric": posdef.get("defMetric"),
+        "defSourceSeasons": posdef.get("defSourceSeasons") or [],
+        "defSourceWindow": posdef.get("defSourceWindow") or "",
+        "defUnavailable": posdef.get("defUnavailable"),
         "combinedFactor": combined_factor, "baseProjection": ref_avg,
         "baseProbability": base_score, "adjustedProjection": adj_avg,
         "adjustedProbability": score,
@@ -3576,6 +3740,7 @@ def _analyze_new_prop_raw(pl: Dict, df, home_abbr: str, away_abbr: str,
         "role": role.get("role"), "roleRank": role.get("roleRank"),
         "teamOptionRank": role.get("option_rank"), "roleConfidence": role.get("confidence"),
         "roleFactor": role_factor, "roleReason": role.get("reason"),
+        "positionGroup": position,
         "defAllowed": posdef.get("allowed"), "defSample": posdef.get("sample",0),
         "defenseVenue": posdef.get("defenseVenue"),
         "defHomeAllowed": posdef.get("defHomeAllowed"),
@@ -3584,6 +3749,13 @@ def _analyze_new_prop_raw(pl: Dict, df, home_abbr: str, away_abbr: str,
         "defAwaySample": posdef.get("defAwaySample",0),
         "defConfidence": posdef.get("confidence",.15),
         "defRawFactor": posdef.get("rawFactor"), "defFactor": def_factor,
+        "defSchemaVersion": posdef.get("defSchemaVersion", 2),
+        "defPositionGroup": posdef.get("defPositionGroup", position),
+        "defStat": posdef.get("defStat", stat_col),
+        "defMetric": posdef.get("defMetric"),
+        "defSourceSeasons": posdef.get("defSourceSeasons") or [],
+        "defSourceWindow": posdef.get("defSourceWindow") or "",
+        "defUnavailable": posdef.get("defUnavailable"),
         "combinedFactor": combined_factor, "baseProjection": evidence,
         "baseProbability": side_rate, "adjustedProjection": projection,
         "adjustedProbability": score,
@@ -3719,7 +3891,7 @@ def _nfl_enrich_cached_result(result, df=None, target_season=None,
                               system="OLD"):
     if not isinstance(result, dict):
         return result
-    if result.get("_nflVenueEnrichedV3"):
+    if result.get("_nflVenueEnrichedV4"):
         return result
     # Callers own freshly decoded disk/Supabase payloads, not shared objects.
     out = result
@@ -3770,6 +3942,14 @@ def _nfl_enrich_cached_result(result, df=None, target_season=None,
                     "defFactor": 1.0, "defRawFactor": 1.0,
                     "defConfidence": .15,
                     "defUnavailable": "Venue defense split unavailable",
+                    "defSchemaVersion": 2,
+                    "defPositionGroup": _nfl_position_group(
+                        pick.get("positionGroup") or pick.get("position")
+                        or pick.get("roster_position") or ""),
+                    "defStat": stat,
+                    "defMetric": "team positional total per completed game",
+                    "defSourceSeasons": [],
+                    "defSourceWindow": "",
                 })
                 continue
             pos = _nfl_position_group(
@@ -3789,6 +3969,13 @@ def _nfl_enrich_cached_result(result, df=None, target_season=None,
                 "defRank": profile.get("rank"),
                 "defConfidence": profile.get("confidence", .15),
                 "defAdj": round((profile.get("factor", 1.0) - 1) * 100, 1),
+                "defSchemaVersion": profile.get("defSchemaVersion", 2),
+                "defPositionGroup": profile.get("defPositionGroup", pos),
+                "defStat": profile.get("defStat", stat),
+                "defMetric": profile.get("defMetric"),
+                "defSourceSeasons": profile.get("defSourceSeasons") or [],
+                "defSourceWindow": profile.get("defSourceWindow") or "",
+                "defUnavailable": profile.get("defUnavailable"),
             })
             # A saved base probability is sufficient to restore the exact
             # side-aware venue nudge without reconstructing player history.
@@ -3831,12 +4018,14 @@ def _nfl_enrich_cached_result(result, df=None, target_season=None,
                     pass
     out.pop("_nflVenueEnrichedV1", None)
     out.pop("_nflVenueEnrichedV2", None)
-    out["_nflVenueEnrichedV3"] = True
+    out.pop("_nflVenueEnrichedV3", None)
+    out["_nflVenueEnrichedV4"] = True
+    out["defense_schema_version"] = 2
     return _nfl_json_ready(out)
 
 async def _nfl_enrich_cached_response(result, date_str, system="OLD"):
     """Enrich an old saved board without calling ESPN."""
-    if not isinstance(result, dict) or result.get("_nflVenueEnrichedV3"):
+    if not isinstance(result, dict) or result.get("_nflVenueEnrichedV4"):
         return result
     try:
         await _build_ha_lookup()
@@ -5060,6 +5249,7 @@ async def _run_pipeline_unlocked(date_str: str, progress=None, simulate: bool = 
         if p.get("odds_warning")
     ]
     result  = {"picks":picks, "all":all_results, "td_picks":td_picks, "date":date_str,
+               "defense_schema_version": 2,
                "games":games_out, "qualified":len(picks),
                "prop_coverage_complete": prop_coverage_complete,
                "skipped_matchups": skipped_matchups,
@@ -5391,6 +5581,10 @@ async def _build_alt_coach_unlocked(date_str: str, system: str = "OLD") -> dict:
         raise RuntimeError(f"NFL stats are unavailable: {exc}") from exc
     if df is None:
         raise RuntimeError("NFL stats are unavailable.")
+    alt_target = games[0] if games else {}
+    defense_df = await asyncio.to_thread(
+        _nfl_prop_analysis_frame, df, alt_target.get("season"),
+        alt_target.get("week"), alt_target.get("season_type", "REG"))
 
     def _analyze_alt_lines():
         analyzed_picks, timed_out = [], False
@@ -5398,15 +5592,22 @@ async def _build_alt_coach_unlocked(date_str: str, system: str = "OLD") -> dict:
             time.monotonic() + _NFL_ALT_ANALYSIS_STAGE_TIMEOUT,
             overall_deadline)
         with _NFL_ANALYSIS_LOCK:
-            for line in lines:
-                if time.monotonic() >= deadline:
-                    timed_out = True
-                    break
-                analyzer = _analyze_new_prop if system == "NEW" else _analyze_prop
-                result = analyzer(
-                    line, df, line.get("home_abbr", ""), line.get("away_abbr", ""))
-                if _nfl_alt_result_eligible(result):
-                    analyzed_picks.append(result)
+            _NFL_POSDEF_FRAME_LOCAL.frame = defense_df
+            try:
+                for line in lines:
+                    if time.monotonic() >= deadline:
+                        timed_out = True
+                        break
+                    analyzer = _analyze_new_prop if system == "NEW" else _analyze_prop
+                    result = analyzer(
+                        line, df, line.get("home_abbr", ""), line.get("away_abbr", ""))
+                    if _nfl_alt_result_eligible(result):
+                        analyzed_picks.append(result)
+            finally:
+                try:
+                    del _NFL_POSDEF_FRAME_LOCAL.frame
+                except AttributeError:
+                    pass
         return analyzed_picks, timed_out
 
     picks, analysis_timed_out = await asyncio.to_thread(_analyze_alt_lines)
@@ -5984,6 +6185,10 @@ def _nfl_merge_week_results(anchor_date: str, daily_results: list,
             warnings.append(result["data_warning"])
         if result.get("data_note") and result["data_note"] not in warnings:
             warnings.append(result["data_note"])
+        if result.get("defense_legacy_warning"):
+            legacy = "⚠️ " + str(result["defense_legacy_warning"])
+            if legacy not in warnings:
+                warnings.append(legacy)
         if consume and spool_path is not None:
             try:
                 spool_path.unlink(missing_ok=True)
@@ -6150,8 +6355,16 @@ def _nfl_read_saved_board(date_str, system):
     getter = _new_cache_get if system == "NEW" else _cache_get
     saved = getter(date_str, allow_stale=True) or _nfl_load_board_snapshots(date_str, system)
     if isinstance(saved, dict):
+        # A shallow response wrapper avoids mutating the frozen saved payload or
+        # copying its large pick trees. Legacy values are shown as unverified;
+        # Get Picks never loads stats or recomputes them.
+        saved = dict(saved)
         saved["system"] = system
         saved["saved_board"] = True
+        if saved.get("defense_schema_version") != 2:
+            saved["defense_legacy_warning"] = (
+                "Legacy saved board: defensive position/stat venue allowances "
+                "are unverified and were not recomputed.")
         if system == "NEW":
             saved.setdefault("model_version", "NEW-v1-ewma-blend")
     return saved
@@ -9318,7 +9531,7 @@ tr:last-child td{border-bottom:none}
     <h2>Run NFL Picks</h2>
     <div class="date-row">
       <label>Date</label>
-      <input type="date" id="datePicker" class="date-input" value="__TODAY__" >
+      <input type="date" id="datePicker" class="date-input" value="__TODAY__" onchange="if(typeof _nflPerfectParlayInvalidate==='function')_nflPerfectParlayInvalidate('date')">
       <label for="nflSystem" style="margin-left:8px">System</label>
       <select id="nflSystem" class="date-input" onchange="_nflSystemChanged()" style="min-width:130px">
         <option value="OLD" selected>OLD</option>
@@ -9378,7 +9591,7 @@ tr:last-child td{border-bottom:none}
        <div><div style="color:#38bdf8;font-size:.66rem;font-weight:900;letter-spacing:.12em;text-transform:uppercase">Grounded NFL analysis</div>
        <h2 style="font-family:'Playfair Display',serif;color:#fff;font-size:1.35rem;margin-top:4px">The Edge Coach · NFL Props Analyst</h2>
        <div style="color:#94a3b8;font-size:.76rem;margin-top:5px">Find safer sportsbook sides or scan every supported market for positive Coach Edge. Choose Over, Under, categories, and games above.</div></div>
-      <div><button onclick="openNflCoachTrack()" style="background:#0e7490;color:#fff;border:0;border-radius:8px;padding:8px 11px;font-weight:900;font-size:.7rem;cursor:pointer">AI Coach Track Record</button><div style="color:#86efac;border:1px solid rgba(74,222,128,.35);border-radius:999px;padding:5px 9px;height:max-content;font-size:.62rem;font-weight:900;margin-top:6px">NO INVENTED PLAYS</div></div>
+      <div><button onclick="openNflCoachTrack()" style="width:100%;background:#0e7490;color:#fff;border:0;border-radius:8px;padding:8px 11px;font-weight:900;font-size:.7rem;cursor:pointer">AI Coach Track Record</button><button onclick="showNflPerfectParlayBuilder()" style="width:100%;margin-top:8px;background:linear-gradient(135deg,#0369a1,#7c3aed);color:#fff;border:1px solid rgba(125,211,252,.5);border-radius:8px;padding:8px 10px;font-size:.7rem;font-weight:950;cursor:pointer;white-space:nowrap;box-shadow:0 4px 14px rgba(124,58,237,.22)">&#10024; Perfect Parlay</button><div style="color:#86efac;border:1px solid rgba(74,222,128,.35);border-radius:999px;padding:5px 9px;height:max-content;font-size:.62rem;font-weight:900;margin-top:6px">NO INVENTED PLAYS</div></div>
     </div>
     <div class="nfl-coach-presets">
       <button class="nfl-coach-preset" onclick="askNflCoachPreset('Show every play with a 100% App Hit Rate','app_hit_rate_100')" style="border-color:#22c55e;color:#bbf7d0">100% App Hit Rate</button>
@@ -10021,6 +10234,7 @@ function _nflSystem(){
   return el&&el.value==='NEW'?'NEW':'OLD';
 }
 function _nflSystemChanged(){
+  if(typeof _nflPerfectParlayInvalidate==='function')_nflPerfectParlayInvalidate('system');
   var s=_nflSystem(),badge=document.getElementById('nflSystemBadge');
   if(badge){badge.textContent='SYSTEM: '+s;badge.style.color=s==='NEW'?'#67e8f9':'#fbbf24';}
   ['nflCoachSystemBadge','nflTrackSystemBadge','nflOverflowSystemBadge'].forEach(function(id){
@@ -10075,6 +10289,7 @@ function _nflTodayLocal(){
   return y+'-'+m+'-'+day;
 }
 function _nflRunScopeChanged(){
+  if(typeof _nflPerfectParlayInvalidate==='function')_nflPerfectParlayInvalidate('scope');
   var hint=document.getElementById('runScopeHint'),week=_nflRunScope()==='week';
   if(hint)hint.textContent=week
     ?'Runs the NFL week containing this date: Wednesday through Tuesday, including Monday Night Football.'
@@ -10397,11 +10612,24 @@ function _nflRecentVenueLabel(p){
   return side+' · L10 H/A';
 }
 function _nflDefenseSplitHtml(p){
-  var m=_esc(String(p&&p.mkt||'stat').replace(/Yds/gi,'yards').toLowerCase());
+  var statLabels={
+    player_pass_yds:'passing yards',player_pass_tds:'passing TDs',
+    player_pass_completions:'completions',player_pass_attempts:'pass attempts',
+    player_pass_interceptions:'interceptions thrown',
+    player_rush_yds:'rushing yards',player_rush_attempts:'carries',
+    player_rush_reception_yds:'rushing + receiving yards',
+    player_reception_yds:'receiving yards',player_receptions:'receptions',
+    player_anytime_td:'rushing + receiving TDs'
+  };
+  var m=_esc(statLabels[String(p&&p.market||'')]||String(p&&p.mkt||'stat').replace(/Yds/gi,'yards').toLowerCase());
+  var pg=_esc(String(p&&p.defPositionGroup||p&&p.positionGroup||p&&p.position||'position').toUpperCase());
   var o=_esc((p&&p.opponent)||'Opponent');
   var line=p&&p.realLine!=null?p.realLine:p.dispLine;
+  if(p&&p.defSchemaVersion!==2){
+    return '<div class="pm-split-empty">Legacy/unverified defensive allowance — this frozen saved board was not recomputed.</div>';
+  }
   if(!p||(p.defHomeAllowed==null&&p.defAwayAllowed==null)){
-    return '<div class="pm-split-empty">Sportsbook line: <strong style="color:#f8fafc">'+line+'</strong> &middot; Venue defense split unavailable</div>';
+    return '<div class="pm-split-empty">Sportsbook line: <strong style="color:#f8fafc">'+line+'</strong> &middot; '+_esc(p&&p.defUnavailable||('Exact '+m+' allowed to '+pg+'s by opponent venue is unavailable; neutral adjustment.'))+'</div>';
   }
   var hA=p.defenseVenue==='HOME';
   var aA=p.defenseVenue==='AWAY';
@@ -10415,10 +10643,11 @@ function _nflDefenseSplitHtml(p){
     return '<div class="pm-split-context">OVER needs '+overNeed+'+ &middot; UNDER wins at '+underMax+' or fewer<br>Average is '+gap+' '+relation+' the '+overNeed+'-TD OVER requirement</div>';
   }
   return '<div class="pm-split-container">'
-    +'<div class="pm-split-header"><span class="pm-split-title">Sportsbook Line</span><span class="pm-split-line">'+line+'</span></div>'
+    +'<div class="pm-split-header"><span class="pm-split-title">Team positional totals · vs '+pg+' · '+m+'</span><span class="pm-split-line">Line '+line+'</span></div>'
+    +'<div class="pm-split-empty">Defense venue shown below is opposite the player offense venue. '+_esc(p.defSourceWindow||'Two-season point-in-time sample')+'. Not a personal scoring probability.</div>'
     +'<div class="pm-split-grid">'
-    +'<div class="pm-split-card '+(hA?'pm-split-active':'')+'"><div class="pm-split-venue">'+o+' HOME</div><div class="pm-split-val">'+(p.defHomeAllowed!=null?p.defHomeAllowed:'—')+'</div><div class="pm-split-desc">'+m+' allowed/game</div>'+tdLineContext(p.defHomeAllowed)+'<div class="pm-split-sample">'+(p.defHomeSample!=null?p.defHomeSample:0)+' games</div>'+(hA?'<div class="pm-split-badge">USED TODAY</div>':'')+'</div>'
-    +'<div class="pm-split-card '+(aA?'pm-split-active':'')+'"><div class="pm-split-venue">'+o+' AWAY</div><div class="pm-split-val">'+(p.defAwayAllowed!=null?p.defAwayAllowed:'—')+'</div><div class="pm-split-desc">'+m+' allowed/game</div>'+tdLineContext(p.defAwayAllowed)+'<div class="pm-split-sample">'+(p.defAwaySample!=null?p.defAwaySample:0)+' games</div>'+(aA?'<div class="pm-split-badge">USED TODAY</div>':'')+'</div>'
+    +'<div class="pm-split-card '+(hA?'pm-split-active':'')+'"><div class="pm-split-venue">'+o+' HOME</div><div class="pm-split-val">'+(p.defHomeAllowed!=null?p.defHomeAllowed:'—')+'</div><div class="pm-split-desc">'+m+' to '+pg+'s per game</div>'+tdLineContext(p.defHomeAllowed)+'<div class="pm-split-sample">'+(p.defHomeSample!=null?p.defHomeSample:0)+' completed games</div>'+(hA?'<div class="pm-split-badge">USED TODAY · OFFENSE AWAY</div>':'')+'</div>'
+    +'<div class="pm-split-card '+(aA?'pm-split-active':'')+'"><div class="pm-split-venue">'+o+' AWAY</div><div class="pm-split-val">'+(p.defAwayAllowed!=null?p.defAwayAllowed:'—')+'</div><div class="pm-split-desc">'+m+' to '+pg+'s per game</div>'+tdLineContext(p.defAwayAllowed)+'<div class="pm-split-sample">'+(p.defAwaySample!=null?p.defAwaySample:0)+' completed games</div>'+(aA?'<div class="pm-split-badge">USED TODAY · OFFENSE HOME</div>':'')+'</div>'
     +'</div></div>';
 }
 function nflCard(p,i){
@@ -11225,6 +11454,168 @@ function _nflCoachAccordions(p){
     +(s.injuryNote?'<div style="margin-top:7px;color:#94a3b8">'+_esc(s.injuryNote)+'</div>':'')
     +'</div></details></div>';
 }
+var __nflPerfectParlayPool=[],__nflPerfectParlayLegs=[],__nflPerfectParlayBoard=null;
+var __nflPerfectParlayStake=100,__nflPerfectParlayNotice='',__nflPerfectParlayBoardSeq=0;
+var __nflPerfectParlaySettings={legs:3,categories:[],side:'ALL'};
+function _nflPerfectParlayInvalidate(reason){
+  __nflPerfectParlayBoardSeq++;
+  __nflPerfectParlayPool=[];__nflPerfectParlayLegs=[];__nflPerfectParlayBoard=null;
+  __nflPerfectParlayNotice=reason?'The loaded board, date, scope, or system changed. Build a new parlay.':'';
+}
+function _nflPerfectParlayCommit(html){
+  var el=document.getElementById('nflCoachAnswer');
+  if(el){el.innerHTML=html;el.style.display='block';}
+}
+function _nflPerfectParlayPlayerKey(x){
+  return String((x&&x.player)||'').toLowerCase().replace(/[^a-z0-9]/g,'');
+}
+function _nflPerfectParlayBoardSignature(){
+  var d=(window._nflState||{}).d||{},dp=document.getElementById('datePicker');
+  return [String((dp&&dp.value)||''),_nflRunScope(),_nflSystem(),
+    String(d.anchor_date||d.date||''),d.week_mode?'week':'day',String(__nflPerfectParlayBoardSeq)].join('|');
+}
+function _nflPerfectParlayCurrent(){
+  var ok=!!(__nflPerfectParlayBoard&&window._nflState&&
+    __nflPerfectParlayBoard.state===window._nflState&&
+    __nflPerfectParlayBoard.signature===_nflPerfectParlayBoardSignature()&&
+    !__nflPerfectParlayPool.some(function(p){return _nflGameDone(p.source);}));
+  if(!ok){
+    var note=document.getElementById('nflPerfectParlayNotice');
+    if(note)note.textContent='The loaded board, date, scope, or system changed. Build a new parlay from the current displayed picks.';
+  }
+  return ok;
+}
+function _nflPerfectParlayEligibleRows(side){
+  var d=(window._nflState||{}).d||{},displayed=Array.isArray(d.picks)?d.picks:[],wanted=side||'ALL';
+  return _nflCoachProps(displayed).filter(function(p){
+    var src=p.source||{},book=p.book||'',sourceMarket=String(src.sourceMarket||src.market||'');
+    if(wanted!=='ALL'&&p.side!==wanted)return false;
+    if(p.side!=='OVER'&&p.side!=='UNDER')return false;
+    if(p.isAlternate||src.isAlternate||/_alternate$/i.test(sourceMarket))return false;
+    if(!book||src.realLine==null||p.line==null||!isFinite(Number(p.line))||Number(src.realLine)!==Number(p.line))return false;
+    if(!isFinite(Number(p.odds))||Number(p.odds)<-1000||Number(p.odds)===0)return false;
+    if(!isFinite(Number(p.appProb))||!isFinite(Number(p.implied))||Number(p.edge)<=0)return false;
+    if(_nflGameDone(src))return false;
+    p.slate_date=p.slate_date||src.slate_date||(!d.week_mode?d.date:'')||'';
+    if(!p.slate_date)return false;
+    return true;
+  });
+}
+function setNflPerfectParlayCategories(on){
+  document.querySelectorAll('input[name="nflPerfectParlayCat"]:not(:disabled)').forEach(function(cb){cb.checked=!!on;});
+}
+function showNflPerfectParlayBuilder(){
+  var saved=__nflPerfectParlaySettings||{},savedLegs=Math.max(2,Math.min(10,Number(saved.legs)||3));
+  var side=saved.side||'ALL',eligible=_nflPerfectParlayEligibleRows('ALL'),counts={};
+  eligible.forEach(function(p){counts[String(p.market||'')]=(counts[String(p.market||'')]||0)+1;});
+  var selected=(saved.categories&&saved.categories.length)?saved.categories.slice():_MORDER.slice();
+  var cats=_MORDER.map(function(label){
+    var count=counts[label]||0,checked=selected.indexOf(label)>=0,disabled=!count;
+    return '<label style="display:flex;align-items:center;gap:6px;padding:7px 9px;background:'+(checked&&!disabled?'rgba(14,165,233,.14)':'#020617')+';border:1px solid '+(checked&&!disabled?'#0ea5e9':'#334155')+';border-radius:7px;color:'+(disabled?'#475569':'#e2e8f0')+';font-size:.68rem;font-weight:800;cursor:'+(disabled?'not-allowed':'pointer')+'"><input type="checkbox" name="nflPerfectParlayCat" value="'+_esc(label)+'"'+(checked&&!disabled?' checked':'')+(disabled?' disabled':'')+' style="accent-color:#0ea5e9"> '+_esc(label)+' <span style="color:#64748b">('+count+')</span></label>';
+  }).join('');
+  var sizes='';for(var i=2;i<=10;i++)sizes+='<option value="'+i+'"'+(i===savedLegs?' selected':'')+'>'+i+' legs</option>';
+  var field='margin-top:5px;min-width:150px;background:#020617;color:#fff;border:1px solid #475569;border-radius:7px;padding:9px 10px;font-weight:800';
+  _nflPerfectParlayCommit('<div><div class="nfl-coach-question">&#10024; Perfect Parlay</div>'
+    +'<div class="nfl-coach-summary">Build a display-only parlay from the currently loaded NFL market boards. Legs require the exact displayed player, standard market, side, line, slate date, sportsbook, and price; alternate or borrowed quotes never qualify.</div>'
+    +'<div style="margin-top:12px;padding:12px;background:#0f172a;border:1px solid #334155;border-radius:10px">'
+    +'<div style="display:flex;justify-content:space-between;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px"><b style="color:#94a3b8;font-size:.68rem">CATEGORIES — SELECT ONE OR MORE</b><span><button onclick="setNflPerfectParlayCategories(true)" style="background:#1e293b;color:#bae6fd;border:1px solid #334155;border-radius:6px;padding:5px 8px;font-weight:800;cursor:pointer">Select all</button> <button onclick="setNflPerfectParlayCategories(false)" style="background:#1e293b;color:#94a3b8;border:1px solid #334155;border-radius:6px;padding:5px 8px;font-weight:800;cursor:pointer">Clear</button></span></div>'
+    +'<div style="display:flex;flex-wrap:wrap;gap:7px">'+cats+'</div>'
+    +'<div style="display:flex;align-items:end;gap:9px;flex-wrap:wrap;margin-top:13px">'
+    +'<label style="color:#94a3b8;font-size:.68rem;font-weight:800">PARLAY SIZE<br><select id="nflPerfectParlayLegCount" style="'+field+'">'+sizes+'</select></label>'
+    +'<label style="color:#94a3b8;font-size:.68rem;font-weight:800">SIDE<br><select id="nflPerfectParlaySide" style="'+field+'"><option value="ALL"'+(side==='ALL'?' selected':'')+'>Best available</option><option value="OVER"'+(side==='OVER'?' selected':'')+'>Overs only</option><option value="UNDER"'+(side==='UNDER'?' selected':'')+'>Unders only</option></select></label>'
+    +'<button onclick="buildNflPerfectParlay()" style="background:linear-gradient(135deg,#0284c7,#7c3aed);color:#fff;border:0;border-radius:8px;padding:10px 15px;font-weight:950;cursor:pointer">BUILD PERFECT PARLAY</button></div></div></div>');
+}
+function _nflPerfectParlayAmerican(decimalOdds){
+  var d=Number(decimalOdds);if(!isFinite(d)||d<=1)return 'N/A';
+  var a=d>=2?(d-1)*100:-100/(d-1),r=Math.round(a);return (r>0?'+':'')+r;
+}
+function changeNflPerfectParlayLeg(index){
+  if(!_nflPerfectParlayCurrent())return;
+  var legs=__nflPerfectParlayLegs,pool=__nflPerfectParlayPool,current=legs[index];if(!current)return;
+  var used={};legs.forEach(function(x,i){if(i!==index)used[_nflPerfectParlayPlayerKey(x)]=1;});
+  var start=pool.indexOf(current),currentKey=_nflPerfectParlayPlayerKey(current);
+  for(var step=1;step<=pool.length;step++){
+    var next=pool[(Math.max(0,start)+step)%pool.length],key=_nflPerfectParlayPlayerKey(next);
+    if(key!==currentKey&&!used[key]){
+      legs[index]=next;__nflPerfectParlayNotice='Leg replaced. Combined odds and estimated payout updated.';
+      renderNflPerfectParlay();return;
+    }
+  }
+}
+function generateNewNflPerfectParlay(){
+  if(!_nflPerfectParlayCurrent())return;
+  var legs=__nflPerfectParlayLegs,pool=__nflPerfectParlayPool,used={};
+  legs.forEach(function(x){used[_nflPerfectParlayPlayerKey(x)]=1;});
+  var fresh=pool.filter(function(x){return !used[_nflPerfectParlayPlayerKey(x)];});
+  if(!fresh.length){__nflPerfectParlayNotice='No unused qualifying player remains. Edit categories, side, or leg count for more options.';renderNflPerfectParlay();return;}
+  var next=fresh.slice(0,legs.length),rotated=legs.slice(1).concat(legs.slice(0,1));
+  next=next.concat(rotated.slice(0,legs.length-next.length));
+  var replacements=Math.min(fresh.length,legs.length);
+  __nflPerfectParlayLegs=next;
+  __nflPerfectParlayNotice=replacements===legs.length?'New parlay: every player was replaced using the same approved pool.':replacements+' fresh player'+(replacements===1?'':'s')+' included; '+(legs.length-replacements)+' retained because only '+pool.length+' unique qualifying players are available.';
+  renderNflPerfectParlay();
+}
+function updateNflPerfectParlayStake(input){
+  var stake=Number(input.value),valid=input.value.trim()!==''&&isFinite(stake)&&stake>0,combined=1;
+  input.setCustomValidity(valid?'':'Enter a stake greater than zero.');
+  __nflPerfectParlayLegs.forEach(function(x){combined*=Number(_amToDec(x.odds)||1);});
+  if(valid)__nflPerfectParlayStake=stake;
+  var profit=document.getElementById('nflPerfectParlayProfit'),ret=document.getElementById('nflPerfectParlayReturn');
+  if(profit)profit.textContent=valid?'$'+(stake*(combined-1)).toFixed(2):'—';
+  if(ret)ret.textContent=valid?'$'+(stake*combined).toFixed(2):'—';
+}
+function openNflPerfectParlayDetail(index){
+  var p=__nflPerfectParlayLegs[index];if(!p||!_nflPerfectParlayCurrent())return;
+  var why='<div style="background:rgba(14,165,233,.08);border:1px solid rgba(14,165,233,.3);border-radius:10px;padding:11px 12px;margin:10px 0 14px;color:#cbd5e1;font-size:.78rem;line-height:1.5"><b style="color:#7dd3fc">Why this leg:</b> Exact displayed standard-line pick with '+Number(p.appProb).toFixed(1)+'% app probability, '+Number(p.implied).toFixed(1)+'% implied probability, and '+_nflCoachSigned(p.edge)+' Coach Edge points.</div>';
+  _openModal(_esc(p.player),_esc(p.market)+' · '+_esc(p.team)+' vs '+_esc(p.opponent)+' · '+_esc(p.side)+' '+_esc(String(p.line))+' · '+_esc(_nflCoachOdds(p.odds))+' · '+_esc(p.book),why+_nflCoachAccordions(p));
+}
+function renderNflPerfectParlay(){
+  var legs=__nflPerfectParlayLegs||[];if(!legs.length)return;
+  var combined=1,used={},hundred=0;
+  legs.forEach(function(p){combined*=Number(_amToDec(p.odds)||1);used[_nflPerfectParlayPlayerKey(p)]=1;if(Number(p.appProb)>=99.95)hundred++;});
+  var fresh=__nflPerfectParlayPool.filter(function(p){return !used[_nflPerfectParlayPlayerKey(p)];}).length;
+  var rows=legs.map(function(p,i){
+    var key=_nflPerfectParlayPlayerKey(p),canSwap=__nflPerfectParlayPool.some(function(x){var k=_nflPerfectParlayPlayerKey(x);return k!==key&&!used[k];});
+    return '<tr><td style="padding:9px;border-top:1px solid #263244">'+(i+1)+'</td><td style="padding:9px;border-top:1px solid #263244"><button onclick="openNflPerfectParlayDetail('+i+')" style="background:none;border:0;color:#fff;text-decoration:underline;text-decoration-style:dotted;font-weight:900;cursor:pointer;padding:0">'+_esc(p.player)+'</button><br><small style="color:#64748b">'+_esc(p.team)+' vs '+_esc(p.opponent)+(p.slate_date?' · '+_esc(p.slate_date):'')+(Number(p.appProb)>=99.95?' · 100% APP PLAY':'')+'</small></td>'
+      +'<td style="padding:9px;border-top:1px solid #263244">'+_esc(p.market)+'<br><b style="color:'+(p.side==='OVER'?'#4ade80':'#f87171')+'">'+_esc(p.side)+' '+_esc(String(p.line))+'</b></td><td style="padding:9px;border-top:1px solid #263244">'+_esc(_nflCoachOdds(p.odds))+'<br><small style="color:#64748b">'+_esc(p.book)+'</small></td>'
+      +'<td style="padding:9px;border-top:1px solid #263244;font-weight:900;color:'+(Number(p.appProb)>=99.95?'#fbbf24':'#e5e7eb')+'">'+Number(p.appProb).toFixed(1)+'%</td><td style="padding:9px;border-top:1px solid #263244;color:#4ade80;font-weight:900">+'+Number(p.edge).toFixed(2)+' pts</td>'
+      +'<td style="padding:9px;border-top:1px solid #263244;text-align:center">'+(canSwap?'<button aria-label="Change '+_esc(p.player)+' leg" onclick="changeNflPerfectParlayLeg('+i+')" style="width:32px;height:32px;border-radius:50%;background:#1e3a8a;color:#bfdbfe;border:1px solid #3b82f6;font-size:1rem;font-weight:900;cursor:pointer">&#8635;</button>':'<span style="color:#475569">&#8212;</span>')+'</td></tr>';
+  }).join('');
+  var stake=__nflPerfectParlayStake,settings=__nflPerfectParlaySettings,labels=(settings.categories||[]).join(', ');
+  var hundredNote=hundred?hundred+' exact 100% app-probability play'+(hundred===1?' is':'s are')+' included.':'No exact 100% play is available in these legs; all selections still have positive Coach Edge.';
+  var newDisabled=!fresh,button='<button onclick="generateNewNflPerfectParlay()"'+(newDisabled?' disabled':'')+' style="background:linear-gradient(135deg,#0284c7,#7c3aed);color:#fff;border:1px solid #7dd3fc;border-radius:8px;padding:10px 14px;font-weight:900;cursor:'+(newDisabled?'not-allowed':'pointer')+';opacity:'+(newDisabled?'.5':'1')+'">&#8635; Generate New</button>';
+  _nflPerfectParlayCommit('<div><div style="display:flex;justify-content:space-between;gap:10px;align-items:center;flex-wrap:wrap"><div class="nfl-coach-question">&#10024; Perfect Parlay · '+legs.length+' Legs</div>'+button+'</div>'
+    +'<div style="margin-top:11px;padding:11px 12px;background:linear-gradient(135deg,rgba(2,132,199,.16),rgba(124,58,237,.16));border:1px solid rgba(125,211,252,.35);border-radius:10px;color:#e5e7eb;font-size:.74rem;line-height:1.5">'+hundredNote+' Every leg is from the loaded displayed NFL boards, uses one player once, and is display-only.<br><b style="color:#bae6fd">'+_esc(labels)+' · '+_esc(settings.side==='ALL'?'Best available side':settings.side+' only')+'</b>'
+    +'<div style="display:flex;flex-wrap:wrap;gap:18px;align-items:center;margin-top:12px;padding-top:12px;border-top:1px solid #475569"><div><small style="color:#94a3b8">COMBINED ODDS</small><br><b style="color:#fbbf24;font-size:1.25rem">'+_nflPerfectParlayAmerican(combined)+'</b><br><small style="color:#94a3b8">'+combined.toFixed(2)+' decimal</small></div><label style="color:#cbd5e1;font-size:.7rem">BET AMOUNT ($)<br><input type="number" min="0.01" step="0.01" value="'+stake+'" oninput="updateNflPerfectParlayStake(this)" style="margin-top:5px;width:105px;padding:9px;background:#020617;border:1px solid #64748b;border-radius:7px;color:#fff;font-size:1rem"></label><div><small style="color:#94a3b8">POTENTIAL PROFIT</small><br><b id="nflPerfectParlayProfit" style="color:#4ade80;font-size:1.25rem">$'+(stake*(combined-1)).toFixed(2)+'</b></div><div><small style="color:#94a3b8">TOTAL RETURN · INCLUDES STAKE</small><br><b id="nflPerfectParlayReturn" style="color:#fff;font-size:1.25rem">$'+(stake*combined).toFixed(2)+'</b></div></div></div>'
+    +'<div id="nflPerfectParlayNotice" role="status" aria-live="polite" style="margin:10px 0;color:#cbd5e1;font-size:.72rem">'+_esc(__nflPerfectParlayNotice||(__nflPerfectParlayPool.length+' unique qualifying players · '+fresh+' unused alternatives. Generate New maximizes fresh players.'))+'</div>'
+    +'<div style="overflow-x:auto;border:1px solid #263244;border-radius:10px"><table style="width:100%;min-width:900px;border-collapse:collapse;color:#e5e7eb;font-size:.7rem"><thead><tr style="background:#111827;color:#94a3b8;text-align:left"><th style="padding:9px">#</th><th style="padding:9px">Player</th><th style="padding:9px">Play</th><th style="padding:9px">Odds</th><th style="padding:9px">App Prob</th><th style="padding:9px">Coach Edge</th><th style="padding:9px">Change Leg</th></tr></thead><tbody>'+rows+'</tbody></table></div>'
+    +'<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px">'+button+'<button onclick="showNflPerfectParlayBuilder()" style="background:#1e293b;color:#fff;border:1px solid #475569;border-radius:8px;padding:10px 14px;font-weight:900;cursor:pointer">Edit parlay options</button></div><div style="margin-top:10px;color:#94a3b8;font-size:.65rem;line-height:1.5">Estimated payout if every leg wins. Prices can come from different books, so a sportsbook may offer different combined odds. App probabilities are not guarantees. Perfect Parlay never writes to tracking or saved picks.</div></div>');
+}
+function buildNflPerfectParlay(){
+  var countEl=document.getElementById('nflPerfectParlayLegCount'),sideEl=document.getElementById('nflPerfectParlaySide');
+  var requested=Math.max(2,Math.min(10,parseInt((countEl&&countEl.value)||'3',10)||3));
+  var categories=Array.prototype.slice.call(document.querySelectorAll('input[name="nflPerfectParlayCat"]:checked')).map(function(cb){return cb.value;});
+  var side=(sideEl&&sideEl.value)||'ALL';
+  __nflPerfectParlaySettings={legs:requested,categories:categories.slice(),side:side};
+  if(!categories.length){_nflPerfectParlayCommit('<div><div class="nfl-coach-question">&#10024; Perfect Parlay</div><div class="nfl-coach-summary">Select at least one category before building.</div><button onclick="showNflPerfectParlayBuilder()" style="background:#1e293b;color:#fff;border:1px solid #475569;border-radius:8px;padding:9px 12px;font-weight:900;cursor:pointer">Edit parlay options</button></div>');return;}
+  var d=(window._nflState||{}).d,dp=document.getElementById('datePicker'),selectedDate=String((dp&&dp.value)||'');
+  if(!d||!Array.isArray(d.picks)||!d.picks.length||String(d.anchor_date||d.date||'')!==selectedDate||String(d.system||'OLD')!==_nflSystem()||(d.week_mode?'week':'day')!==_nflRunScope()){
+    _nflPerfectParlayCommit('<div><div class="nfl-coach-question">&#10024; Perfect Parlay · '+requested+' Legs</div><div class="nfl-coach-summary">Load the displayed NFL picks for '+_esc(selectedDate||'your selected date')+' first. Full-week boards use each row’s own slate date.</div></div>');return;
+  }
+  var raw=_nflPerfectParlayEligibleRows(side).filter(function(p){return categories.indexOf(String(p.market||''))>=0;}),byPlayer={};
+  raw.forEach(function(p){
+    var key=_nflPerfectParlayPlayerKey(p),old=byPlayer[key];if(!key)return;
+    if(!old||p.appProb>old.appProb||(p.appProb===old.appProb&&p.edge>old.edge))byPlayer[key]=p;
+  });
+  var pool=Object.keys(byPlayer).map(function(k){return byPlayer[k];});
+  pool.sort(function(a,b){return b.appProb-a.appProb||b.edge-a.edge||String(a.player).localeCompare(String(b.player));});
+  if(pool.length<requested){
+    _nflPerfectParlayCommit('<div><div class="nfl-coach-question">&#10024; Perfect Parlay · '+requested+' Legs</div><div class="nfl-coach-summary">Only '+pool.length+' unique player'+(pool.length===1?'':'s')+' from the currently displayed boards qualify with an exact genuine standard-line price of -1000 or better and positive Coach Edge. Choose fewer legs or broaden the filters.</div><button onclick="showNflPerfectParlayBuilder()" style="background:#1e293b;color:#fff;border:1px solid #475569;border-radius:8px;padding:9px 12px;font-weight:900;cursor:pointer">Edit parlay options</button></div>');return;
+  }
+  __nflPerfectParlayPool=pool.slice();__nflPerfectParlayLegs=pool.slice(0,requested);__nflPerfectParlayNotice='';
+  __nflPerfectParlayBoard={state:window._nflState,signature:_nflPerfectParlayBoardSignature()};
+  renderNflPerfectParlay();
+}
 function _nflCoachRender(question,rows,total,mode,isAlternate){
   var el=document.getElementById('nflCoachAnswer');if(!el)return;
   el.style.display='block';
@@ -11710,6 +12101,7 @@ function _renderNflTdPredictor(d){
 }
 function renderResults(d){
   var res=document.getElementById('results');
+  if(typeof _nflPerfectParlayInvalidate==='function')_nflPerfectParlayInvalidate('board');
   if(!d){ res.innerHTML=''; return; }
   if(d.error){
     var failed=(d.skipped_matchups||[]);
@@ -11726,9 +12118,10 @@ function renderResults(d){
   var weekNotice=d.week_notice?('<div style="margin-bottom:10px;padding:11px 14px;border:1px solid '+(d.incomplete?'#b45309':'#6d28d9')+';background:'+(d.incomplete?'rgba(180,83,9,.16)':'rgba(109,40,217,.12)')+';border-radius:10px;color:'+(d.incomplete?'#fde68a':'#ddd6fe')+';font-size:.82rem;font-weight:'+(d.incomplete?'700':'400')+'">'+_esc(d.week_notice)+'</div>'):'';
   var note=d.data_note?('<div style="margin-bottom:10px;padding:11px 14px;border:1px solid #24506b;background:#0b2230;border-radius:10px;color:#9bd5f5;font-size:.82rem">'+d.data_note+'</div>'):'';
   var warn=d.data_warning?('<div class="err-box" style="margin-bottom:10px">'+d.data_warning+'</div>'):'';
+  var legacyWarn=d.defense_legacy_warning?('<div class="err-box" style="margin-bottom:10px">'+_esc(d.defense_legacy_warning)+'</div>'):'';
   var skipped=(d.skipped_matchups||[]);
   var completenessWarn=skipped.length?('<div class="err-box" style="margin-bottom:10px"><strong>Incomplete sportsbook slate:</strong> no player props were loaded for '+skipped.map(_esc).join(', ')+'. These matchups were skipped after the sportsbook request timed out or failed.</div>'):'';
-  res.innerHTML=weekNotice+completenessWarn+note+warn+'<div class="nfl-toolbar"><input id="nflSearch" type="text" placeholder="Search player…" oninput="_nflPaint(this.value)"/></div><div id="nflBody"></div>';
+  res.innerHTML=weekNotice+completenessWarn+legacyWarn+note+warn+'<div class="nfl-toolbar"><input id="nflSearch" type="text" placeholder="Search player…" oninput="_nflPaint(this.value)"/></div><div id="nflBody"></div>';
   _renderNflGamePredictor(d);
   _renderNflTdPredictor(d);
   _nflPaint('');
