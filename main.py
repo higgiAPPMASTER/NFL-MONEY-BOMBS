@@ -10270,6 +10270,9 @@ tr:last-child td{border-bottom:none}
       <label class="nfl-gp-filter nfl-gp-filter-date">Game Date
         <select id="nflGpDate" class="date-input" onchange="renderNflGpRecord()"></select>
       </label>
+      <label class="nfl-gp-filter">Bet Amount
+        <input id="nflGpStake" class="date-input" type="number" min="0.01" step="0.01" value="20" oninput="_nflGpStakeChanged()" style="width:110px">
+      </label>
     </div>
     <div id="nflGpTrkSummary"></div>
     <div id="nflGpTrkBody"></div>
@@ -13379,6 +13382,46 @@ function _nflGpControlChanged(which){
   _nflGpPopulateControls(_nflGpDaily());
   renderNflGpRecord();
 }
+function _nflGpStake(){
+  var el=document.getElementById('nflGpStake');
+  if(el&&el.dataset.ready!=='1'){
+    try{var saved=Number(localStorage.getItem('nflGpStake'));if(isFinite(saved)&&saved>0)el.value=String(saved);}catch(e){}
+    el.dataset.ready='1';
+  }
+  var stake=Number(el&&el.value);
+  return isFinite(stake)&&stake>0?stake:20;
+}
+function _nflGpStakeChanged(){
+  var el=document.getElementById('nflGpStake'),stake=_nflGpStake();
+  if(el&&Number(el.value)!==stake)el.value=stake.toFixed(2);
+  try{localStorage.setItem('nflGpStake',String(stake));}catch(e){}
+  renderNflGpRecord();
+}
+function _nflGpOdds(g,key){
+  if(key==='winner_result')return g.pick_home?g.home_ml_odds:g.away_ml_odds;
+  return g.total_pick==='OVER'?g.total_over_odds:g.total_under_odds;
+}
+function _nflGpBook(g,key){
+  if(key==='winner_result')return g.pick_home?g.home_ml_book:g.away_ml_book;
+  return g.total_pick==='OVER'?g.total_over_book:g.total_under_book;
+}
+function _nflGpProfit(result,odds,stake){
+  if(result==='PUSH')return 0;
+  if(result!=='WIN'&&result!=='LOSS')return null;
+  var n=Number(odds);
+  if(!isFinite(n)||n===0)return null;
+  if(result==='LOSS')return -stake;
+  return n>0?stake*n/100:stake*100/Math.abs(n);
+}
+function _nflGpImplied(odds){
+  var n=Number(odds);
+  if(!isFinite(n)||n===0)return null;
+  return n>0?100/(n+100)*100:Math.abs(n)/(Math.abs(n)+100)*100;
+}
+function _nflGpMoney(v){
+  if(v==null||!isFinite(Number(v)))return '—';
+  return (Number(v)>=0?'+$':'-$')+Math.abs(Number(v)).toFixed(2);
+}
 function renderNflGpRecord(){
   var sumEl=document.getElementById('nflGpTrkSummary'),bodyEl=document.getElementById('nflGpTrkBody');
   if(!sumEl||!bodyEl) return;
@@ -13394,21 +13437,39 @@ function renderNflGpRecord(){
   _nflGpPopulateControls(daily);
   var allGames=[];
   daily.forEach(function(day){(day.games||[]).forEach(function(g){allGames.push(Object.assign({record_date:day.date},g));});});
-  function rec(key){
-    var w=allGames.filter(function(g){return g[key]==='WIN';}).length;
-    var l=allGames.filter(function(g){return g[key]==='LOSS';}).length;
-    var p=allGames.filter(function(g){return g[key]==='PUSH';}).length;
-    return {w:w,l:l,p:p,rate:(w+l)?(w/(w+l)*100):null};
+  function rec(key,games){
+    games=games||allGames;
+    var w=games.filter(function(g){return g[key]==='WIN';}).length;
+    var l=games.filter(function(g){return g[key]==='LOSS';}).length;
+    var p=games.filter(function(g){return g[key]==='PUSH';}).length;
+    var settled=games.filter(function(g){return g[key]==='WIN'||g[key]==='LOSS'||g[key]==='PUSH';});
+    var priced=settled.filter(function(g){return _nflGpOdds(g,key)!=null&&isFinite(Number(_nflGpOdds(g,key)));});
+    var stake=_nflGpStake();
+    var net=priced.reduce(function(sum,g){return sum+(_nflGpProfit(g[key],_nflGpOdds(g,key),stake)||0);},0);
+    var risk=priced.length*stake;
+    var avgBe=priced.length?priced.reduce(function(sum,g){return sum+_nflGpImplied(_nflGpOdds(g,key));},0)/priced.length:null;
+    return {w:w,l:l,p:p,rate:(w+l)?(w/(w+l)*100):null,priced:priced.length,
+      net:net,risk:risk,roi:risk?net/risk*100:null,units:stake?net/stake:null,
+      returned:risk+net,breakEven:avgBe};
   }
   var replay=_nflTrkData&&_nflTrkData.historical
     ?'<div style="background:rgba(245,158,11,.1);border:1px solid rgba(245,158,11,.35);border-radius:9px;padding:9px 12px;margin-bottom:10px;color:#fbbf24;font-size:.76rem;font-weight:800">Historical Replay — these results are view-only and excluded from the official Game Predictor record.</div>'
     :'';
   function statCard(title,r,color){
+    var plColor=r.net>=0?'#4ade80':'#f87171';
     return '<div style="flex:1;min-width:210px;background:#111827;border:1px solid #293548;border-radius:12px;padding:14px">'
       +'<div style="font-size:.68rem;color:#94a3b8;font-weight:900;letter-spacing:.1em;text-transform:uppercase">'+title+'</div>'
       +'<div style="font-size:1.45rem;color:#fff;font-weight:900;margin-top:4px"><span style="color:#4ade80">'+r.w+'</span>-<span style="color:#f87171">'+r.l+'</span>'
       +(r.p?' <span style="font-size:.72rem;color:#94a3b8">('+r.p+' push)</span>':'')+'</div>'
-      +'<div style="font-size:.82rem;color:'+color+';font-weight:800;margin-top:3px">'+(r.rate==null?'Pending':r.rate.toFixed(1)+'% hit rate')+'</div></div>';
+      +'<div style="font-size:.82rem;color:'+color+';font-weight:800;margin-top:3px">'+(r.rate==null?'Pending':r.rate.toFixed(1)+'% hit rate')+'</div>'
+      +'<div style="display:grid;grid-template-columns:repeat(2,minmax(92px,1fr));gap:8px;margin-top:12px;padding-top:10px;border-top:1px solid #293548;font-family:monospace;font-size:.72rem">'
+      +'<span style="color:#94a3b8">Risked<br><b style="color:#fff">$'+r.risk.toFixed(2)+'</b></span>'
+      +'<span style="color:#94a3b8">Net P/L<br><b style="color:'+plColor+'">'+_nflGpMoney(r.net)+'</b></span>'
+      +'<span style="color:#94a3b8">ROI<br><b style="color:'+plColor+'">'+(r.roi==null?'—':(r.roi>=0?'+':'')+r.roi.toFixed(1)+'%')+'</b></span>'
+      +'<span style="color:#94a3b8">Units<br><b style="color:'+plColor+'">'+(r.units==null?'—':(r.units>=0?'+':'')+r.units.toFixed(2)+'u')+'</b></span>'
+      +'<span style="color:#94a3b8">Return<br><b style="color:#fff">$'+r.returned.toFixed(2)+'</b></span>'
+      +'<span style="color:#94a3b8">Avg break-even<br><b style="color:#fff">'+(r.breakEven==null?'—':r.breakEven.toFixed(1)+'%')+'</b></span>'
+      +'</div><div style="color:#64748b;font-size:.63rem;margin-top:9px">'+r.priced+' priced settled bet'+(r.priced===1?'':'s')+' · flat $'+_nflGpStake().toFixed(2)+'/pick</div></div>';
   }
   var seasonEl=document.getElementById('nflGpSeason'),weekEl=document.getElementById('nflGpWeek'),dateEl=document.getElementById('nflGpDate');
   var season=seasonEl?seasonEl.value:'',week=weekEl?weekEl.value:'all',sel=dateEl?dateEl.value:'all';
@@ -13418,13 +13479,10 @@ function renderNflGpRecord(){
       &&(sel==='all'||g.record_date===sel);
   });
   var shown=[].concat(scopeGames).sort(function(a,b){return String(b.record_date||'').localeCompare(String(a.record_date||''));}).slice(0,80);
-  function selectedRec(key){
-    var w=scopeGames.filter(function(g){return g[key]==='WIN';}).length,l=scopeGames.filter(function(g){return g[key]==='LOSS';}).length,p=scopeGames.filter(function(g){return g[key]==='PUSH';}).length;
-    return {w:w,l:l,p:p,rate:(w+l)?(w/(w+l)*100):null};
-  }
-  var wr=selectedRec('winner_result'),tr=selectedRec('total_result');
+  var wr=rec('winner_result',scopeGames),tr=rec('total_result',scopeGames);
   sumEl.innerHTML=replay+'<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px">'
-    +statCard('Game Winners',wr,'#a78bfa')+statCard('Point Totals',tr,'#38bdf8')+'</div>';
+    +statCard('Game Winners',wr,'#a78bfa')+statCard('Point Totals',tr,'#38bdf8')+'</div>'
+    +'<div style="color:#64748b;font-size:.68rem;line-height:1.5;margin:-4px 2px 13px">ROI = net profit ÷ amount risked. Units = net profit ÷ selected bet amount. Pushes return the stake. Predictions without captured odds stay in the win/loss record but are excluded from financial results.</div>';
   function badge(result){
     if(!result)return '<span style="color:#64748b;font-weight:800">PENDING</span>';
     var color=result==='WIN'?'#4ade80':result==='LOSS'?'#f87171':'#fbbf24';
@@ -13442,21 +13500,26 @@ function renderNflGpRecord(){
         ?((g.actual_away!=null&&g.actual_home!=null)?_esc(g.away_abbr)+' '+g.actual_away+' — '+_esc(g.home_abbr)+' '+g.actual_home:'—')
         :(g.actual_total!=null?_esc(String(g.actual_total)):'—');
       var pick=key==='winner_result'?(g.pick_abbr||'—'):(g.total_pick?(g.total_pick+' '+g.total_line):'—');
-      var book=key==='winner_result'
-        ?(g.pick_home?g.home_ml_book:g.away_ml_book)
-        :(g.total_pick==='OVER'?g.total_over_book:g.total_under_book);
+      var book=_nflGpBook(g,key),odds=_nflGpOdds(g,key),stake=_nflGpStake();
+      var profit=_nflGpProfit(g[key],odds,stake);
+      var oddsLabel=odds==null?'—':(Number(odds)>0?'+':'')+Number(odds);
+      var implied=_nflGpImplied(odds);
       return '<tr><td class="trk-date" data-label="Date" style="color:#94a3b8">'+_esc(g.record_date||'')+'</td>'
         +'<td data-label="Matchup" style="color:#fff;font-weight:800">'+_esc(g.away_abbr)+' @ '+_esc(g.home_abbr)
         +(g.weather_applied?'<br><small style="color:#fde68a">'+_esc(g.weather_label||'Weather')+' · '+_esc(g.weather_summary||'weather adjustment saved')+'</small>':'')+'</td>'
-        +'<td data-label="Pick" style="color:'+accent+';font-weight:900">'+_esc(pick)+'<br><small style="color:#94a3b8">'+_esc(book||'Book unavailable')+'</small></td>'
+        +'<td data-label="Pick" style="color:'+accent+';font-weight:900">'+_esc(pick)+'</td>'
+        +'<td data-label="Odds / Book" style="font-family:monospace;color:#fff;font-weight:800">'+_esc(oddsLabel)+'<br><small style="color:#94a3b8">'+_esc(book||'Book unavailable')+'</small></td>'
+        +'<td data-label="Implied / Bet" style="font-family:monospace;color:#cbd5e1">'+(implied==null?'—':implied.toFixed(1)+'%')+'<br><small style="color:#94a3b8">$'+stake.toFixed(2)+' risk</small></td>'
         +'<td data-label="Actual" style="color:#cbd5e1">'+actual+'</td>'
-        +'<td data-label="Result">'+badge(g[key])+'</td></tr>';
+        +'<td data-label="Result / P&L">'+badge(g[key])+'<br><small style="font-family:monospace;color:'+(profit!=null&&profit>=0?'#4ade80':'#f87171')+'">'+_nflGpMoney(profit)+'</small></td></tr>';
     }).join('');
     return '<details class="nfl-trk-group" style="--trk-accent:'+accent+'"><summary class="nfl-trk-group-head">'
       +'<div class="nfl-trk-group-title"><span class="nfl-trk-group-kicker">Game Predictor</span><span class="nfl-trk-group-name">'+title+'</span></div>'
       +'<div class="nfl-trk-group-summary"><span>'+record.w+'W · '+record.l+'L'+(record.p?' · '+record.p+'P':'')+'</span>'
-      +'<span class="nfl-trk-group-rate">'+(record.rate==null?'—':record.rate.toFixed(1)+'%')+'</span><span class="nfl-trk-group-toggle" aria-hidden="true"></span></div></summary>'
-      +'<div class="nfl-trk-table-scroll"><table class="nfl-trk-tbl nfl-trk-compact"><thead><tr><th>Date</th><th>Matchup</th><th>Pick</th><th>Actual</th><th>Result</th></tr></thead><tbody>'+rows+'</tbody></table></div></details>';
+      +'<span class="nfl-trk-group-rate">'+(record.rate==null?'—':record.rate.toFixed(1)+'%')+'</span>'
+      +'<span style="color:'+(record.net>=0?'#4ade80':'#f87171')+'">'+_nflGpMoney(record.net)+' · '+(record.roi==null?'—':(record.roi>=0?'+':'')+record.roi.toFixed(1)+'% ROI')+'</span>'
+      +'<span class="nfl-trk-group-toggle" aria-hidden="true"></span></div></summary>'
+      +'<div class="nfl-trk-table-scroll"><table class="nfl-trk-tbl nfl-trk-compact"><thead><tr><th>Date</th><th>Matchup</th><th>Pick</th><th>Odds / Book</th><th>Implied / Bet</th><th>Actual</th><th>Result / P&L</th></tr></thead><tbody>'+rows+'</tbody></table></div></details>';
   }
   bodyEl.innerHTML='<div style="color:#94a3b8;font-size:.72rem;font-weight:900;text-transform:uppercase;letter-spacing:.08em;margin:2px 0 8px">'+label+'</div>'
     +gpGroup('Game Winners','winner_result','pick_abbr','final','#a78bfa',wr)
