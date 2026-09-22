@@ -1289,6 +1289,8 @@ async def get_espn_games(date_str: str) -> List[Dict]:
                     "away_team": away.get("displayName", ""),
                     "home_abbr": home.get("abbreviation", ""),
                     "away_abbr": away.get("abbreviation", ""),
+                    "home_team_id": str(home.get("id") or ""),
+                    "away_team_id": str(away.get("id") or ""),
                     "game":      f"{away.get('displayName','')} @ {home.get('displayName','')}",
                     # ISO kickoff time — picks carry this so finished games drop off board
                     "start":     raw_start,
@@ -1994,6 +1996,63 @@ def _nfl_position_group(value: str) -> str:
     pos = str(value or "").upper()
     return "RB" if pos in ("RB", "HB", "FB") else pos
 
+def _nfl_depth_chart_map(payload: dict) -> dict:
+    """Return ESPN athlete id -> offensive depth metadata.
+
+    ESPN's core depth-chart endpoint is unofficial and has used both `athletes`
+    and `items` containers. Parse either shape and fail neutral when fields move.
+    """
+    out = {}
+    for chart in (payload or {}).get("items") or []:
+        chart_name = str(chart.get("name") or chart.get("displayName") or "")
+        chart_low = chart_name.lower()
+        if "defense" in chart_low or "special" in chart_low:
+            continue
+        positions = chart.get("positions") or {}
+        if isinstance(positions, list):
+            positions = {str(i): row for i, row in enumerate(positions)}
+        for slot_key, slot in positions.items():
+            if not isinstance(slot, dict):
+                continue
+            pos_obj = slot.get("position") or {}
+            position = str(
+                pos_obj.get("abbreviation") or pos_obj.get("name")
+                or slot.get("abbreviation") or slot_key or "").upper()
+            entries = (slot.get("athletes") or slot.get("items")
+                       or slot.get("entries") or [])
+            if isinstance(entries, dict):
+                entries = list(entries.values())
+            for index, entry in enumerate(entries):
+                if not isinstance(entry, dict):
+                    continue
+                athlete = entry.get("athlete") or entry.get("player") or entry
+                if not isinstance(athlete, dict):
+                    athlete = {}
+                athlete_id = str(athlete.get("id") or entry.get("athleteId") or "")
+                ref = str(athlete.get("$ref") or entry.get("$ref") or "")
+                if not athlete_id and ref:
+                    match = re.search(r"/athletes/(\d+)", ref)
+                    athlete_id = match.group(1) if match else ""
+                if not athlete_id:
+                    continue
+                rank = entry.get("rank")
+                if rank is None:
+                    rank = entry.get("slot")
+                if rank is None:
+                    rank = entry.get("order")
+                try:
+                    rank = max(1, int(rank))
+                except (TypeError, ValueError):
+                    rank = index + 1
+                existing = out.get(athlete_id)
+                candidate = {
+                    "depth_rank": rank, "depth_position": position,
+                    "depth_chart": chart_name or "ESPN offensive depth chart",
+                }
+                if existing is None or rank < existing.get("depth_rank", 999):
+                    out[athlete_id] = candidate
+    return out
+
 def _apply_nfl_injury_context(lines: list, roster_map: dict) -> None:
     """Stamp availability and conservative same-position opportunity changes."""
     by_group = {}
@@ -2012,6 +2071,11 @@ def _apply_nfl_injury_context(lines: list, roster_map: dict) -> None:
     status_weight = {"OUT": 1.0, "DOUBTFUL": 0.75,
                      "QUESTIONABLE": 0.40, "LIMITED": 0.20}
     caps = {"RB": 0.10, "WR": 0.10, "TE": 0.10}
+    # Depths at or beyond these positions are not promoted into premium boards.
+    # WR3 remains eligible because three-receiver personnel is a normal starting
+    # package; TE3/RB3 and backup quarterbacks are materially different roles.
+    depth_avoid = {"QB": 2, "RB": 3, "TE": 3, "WR": 5}
+    depth_watch = {"RB": 2, "TE": 2, "WR": 4}
     for line in lines:
         info = roster_map.get(_norm(line.get("name", ""))) if roster_map else None
         line["availability_verified"] = bool(info)
@@ -2030,6 +2094,47 @@ def _apply_nfl_injury_context(lines: list, roster_map: dict) -> None:
             info and info.get("rookie_verified")
             and info.get("is_rookie"))
         position = _nfl_position_group((info or {}).get("position"))
+        depth_rank = (info or {}).get("depth_rank")
+        depth_position = (info or {}).get("depth_position") or position
+        line["depth_rank"] = depth_rank
+        line["depth_position"] = depth_position
+        line["depth_chart"] = (info or {}).get("depth_chart", "")
+        line["depth_updated_at"] = (info or {}).get("depth_updated_at")
+        risk_status, risk_reasons, block_premium = "CLEAR", [], False
+        player_status = (info or {}).get("injury_status", "UNVERIFIED")
+        if info and (not info.get("eligible", True) or player_status == "OUT"):
+            risk_status, block_premium = "AVOID", True
+            risk_reasons.append(
+                (info or {}).get("injury_note") or "Unavailable on current ESPN roster")
+        elif player_status == "DOUBTFUL":
+            risk_status, block_premium = "AVOID", True
+            risk_reasons.append((info or {}).get("injury_note") or "Doubtful")
+        elif player_status in ("QUESTIONABLE", "LIMITED"):
+            risk_status = "WATCH"
+            risk_reasons.append((info or {}).get("injury_note") or player_status.title())
+        try:
+            depth_rank_int = int(depth_rank)
+        except (TypeError, ValueError):
+            depth_rank_int = None
+        if depth_rank_int is not None:
+            if position in depth_avoid and depth_rank_int >= depth_avoid[position]:
+                risk_status, block_premium = "AVOID", True
+                risk_reasons.append(
+                    f"ESPN depth chart lists {position}{depth_rank_int}")
+            elif position in depth_watch and depth_rank_int >= depth_watch[position]:
+                if risk_status == "CLEAR":
+                    risk_status = "WATCH"
+                risk_reasons.append(
+                    f"ESPN depth chart lists {position}{depth_rank_int}")
+        if not info:
+            risk_status = "UNVERIFIED"
+            risk_reasons = ["Current ESPN roster/depth status unavailable"]
+        line["role_risk_status"] = risk_status
+        line["role_risk_reasons"] = risk_reasons
+        line["role_risk_block_premium"] = block_premium
+        line["role_risk_source"] = (
+            "ESPN roster + offensive depth chart" if depth_rank_int is not None
+            else "ESPN roster")
         factor, reasons = 1.0, []
         if info and line.get("market") in market_ok and position in base_share:
             for mate in by_group.get((info.get("team", ""), position), []):
@@ -2059,8 +2164,13 @@ async def get_espn_roster_map(espn_games: List[Dict], date_str: str) -> dict:
             return {}
     except Exception:
         return {}
-    teams = sorted({a for g in espn_games for a in
-                    (g.get("home_abbr", ""), g.get("away_abbr", "")) if a})
+    team_specs = {}
+    for game in espn_games:
+        for side in ("home", "away"):
+            abbr = str(game.get(f"{side}_abbr") or "")
+            if abbr:
+                team_specs[abbr] = str(game.get(f"{side}_team_id") or "")
+    teams = sorted(team_specs)
     now = time.time()
 
     async def _one(team):
@@ -2070,9 +2180,19 @@ async def get_espn_roster_map(espn_games: List[Dict], date_str: str) -> dict:
         players = {}
         try:
             async with httpx.AsyncClient(timeout=12) as c:
-                r = await c.get(
+                roster_call = c.get(
                     f"https://site.api.espn.com/apis/site/v2/sports/football/nfl/teams/{team}/roster")
-            if r.is_success:
+                team_id = team_specs.get(team) or team
+                depth_call = c.get(
+                    "https://sports.core.api.espn.com/v2/sports/football/"
+                    f"leagues/nfl/seasons/{_cur_season}/teams/{team_id}/depthcharts")
+                roster_result, depth_result = await asyncio.gather(
+                    roster_call, depth_call, return_exceptions=True)
+            r = roster_result if isinstance(roster_result, httpx.Response) else None
+            depth_map = {}
+            if isinstance(depth_result, httpx.Response) and depth_result.is_success:
+                depth_map = _nfl_depth_chart_map(depth_result.json())
+            if r is not None and r.is_success:
                 for group in r.json().get("athletes", []):
                     bucket = str(group.get("position") or "")
                     for athlete in group.get("items", []):
@@ -2081,6 +2201,7 @@ async def get_espn_roster_map(espn_games: List[Dict], date_str: str) -> dict:
                             continue
                         status = athlete.get("status") or {}
                         pos = athlete.get("position") or {}
+                        athlete_id = str(athlete.get("id") or "")
                         status_type = str(status.get("type") or "").lower()
                         injury_status, injury_note, participation = (
                             _nfl_injury_status(athlete))
@@ -2096,6 +2217,7 @@ async def get_espn_roster_map(espn_games: List[Dict], date_str: str) -> dict:
                                     and status_type not in
                                     ("injuredreserve", "out", "suspended", "practicesquad")
                                     and injury_status != "OUT")
+                        depth = depth_map.get(athlete_id) or {}
                         players[_norm(name)] = {
                             "team": team, "eligible": eligible,
                             "bucket": bucket,
@@ -2108,6 +2230,13 @@ async def get_espn_roster_map(espn_games: List[Dict], date_str: str) -> dict:
                             "rookie_verified": rookie_verified,
                             "is_rookie": bool(
                                 rookie_verified and experience_years == 0),
+                            "athlete_id": athlete_id,
+                            "depth_rank": depth.get("depth_rank"),
+                            "depth_position": depth.get("depth_position"),
+                            "depth_chart": depth.get("depth_chart", ""),
+                            "depth_updated_at": (
+                                datetime.now(timezone.utc).isoformat()
+                                if depth else None),
                             "injury_updated_at": datetime.now(
                                 timezone.utc).isoformat(),
                         }
@@ -3128,6 +3257,14 @@ def _nfl_role_profile(df, team, pos, name, stat_col=""):
             if "offense_pct" in recent:
                 snap_conf = recent.groupby("player_display_name")["offense_pct"].mean()
                 agg["snap_mean"] = agg.player_display_name.map(snap_conf)
+                snap_recent = recent[recent["_player_recent_n"] < 2].groupby(
+                    "player_display_name")["offense_pct"].mean()
+                snap_prior = recent[
+                    (recent["_player_recent_n"] >= 2)
+                    & (recent["_player_recent_n"] < 7)
+                ].groupby("player_display_name")["offense_pct"].mean()
+                agg["snap_recent"] = agg.player_display_name.map(snap_recent)
+                agg["snap_prior"] = agg.player_display_name.map(snap_prior)
             # Receiving option rank deliberately spans WR/TE/RB and never uses carries.
             rec=df[df.recent_team.astype(str).str.upper()==str(team).upper()].copy()
             if "position" in rec:
@@ -3165,7 +3302,57 @@ def _nfl_role_profile(df, team, pos, name, stat_col=""):
     snap_bonus = 0.0
     try: snap_bonus = min(.12, max(0.0, float(d.iloc[ix].get("snap_mean") or 0) / 1000.0))
     except (TypeError, ValueError): pass
-    return {"role":role,"roleRank":ix+1,"option_rank":option_rank,"confidence":round(min(.9,.35+min(float(d.iloc[ix].games),10)*.055+snap_bonus),2),"factor":round(lead if ix==0 else 1+(tail-1)*min(ix,2)/2,3),"reason":"Recent usage ranking; snap participation blended when available"}
+    snap_recent = snap_prior = snap_delta = None
+    try:
+        snap_recent = float(d.iloc[ix].get("snap_recent"))
+        if not math.isfinite(snap_recent): snap_recent = None
+    except (TypeError, ValueError):
+        snap_recent = None
+    try:
+        snap_prior = float(d.iloc[ix].get("snap_prior"))
+        if not math.isfinite(snap_prior): snap_prior = None
+    except (TypeError, ValueError):
+        snap_prior = None
+    if snap_recent is not None and snap_prior is not None:
+        snap_delta = round(snap_recent - snap_prior, 1)
+    return {"role":role,"roleRank":ix+1,"option_rank":option_rank,
+            "confidence":round(min(.9,.35+min(float(d.iloc[ix].games),10)*.055+snap_bonus),2),
+            "factor":round(lead if ix==0 else 1+(tail-1)*min(ix,2)/2,3),
+            "reason":"Recent usage ranking; snap participation blended when available",
+            "snapRecent":round(snap_recent,1) if snap_recent is not None else None,
+            "snapPrior":round(snap_prior,1) if snap_prior is not None else None,
+            "snapDelta":snap_delta}
+
+def _nfl_role_risk_context(pl: dict, role: dict) -> dict:
+    """Combine verified current status with historical snap-trend context."""
+    status = str(pl.get("role_risk_status") or "UNVERIFIED").upper()
+    reasons = [str(x) for x in (pl.get("role_risk_reasons") or []) if str(x)]
+    block_premium = bool(pl.get("role_risk_block_premium"))
+    snap_recent = role.get("snapRecent")
+    snap_prior = role.get("snapPrior")
+    snap_delta = role.get("snapDelta")
+    try:
+        usage_drop = (
+            snap_recent is not None and snap_delta is not None
+            and float(snap_recent) < 55.0 and float(snap_delta) <= -20.0)
+    except (TypeError, ValueError):
+        usage_drop = False
+    if usage_drop:
+        if status == "CLEAR":
+            status = "WATCH"
+        reasons.append(
+            f"Recent offense snaps fell to {float(snap_recent):.0f}% "
+            f"from {float(snap_prior):.0f}%")
+    confidence_factor = 0.76 if status == "AVOID" else (0.88 if status == "WATCH" else 1.0)
+    return {
+        "status": status, "reasons": reasons, "blockPremium": block_premium,
+        "source": pl.get("role_risk_source") or "ESPN roster",
+        "updatedAt": pl.get("depth_updated_at") or pl.get("injury_updated_at"),
+        "confidenceFactor": confidence_factor,
+        "snapRecent": snap_recent, "snapPrior": snap_prior,
+        "snapDelta": snap_delta,
+    }
+
 def _nfl_posdef_profile(df, defense, pos, stat, defense_venue=None):
     """Point-in-time positional defense profile split by the defense's venue.
 
@@ -3443,6 +3630,7 @@ def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str,
     # Market-specific opponent positional defense and current offensive role
     # change the projection itself; generic defense remains a low-data fallback.
     role = _nfl_role_profile(df, game_team, effective_position, name, stat_col)
+    role_risk = _nfl_role_risk_context(pl, role)
     defense_venue = ("AWAY" if is_home else "HOME") if is_home is not None else None
     posdef = (_nfl_posdef_profile(df, opp_abbr, effective_position, stat_col,
                                   defense_venue)
@@ -3533,6 +3721,9 @@ def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str,
         score = round(50.0 + (score - 50.0) * 0.80, 1)
     elif player_injury_status == "LIMITED":
         score = round(50.0 + (score - 50.0) * 0.92, 1)
+    if role_risk["confidenceFactor"] != 1.0:
+        score = round(50.0 + (score - 50.0)
+                      * role_risk["confidenceFactor"], 1)
     tag     = _book_tag_nfl(pick, score, gap, under_rate)
     # Anytime TD is a binary, price-sensitive market. A raw historical hit
     # rate is not enough: a 44% TD rate loses at +100 and only starts to clear
@@ -3561,6 +3752,11 @@ def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str,
                 value_reason = "No positive model edge over break-even"
             else:
                 value_reason = "Model does not project an OVER"
+    if role_risk["blockPremium"]:
+        bet_qualified = False
+        value_reason = (
+            "Role Risk: " + "; ".join(role_risk["reasons"])
+            if role_risk["reasons"] else "Role Risk: verified reduced role")
 
     # Recent game log (newest first) for the ladder modal
     glog = []
@@ -3632,6 +3828,17 @@ def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str,
         "role": role.get("role"), "teamOptionRank": role.get("option_rank"),
         "roleConfidence": role.get("confidence"), "roleFactor": role_factor,
         "roleReason": role.get("reason"), "positionGroup": effective_position,
+        "recentSnapPct": role.get("snapRecent"),
+        "priorSnapPct": role.get("snapPrior"),
+        "snapTrendPct": role.get("snapDelta"),
+        "depthRank": pl.get("depth_rank"),
+        "depthPosition": pl.get("depth_position"),
+        "depthChart": pl.get("depth_chart", ""),
+        "roleRiskStatus": role_risk["status"],
+        "roleRiskReasons": role_risk["reasons"],
+        "roleRiskSource": role_risk["source"],
+        "roleRiskUpdatedAt": role_risk["updatedAt"],
+        "roleRiskBlockPremium": role_risk["blockPremium"],
         "defAllowed": posdef.get("allowed"), "defSample": posdef.get("sample", 0),
         "defenseVenue": posdef.get("defenseVenue"),
         "defHomeAllowed": posdef.get("defHomeAllowed"),
@@ -3914,6 +4121,7 @@ def _analyze_new_prop_raw(pl: Dict, df, home_abbr: str, away_abbr: str,
         if history_lock else "")
 
     role = _nfl_role_profile(df, team, position, name, stat_col)
+    role_risk = _nfl_role_risk_context(pl, role)
     defense_venue = "AWAY" if home_road == "H" else "HOME"
     posdef = _nfl_posdef_profile(df, opp, position, stat_col, defense_venue)
     defcontext = _nfl_defense_context_profile(
@@ -4055,6 +4263,9 @@ def _analyze_new_prop_raw(pl: Dict, df, home_abbr: str, away_abbr: str,
         # A permissive defense helps an OVER but hurts an UNDER, and vice versa.
         side_factor = combined_factor if pick == "OVER" else (2.0 - combined_factor)
         score = round(max(0.0, min(100.0, 50.0 + (score - 50.0) * side_factor)), 1)
+    if pick and role_risk["confidenceFactor"] != 1.0:
+        score = round(50.0 + (score - 50.0)
+                      * role_risk["confidenceFactor"], 1)
     avg = round(recent_mean, 1) if recent_mean is not None else None
     def_adj = round((def_factor - 1.0) * 100)
     unadjusted_projection = (
@@ -4128,6 +4339,17 @@ def _analyze_new_prop_raw(pl: Dict, df, home_abbr: str, away_abbr: str,
         "teamOptionRank": role.get("option_rank"), "roleConfidence": role.get("confidence"),
         "roleFactor": role_factor, "roleReason": role.get("reason"),
         "positionGroup": position,
+        "recentSnapPct": role.get("snapRecent"),
+        "priorSnapPct": role.get("snapPrior"),
+        "snapTrendPct": role.get("snapDelta"),
+        "depthRank": pl.get("depth_rank"),
+        "depthPosition": pl.get("depth_position"),
+        "depthChart": pl.get("depth_chart", ""),
+        "roleRiskStatus": role_risk["status"],
+        "roleRiskReasons": role_risk["reasons"],
+        "roleRiskSource": role_risk["source"],
+        "roleRiskUpdatedAt": role_risk["updatedAt"],
+        "roleRiskBlockPremium": role_risk["blockPremium"],
         "defAllowed": posdef.get("allowed"), "defSample": posdef.get("sample",0),
         "defenseVenue": posdef.get("defenseVenue"),
         "defHomeAllowed": posdef.get("defHomeAllowed"),
@@ -4172,7 +4394,8 @@ def _analyze_new_prop_raw(pl: Dict, df, home_abbr: str, away_abbr: str,
         "availabilityVerified": bool(pl.get("availability_verified")),
         "coachEligible": bool(pl.get("coach_eligible", True)), "score": score, "dispScore": score,
         "gap": gap, "pick": pick, "tag": "SUGGESTED" if pick else "",
-        "betQualified": bool(pick), "valueEdge": value_edge,
+        "betQualified": bool(pick) and not role_risk["blockPremium"],
+        "valueEdge": value_edge,
         "valueReason": "" if pick else ("Sparse history / no meaningful projection gap"
                                         if sparse else "No meaningful model gap"),
         "glog": glog, "vsOppLog": vs_opp_log, "sparseHistory": sparse,
@@ -7706,6 +7929,9 @@ def _nfl_coach_hist_family(label):
 def _nfl_coach_hist_candidates(picks):
     selected, seen = [], set()
     for pick in picks or []:
+        if (pick.get("betQualified") is False
+                or pick.get("roleRiskBlockPremium") is True):
+            continue
         side = str(pick.get("pick") or "OVER").upper()
         odds = pick.get("realUnderOdds") if side == "UNDER" else pick.get("realOdds")
         implied = _nfl_coach_hist_implied(odds)
@@ -11258,6 +11484,10 @@ function nflCard(p,i){
     defChip='<div style="font-size:.62rem;font-weight:800;color:'+dcol+';margin-top:2px">vs #'+p.defRank+' '+(p.defLbl||'D')+' · '+(p.defAdj>0?'+':'')+p.defAdj+'% projection'+(p.defAllowed!=null?' · '+p.defAllowed+' allowed':'')+'</div>';
   }
   var roleChip=p.role?'<div style="font-size:.62rem;font-weight:800;color:#93c5fd;margin-top:2px">'+_esc(p.role)+(p.teamOptionRank!=null?' · team receiving option #'+p.teamOptionRank:'')+' · '+Math.round(Number(p.roleConfidence||0)*100)+'% role confidence</div>':'';
+  var riskStatus=String(p.roleRiskStatus||'').toUpperCase();
+  var riskChip=(riskStatus==='WATCH'||riskStatus==='AVOID')
+    ?'<div style="margin-top:5px;padding:5px 7px;border-radius:6px;border:1px solid '+(riskStatus==='AVOID'?'rgba(248,113,113,.55)':'rgba(251,191,36,.5)')+';background:'+(riskStatus==='AVOID'?'rgba(127,29,29,.18)':'rgba(120,80,0,.15)')+';color:'+(riskStatus==='AVOID'?'#fca5a5':'#fde68a')+';font-size:.62rem;font-weight:900">ROLE '+riskStatus+' · '+_esc((p.roleRiskReasons||[])[0]||'Review expected usage')+'</div>'
+    :'';
   return `
    <div class="pick-card ${_accFor(p.mkt)}">
      <div class="pc-rank">${i}</div>
@@ -11271,6 +11501,7 @@ function nflCard(p,i){
            <div class="pc-meta">${systemBadge} ${sparseBadge} ${posBadge}${p.team} vs ${p.opponent} ${haBadge}${p.slate_date?' · '+p.slate_date:''}</div>
          <div class="pc-mkt">${p.mkt||''} · ${p.pick||''}</div>
          ${roleChip}
+          ${riskChip}
          ${defChip}
        </div>
      </div>
@@ -11291,6 +11522,45 @@ function nflCardGrid(picks,startRank){
   if(!picks||!picks.length) return '<div class="no-picks">No qualifying picks for this market.</div>';
    startRank=(startRank==null?1:startRank);
    return '<div class="picks-grid">'+picks.map(function(p,i){return nflCard(p,startRank+i);}).join('')+'</div>';
+}
+function _nflRoleRiskBoard(rows){
+  var allSeen={},allPlayers=(rows||[]).filter(function(p){
+    var key=String(p.name||'').toLowerCase().replace(/[^a-z0-9]/g,'');
+    if(!key||allSeen[key])return false;allSeen[key]=1;return true;
+  });
+  var unverified=allPlayers.filter(function(p){
+    return String(p.roleRiskStatus||'UNVERIFIED').toUpperCase()==='UNVERIFIED';
+  }).length;
+  var seen={},players=(rows||[]).filter(function(p){
+    var status=String(p.roleRiskStatus||'').toUpperCase();
+    if(status!=='WATCH'&&status!=='AVOID')return false;
+    var key=String(p.name||'').toLowerCase().replace(/[^a-z0-9]/g,'');
+    if(!key||seen[key])return false;seen[key]=1;return true;
+  }).sort(function(a,b){
+    var ar=String(a.roleRiskStatus).toUpperCase()==='AVOID'?0:1;
+    var br=String(b.roleRiskStatus).toUpperCase()==='AVOID'?0:1;
+    return ar-br||String(a.name).localeCompare(String(b.name));
+  });
+  if(!players.length){
+    var neutral=unverified
+      ?unverified+' player'+(unverified===1?'':'s')+' could not be verified on the current ESPN roster/depth feed.'
+      :'No verified depth, injury, suspension, or recent-snap warning was found for the loaded players.';
+    return '<details style="margin:14px 0;border:1px solid #334155;border-radius:12px;background:#0b1220;overflow:hidden"><summary style="cursor:pointer;padding:12px 15px;color:#93c5fd;font-weight:950">Pregame Role Risk Monitor · No flagged players</summary><div style="padding:0 15px 12px;color:#94a3b8;font-size:.7rem;line-height:1.45">'+neutral+'</div></details>';
+  }
+  var body=players.map(function(p){
+    var key=_ladKey(p);window.__NFLLAD__[key]=p;
+    var status=String(p.roleRiskStatus||'WATCH').toUpperCase();
+    var color=status==='AVOID'?'#fca5a5':'#fde68a';
+    var depth=p.depthRank!=null?_esc(p.depthPosition||p.position)+' '+p.depthRank:'Depth unavailable';
+    var snap=p.recentSnapPct!=null?Number(p.recentSnapPct).toFixed(0)+'% recent snaps':'Snap trend unavailable';
+    return '<button onclick="openNflLadder(&#39;'+key+'&#39;)" style="width:100%;display:grid;grid-template-columns:minmax(120px,1.1fr) minmax(90px,.7fr) minmax(180px,2fr);gap:10px;align-items:center;text-align:left;background:#0b1220;border:1px solid #334155;border-radius:8px;padding:9px 11px;color:#e2e8f0;cursor:pointer">'
+      +'<span><b style="color:#fff">'+_esc(p.name)+'</b><br><small style="color:#94a3b8">'+_esc(p.team)+' · '+_esc(p.position||'')+'</small></span>'
+      +'<span style="color:'+color+';font-weight:900">'+status+'<br><small>'+depth+'</small></span>'
+      +'<span style="font-size:.68rem;color:#cbd5e1">'+_esc((p.roleRiskReasons||[]).join(' · ')||'Review role')+'<br><small style="color:#64748b">'+snap+'</small></span></button>';
+  }).join('');
+  return '<details open style="margin:14px 0;border:1px solid rgba(251,191,36,.42);border-radius:12px;background:rgba(120,80,0,.08);overflow:hidden">'
+    +'<summary style="cursor:pointer;padding:12px 15px;color:#fde68a;font-weight:950">⚠ Pregame Role Risk Monitor · '+players.length+' player'+(players.length===1?'':'s')+'</summary>'
+    +'<div style="padding:0 12px 12px;display:grid;gap:7px"><div style="color:#cbd5e1;font-size:.7rem;line-height:1.45">AVOID players are excluded from Locks, Coach Edge, and Perfect Parlay. WATCH players remain eligible with reduced confidence. Click a player for depth, snap, injury, and source details.</div>'+body+'</div></details>';
 }
 function _spRow(p){
   var key=_ladKey(p); window.__NFLLAD__[key]=p;
@@ -11452,8 +11722,12 @@ function openNflLadder(key){
     :'';
 
   var roleHtml = p.role
-    ? '<div class="pm-stat"><span class="k">Role / opportunity<span class="pm-stat-note">Estimated depth-chart opportunity from recent usage</span></span><span class="v">'+_esc(p.role)+(p.teamOptionRank!=null?' &middot; Option #'+p.teamOptionRank:'')+' ('+Math.round(Number(p.roleConfidence||0)*100)+'% conf)</span></div>'
+    ? '<div class="pm-stat"><span class="k">Role / opportunity<span class="pm-stat-note">Recent usage plus current ESPN offensive depth chart when available</span></span><span class="v">'+_esc(p.role)+(p.teamOptionRank!=null?' &middot; Option #'+p.teamOptionRank:'')+(p.depthRank!=null?' &middot; ESPN '+_esc(p.depthPosition||p.position)+' '+p.depthRank:'')+' ('+Math.round(Number(p.roleConfidence||0)*100)+'% conf)</span></div>'
     : '';
+  var roleRiskStatus=String(p.roleRiskStatus||'').toUpperCase();
+  var roleRiskHtml=(roleRiskStatus&&roleRiskStatus!=='CLEAR'&&roleRiskStatus!=='UNVERIFIED')
+    ?'<div class="pm-callout '+(roleRiskStatus==='AVOID'?'pm-callout-amber':'pm-callout-blue')+'"><div class="pm-co-title">Role Risk · '+_esc(roleRiskStatus)+'</div><div class="pm-co-body">'+_esc((p.roleRiskReasons||[]).join(' · ')||'Reduced-role evidence requires review')+(p.recentSnapPct!=null?'<br>Recent offense snaps: '+Number(p.recentSnapPct).toFixed(0)+'%'+(p.priorSnapPct!=null?' vs prior '+Number(p.priorSnapPct).toFixed(0)+'%':''):'')+'<br><span style="color:#94a3b8">Source: '+_esc(p.roleRiskSource||'ESPN roster')+'</span></div></div>'
+    :'';
     
   var probHtml = (p.baseProbability!=null||p.adjustedProbability!=null)
     ? '<div class="pm-stat"><span class="k">Base &rarr; adjusted probability<span class="pm-stat-note">Base blends opponent history and recent venue form; adjusted adds role, defense and verified injury effects</span></span><span class="v">'+(p.baseProbability!=null?Number(p.baseProbability).toFixed(1):'—')+'% &rarr; '+(p.adjustedProbability!=null?Number(p.adjustedProbability).toFixed(1):'—')+'%</span></div>'
@@ -11480,6 +11754,7 @@ function openNflLadder(key){
     +'</div>'
     +'<div class="pm-body">'
     +_nflPlayerWeatherHtml(p)
+     +roleRiskHtml
     +parlayWhy
     +historyRule
     +splitHtml
@@ -11821,7 +12096,8 @@ function _nflCoachProps(sourceCandidates){
     (Array.isArray(d.coach_candidates)&&d.coach_candidates.length?d.coach_candidates:
       (Array.isArray(d.all)&&d.all.length?d.all:(d.picks||[])));
   source.forEach(function(p){
-    if(p.coachEligible===false || p.availabilityVerified===false)return;
+    if(p.coachEligible===false || p.availabilityVerified===false
+       ||p.betQualified===false||p.roleRiskBlockPremium===true)return;
     // The live API only serves the current result cache for 15 minutes. Do not
     // apply a second browser-clock/per-row timestamp gate: old-format rows or a
     // page left open can otherwise erase every Coach candidate after loading.
@@ -12776,6 +13052,7 @@ function _nflPaint(q){
   var allF=(d.all||[]);
 
   var h='';
+  h+=_nflRoleRiskBoard(allF);
 
   // Chips (market chips are tappable -> all plays for that market)
   h+='<div class="chips">';
@@ -12822,6 +13099,7 @@ function _nflPaint(q){
   // ── 🔒 80–100% Locks — every tracked sample hit at 80%+ ─────────────────
   var lockPicks=(d.all||[]).filter(function(p){
     return !_nflGameDone(p) && p.betQualified!==false
+      && p.roleRiskBlockPremium!==true
       && Number(p.score||p.dispScore)>=80 && p.pick;
   });
   if(q) lockPicks=lockPicks.filter(function(p){return (p.name||'').toLowerCase().indexOf(q)>=0;});
