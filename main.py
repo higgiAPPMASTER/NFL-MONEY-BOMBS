@@ -7880,7 +7880,7 @@ _NFL_COACH_CATS = ("app_hit_rate_100", "safest_bets", "coach_edge", "alt_line_ed
                    "td_scorers", "best_unders", "rookie_plays")
 _NFL_COACH_CAPTURE_GUARD_SECONDS = 120
 _NFL_OBSERVATION_ONLY_TRACK_MARKETS = frozenset((
-    "player_anytime_td", "player_pass_tds",
+    "player_anytime_td",
 ))
 
 def _nfl_td_observation_only(row) -> bool:
@@ -7895,7 +7895,11 @@ def _nfl_td_observation_only(row) -> bool:
     label = str(
         row.get("market_label") or row.get("mkt")
         or row.get("label") or row.get("category") or "").strip().lower()
-    return "touchdown" in label or "anytime td" in label or label == "td scorers"
+    return (
+        "anytime td" in label
+        or "anytime touchdown" in label
+        or label == "td scorers"
+    )
 
 # NEW namespaces are intentionally separate PostgREST app values and category
 # keys.  No NEW read/write is allowed to silently fall through to the OLD
