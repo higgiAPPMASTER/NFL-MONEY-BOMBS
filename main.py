@@ -635,7 +635,12 @@ def _alt_coach_cache_get(date_key, allow_stale=False, system="OLD"):
         if p.exists() and (allow_stale or
                            (time.time() - p.stat().st_mtime) < _ALT_COACH_TTL):
             value = json.loads(p.read_text(encoding="utf-8"))
-            return value if isinstance(value, dict) else None
+            if isinstance(value, dict):
+                value.setdefault(
+                    "generated_at",
+                    datetime.fromtimestamp(
+                        p.stat().st_mtime, timezone.utc).isoformat())
+                return value
     except Exception as e:
         print(f"[AltCoachCache] read error: {e}")
     return None
@@ -643,6 +648,8 @@ def _alt_coach_cache_get(date_key, allow_stale=False, system="OLD"):
 def _alt_coach_cache_set(date_key, result, system="OLD"):
     try:
         prefix = "nfl_new_alt_coach" if str(system).upper() == "NEW" else "nfl_alt_coach"
+        result = dict(result or {})
+        result.setdefault("generated_at", datetime.now(timezone.utc).isoformat())
         (_CACHE_DIR / f"{prefix}_v{_ALT_COACH_CACHE_VERSION}_{date_key}.json").write_text(
             json.dumps(result, ensure_ascii=False), encoding="utf-8")
     except Exception as e:
@@ -6199,6 +6206,8 @@ async def _build_alt_coach_unlocked(date_str: str, system: str = "OLD") -> dict:
         return await asyncio.wait_for(coro, timeout=remaining)
     cached = await asyncio.to_thread(_alt_coach_cache_get, date_str, False, system)
     if cached and not cached.get("partial"):
+        await asyncio.to_thread(
+            _nfl_auto_capture_alt_coach, date_str, cached, system)
         if system == "NEW":
             cached.setdefault("system", "NEW")
             cached = _new_sanitize_json(cached)
@@ -6355,6 +6364,7 @@ async def _build_alt_coach_unlocked(date_str: str, system: str = "OLD") -> dict:
         "date": date_str, "picks": picks if not partial else [], "lines": len(lines),
         "partial": partial, "authoritative": not partial,
         "capture_allowed": not partial,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
         "warning": warning,
         "failed_games": unique_failures,
         "failed_game_count": len(unique_failures),
@@ -6367,6 +6377,8 @@ async def _build_alt_coach_unlocked(date_str: str, system: str = "OLD") -> dict:
     # board stays available through the endpoint fallback.
     if not partial:
         await asyncio.to_thread(_alt_coach_cache_set, date_str, payload, system)
+        await asyncio.to_thread(
+            _nfl_auto_capture_alt_coach, date_str, payload, system)
     if partial:
         retry_key = f"{system}:{date_str}"
         count = _ALT_COACH_RETRY_COUNT.get(retry_key, 0) + 1
@@ -6398,6 +6410,9 @@ async def api_nfl_coach_alternates(request: Request, date_str: str = "",
         _alt_coach_cache_get, ds, True, system)
     if stale_complete and stale_complete.get("partial"):
         stale_complete = None
+    if stale_complete:
+        await asyncio.to_thread(
+            _nfl_auto_capture_alt_coach, ds, stale_complete, system)
     if cached and not cached.get("partial"):
         return JSONResponse(cached)
     task, started = _alt_coach_start_task(ds, system)
@@ -7862,8 +7877,25 @@ _NFL_COACH_HIST_APP = "nfl_coach_historical"
 _NFL_COACH_CATS = ("app_hit_rate_100", "safest_bets", "coach_edge", "alt_line_edge",
                    "coach_over_movement", "coach_under_movement", "passing",
                    "rushing", "receiving", "defense", "kicking",
-                   "td_scorers", "best_unders", "rookie_plays")
+                   "best_unders", "rookie_plays")
 _NFL_COACH_CAPTURE_GUARD_SECONDS = 120
+_NFL_OBSERVATION_ONLY_TRACK_MARKETS = frozenset((
+    "player_anytime_td", "player_pass_tds",
+))
+
+def _nfl_td_observation_only(row) -> bool:
+    """TD recommendations stay visible but never enter any NFL record."""
+    if not isinstance(row, dict):
+        return False
+    market = str(
+        row.get("market") or row.get("source_market")
+        or row.get("sourceMarket") or "").strip().lower()
+    if market in _NFL_OBSERVATION_ONLY_TRACK_MARKETS:
+        return True
+    label = str(
+        row.get("market_label") or row.get("mkt")
+        or row.get("label") or row.get("category") or "").strip().lower()
+    return "touchdown" in label or "anytime td" in label or label == "td scorers"
 
 # NEW namespaces are intentionally separate PostgREST app values and category
 # keys.  No NEW read/write is allowed to silently fall through to the OLD
@@ -8000,6 +8032,13 @@ def _nfl_coach_hist_candidates(picks):
             selected.append(opposite)
     return selected
 
+def _nfl_coach_tracking_candidates(picks):
+    """Build Coach candidates with every TD market removed from tracking."""
+    return [
+        row for row in _nfl_coach_hist_candidates(picks)
+        if not _nfl_td_observation_only(row)
+    ]
+
 def _nfl_coach_hist_select(candidates, category, alternate=False):
     if category == "app_hit_rate_100":
         rows = [
@@ -8115,7 +8154,7 @@ async def _nfl_build_historical_coach(
     system = "NEW" if str(system).upper() == "NEW" else "OLD"
     target_positions = target_positions or {}
     def _build_standard():
-        standard = _nfl_coach_hist_candidates(picks)
+        standard = _nfl_coach_tracking_candidates(picks)
         return {
             category: _nfl_coach_hist_select(standard, category)
             for category in _NFL_COACH_CATS if category != "alt_line_edge"
@@ -8198,7 +8237,8 @@ async def _nfl_build_historical_coach(
                         analyzed_rows.append(analyzed)
         return analyzed_rows
     alt_results = await asyncio.to_thread(_analyze_historical_alts)
-    alt_candidates = await asyncio.to_thread(_nfl_coach_hist_candidates, alt_results)
+    alt_candidates = await asyncio.to_thread(
+        _nfl_coach_tracking_candidates, alt_results)
     output["alt_line_edge"] = await asyncio.to_thread(
         _nfl_coach_hist_select, alt_candidates, "alt_line_edge", alternate=True)
     for category, rows in output.items():
@@ -8339,7 +8379,7 @@ def _nfl_auto_capture_coach_categories(
     source = (
         result.get("coach_candidates") or result.get("all")
         or result.get("picks") or [])
-    candidates = _nfl_coach_hist_candidates(source)
+    candidates = _nfl_coach_tracking_candidates(source)
     if not candidates:
         return {}
     cfg = _nfl_store_config(system)
@@ -8385,6 +8425,65 @@ def _nfl_auto_capture_coach_categories(
           f"{date_str} {system}: {statuses}")
     return statuses
 
+def _nfl_auto_capture_alt_coach(
+        date_str: str, cached: dict, system: str = "OLD") -> str:
+    """Bank a complete alternate Coach cache using its pre-kickoff timestamp.
+
+    This is the asynchronous counterpart to standard preset capture. A stale
+    cache remains valid evidence only when it was generated before every saved
+    game's kickoff; final scores never participate in selection.
+    """
+    if (not isinstance(cached, dict) or cached.get("partial")
+            or not cached.get("authoritative", True)):
+        return "invalid"
+    candidates = _nfl_coach_tracking_candidates(
+        cached.get("picks") or cached.get("all") or [])
+    selected = _nfl_coach_hist_select(
+        candidates, "alt_line_edge", alternate=True)
+    if not selected:
+        return "empty"
+    generated_raw = str(cached.get("generated_at") or "")
+    try:
+        generated_at = datetime.fromisoformat(
+            generated_raw.replace("Z", "+00:00"))
+        if generated_at.tzinfo is None:
+            generated_at = generated_at.replace(tzinfo=timezone.utc)
+        generated_at = generated_at.astimezone(timezone.utc)
+    except (TypeError, ValueError):
+        return "missing_timestamp"
+    frozen, kickoffs = [], []
+    for raw in selected:
+        kickoff = _nfl_coach_kickoff(raw.get("game_start"))
+        kickoff_date = (
+            kickoff.astimezone(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
+            if kickoff else "")
+        if (not kickoff or kickoff_date != date_str
+                or generated_at + timedelta(
+                    seconds=_NFL_COACH_CAPTURE_GUARD_SECONDS) >= kickoff):
+            return "not_pregame"
+        kickoffs.append(kickoff)
+        frozen.append({
+            **dict(raw),
+            "captured_at": generated_at.isoformat(),
+            "result": "PENDING",
+            "actual": None,
+            "units": None,
+        })
+    deadline = min(kickoffs).isoformat()
+    for row in frozen:
+        row["snapshot_deadline"] = deadline
+    cfg = _nfl_store_config(system)
+    status = _nfl_sb_save_latest_unlocked(
+        "mpa_track_ledger", {
+            "app": cfg["coach"], "date": date_str,
+            "category": "alt_line_edge", "side": "ALL",
+            "wins": 0, "losses": 0, "locked": False,
+            "locked_at": deadline, "detail": frozen,
+        }, generated_at.isoformat())
+    print("[nfl_coach_track] cached alternate preset capture "
+          f"{date_str} {system}: {status} ({len(frozen)} plays)")
+    return status
+
 def _nfl_official_capture_allowed(date_str: str, result: dict) -> bool:
     """Official records require a slate captured before every kickoff.
     Historical/manual after-the-fact runs remain view-only simulations."""
@@ -8426,6 +8525,14 @@ def _nfl_save_historical_replay(date_str: str, replay: dict, system: str = "OLD"
     overflow_daily = replay.get("overflow_dates") or []
     props = daily[0].get("detail") if daily else []
     overflow = overflow_daily[0].get("detail") if overflow_daily else []
+    props = [
+        row for row in (props or [])
+        if not _nfl_td_observation_only(row)
+    ]
+    overflow = [
+        row for row in (overflow or [])
+        if not _nfl_td_observation_only(row)
+    ]
     gp = replay.get("game_predictor") or {}
     if not props and not overflow and not gp.get("daily"):
         return False
@@ -8566,6 +8673,7 @@ def _nfl_save_picks_snapshot(date_str: str, result: dict, system: str = "OLD"):
     picks = [
         {**pick, "snapshot_captured_at": captured_at.isoformat()}
         for pick in (result.get("picks") or [])
+        if not _nfl_td_observation_only(pick)
     ]
     if not picks:
         return
@@ -8943,7 +9051,8 @@ def _nfl_grade_date(date_str: str, snap: list, box_override: dict = None) -> dic
 def _nfl_aggregate_graded(graded: dict) -> dict:
     agg: dict = {}
     for row in graded.get("main", []) + graded.get("overflow", []) + graded.get("locks", []):
-        if row.get("result") not in ("WIN", "LOSS"):
+        if (_nfl_td_observation_only(row)
+                or row.get("result") not in ("WIN", "LOSS")):
             continue
         cat  = row["category"]
         side = row.get("side", "OVER")
@@ -8963,7 +9072,8 @@ def _nfl_detail_graded(graded: dict, include_overflow: bool = True,
     if include_overflow or overflow_only:
         rows += graded.get("overflow", [])
     for row in rows:
-        if row.get("result") not in ("WIN", "LOSS"):
+        if (_nfl_td_observation_only(row)
+                or row.get("result") not in ("WIN", "LOSS")):
             continue
         out.append({k: row.get(k) for k in (
             "name", "team", "category", "side", "market",
@@ -9003,7 +9113,10 @@ def _nfl_historical_replay_payload(result: dict, espn_games: list = None,
     """Build a view-only Track Record payload for one completed historical date."""
     date_str = result.get("date") or ""
     graded = _nfl_grade_date(
-        date_str, result.get("picks") or [], box_override=replay_box)
+        date_str, [
+            pick for pick in (result.get("picks") or [])
+            if not _nfl_td_observation_only(pick)
+        ], box_override=replay_box)
     detail = _nfl_detail_graded(graded, include_overflow=False)
     overflow_detail = _nfl_detail_graded(graded, overflow_only=True)
 
@@ -9135,6 +9248,10 @@ def _nfl_update_track_ledger(include_date: str = "", system: str = "OLD"):
             if d >= today or d in locked:
                 continue
             snap = _nfl_load_picks_snapshot(d, system)
+            snap = [
+                pick for pick in snap
+                if not _nfl_td_observation_only(pick)
+            ]
             if not snap:
                 continue
             try:
@@ -9370,7 +9487,13 @@ async def nfl_track_record(grade: bool = False, date_str: str = "", system: str 
         "app": f"eq.{cfg['app']}", "category": f"eq.{cfg['detail']}",
         "locked": "eq.true", "select": "date,detail", "limit": "365",
     })
-    detail_by_date = {r["date"]: (r.get("detail") or []) for r in (led_rows or [])}
+    detail_by_date = {
+        r["date"]: [
+            row for row in (r.get("detail") or [])
+            if not _nfl_td_observation_only(row)
+        ]
+        for r in (led_rows or [])
+    }
     dates = sorted(detail_by_date.keys(), reverse=True)
     result = []
     for d in dates:
@@ -9412,7 +9535,13 @@ async def nfl_track_record(grade: bool = False, date_str: str = "", system: str 
         "locked": "eq.true", "select": "date,detail", "limit": "365",
     })
     overflow_dates = [
-        {"date": r.get("date"), "detail": r.get("detail") or []}
+        {
+            "date": r.get("date"),
+            "detail": [
+                row for row in (r.get("detail") or [])
+                if not _nfl_td_observation_only(row)
+            ],
+        }
         for r in (overflow_rows or []) if r.get("date")
     ]
     overflow_dates.sort(key=lambda x: x["date"], reverse=True)
@@ -9427,9 +9556,19 @@ async def nfl_track_record(grade: bool = False, date_str: str = "", system: str 
         payload = saved.get("detail") or {}
         if not d or not isinstance(payload, dict):
             continue
-        historical_dates.append({"date": d, "detail": payload.get("props") or []})
+        historical_dates.append({
+            "date": d,
+            "detail": [
+                row for row in (payload.get("props") or [])
+                if not _nfl_td_observation_only(row)
+            ],
+        })
         historical_overflow_dates.append({
-            "date": d, "detail": payload.get("overflow") or [],
+            "date": d,
+            "detail": [
+                row for row in (payload.get("overflow") or [])
+                if not _nfl_td_observation_only(row)
+            ],
         })
         gp = payload.get("game_predictor") or {}
         historical_gp_daily.extend(gp.get("daily") or [])
@@ -9527,14 +9666,14 @@ def _nfl_coach_canonical_capture(date_str, category, filters=None, system: str =
         picks = ((source.get("picks") or source.get("all"))
                  if isinstance(source, dict) else [])
         candidates = _nfl_coach_filter_candidates(
-            _nfl_coach_hist_candidates(picks), filters)
+            _nfl_coach_tracking_candidates(picks), filters)
         return _nfl_coach_hist_select(candidates, category, alternate=True)
     source = _new_cache_get(date_str) if str(system).upper() == "NEW" else _cache_get(date_str)
     picks = ((source.get("coach_candidates") or source.get("all")
               or source.get("picks") or [])
              if isinstance(source, dict) else [])
     candidates = _nfl_coach_filter_candidates(
-        _nfl_coach_hist_candidates(picks), filters)
+        _nfl_coach_tracking_candidates(picks), filters)
     return _nfl_coach_hist_select(candidates, category)
 
 def _nfl_grade_coach_ledger(system: str = "OLD"):
@@ -9757,7 +9896,8 @@ async def nfl_coach_track(request: Request, token: str = "", grade: bool = False
                 continue
         if saved.get("category") in grouped:
             for row in (saved.get("detail") or []):
-                if not isinstance(row, dict):
+                if (not isinstance(row, dict)
+                        or _nfl_td_observation_only(row)):
                     continue
                 clean = {
                     **row,
@@ -12590,7 +12730,11 @@ function askNflTdCoach(){
     seen[key]=1;return true;
   }).slice(0,10);
   _nflCoachRender(q,shown,props.length,'td_probability',false);
-  _nflCoachCapture(_nflCoachTrackedCategory('td_scorers'),shown);
+  var captureStatus=document.getElementById('nflCoachCaptureStatus');
+  if(captureStatus){
+    captureStatus.textContent='TD plays are observation only and are not tracked.';
+    captureStatus.style.color='#fbbf24';
+  }
   return shown;
 }
 async function askNflAltCoach(){
