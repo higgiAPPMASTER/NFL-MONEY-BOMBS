@@ -12940,7 +12940,7 @@ function askNflCoach(options){
   var rows=candidates.filter(function(p){
     if(exactHundred&&Math.abs(Number(p.appProb)-100)>0.05)return false;
     if(exactHundred&&p.isAlternate)return false;
-    if(!exactHundred&&f.mode!=='safe'&&p.edge<=0)return false;
+    if(!exactHundred&&(options.alternate||f.mode!=='safe')&&p.edge<=0)return false;
     if(options.alternate&&p.appProb<85)return false;
     if(options.alternate&&p.implied<70)return false;
     if(options.alternate&&(p.odds==null||p.odds<-1000))return false;
