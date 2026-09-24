@@ -161,8 +161,8 @@ _NFL_ALT_FETCH_CONCURRENCY = 3
 _NFL_ALT_GAME_TIMEOUT = 24
 _NFL_ALT_FETCH_STAGE_TIMEOUT = 90
 _NFL_ALT_LOAD_STAGE_TIMEOUT = 180
-_NFL_ALT_ANALYSIS_STAGE_TIMEOUT = 180
-_NFL_ALT_OVERALL_TIMEOUT = 300
+_NFL_ALT_ANALYSIS_STAGE_TIMEOUT = 360
+_NFL_ALT_OVERALL_TIMEOUT = 480
 _NFL_ALT_MIN_ODDS = -1000
 
 def _nfl_alt_fetch_deadline(game_count):
@@ -6169,6 +6169,22 @@ def _nfl_alt_side_metrics(result, side):
     except (TypeError, ValueError):
         return None, None, None, None
 
+def _nfl_alt_has_qualifying_price(line):
+    """Skip only ladders where neither real book side can pass Coach's price gate.
+
+    The model still evaluates every player/market/line with a potentially
+    qualifying price; this is not a cap on games, players, or markets.
+    """
+    for key in ("over_odds", "under_odds"):
+        try:
+            price = float(line.get(key))
+        except (TypeError, ValueError):
+            continue
+        implied = _nfl_implied_prob(price)
+        if price >= _NFL_ALT_MIN_ODDS and implied is not None and implied >= 70:
+            return True
+    return False
+
 def _nfl_alt_result_eligible(result):
     if not result or not result.get("coachEligible", True):
         return False
@@ -6312,9 +6328,10 @@ async def _build_alt_coach_unlocked(date_str: str, system: str = "OLD") -> dict:
             })
             lines.append(line)
     lines = _nfl_dedupe_alt_lines(lines)
+    priced_lines = [line for line in lines if _nfl_alt_has_qualifying_price(line)]
     if time.monotonic() - started > _NFL_ALT_OVERALL_TIMEOUT:
         failed_events.append("alternate analysis deadline")
-    await asyncio.to_thread(_apply_nfl_injury_context, lines, roster_map)
+    await asyncio.to_thread(_apply_nfl_injury_context, priced_lines, roster_map)
     try:
         df = await _alt_stage(get_nfl_stats(), _NFL_ALT_LOAD_STAGE_TIMEOUT)
     except Exception as exc:
@@ -6334,7 +6351,7 @@ async def _build_alt_coach_unlocked(date_str: str, system: str = "OLD") -> dict:
         with _NFL_ANALYSIS_LOCK:
             _NFL_POSDEF_FRAME_LOCAL.frame = defense_df
             try:
-                for line in lines:
+                for line in priced_lines:
                     if time.monotonic() >= deadline:
                         timed_out = True
                         break
@@ -6362,6 +6379,7 @@ async def _build_alt_coach_unlocked(date_str: str, system: str = "OLD") -> dict:
         if failed_events else "")
     payload = {
         "date": date_str, "picks": picks if not partial else [], "lines": len(lines),
+        "priced_lines": len(priced_lines),
         "partial": partial, "authoritative": not partial,
         "capture_allowed": not partial,
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -12829,7 +12847,7 @@ async function askNflAltCoach(){
   var date=(dateEl&&dateEl.value)||window.__NFL_DATE__||'';
   var run={date:date,system:_nflSystem(),generation:_nflSystemGeneration,
     seq:(window.__NFL_ALT_COACH_SEQ__||0)+1,cancelled:false,requestController:null,
-    deadline:Date.now()+10*60*1000};
+    deadline:Date.now()+15*60*1000};
   run.viewSeq=window.__NFL_COACH_VIEW_SEQ__||0;
   window.__NFL_ALT_COACH_SEQ__=run.seq;
   window.__NFL_ALT_COACH_RUN__=run;
@@ -12885,6 +12903,12 @@ async function askNflAltCoach(){
     if(!res.ok||data.error)throw new Error(data.detail||data.error||('HTTP '+res.status));
     ensureCurrent();
     var partial=!!(data.stale||data.partial||data.complete===false||String(data.warning||'').trim());
+    if(partial&&!(data.picks||[]).length){
+      var reason=data.warning||'The alternate scan is incomplete; no verified Top 10 is available yet.';
+      if(answer){answer.style.display='block';answer.innerHTML='<div class="nfl-coach-summary" style="color:#fbbf24">'+_esc(reason)+' Retry this scan shortly; no picks were captured.</div>';}
+      if(captureStatus){captureStatus.textContent='Alternate scan incomplete. Nothing was captured.';captureStatus.style.color='#fbbf24';}
+      return;
+    }
     var altProps=_nflCoachProps(data.picks||[]);
     window.__NFL_LAST_ALT_COACH__=partial?window.__NFL_LAST_ALT_COACH__:(data.picks||[]).slice();
     window.__NFL_LAST_ALT_COACH_DATE__=partial?window.__NFL_LAST_ALT_COACH_DATE__:date;
