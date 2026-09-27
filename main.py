@@ -6046,26 +6046,46 @@ async def _run_pipeline_unlocked(date_str: str, progress=None, simulate: bool = 
         await asyncio.to_thread(_nfl_capture_opening_lines, date_str, result)
     await asyncio.to_thread(_nfl_attach_line_movement, date_str, result)
     await asyncio.to_thread(_nfl_json_ready, result)
-    # The short-lived /tmp cache is only an accelerator. Persist each game's
-    # latest completed pre-kickoff board independently so a service restart or
-    # an early kickoff cannot erase/block the still-bettable late-game slate.
-    await asyncio.to_thread(_nfl_save_board_snapshots, date_str, result, system)
+    # Capture the official slate first. A slow per-game board upload must not
+    # consume the remaining pre-kickoff window for the official record.
     official_capture = (
         capture_official and _nfl_official_capture_allowed(date_str, result))
-    result["official_tracking"] = official_capture
+    picks_saved = gp_saved = False
     if not capture_official:
         result["tracking_reason"] = (
             "Weekly opening-line snapshot only; official picks remain available "
             "for the first eligible game-day run.")
     if official_capture:
-        await asyncio.to_thread(_nfl_save_picks_snapshot, date_str, result, system)
-        await asyncio.to_thread(_nfl_save_gp_snapshot, date_str, result, system)
+        picks_saved = await asyncio.to_thread(
+            _nfl_save_picks_snapshot, date_str, result, system)
+        gp_saved = await asyncio.to_thread(
+            _nfl_save_gp_snapshot, date_str, result, system)
         await asyncio.to_thread(
             _nfl_auto_capture_coach_categories, date_str, result, system)
     else:
         print(f"[nfl_track] official snapshot skipped for {date_str}: "
               + ("weekly opening-line mode"
                  if not capture_official else "capture was not before every kickoff"))
+    result["official_tracking"] = bool(official_capture and picks_saved)
+    # The short-lived /tmp cache is only an accelerator. Persist each game's
+    # latest completed pre-kickoff board independently so a service restart or
+    # an early kickoff cannot erase/block the still-bettable late-game slate.
+    board_saved = await asyncio.to_thread(
+        _nfl_save_board_snapshots, date_str, result, system)
+    missing_snapshots = []
+    if not board_saved and result.get("game_predictions"):
+        missing_snapshots.append("per-game board snapshots")
+    if official_capture and not picks_saved:
+        missing_snapshots.append("official player-prop record")
+    if official_capture and not gp_saved:
+        missing_snapshots.append("official Game Predictor record")
+    if missing_snapshots:
+        warning = ("⚠️ Snapshot storage not confirmed for "
+                   + ", ".join(missing_snapshots)
+                   + ". Picks are displayed, but those records are not confirmed in Supabase.")
+        result["data_warning"] = " · ".join(
+            part for part in (result.get("data_warning"), warning) if part)
+        print(f"[nfl_track] {warning}")
     await asyncio.to_thread(
         _new_cache_set if system == "NEW" else _cache_set, date_str, result)
     if system == "OLD":
@@ -7565,7 +7585,28 @@ def _nfl_sb_get(table, params=None):
         print(f"[nfl_sb_get] {e}")
     return []
 
-def _nfl_sb_upsert(table, rows, on_conflict=None):
+def _nfl_sb_get_strict(table, params=None):
+    """For pregame writes, a failed read must never look like a missing row."""
+    if not _SB_URL or not _SB_KEY:
+        return None
+    for attempt in range(2):
+        try:
+            r = httpx.get(
+                f"{_SB_URL}/rest/v1/{table}",
+                headers={"apikey": _SB_KEY, "Authorization": f"Bearer {_SB_KEY}"},
+                params=params or {}, timeout=30)
+            if r.status_code == 200:
+                return r.json()
+            print(f"[nfl_sb_get_strict] HTTP {r.status_code}")
+            if r.status_code not in (429, 500, 502, 503, 504):
+                break
+        except httpx.RequestError as e:
+            print(f"[nfl_sb_get_strict] {e}")
+        if attempt == 0:
+            time.sleep(1)
+    return None
+
+def _nfl_sb_upsert(table, rows, on_conflict=None, timeout=20):
     if not _SB_URL or not _SB_KEY or not rows:
         return False
     try:
@@ -7577,13 +7618,13 @@ def _nfl_sb_upsert(table, rows, on_conflict=None):
         url = f"{_SB_URL}/rest/v1/{table}"
         if on_conflict:
             url += f"?on_conflict={on_conflict}"
-        r = httpx.post(url, headers=h, json=rows, timeout=20)
+        r = httpx.post(url, headers=h, json=rows, timeout=timeout)
         return r.status_code in (200, 201, 204)
     except Exception as e:
         print(f"[nfl_sb_upsert] {e}")
     return False
 
-def _nfl_sb_insert_ignore(table, rows, on_conflict):
+def _nfl_sb_insert_ignore(table, rows, on_conflict, timeout=20):
     """Insert without ever replacing an existing ledger snapshot.
     The returned representation is empty when PostgREST ignored a duplicate."""
     if not _SB_URL or not _SB_KEY or not rows:
@@ -7594,7 +7635,7 @@ def _nfl_sb_insert_ignore(table, rows, on_conflict):
             headers={"apikey": _SB_KEY, "Authorization": f"Bearer {_SB_KEY}",
                      "Content-Type": "application/json",
                      "Prefer": "resolution=ignore-duplicates,return=representation"},
-            json=rows, timeout=20)
+            json=rows, timeout=timeout)
         if r.status_code not in (200, 201):
             return None
         return r.json() if r.content else []
@@ -8626,12 +8667,32 @@ def _nfl_save_board_snapshots(date_str: str, result: dict, system: str = "OLD"):
         })
     if not rows:
         return False
+    saved = 0
+    deadline = time.monotonic() + 150
     with _NFL_BOARD_SNAPSHOT_LOCK:
-        ok = _nfl_sb_upsert(
-            "mpa_track_ledger", rows, on_conflict="app,date,category,side")
-    print(f"[nfl_board] {'saved' if ok else 'FAILED'}: "
-          f"{len(rows)} unstarted game snapshots -> {date_str}")
-    return ok
+        # The complete 14-game batch contains many large player dictionaries.
+        # Send one game at a time instead of timing out on a single huge POST.
+        # Bound the entire stage so an unavailable store cannot stall the job.
+        for row in rows:
+            kickoff = _nfl_snapshot_kickoff(row["locked_at"])
+            remaining = deadline - time.monotonic()
+            if (remaining <= 0 or not kickoff
+                    or datetime.now(timezone.utc) >= kickoff):
+                continue
+            ok = _nfl_sb_upsert(
+                "mpa_track_ledger", [row], on_conflict="app,date,category,side",
+                timeout=min(25, remaining))
+            remaining = deadline - time.monotonic()
+            if (not ok and remaining > 1
+                    and datetime.now(timezone.utc) < kickoff):
+                ok = _nfl_sb_upsert(
+                    "mpa_track_ledger", [row], on_conflict="app,date,category,side",
+                    timeout=min(25, remaining))
+            if ok:
+                saved += 1
+    print(f"[nfl_board] {saved}/{len(rows)} confirmed unstarted game "
+          f"snapshots -> {date_str}")
+    return saved == len(rows)
 
 def _nfl_load_board_snapshots(date_str: str, system: str = "OLD"):
     """Rebuild a day's board from durable per-game pre-kickoff snapshots."""
@@ -8701,16 +8762,20 @@ def _nfl_save_picks_snapshot(date_str: str, result: dict, system: str = "OLD"):
         for pick in (result.get("picks") or [])
     ]
     if not picks:
-        return
+        return False
     with _NFL_PICKS_SNAPSHOT_LOCK:
-        existing = _nfl_sb_get("mpa_track_ledger", {
+        identity = {
             "app": f"eq.{cfg['app']}", "category": f"eq.{cfg['picks']}",
             "side": "eq.ALL", "date": f"eq.{date_str}",
             "select": "detail,locked", "limit": "1",
-        })
+        }
+        existing = _nfl_sb_get_strict("mpa_track_ledger", identity)
+        if existing is None:
+            print(f"[nfl_track] snapshot NOT CONFIRMED: cannot check existing record -> {date_str}")
+            return False
         if existing and existing[0].get("locked"):
             print(f"[nfl_track] snapshot kept: official record already locked -> {date_str}")
-            return
+            return True
         if existing:
             starts = [
                 _nfl_coach_kickoff(pick.get("game_start"))
@@ -8719,7 +8784,10 @@ def _nfl_save_picks_snapshot(date_str: str, result: dict, system: str = "OLD"):
             known_starts = [start for start in starts if start]
             if known_starts and captured_at >= min(known_starts):
                 print(f"[nfl_track] snapshot kept: saved slate already started -> {date_str}")
-                return
+                return True
+        if not _nfl_official_capture_allowed(date_str, result):
+            print(f"[nfl_track] snapshot skipped: slate started during saving -> {date_str}")
+            return False
         row = {
             "app": cfg["app"], "date": date_str,
             "category": cfg["picks"], "side": "ALL",
@@ -8727,10 +8795,24 @@ def _nfl_save_picks_snapshot(date_str: str, result: dict, system: str = "OLD"):
             "detail": picks,
         }
         ok = _nfl_sb_upsert(
-            "mpa_track_ledger", [row], on_conflict="app,date,category,side")
+            "mpa_track_ledger", [row], on_conflict="app,date,category,side",
+            timeout=60)
+        if not ok:
+            # The server may have committed a timed-out POST. Read before any
+            # retry, and never retry after the first kickoff.
+            confirmed = _nfl_sb_get_strict("mpa_track_ledger", identity)
+            ok = bool(confirmed and isinstance(confirmed[0].get("detail"), list)
+                      and confirmed[0]["detail"]
+                      and confirmed[0]["detail"][0].get("snapshot_captured_at")
+                      == captured_at.isoformat())
+            if not ok and confirmed is not None and _nfl_official_capture_allowed(date_str, result):
+                ok = _nfl_sb_upsert(
+                    "mpa_track_ledger", [row], on_conflict="app,date,category,side",
+                    timeout=60)
         action = "updated" if existing else "saved"
-        print(f"[nfl_track] snapshot {action if ok else 'FAILED'}: "
+        print(f"[nfl_track] snapshot {action if ok else 'NOT CONFIRMED'}: "
               f"{len(picks)} picks -> {date_str}")
+        return ok
 
 def _nfl_load_picks_snapshot(date_str: str, system: str = "OLD") -> list:
     cfg = _nfl_store_config(system)
@@ -8813,7 +8895,7 @@ def _nfl_save_gp_snapshot(date_str: str, result: dict, system: str = "OLD"):
     # kickoff), wait rather than permanently saving only the remaining games.
     if not predictions or not all(_nfl_gp_is_pre_game(p) for p in predictions):
         print(f"[nfl_track] GP snapshot skipped: incomplete pre-game slate for {date_str}")
-        return
+        return False
     detail = []
     for p in predictions:
         detail.append({
@@ -8844,13 +8926,31 @@ def _nfl_save_gp_snapshot(date_str: str, result: dict, system: str = "OLD"):
             "weather_summary": p.get("weather_summary", ""),
             "weather_status": p.get("weather_status", "UNAVAILABLE"),
         })
-    ok = _nfl_sb_insert_ignore("mpa_track_ledger", [{
+    row = {
         "app": cfg["app"], "date": date_str, "category": cfg["gp"],
         "side": "ALL", "wins": 0, "losses": 0, "locked": False,
         "detail": detail,
-    }], "app,date,category,side")
-    print(f"[nfl_track] GP snapshot {'saved' if ok else 'FAILED'}: "
+    }
+    inserted = _nfl_sb_insert_ignore(
+        "mpa_track_ledger", [row], "app,date,category,side", timeout=40)
+    if inserted is None and all(_nfl_gp_is_pre_game(p) for p in predictions):
+        inserted = _nfl_sb_insert_ignore(
+            "mpa_track_ledger", [row], "app,date,category,side", timeout=40)
+    if inserted is None or not inserted:
+        # Empty representation also means an earlier immutable snapshot won.
+        # A timeout is ambiguous: check the row, never rewrite an old forecast.
+        existing = _nfl_sb_get_strict("mpa_track_ledger", {
+            "app": f"eq.{cfg['app']}", "date": f"eq.{date_str}",
+            "category": f"eq.{cfg['gp']}", "side": "eq.ALL",
+            "select": "detail", "limit": "1",
+        })
+        ok = bool(existing and isinstance(existing[0].get("detail"), list)
+                  and len(existing[0]["detail"]) == len(detail))
+    else:
+        ok = True
+    print(f"[nfl_track] GP snapshot {'confirmed' if ok else 'NOT CONFIRMED'}: "
           f"{len(detail)} games -> {date_str}")
+    return ok
 
 def _nfl_load_gp_snapshots(system: str = "OLD") -> list:
     cfg = _nfl_store_config(system)
