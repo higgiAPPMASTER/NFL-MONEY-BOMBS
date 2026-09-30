@@ -3502,14 +3502,10 @@ def _nfl_current_season_values(rows, analysis_df, stat_col):
     return _new_numeric_values(selected, stat_col)
 
 
-def _nfl_matchup_season_side(opp_rows, stat_col, line, venue, season_values):
-    """A 3-game/70% matchup side wins; otherwise use this season's average.
-
-    Prefer the player's actual HOME/AWAY meetings against this opponent. When
-    fewer than three verified same-venue meetings exist, use all venues. An
-    unknown historical venue is never silently counted as same-venue.
-    """
-    all_values, venue_values = [], []
+def _nfl_matchup_season_side(opp_rows, stat_col, line, venue, season_values,
+                            recent_venue_values):
+    """Opponent history first (even 1/1), then venue L10, then season average."""
+    all_values = []
     if opp_rows is not None and not opp_rows.empty and stat_col in opp_rows.columns:
         for _, row in opp_rows.iterrows():
             try:
@@ -3519,17 +3515,14 @@ def _nfl_matchup_season_side(opp_rows, stat_col, line, venue, season_values):
             except (TypeError, ValueError):
                 continue
             all_values.append(value)
-            if venue and _nfl_history_venue(row) == venue:
-                venue_values.append(value)
-    use_venue = len(venue_values) >= 3
-    chosen = venue_values if use_venue else all_values
-    scope = venue if use_venue else "all venues"
+    chosen = all_values
+    scope = "all venues"
     season_avg = (round(sum(season_values) / len(season_values), 1)
                   if season_values else None)
     result = {"side": None, "source": "", "reason": "",
               "values": chosen, "scope": scope,
               "seasonAvg": season_avg, "seasonGames": len(season_values)}
-    if len(chosen) >= 3:
+    if chosen:
         for side, hits in (("OVER", sum(v > line for v in chosen)),
                            ("UNDER", sum(v < line for v in chosen))):
             rate = hits / len(chosen)
@@ -3540,12 +3533,26 @@ def _nfl_matchup_season_side(opp_rows, stat_col, line, venue, season_values):
                                       f"({rate:.1%}) sets the side"),
                               primaryRate=round(rate * 100, 1))
                 return result
+    if recent_venue_values:
+        for side, hits in (("OVER", sum(v > line for v in recent_venue_values)),
+                           ("UNDER", sum(v < line for v in recent_venue_values))):
+            rate = hits / len(recent_venue_values)
+            if rate > .50:
+                recent_scope = f"{venue} L10" if venue and _HA_LOADED else "all-venue L10"
+                result.update(side=side, source="VENUE_L10",
+                              scope=recent_scope,
+                              reason=(f"No 70% side vs opponent; "
+                                      f"{hits}/{len(recent_venue_values)} {side} in "
+                                      f"{recent_scope} against today's {line} line "
+                                      f"({rate:.1%}) sets the side"),
+                              primaryRate=round(rate * 100, 1))
+                return result
     if season_avg is not None and season_avg != line:
         side = "OVER" if season_avg > line else "UNDER"
         hits = sum(v > line if side == "OVER" else v < line
                    for v in season_values)
         result.update(side=side, source="SEASON",
-                      reason=(f"No qualifying 3-game/70% {scope} matchup side; "
+                      reason=(f"No 70% opponent side or majority in recent L10; "
                               f"current-season average {season_avg} in "
                               f"{len(season_values)} games is "
                               f"{'above' if side == 'OVER' else 'below'} "
@@ -3658,13 +3665,6 @@ def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str,
     tot_a   = len(vs_vals)
     rate_a  = round(hits_a/tot_a*100, 1) if tot_a >= 1 else None
     season_values = _nfl_current_season_values(pdf_sorted, df, stat_col)
-    side_rule = _nfl_matchup_season_side(
-        vs_opp, stat_col, line,
-        "HOME" if is_home else "AWAY" if is_home is False else "",
-        season_values)
-    # Anytime TD retains its separate one-sided price/calibration rules.
-    history_lock = side_rule["side"] if market != "player_anytime_td" else None
-    history_lock_reason = side_rule["reason"] if history_lock else ""
 
     # Last 10 H/A games (any opponent)
     if is_home is not None and _HA_LOADED:
@@ -3679,6 +3679,13 @@ def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str,
     rate_b   = round(hits_b/tot_b*100, 1) if tot_b >= 1 else None
     under_hits = sum(1 for v in l10_vals if v < line)
     under_rate = round(under_hits/tot_b*100, 1) if tot_b >= 1 else None
+    side_rule = _nfl_matchup_season_side(
+        vs_opp, stat_col, line,
+        "HOME" if is_home else "AWAY" if is_home is False else "",
+        season_values, l10_vals)
+    # Anytime TD retains its separate one-sided price/calibration rules.
+    history_lock = side_rule["side"] if market != "player_anytime_td" else None
+    history_lock_reason = side_rule["reason"] if history_lock else ""
 
     # Hits vs the book line over last 10 games (any location)
     last10_any = pdf_sorted.head(10)
@@ -3738,8 +3745,8 @@ def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str,
     if market == "player_anytime_td" and tot_b:
         pick = "OVER"
     elif history_lock:
-        # Same-venue (or all-venue fallback) matchup history wins at 3+/70%.
-        # When it is inconclusive, this season's average sets the side.
+        # Opponent history wins at 70% even for one meeting; otherwise venue
+        # L10 sets the side before this season's average is considered.
         # Projection, defense and recent form cannot reverse either decision.
         pick = history_lock
 
@@ -4184,7 +4191,7 @@ def _analyze_new_prop_raw(pl: Dict, df, home_abbr: str, away_abbr: str,
     season_values = _nfl_current_season_values(participation_pdf, df, stat_col)
     side_rule = _nfl_matchup_season_side(
         opp_rows, stat_col, line, "HOME" if home_road == "H" else "AWAY",
-        season_values)
+        season_values, ha_values)
     # Anytime TD remains a separately calibrated, one-sided market.
     history_lock = side_rule["side"] if market != "player_anytime_td" else None
     history_lock_reason = side_rule["reason"] if history_lock else ""
@@ -4286,9 +4293,8 @@ def _analyze_new_prop_raw(pl: Dict, df, home_abbr: str, away_abbr: str,
         if history_lock:
             pick = history_lock
             recent_side_rate = over_rate if history_lock == "OVER" else under_rate
-            # Use the actual matchup/season hit rate, not a fabricated 100%
-            # for a 70%-qualified matchup. Recent form may change confidence,
-            # but cannot change the chosen side.
+            # Use the actual decisive evidence rate. Recent form may change
+            # confidence, but cannot change the chosen side.
             primary_rate = side_rule["primaryRate"]
             side_rate = (round(primary_rate * .70 + recent_side_rate * .30, 1)
                          if recent_side_rate is not None else primary_rate)
@@ -12128,7 +12134,7 @@ function openNflLadder(key){
     ?'<div class="pm-callout pm-callout-amber"><div class="pm-co-title">Pick-side rule</div><div class="pm-co-body">'+_esc(p.historyLockReason)+'. The small defense adjustment cannot reverse this side.</div></div>'
     :'';
   var seasonAvgRow=(p.seasonAvg!=null&&Number(p.seasonGames)>0)
-    ?'<div class="pm-stat"><span class="k">Current-season average<span class="pm-stat-note">Completed games before this matchup; used when opponent history has no 3-game, 70% side</span></span><span class="v">'+Number(p.seasonAvg).toFixed(1)+'<span class="pm-stat-note">'+Number(p.seasonGames)+' games · '+statName+' per game</span></span></div>'
+    ?'<div class="pm-stat"><span class="k">Current-season average<span class="pm-stat-note">Completed games before this matchup; used when neither opponent history nor venue L10 selects a side</span></span><span class="v">'+Number(p.seasonAvg).toFixed(1)+'<span class="pm-stat-note">'+Number(p.seasonGames)+' games · '+statName+' per game</span></span></div>'
     :'';
 
   var roleHtml = p.role
@@ -12140,7 +12146,7 @@ function openNflLadder(key){
     :'';
     
   var probHtml = (p.baseProbability!=null||p.adjustedProbability!=null)
-    ? '<div class="pm-stat"><span class="k">Base &rarr; adjusted probability<span class="pm-stat-note">Base uses qualifying matchup history or the current-season rate with recent venue form; adjusted adds role, defense and verified injury effects</span></span><span class="v">'+(p.baseProbability!=null?Number(p.baseProbability).toFixed(1):'—')+'% &rarr; '+(p.adjustedProbability!=null?Number(p.adjustedProbability).toFixed(1):'—')+'%</span></div>'
+    ? '<div class="pm-stat"><span class="k">Base &rarr; adjusted probability<span class="pm-stat-note">Base uses opponent history first, then venue L10, then the current-season average; adjusted adds role, defense and verified injury effects</span></span><span class="v">'+(p.baseProbability!=null?Number(p.baseProbability).toFixed(1):'—')+'% &rarr; '+(p.adjustedProbability!=null?Number(p.adjustedProbability).toFixed(1):'—')+'%</span></div>'
     : '';
     
   var defHtml = (p.defRank!=null&&p.defAdj!=null)
