@@ -3526,7 +3526,7 @@ def _nfl_matchup_season_side(opp_rows, stat_col, line, venue, season_values,
         for side, hits in (("OVER", sum(v > line for v in chosen)),
                            ("UNDER", sum(v < line for v in chosen))):
             rate = hits / len(chosen)
-            if rate >= .70:
+            if rate >= .60:
                 result.update(side=side, source="MATCHUP",
                               reason=(f"{hits}/{len(chosen)} {side} vs opponent "
                                       f"at {scope} against today's {line} line "
@@ -3541,7 +3541,7 @@ def _nfl_matchup_season_side(opp_rows, stat_col, line, venue, season_values,
                 recent_scope = f"{venue} L10" if venue and _HA_LOADED else "all-venue L10"
                 result.update(side=side, source="VENUE_L10",
                               scope=recent_scope,
-                              reason=(f"No 70% side vs opponent; "
+                              reason=(f"No 60% side vs opponent; "
                                       f"{hits}/{len(recent_venue_values)} {side} in "
                                       f"{recent_scope} against today's {line} line "
                                       f"({rate:.1%}) sets the side"),
@@ -3552,7 +3552,7 @@ def _nfl_matchup_season_side(opp_rows, stat_col, line, venue, season_values,
         hits = sum(v > line if side == "OVER" else v < line
                    for v in season_values)
         result.update(side=side, source="SEASON",
-                      reason=(f"No 70% opponent side or majority in recent L10; "
+                      reason=(f"No 60% opponent side or majority in recent L10; "
                               f"current-season average {season_avg} in "
                               f"{len(season_values)} games is "
                               f"{'above' if side == 'OVER' else 'below'} "
@@ -3745,7 +3745,7 @@ def _analyze_prop(pl: Dict, df, home_abbr: str, away_abbr: str,
     if market == "player_anytime_td" and tot_b:
         pick = "OVER"
     elif history_lock:
-        # Opponent history wins at 70% even for one meeting; otherwise venue
+        # Opponent history wins at 60% even for one meeting; otherwise venue
         # L10 sets the side before this season's average is considered.
         # Projection, defense and recent form cannot reverse either decision.
         pick = history_lock
