@@ -16,6 +16,7 @@ from nfl_receiving_boards import (
     RECEIVING_MARKETS, RECEIVING_POSITIONS,
     mark_receiving_picks, split_receiving_records,
 )
+from nfl_game_picks_record import record_payload as _game_record_payload, record_ui as _game_record_ui
 
 import httpx
 from fastapi import FastAPI, Request, HTTPException
@@ -9430,7 +9431,8 @@ def _nfl_aggregate_graded(graded: dict) -> dict:
     return agg
 
 def _nfl_detail_graded(graded: dict, include_overflow: bool = True,
-                       overflow_only: bool = False) -> list:
+                       overflow_only: bool = False,
+                       include_pending: bool = False) -> list:
     out = []
     rows = []
     if not overflow_only:
@@ -9439,7 +9441,8 @@ def _nfl_detail_graded(graded: dict, include_overflow: bool = True,
         rows += graded.get("overflow", [])
     for row in rows:
         if row.get("result") not in ("WIN", "LOSS"):
-            continue
+            if not include_pending or row.get("result") not in (None, "", "PENDING"):
+                continue
         detail = {k: row.get(k) for k in (
             "name", "team", "category", "side", "market",
             "line", "odds", "rank", "result", "actual", "profit", "pool",
@@ -9449,6 +9452,8 @@ def _nfl_detail_graded(graded: dict, include_overflow: bool = True,
             detail["position"] = row.get("position")
             detail["receivingBoardVersion"] = row["receivingBoardVersion"]
         detail["observation_only"] = _nfl_td_observation_only(row)
+        if include_pending and not detail.get("result"):
+            detail["result"] = "PENDING"
         out.append(detail)
     return out
 
@@ -9606,6 +9611,7 @@ def _nfl_update_track_ledger(include_date: str = "", system: str = "OLD"):
     Safe to call repeatedly — locked dates are skipped."""
     from datetime import date as _d
     today = _nfl_today()
+    selected_grade = {}
     with _NFL_TRK_LOCK:
         cfg = _nfl_store_config(system)
         locked_rows = _nfl_sb_get("mpa_track_ledger", {
@@ -9618,6 +9624,7 @@ def _nfl_update_track_ledger(include_date: str = "", system: str = "OLD"):
             if d > today or (d == today and d != include_date) or d in locked:
                 continue
             snap = _nfl_load_picks_snapshot(d, system)
+            official_snapshot_saved = bool(snap)
             snap = _nfl_restore_td_observations_from_board(d, snap, system)
             if not snap:
                 continue
@@ -9626,6 +9633,8 @@ def _nfl_update_track_ledger(include_date: str = "", system: str = "OLD"):
             except Exception as e:
                 print(f"[nfl_track] grade failed {d}: {e}")
                 continue
+            if d == include_date and official_snapshot_saved:
+                selected_grade[d] = graded
             if not graded.get("any_game"):
                 continue
             try:
@@ -9654,6 +9663,7 @@ def _nfl_update_track_ledger(include_date: str = "", system: str = "OLD"):
         _nfl_update_gp_ledger(include_date, system)
     except Exception as e:
         print(f"[nfl_track] GP background error: {e}")
+    return selected_grade
 
 def _nfl_trk_bg():
     try:
@@ -9841,19 +9851,45 @@ async def nfl_gp_record(grade: bool = False, date_str: str = "", system: str = "
                          "system": "NEW" if str(system).upper() == "NEW" else "OLD"})
 
 
+@app.get("/api/game-picks-record")
+async def nfl_game_picks_record(date_str: str = "", period: str = "day",
+                                system: str = "OLD", grade: bool = False):
+    """Isolated game-popup 80–100% record; no model reruns or background jobs."""
+    system = str(system).upper()
+    if system not in ("OLD", "NEW"):
+        raise HTTPException(status_code=400, detail="Choose the OLD or NEW system.")
+    try:
+        payload = await asyncio.get_running_loop().run_in_executor(
+            None, partial(
+                _game_record_payload, _nfl_store_config(system),
+                date_str or _nfl_today(), period, grade,
+                _nfl_sb_get_strict, _nfl_sb_upsert, _nfl_coach_grade_snapshot,
+                _nfl_snapshot_kickoff, PROP_LABELS))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    payload["system"] = system
+    return JSONResponse(payload)
+
+
 @app.get("/api/track-record")
 async def nfl_track_record(grade: bool = False, date_str: str = "", system: str = "OLD"):
-    """NFL Track Record — all graded picks by date with W/L, ROI at $20/play."""
+    """Official finalized results plus saved pregame picks awaiting settlement."""
+    selected_grade = {}
     if grade:
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, _nfl_update_track_ledger, date_str, system)
+        selected_grade = await loop.run_in_executor(
+            None, _nfl_update_track_ledger, date_str, system) or {}
     else:
         _bt_th.Thread(target=_nfl_update_track_ledger, args=("", system), daemon=True).start()
     cfg = _nfl_store_config(system)
-    led_rows = _nfl_sb_get("mpa_track_ledger", {
+    led_rows = _nfl_sb_get_strict("mpa_track_ledger", {
         "app": f"eq.{cfg['app']}", "category": f"eq.{cfg['detail']}",
         "locked": "eq.true", "select": "date,detail", "limit": "365",
     })
+    if led_rows is None:
+        raise HTTPException(status_code=503, detail="Could not read saved Track Record results. Please retry Get Results.")
     detail_by_date = {
         r["date"]: [
             {**row, "observation_only": _nfl_td_observation_only(row)}
@@ -9861,6 +9897,30 @@ async def nfl_track_record(grade: bool = False, date_str: str = "", system: str 
         ]
         for r in (led_rows or [])
     }
+    selected_date = date_str or _nfl_today()
+    if selected_date not in detail_by_date and selected_date not in selected_grade:
+        saved = _nfl_sb_get_strict("mpa_track_ledger", {
+            "app": f"eq.{cfg['app']}", "category": f"eq.{cfg['picks']}",
+            "side": "eq.ALL", "date": f"eq.{selected_date}",
+            "select": "detail", "limit": "1",
+        })
+        if saved is None:
+            raise HTTPException(status_code=503, detail="Could not confirm saved pregame picks. Please retry Get Results.")
+        snapshot = saved[0].get("detail") if saved else []
+        if not isinstance(snapshot, list):
+            raise HTTPException(status_code=503, detail="Saved pregame picks could not be read. Please retry Get Results.")
+        if snapshot:
+            # Display only: no live stats lookup, model run, or snapshot write.
+            selected_grade[selected_date] = _nfl_grade_date(
+                selected_date, snapshot, box_override={})
+    pending_overflow = {}
+    for d, graded in selected_grade.items():
+        if d in detail_by_date:
+            continue  # Finalized ledger rows always win; never duplicate a date.
+        detail_by_date[d] = _nfl_detail_graded(
+            graded, include_overflow=False, include_pending=True)
+        pending_overflow[d] = _nfl_detail_graded(
+            graded, overflow_only=True, include_pending=True)
     dates = sorted(detail_by_date.keys(), reverse=True)
     result = []
     for d in dates:
@@ -9902,11 +9962,15 @@ async def nfl_track_record(grade: bool = False, date_str: str = "", system: str 
             "date": d, "wins": wins, "losses": losses,
             "net_pl": net_pl, "roi": roi,
             "by_cat": by_cat, "detail": det,
+            "pending": sum(1 for r in det if not _nfl_td_observation_only(r)
+                           and r.get("result") == "PENDING"),
         })
-    overflow_rows = _nfl_sb_get("mpa_track_ledger", {
+    overflow_rows = _nfl_sb_get_strict("mpa_track_ledger", {
         "app": f"eq.{cfg['app']}", "category": f"eq.{cfg['overflow']}",
         "locked": "eq.true", "select": "date,detail", "limit": "365",
     })
+    if overflow_rows is None:
+        raise HTTPException(status_code=503, detail="Could not read saved Overflow results. Please retry Get Results.")
     overflow_dates = [
         {
             "date": r.get("date"),
@@ -9917,6 +9981,11 @@ async def nfl_track_record(grade: bool = False, date_str: str = "", system: str 
         }
         for r in (overflow_rows or []) if r.get("date")
     ]
+    saved_overflow_dates = {r["date"] for r in overflow_dates}
+    overflow_dates.extend(
+        {"date": d, "detail": rows}
+        for d, rows in pending_overflow.items()
+        if d not in saved_overflow_dates)
     overflow_dates.sort(key=lambda x: x["date"], reverse=True)
 
     historical_rows = _nfl_sb_get("mpa_track_ledger", {
@@ -11579,6 +11648,7 @@ function _nflSystem(){
   return el&&el.value==='NEW'?'NEW':'OLD';
 }
 function _nflSystemChanged(){
+  if(typeof closeNflGamePicksRecord==='function')closeNflGamePicksRecord();
   if(typeof _nflPerfectParlayInvalidate==='function')_nflPerfectParlayInvalidate('system');
   var s=_nflSystem(),badge=document.getElementById('nflSystemBadge');
   if(badge){badge.textContent='SYSTEM: '+s;badge.style.color=s==='NEW'?'#67e8f9':'#fbbf24';}
@@ -12211,6 +12281,7 @@ function _gameModal(gi){
   var st=window._nflState||{}; var g=((st.d||{}).games||[])[gi]; if(!g) return;
   var gk=g.game; var mu=(g.away_abbr||g.away_team||'?')+' @ '+(g.home_abbr||g.home_team||'?');
   var plays=(st.all||[]).filter(function(p){return p.game===gk;});
+  var recordButton='<button type="button" class="ngr-btn" data-game="'+_esc(gk)+'" data-date="'+_esc((st.d||{}).date||'')+'" data-start="'+_esc(g.game_start||g.start||'')+'" onclick="event.stopPropagation();openNflGamePicksRecord(this.dataset.game,this.dataset.date,this.dataset.start)">80–100% Record · Results / ROI</button>';
   var body='';
   _MORDER.forEach(function(m){
     var mp=plays.filter(function(p){return (p.mkt||p.label)===m;}).sort(function(a,b){return _edge(b)-_edge(a);});
@@ -12218,7 +12289,7 @@ function _gameModal(gi){
     body+='<div class="mk-hdr">'+_mIcon(m)+' '+m+'</div>'+mp.map(_playRow).join('');
   });
   if(!body) body='<div class="mt" style="color:#6b7280;padding:10px">No plays for this game.</div>';
-  _openModal(mu, ((st.d||{}).date||'')+' · tap any play for its game log', _nflWeatherHtml(g.weather)+body);
+  _openModal(mu, ((st.d||{}).date||'')+' · tap any play for its game log', '<div style="margin:10px 0">'+recordButton+'</div>'+_nflWeatherHtml(g.weather)+body);
 }
 function _marketModal(m){
   var st=window._nflState||{};
@@ -13884,11 +13955,12 @@ function _nflPaint(q){
   // Existing matchup tiles belong after the market boards. Each tile opens
   // the complete game-picks modal, so no second by-game accordion is needed.
   if((d.games||[]).length){
-    h+='<div id="nfl-by-game-section"><div class="sec">- Games -- '+(d.date||'')+'</div><div class="games">';
+    h+='<div id="nfl-by-game-section"><div class="sec">- Games -- '+(d.date||'')+' <button type="button" class="ngr-btn" onclick="openNflGamePicksRecord()">80–100% Game Record</button></div><div class="games">';
     d.games.forEach(function(g,gi){
       var mu=(g.away_abbr||g.away_team||'?')+' @ '+(g.home_abbr||g.home_team||'?');
       var day=g.slate_date?'<div style="color:#a78bfa;font-size:.64rem;font-weight:900;margin-bottom:3px">'+g.slate_date+'</div>':'';
-      h+='<div class="gcard" onclick="_gameModal('+gi+')">'+day+'<div class="mu">'+mu+'</div><div class="gc-hint">tap for plays</div></div>';
+      h+='<div class="gcard" onclick="_gameModal('+gi+')">'+day+'<div class="mu">'+mu+'</div><div class="gc-hint">tap for all plays</div>'
+        +'<button type="button" class="ngr-btn" style="margin-top:6px" data-game="'+_esc(g.game||mu)+'" data-date="'+_esc(d.date||'')+'" data-start="'+_esc(g.game_start||g.start||'')+'" onclick="event.stopPropagation();openNflGamePicksRecord(this.dataset.game,this.dataset.date,this.dataset.start)">80–100% Results / ROI</button></div>';
     });
     h+='</div></div>';
   }
@@ -14138,7 +14210,8 @@ function renderNflOverflowDay(){
     :(_nflOvfData.overflow_dates||[]);
   var selected=_nflTrkFilterDates(dates,selDate,period),rows=[];
   selected.forEach(function(d){(d.detail||[]).forEach(function(r){
-    if(r.result==='WIN'||r.result==='LOSS')rows.push(Object.assign({record_date:d.date},r));
+    var result=String(r.result||'PENDING').toUpperCase();
+    if(result==='WIN'||result==='LOSS'||result==='PENDING')rows.push(Object.assign({},r,{record_date:d.date,result:result}));
   });});
   _nflRenderRecordBook(
     rows,stake,_nflTrkPeriodLabel(selDate,period),
@@ -14530,7 +14603,8 @@ function renderNflTrackDay(){
     days.forEach(function(d){(d.detail||[]).forEach(function(r){
       out.push(Object.assign({record_date:d.date},r));
     });});
-    return out.filter(function(r){return r.result==='WIN'||r.result==='LOSS';});
+    return out.map(function(r){return Object.assign({},r,{result:String(r.result||'PENDING').toUpperCase()});})
+      .filter(function(r){return r.result==='WIN'||r.result==='LOSS'||r.result==='PENDING';});
   }
   var label=_nflTrkPeriodLabel(selDate,period);
   _nflRenderRecordBook(
@@ -14564,32 +14638,35 @@ function _nflRenderRecordBook(decided,stake,label,sumEl,bodyEl,isOverflow,source
   if(!sumEl||!bodyEl) return;
   if(!decided.length){
     sumEl.innerHTML='<p style="color:#9ca3af;padding:12px;text-align:center">No '
-      +(source==='historical'?'saved historical':'official graded')+' '
+      +(source==='historical'?'saved historical':'saved official')+' '
       +(isOverflow?'overflow ':'')+'picks for '+label+'.</p>';
     bodyEl.innerHTML='';return;
   }
   var counted=decided.filter(function(r){return !r.observation_only;});
+  var settled=counted.filter(function(r){return r.result==='WIN'||r.result==='LOSS';});
+  var pending=counted.filter(function(r){return r.result==='PENDING';}).length;
   var observations=decided.length-counted.length;
-  var wins=counted.filter(function(r){return r.result==='WIN';}).length;
-  var losses=counted.length-wins;
-  var priced=counted.filter(function(r){return r.odds!=null;});
+  var wins=settled.filter(function(r){return r.result==='WIN';}).length;
+  var losses=settled.length-wins;
+  var priced=settled.filter(function(r){return r.odds!=null;});
   var netPL=priced.reduce(function(a,r){return a+(_nflTrkProfit(r,stake)||0);},0);
   var totalStaked=priced.length*stake;
   var roi=totalStaked?(netPL/totalStaked*100):null;
-  var rate=counted.length?(wins/counted.length*100):null;
+  var rate=settled.length?(wins/settled.length*100):null;
   var plColor=netPL>=0?'#4ade80':'#f87171';
   var plSign=netPL>=0?'+$':'-$';
   var replayNotice=source==='historical'
     ?'<div style="background:rgba(245,158,11,.1);border:1px solid rgba(245,158,11,.35);border-radius:9px;padding:9px 12px;margin-bottom:10px;color:#fbbf24;font-size:.76rem;font-weight:800">'
       +'Historical Analysis — saved point-in-time replays; excluded from the official record.</div>'
     :'';
-  var roiFocusNotice=isOverflow?'':_nflRoiFocusSummary(decided,stake);
+  var roiFocusNotice=isOverflow?'':_nflRoiFocusSummary(settled,stake);
   sumEl.innerHTML=replayNotice+roiFocusNotice+'<div class="nfl-trk-sum">'
     +'<span style="color:#9ca3af;font-size:.78rem;font-weight:800">'+label+'</span>'
     +'<span style="font-size:1.05rem;font-weight:900;color:#fff"><span style="color:#4ade80">'+wins+'</span>/<span style="color:#f87171">'+(wins+losses)+'</span>'
     +(rate!=null?' <span style="color:#9ca3af;font-size:.85rem;font-weight:600">('+rate.toFixed(1)+'%)</span>':'')+'</span>'
     +'<span style="font-family:monospace;font-weight:800;color:'+plColor+'">Net '+plSign+Math.abs(netPL).toFixed(0)+'</span>'
     +(roi!=null?'<span style="font-family:monospace;font-weight:700;color:'+plColor+'">ROI '+(roi>=0?'+':'')+roi.toFixed(1)+'%</span>':'')
+    +(pending?'<span style="color:#9ca3af;font-weight:800">'+pending+' pending</span>':'')
     +(observations?'<span style="color:#fbbf24;font-weight:800">'+observations+' TD observation'+(observations===1?'':'s')+'</span>':'')
     +'<span style="color:#6b7280;font-size:.8rem">$'+stake+'/play \u00b7 ROI uses priced plays only</span>'
     +'</div>';
@@ -14597,13 +14674,13 @@ function _nflRenderRecordBook(decided,stake,label,sumEl,bodyEl,isOverflow,source
     ?_nflTrkCatHtml(decided,stake):_nflTrkListHtml(decided,stake);
 }
 function _nflTrkCatHtml(decided,stake){
-  if(!decided.length) return '<p style="color:#6b7280;padding:20px;text-align:center">No graded picks yet.</p>';
+  if(!decided.length) return '<p style="color:#6b7280;padding:20px;text-align:center">No saved picks yet.</p>';
   var cats={};
   decided.forEach(function(r){
-    var c=cats[r.category]=cats[r.category]||{w:0,l:0,obs:0,pl:0,staked:0};
+    var c=cats[r.category]=cats[r.category]||{w:0,l:0,pending:0,obs:0,pl:0,staked:0};
     if(r.observation_only){c.obs++;return;}
-    if(r.result==='WIN') c.w++; else c.l++;
-    if(r.odds!=null){c.pl+=(_nflTrkProfit(r,stake)||0);c.staked+=stake;}
+    if(r.result==='WIN') c.w++; else if(r.result==='LOSS') c.l++; else c.pending++;
+    if((r.result==='WIN'||r.result==='LOSS')&&r.odds!=null){c.pl+=(_nflTrkProfit(r,stake)||0);c.staked+=stake;}
   });
   var entries=Object.entries(cats).sort(function(a,b){
     return ((b[1].pl/b[1].staked)||0)-((a[1].pl/a[1].staked)||0);
@@ -14613,7 +14690,7 @@ function _nflTrkCatHtml(decided,stake){
     var rate=total?(c.w/total*100):0;
     var roi=c.staked?(c.pl/c.staked*100):null;
     var plColor=c.pl>=0?'#4ade80':'#f87171';
-    var barColor=rate>=70?'#4ade80':rate>=55?'#facc15':'#f87171';
+    var barColor=total?(rate>=70?'#4ade80':rate>=55?'#facc15':'#f87171'):'#94a3b8';
     var list=decided.filter(function(r){return r.category===cat;}).slice().sort(function(a,b){
       return String(b.record_date||'').localeCompare(String(a.record_date||''))||Number(a.rank||999)-Number(b.rank||999)||String(a.name||'').localeCompare(String(b.name||''));
     });
@@ -14631,14 +14708,14 @@ function _nflTrkCatHtml(decided,stake){
     }).join('');
     return '<details class="nfl-trk-group" style="--trk-accent:'+barColor+'"><summary class="nfl-trk-group-head">'
       +'<div class="nfl-trk-group-title"><span class="nfl-trk-group-kicker">Category</span><span class="nfl-trk-group-name">'+_nflEsc(cat)+'</span></div>'
-      +'<div class="nfl-trk-group-summary"><span>'+c.w+'W · '+c.l+'L'+(c.obs?' · '+c.obs+' observations':'')+'</span><span class="nfl-trk-group-rate">'+(total?rate.toFixed(1)+'%':'—')+'</span>'
+      +'<div class="nfl-trk-group-summary"><span>'+c.w+'W · '+c.l+'L'+(c.pending?' · '+c.pending+' pending':'')+(c.obs?' · '+c.obs+' observations':'')+'</span><span class="nfl-trk-group-rate">'+(total?rate.toFixed(1)+'%':'—')+'</span>'
       +'<span class="nfl-trk-group-pl" style="color:'+plColor+'">'+(c.pl>=0?'+$':'-$')+Math.abs(c.pl).toFixed(0)+'</span>'
       +'<span style="color:'+plColor+'">'+(roi!=null?(roi>=0?'+':'')+roi.toFixed(1)+'% ROI':'—')+'</span><span class="nfl-trk-group-toggle" aria-hidden="true"></span></div></summary>'
       +'<div class="nfl-trk-table-scroll"><table class="nfl-trk-tbl nfl-trk-compact"><thead><tr><th>Date</th><th>Player</th><th>Team</th><th>Pick</th><th>Odds / Book</th><th>Actual</th><th>Result / P&L</th></tr></thead><tbody>'+detail+'</tbody></table></div></details>';
   }).join('');
 }
 function _nflTrkListHtml(decided,stake){
-  if(!decided.length) return '<p style="color:#6b7280;padding:20px;text-align:center">No graded picks yet.</p>';
+  if(!decided.length) return '<p style="color:#6b7280;padding:20px;text-align:center">No saved picks yet.</p>';
   var catOrder=['Pass Yds','Pass TDs','Completions','Pass Att','INT Thrown',
     'Rush Yds','RB Total Yds','Rush Att','Rec Yds','Receptions','Anytime TD','Tackles+Ast',
     'Sacks','Def INT','Kick Pts','FG Made','80-100% Locks'];
@@ -14685,7 +14762,7 @@ function _nflTrkListHtml(decided,stake){
     var l=counted.filter(function(r){return r.result==='LOSS';}).length;
     var pushes=counted.filter(function(r){return r.result==='PUSH';}).length;
     var pending=counted.length-w-l-pushes;
-    var priced=counted.filter(function(r){return r.odds!=null;});
+    var priced=counted.filter(function(r){return r.odds!=null&&(r.result==='WIN'||r.result==='LOSS');});
     var pl=priced.reduce(function(x,r){return x+(_nflTrkProfit(r,stake)||0);},0);
     var rate=(w+l)?w/(w+l)*100:null;
     var accent=catColors[cat]||'#22d3ee';
@@ -14757,3 +14834,5 @@ document.addEventListener('DOMContentLoaded',function(){
 <button id="nfl-btn-bot" onclick="window.scrollTo({top:document.body.scrollHeight,behavior:'smooth'})" title="Scroll to bottom" style="position:fixed;bottom:22px;right:22px;z-index:9999;display:none;width:48px;height:48px;border-radius:50%;border:none;cursor:pointer;background:#0ea5e9;color:#0a0a0a;font-size:1.4rem;font-weight:900;box-shadow:0 4px 14px rgba(0,0,0,.45);line-height:1">&#8595;</button>
 </body>
 </html>"""
+
+HTML = HTML.replace("</body>", _game_record_ui() + "</body>")
