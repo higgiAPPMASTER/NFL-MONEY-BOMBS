@@ -10511,6 +10511,9 @@ tr:last-child td{border-bottom:none}
 .nfl-coach-filter-actions{display:flex;gap:5px;flex-wrap:wrap}
 .nfl-coach-filter-actions button{background:#1e293b;color:#cbd5e1;border:1px solid #334155;border-radius:6px;padding:4px 7px;font-size:.61rem;font-weight:900;cursor:pointer}
 .nfl-coach-filter-actions button:hover{border-color:#38bdf8;color:#e0f2fe}
+.nfl-coach-side-controls{flex-wrap:nowrap;overflow-x:auto;padding-bottom:2px}
+.nfl-coach-side-controls .nfl-coach-filter-actions{flex-wrap:nowrap;flex-shrink:0}
+.nfl-coach-side-controls .nfl-coach-filter-label{flex-shrink:0;white-space:nowrap}
 .nfl-coach-market-list{display:flex;gap:5px 10px;flex-wrap:wrap;margin-top:7px}
 .nfl-coach-market-list .nfl-coach-filter-label{font-size:.67rem}
 .nfl-coach-filter-quick{display:flex;gap:5px;flex-wrap:wrap;margin-top:8px}
@@ -10898,14 +10901,19 @@ tr:last-child td{border-bottom:none}
           <div id="nflParlayGames" class="nfl-game-filter-list"><div class="nfl-parlay-cat-empty">Run today&#39;s picks to load games.</div></div>
         </div>
       </details>
-      <div class="nfl-parlay-filter-group">
-        <div class="nfl-parlay-filter-head"><div class="nfl-parlay-filter-title">Normal Plays</div><div class="nfl-parlay-filter-actions"><button type="button" onclick="_nflParlaySetAll('normal',true)">All</button><button type="button" onclick="_nflParlaySetAll('normal',false)">None</button></div></div>
-        <div id="nflParlayNormalCats" class="nfl-parlay-cat-list"><div class="nfl-parlay-cat-empty">Run today&#39;s picks to load categories.</div></div>
-      </div>
-      <div class="nfl-parlay-filter-group" style="border-color:rgba(34,197,94,.3)">
-        <div class="nfl-parlay-filter-head"><div class="nfl-parlay-filter-title" style="color:#86efac">Coach Edge Plays</div><div class="nfl-parlay-filter-actions"><button type="button" onclick="_nflParlaySetAll('coach',true)">All</button><button type="button" onclick="_nflParlaySetAll('coach',false)">None</button></div></div>
-        <div id="nflParlayCoachCats" class="nfl-parlay-cat-list"><div class="nfl-parlay-cat-empty">Run today&#39;s picks to load positive-edge categories.</div></div>
-      </div>
+      <details class="nfl-parlay-filter-group nfl-game-filter-dropdown" style="grid-column:1/-1;border-color:rgba(59,130,246,.35)">
+        <summary><span>Choose Categories</span><span class="nfl-game-filter-summary">Normal + Coach Edge</span></summary>
+        <div class="nfl-parlay-filters nfl-game-filter-panel" style="margin-top:9px">
+          <div class="nfl-parlay-filter-group">
+            <div class="nfl-parlay-filter-head"><div class="nfl-parlay-filter-title">Normal Plays</div><div class="nfl-parlay-filter-actions"><button type="button" onclick="_nflParlaySetAll('normal',true)">All</button><button type="button" onclick="_nflParlaySetAll('normal',false)">None</button></div></div>
+            <div id="nflParlayNormalCats" class="nfl-parlay-cat-list"><div class="nfl-parlay-cat-empty">Run today&#39;s picks to load categories.</div></div>
+          </div>
+          <div class="nfl-parlay-filter-group" style="border-color:rgba(34,197,94,.3)">
+            <div class="nfl-parlay-filter-head"><div class="nfl-parlay-filter-title" style="color:#86efac">Coach Edge Plays</div><div class="nfl-parlay-filter-actions"><button type="button" onclick="_nflParlaySetAll('coach',true)">All</button><button type="button" onclick="_nflParlaySetAll('coach',false)">None</button></div></div>
+            <div id="nflParlayCoachCats" class="nfl-parlay-cat-list"><div class="nfl-parlay-cat-empty">Run today&#39;s picks to load positive-edge categories.</div></div>
+          </div>
+        </div>
+      </details>
     </div>
     <div id="parlayResult" style="margin-top:16px;text-align:left"></div>
   </div>
@@ -10913,7 +10921,7 @@ tr:last-child td{border-bottom:none}
     <div style="display:grid;grid-template-columns:minmax(0,1fr) auto;column-gap:12px;row-gap:6px;align-items:start">
        <div><div style="color:#38bdf8;font-size:.66rem;font-weight:900;letter-spacing:.12em;text-transform:uppercase">Grounded NFL analysis</div>
        <h2 style="font-family:'Playfair Display',serif;color:#fff;font-size:1.35rem;margin-top:4px">The Edge Coach · NFL Props Analyst</h2></div>
-       <button type="button" onclick="showNflPerfectParlayBuilder()" style="background:linear-gradient(135deg,#0369a1,#7c3aed);color:#fff;border:1px solid rgba(125,211,252,.5);border-radius:8px;padding:8px 12px;font-size:.72rem;font-weight:900;cursor:pointer;white-space:nowrap">&#10024; Perfect Parlay</button>
+       <button type="button" id="nflPerfectParlayOpen" onclick="showNflPerfectParlayBuilder()" style="background:linear-gradient(135deg,#0369a1,#7c3aed);color:#fff;border:1px solid rgba(125,211,252,.5);border-radius:8px;padding:8px 12px;font-size:.72rem;font-weight:900;cursor:pointer;white-space:nowrap">&#10024; Perfect Parlay</button>
        <div style="grid-column:1/-1;color:#94a3b8;font-size:.76rem;margin-top:5px">Find safer sportsbook sides or scan every supported market for positive Coach Edge. Choose Over, Under, categories, and games above.</div>
     </div>
     <div class="nfl-coach-presets">
@@ -10935,10 +10943,10 @@ tr:last-child td{border-bottom:none}
        <div class="nfl-coach-filter-head">
          <div><div class="nfl-coach-filter-title">Coach sides, rookies &amp; market categories</div>
          <div class="nfl-coach-filter-help">Rookie combines with any selected category—for example Rookie + Receptions—and applies before Coach ranking, distinct-player dedupe, and the Top 10 cap. Rookie status uses ESPN roster experience. Genuine sportsbook quotes only.</div></div>
-         <div class="nfl-coach-filter-actions"><button type="button" onclick="_nflCoachSetSides(true)">All sides</button><button type="button" onclick="_nflCoachSetSides(false)">No sides</button></div>
        </div>
-       <div class="nfl-coach-filter-row" aria-label="Coach sides">
+        <div class="nfl-coach-filter-row nfl-coach-side-controls" aria-label="Coach sides">
          <span style="color:#64748b;font-size:.62rem;font-weight:900;text-transform:uppercase;letter-spacing:.08em">Sides</span>
+          <div class="nfl-coach-filter-actions"><button type="button" onclick="_nflCoachSetSides(true)">All sides</button><button type="button" onclick="_nflCoachSetSides(false)">No sides</button></div>
          <label class="nfl-coach-filter-label side-over"><input type="checkbox" class="nfl-coach-side-choice" data-side="OVER" checked onchange="_nflCoachSelectionChanged()"> OVER</label>
          <label class="nfl-coach-filter-label side-under"><input type="checkbox" class="nfl-coach-side-choice" data-side="UNDER" checked onchange="_nflCoachSelectionChanged()"> UNDER</label>
          <label class="nfl-coach-filter-label" style="border-color:#a78bfa;color:#ddd6fe"><input type="checkbox" id="nflCoachRookieOnly" class="nfl-coach-rookie-choice" onchange="_nflCoachSelectionChanged()"> ROOKIE</label>
@@ -12218,6 +12226,30 @@ function _marketModal(m){
   var body=plays.length?plays.map(_playRow).join(''):'<div class="mt" style="color:#6b7280;padding:10px">No plays.</div>';
   _openModal(_mIcon(m)+' '+m, plays.length+' plays · tap any play for its game log', body);
 }
+function _nflJumpToMarket(index){
+  var market=_MORDER[index];if(!market)return;
+  var id='nfl-market-category-'+index,target=document.getElementById(id);
+  if(!target){
+    var body=document.getElementById('nflBody');if(!body)return;
+    target=document.createElement('section');
+    target.id=id;target.tabIndex=-1;target.setAttribute('aria-label',market);
+    target.style.scrollMarginTop='96px';
+    target.innerHTML='<div class="sec">'+_mIcon(market)+' '+_esc(market)+'</div>'
+      +'<div class="no-picks" style="padding:20px">No active plays remain in this category on the displayed board.'
+      +'<div style="margin-top:10px"><button type="button" onclick="_marketModal(_MORDER['+index+'])" style="background:#1e293b;color:#cbd5e1;border:1px solid #475569;border-radius:7px;padding:7px 11px;font-weight:800;cursor:pointer">View all loaded category plays</button></div></div>';
+    var games=document.getElementById('nfl-by-game-section');
+    if(games&&games.parentNode===body)body.insertBefore(target,games);
+    else body.appendChild(target);
+  }
+  target.querySelectorAll('[id^="sec_mkt_"],[id^="sec_recv_"]').forEach(function(section){
+    if(/_overflow$/.test(section.id))return;
+    section.style.display='block';
+    var caret=document.getElementById('car_'+section.id.slice(4));
+    if(caret)caret.textContent='▾';
+  });
+  target.scrollIntoView({behavior:'smooth',block:'start'});
+  target.focus({preventScroll:true});
+}
 function _nflJumpToGames(){
   var el=document.getElementById('nfl-by-game-section');
   if(!el)return;
@@ -12921,7 +12953,26 @@ function _nflPerfectParlayInvalidate(reason){
 }
 function _nflPerfectParlayCommit(html){
   var el=document.getElementById('nflCoachAnswer');
-  if(el){el.innerHTML=html;el.style.display='block';}
+  if(el){
+    el.innerHTML=html;el.style.display='block';
+    var heading=el.querySelector('.nfl-coach-question');
+    if(heading){
+      heading.style.display='flex';heading.style.alignItems='center';
+      heading.style.justifyContent='space-between';heading.style.gap='12px';
+      heading.style.flex='1 1 auto';
+      var close=document.createElement('button');
+      close.type='button';close.textContent='Close';
+      close.setAttribute('aria-label','Close Perfect Parlay');
+      close.style.cssText='background:#1e293b;color:#cbd5e1;border:1px solid #475569;border-radius:7px;padding:5px 10px;font-size:.7rem;font-weight:800;cursor:pointer;white-space:nowrap;flex-shrink:0';
+      close.onclick=closeNflPerfectParlay;heading.appendChild(close);
+    }
+  }
+}
+function closeNflPerfectParlay(){
+  var el=document.getElementById('nflCoachAnswer');
+  if(el)el.style.display='none';
+  var launcher=document.getElementById('nflPerfectParlayOpen');
+  if(launcher)launcher.focus({preventScroll:true});
 }
 function _nflPerfectParlayPlayerKey(x){
   return String((x&&x.player)||'').toLowerCase().replace(/[^a-z0-9]/g,'');
@@ -13709,10 +13760,10 @@ function _nflPaint(q){
   var h='';
   h+=_nflRoleRiskBoard(allF);
 
-  // Chips (market chips are tappable -> all plays for that market)
+  // Summary chips jump to the actual market boards; game navigation stays intact.
   h+='<div class="chips">';
   h+='<div class="chip nfl-games-jump" role="button" tabindex="0" onclick="_nflJumpToGames()" onkeydown="if(event.key===\\'Enter\\'||event.key===\\' \\'){event.preventDefault();_nflJumpToGames()}"><div class="val">'+((d.games||[]).length)+'</div><div class="lbl">View Games</div></div>';
-  _MORDER.forEach(function(m){ if(byM[m]&&byM[m].length){ h+='<div class="chip" style="cursor:pointer" onclick="_marketModal(&#39;'+m+'&#39;)"><div class="val">'+byM[m].length+'</div><div class="lbl">'+(_MLBL[m]||m)+'</div></div>'; }});
+  _MORDER.forEach(function(m,i){ if(byM[m]&&byM[m].length){ h+='<button type="button" class="chip" aria-label="Go to '+_esc(m)+' category" style="cursor:pointer;color:inherit;font:inherit" onclick="_nflJumpToMarket('+i+')"><div class="val">'+byM[m].length+'</div><div class="lbl">'+(_MLBL[m]||m)+'</div></button>'; }});
   h+='</div>';
 
   // ROI Focus keeps every existing market board below, but promotes the
@@ -13806,13 +13857,14 @@ function _nflPaint(q){
     var all=(byM[m]||[]).filter(function(p){return !_nflGameDone(p);});
     if(m==='Rec Yds'||m==='Receptions'){
       var receivingHtml=_nflReceivingSections(m,all,i);
-      if(receivingHtml){hasCards=true;h+=receivingHtml;}
+      if(receivingHtml){hasCards=true;h+='<section id="nfl-market-category-'+i+'" tabindex="-1" aria-label="'+_esc(m)+'" style="scroll-margin-top:96px">'+receivingHtml+'</section>';}
       return;
     }
     var overs =all.filter(function(p){return p.pick==='OVER';});
     var unders=all.filter(function(p){return p.pick==='UNDER';});
     if(!overs.length&&!unders.length) return;
     hasCards=true;
+    h+='<section id="nfl-market-category-'+i+'" tabindex="-1" aria-label="'+_esc(m)+'" style="scroll-margin-top:96px">';
     if(overs.length){
       var og=overs.slice(0,10), ofov=overs.slice(10,20);
       h+=_collapseSec('mkt_ov_'+i, '⬆ '+_mIcon(m)+' Top 10 '+m+' — OVERS', nflCardGrid(og), true);
@@ -13823,6 +13875,7 @@ function _nflPaint(q){
       h+=_collapseSec('mkt_un_'+i, '⬇ '+_mIcon(m)+' Top 10 '+m+' — UNDERS', nflCardGrid(ug), true);
       if(ufov.length) h+=_collapseSec('ovf_un_'+i, '⬇ '+m+' UNDERS — Overflow ('+ufov.length+' more)', nflCardGrid(ufov), false);
     }
+    h+='</section>';
   });
   if(!hasCards){
     h+='<div class="no-picks">No qualifying picks'+(q?' for "'+q+'"':' for '+(d.date||'today'))+'.</div>';
