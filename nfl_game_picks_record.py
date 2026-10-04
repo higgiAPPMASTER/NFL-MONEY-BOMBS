@@ -1,4 +1,4 @@
-"""Independent 80–100% game-popup record, derived from frozen pregame boards.
+"""Permanent independent 80–100% game-popup book, captured before kickoff.
 
 No models, migrations, import-time jobs, or changes to existing sport records.
 Storage/network callbacks are supplied by main.py and only used on request.
@@ -7,6 +7,7 @@ Storage/network callbacks are supplied by main.py and only used on request.
 import math
 import re
 import threading
+from hashlib import sha256
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -37,7 +38,7 @@ def _range(selected, period):
     if period == "day":
         return day, day
     if period == "week":
-        first = day - timedelta(days=day.weekday())
+        first = day - timedelta(days=(day.weekday() - 2) % 7)
         return first, first + timedelta(days=6)
     if period == "month":
         first = day.replace(day=1)
@@ -67,13 +68,133 @@ def _read_pages(read, params):
         offset += 1000
 
 
+def _game_sources(snapshot, parse_start):
+    """Use saved schedule identities; predictor rows may contain only team codes.
+
+    Older boards grouped several games at one kickoff. Their full saved
+    schedule and player pool can still identify those games without new data.
+    """
+    sources = {}
+    for game in snapshot.get("games") or []:
+        if not isinstance(game, dict):
+            continue
+        name = str(game.get("game") or "").strip()
+        start = _first(game, "game_start", "start")
+        kickoff = parse_start(start)
+        if name and kickoff:
+            sources[(name, kickoff)] = {**game, "game": name, "game_start": start}
+    aliases = {"LA": "LAR", "WAS": "WSH", "JAC": "JAX"}
+
+    def code(value):
+        value = str(value or "").strip().upper()
+        return aliases.get(value, value)
+
+    for prediction in snapshot.get("game_predictions") or []:
+        if not isinstance(prediction, dict):
+            continue
+        start = _first(prediction, "game_start", "start")
+        kickoff = parse_start(start)
+        if not kickoff:
+            continue
+        name = str(prediction.get("game") or "").strip()
+        if not name:
+            away, home = code(prediction.get("away_abbr")), code(prediction.get("home_abbr"))
+            matches = [g for (label, ko), g in sources.items()
+                       if ko == kickoff and away and home
+                       and code(g.get("away_abbr")) == away
+                       and code(g.get("home_abbr")) == home]
+            if len(matches) != 1:
+                continue
+            name = matches[0]["game"]
+        key = (name, kickoff)
+        sources[key] = {**sources.get(key, {}), **prediction,
+                        "game": name, "game_start": start}
+    return list(sources.values())
+
+
+def _record_category(cfg, game):
+    # Independent of a run's anchor date or a legacy shared-kickoff board key.
+    identity = sha256(game["game_key"].encode("utf-8")).hexdigest()[:24]
+    return cfg["board"] + "gp80:" + identity
+
+
+def _ledger_row(cfg, game, category, locked, updated):
+    countable = [p for p in game["plays"] if not p["observation_only"]]
+    return {
+        "app": cfg["app"] + "_game_picks", "date": game["date"],
+        "category": category, "side": "ALL",
+        "wins": sum(p["result"] == "WIN" for p in countable),
+        "losses": sum(p["result"] == "LOSS" for p in countable),
+        "locked": bool(locked), "locked_at": updated if locked else None,
+        "detail": {**game, "updated_at": updated},
+    }
+
+
+def capture_records(cfg, source_date, result, read, write, parse_start, labels,
+                    captured_at=None):
+    """Automatically persist this book on an existing pregame analysis run.
+
+    No grading, model calls, background work, or writes to other record books.
+    A verified completion timestamp is frozen before the other uploads.
+    """
+    now = datetime.now(timezone.utc)
+    captured = parse_start(captured_at) if captured_at else now
+    if not captured or captured > now:
+        raise RuntimeError("Game Picks capture time could not be verified.")
+    source = {**result, "saved_board_captured_at": captured.isoformat()}
+    games, warning = _games_from_source(source, parse_start, labels, source_date)
+    if not games:
+        future = any(parse_start(g.get("game_start")) and
+                     parse_start(g.get("game_start")) > captured
+                     for g in _game_sources(source, parse_start))
+        if future:
+            raise RuntimeError(warning or "Pregame Game Picks could not be captured.")
+        return {"status": "no_unstarted_games", "saved_games": 0, "eligible_games": 0}
+    app = cfg["app"] + "_game_picks"
+    with _LOCK:
+        prior = {}
+        for day in sorted({g["date"] for g in games}):
+            for row in _read_pages(read, {
+                "app": f"eq.{app}", "category": f"like.{cfg['board']}*",
+                "side": "eq.ALL", "date": f"eq.{day}",
+                "select": "date,category,locked,detail",
+            }):
+                detail = row.get("detail")
+                if not isinstance(detail, dict) or detail.get("version") != _VERSION:
+                    raise RuntimeError("Existing Game Picks could not be verified; nothing was overwritten.")
+                key = detail.get("game_key")
+                old = prior.get(key)
+                stamp = parse_start(detail.get("captured_at"))
+                if not stamp:
+                    raise RuntimeError("Existing Game Picks capture time could not be verified.")
+                if (old is None or row.get("locked") or
+                        (not old.get("locked") and stamp > parse_start(old["detail"]["captured_at"]))):
+                    prior[key] = row
+        writes, unchanged = [], 0
+        for game in games:
+            previous = prior.get(game["game_key"])
+            if previous and (previous.get("locked") or
+                             parse_start(previous["detail"]["captured_at"]) >= captured):
+                unchanged += 1
+                continue
+            category = previous["category"] if previous else _record_category(cfg, game)
+            game.update(source_kind="automatic_pregame", source_category=category)
+            writes.append(_ledger_row(cfg, game, category, False, now.isoformat()))
+        if writes and not write("mpa_track_ledger", writes,
+                                on_conflict="app,date,category,side", timeout=20):
+            raise RuntimeError("Automatic 80–100% Game Picks saving failed; rerun before kickoff to retry.")
+    return {"status": "saved", "saved_games": len(writes),
+            "unchanged_games": unchanged, "eligible_games": len(games),
+            "captured_at": captured.isoformat()}
+
+
 def _games_from_source(snapshot, parse_start, labels, source_date):
     if not isinstance(snapshot, dict):
         raise RuntimeError("A saved game board is unreadable; no history was substituted.")
     captured = parse_start(snapshot.get("saved_board_captured_at"))
     if not captured:
         return [], "A saved board has no verifiable pregame capture time and was excluded."
-    predictions = snapshot.get("game_predictions") or snapshot.get("games") or []
+    predictions = _game_sources(snapshot, parse_start)
     raw = snapshot.get("all")
     if not isinstance(raw, list):
         return [], "A saved board lacks the full game-popup player pool and was excluded."
@@ -191,7 +312,11 @@ def record_payload(cfg, selected, period, grade, read, write, settle_snapshot,
                 raise RuntimeError("A saved Game Picks record is unreadable. Please retry.")
             source_key = (detail.get("source_date"), detail.get("source_category"))
             saved.setdefault(source_key, []).append(row)
-            candidates[detail["game_key"]] = (detail, row["category"], bool(row.get("locked")))
+            previous = candidates.get(detail["game_key"])
+            if (previous is None or
+                    (not previous[2] and (row.get("locked") or
+                     detail["captured_at"] > previous[0]["captured_at"]))):
+                candidates[detail["game_key"]] = (detail, row["category"], bool(row.get("locked")))
 
         # A Full Week run may store Monday's board under Sunday's run date.
         # Use kickoff's Eastern date, never the run date, for record grouping.
@@ -224,11 +349,13 @@ def record_payload(cfg, selected, period, grade, read, write, settle_snapshot,
                 if not first <= date.fromisoformat(game["date"]) <= last:
                     continue
                 prior = candidates.get(game["game_key"])
-                if prior and prior[0]["captured_at"] >= game["captured_at"]:
+                if prior and (prior[2] or
+                              prior[0].get("source_kind") == "automatic_pregame" or
+                              prior[0]["captured_at"] >= game["captured_at"]):
                     continue
                 game["source_category"] = meta["category"]
-                category = meta["category"] + "__gp80_" + re.sub(
-                    r"[^0-9A-Za-z]+", "-", game["game_key"]).strip("-")
+                game["source_kind"] = "verified_saved_pregame_board"
+                category = prior[1] if prior else _record_category(cfg, game)
                 candidates[game["game_key"]] = (game, category, False)
 
         daily = {}
@@ -240,13 +367,7 @@ def record_payload(cfg, selected, period, grade, read, write, settle_snapshot,
             # An explicit Get Results may save this record, never the source or other ledgers.
             if grade:
                 game["updated_at"] = now.isoformat()
-                countable = [p for p in game["plays"] if not p["observation_only"]]
-                writes.append({
-                    "app": app, "date": game["date"], "category": category, "side": "ALL",
-                    "wins": sum(p["result"] == "WIN" for p in countable),
-                    "losses": sum(p["result"] == "LOSS" for p in countable),
-                    "locked": locked, "locked_at": now.isoformat() if locked else None, "detail": game,
-                })
+                writes.append(_ledger_row(cfg, game, category, locked, now.isoformat()))
             daily.setdefault(game["date"], []).append(game)
         if writes and not write("mpa_track_ledger", writes,
                                 on_conflict="app,date,category,side", timeout=30):
@@ -259,6 +380,8 @@ def record_payload(cfg, selected, period, grade, read, write, settle_snapshot,
             "system": "NEW" if str(cfg["app"]).lower().find("new") >= 0 else "OLD",
             "updated_at": now.isoformat(), "dates": dates,
             "warnings": list(dict.fromkeys(warnings)),
+            "saving": "automatic_pregame",
+            "period_start": first.isoformat(), "period_end": last.isoformat(),
         }
 
 
@@ -432,7 +555,7 @@ function bodyHtml(){
   if(S.loading)return '<div class="ngr-skel"></div><div class="ngr-skel"></div><div class="ngr-skel"></div>';
   if(S.err)return '<div class="ngr-err" role="alert">'+esc(S.err)+'<div style="margin-top:8px"><button class="ngr-btn" data-ngr="retry">Retry</button></div></div>';
   if(!S.data)return '<div class="ngr-empty">Press Get Results to load saved plays.</div>';
-  var stake=S.stake,h='';
+  var stake=S.stake,h='<div class="ngr-sub" style="margin-bottom:8px">Permanent 80-100% game record. Runs automatically save unstarted games; Get Results grades saved plays without rerunning models. NFL weeks run Wednesday through Tuesday.</div>';
   (S.data.warnings||[]).forEach(function(w){h+='<div class="ngr-note">'+esc(w)+'</div>';});
   if(S.sel!=null){
     var e=S.entries[S.sel];
@@ -442,7 +565,7 @@ function bodyHtml(){
     if(!e.rows.length)return h+'<div class="ngr-empty">'+esc(missingMsg(e))+'</div>';
     return h+kpis(stats(e.rows,stake))+playsHtml(e.rows,stake);
   }
-  if(!S.entries.length)return h+'<div class="ngr-empty">No saved games for this period.</div>';
+  if(!S.entries.length)return h+'<div class="ngr-empty">No saved games for this period. Future game records are banked automatically when Run Picks finishes before kickoff. Past games require a verified saved pregame source.</div>';
   var all=scopeRows();h+=kpis(stats(all,stake));
   if(!all.length)h+='<div class="ngr-note">No qualified 80-100% picks in this period. Games below show their saved status.</div>';
   var last=null;
@@ -461,8 +584,8 @@ function render(){
   b.innerHTML=bodyHtml();
   var back=$('ngrBack');if(back)back.style.display=S.sel!=null?'':'none';
   ['cat','list'].forEach(function(v){var x=$('ngrV'+v);if(x){x.classList.toggle('on',S.view===v);x.setAttribute('aria-pressed',S.view===v?'true':'false');}});
-  var t=$('ngrTitle');if(t)t.textContent=S.sel!=null&&S.entries[S.sel]?S.entries[S.sel].game.game:(S.game&&!S.data?S.game:'Game Picks Record');
-  var sub=$('ngrSub');if(sub)sub.textContent='Historical 80-100% plays'+(S.data&&S.data.updated_at?' · updated '+S.data.updated_at:'');
+  var t=$('ngrTitle');if(t)t.textContent=S.sel!=null&&S.entries[S.sel]?S.entries[S.sel].game.game:(S.game&&!S.data?S.game:'80-100% Game Track Record');
+  var sub=$('ngrSub');if(sub)sub.textContent='Permanent pre-kickoff history'+(S.data&&S.data.period_start?' · '+S.data.period_start+' to '+S.data.period_end:'')+(S.data&&S.data.updated_at?' · updated '+S.data.updated_at:'');
   var sy=$('ngrSys');if(sy){sy.textContent='SYSTEM: '+S.sys;sy.style.color=S.sys==='NEW'?'#67e8f9':'#fbbf24';}
   var gb=$('ngrGet');if(gb)gb.disabled=S.loading;
 }
@@ -535,11 +658,11 @@ function onKey(e){
 function shell(){
   var ov=document.createElement('div');ov.className='ngr-ov';ov.id=ID;
   ov.innerHTML='<div class="ngr-dlg" role="dialog" aria-modal="true" aria-labelledby="ngrTitle" tabindex="-1">'
-   +'<div class="ngr-head"><div><h3 class="ngr-title" id="ngrTitle">Game Picks Record</h3><div class="ngr-sub" id="ngrSub"></div></div>'
+   +'<div class="ngr-head"><div><h3 class="ngr-title" id="ngrTitle">80-100% Game Track Record</h3><div class="ngr-sub" id="ngrSub"></div></div>'
    +'<div style="display:flex;gap:6px;align-items:center"><span class="ngr-sys" id="ngrSys"></span><button type="button" class="ngr-x" id="ngrClose" aria-label="Close">Close</button></div></div>'
    +'<div class="ngr-ctl"><button type="button" class="ngr-btn" id="ngrBack" style="display:none">Back / All Games</button>'
    +'<label>Date <input id="ngrDate" type="date" min="2000-01-01" max="2100-12-31"></label>'
-   +'<label>Period <select id="ngrPeriod"><option value="day">Day</option><option value="week">Week</option><option value="month">Month</option><option value="year">Year</option><option value="all">All</option></select></label>'
+   +'<label>Period <select id="ngrPeriod"><option value="day">Day</option><option value="week">NFL Week (Wed-Tue)</option><option value="month">Month</option><option value="year">Year</option><option value="all">All</option></select></label>'
    +'<label>Stake $ <input id="ngrStake" class="ngr-stake" type="number" min="0.01" step="any" inputmode="decimal"></label>'
    +'<button type="button" class="ngr-btn" id="ngrVcat" aria-pressed="true">Category</button><button type="button" class="ngr-btn" id="ngrVlist" aria-pressed="false">Full List</button>'
    +'<button type="button" class="ngr-btn" id="ngrGet">Get Results</button><button type="button" class="ngr-btn" id="ngrCsv">CSV</button></div>'
@@ -577,7 +700,7 @@ window.openNflGamePicksRecord=function(game,date,gameStart){
   S.lastFocus=document.activeElement;
   S.game=game?String(game):'';S.start=gameStart?String(gameStart):'';
   var st=window._nflState,bd=st&&st.d&&st.d.date,tp=$('nflTrkDate');
-  S.date=gameStart?window.nflGameRecordDate(gameStart,date||bd):date||bd||(tp&&tp.value)||today();S.period='day';S.sel=null;S.selKeep=!!S.game;
+  S.date=gameStart?window.nflGameRecordDate(gameStart,date||bd):date||bd||(tp&&tp.value)||today();S.period=S.game?'day':'week';S.sel=null;S.selKeep=!!S.game;
   S.data=null;S.err='';S.sys=sysNow();S.open=true;
   shell();
   $('ngrDate').value=S.date;$('ngrPeriod').value='day';$('ngrStake').value=S.stake;
