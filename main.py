@@ -16,7 +16,10 @@ from nfl_receiving_boards import (
     RECEIVING_MARKETS, RECEIVING_POSITIONS,
     mark_receiving_picks, split_receiving_records,
 )
-from nfl_game_picks_record import record_payload as _game_record_payload, record_ui as _game_record_ui
+from nfl_game_picks_record import (
+    record_payload as _game_record_payload, record_ui as _game_record_ui,
+    capture_records as _game_record_capture, _game_sources as _game_record_sources,
+)
 
 import httpx
 from fastapi import FastAPI, Request, HTTPException
@@ -6171,6 +6174,9 @@ async def _run_pipeline_unlocked(date_str: str, progress=None, simulate: bool = 
         await asyncio.to_thread(_nfl_capture_opening_lines, date_str, result)
     await asyncio.to_thread(_nfl_attach_line_movement, date_str, result)
     await asyncio.to_thread(_nfl_json_ready, result)
+    # Freeze this independent book's analysis-completion time before network
+    # uploads. Saving it later must never turn pre-kickoff picks into hindsight.
+    game_record_capture_time = datetime.now(timezone.utc).isoformat()
     # Capture the official slate first. A slow per-game board upload must not
     # consume the remaining pre-kickoff window for the official record.
     official_capture = (
@@ -6190,6 +6196,16 @@ async def _run_pipeline_unlocked(date_str: str, progress=None, simulate: bool = 
               + ("weekly opening-line mode"
                  if not capture_official else "capture was not before every kickoff"))
     result["official_tracking"] = bool(official_capture and picks_saved)
+    # The per-game 80–100% book saves automatically on BOTH daily and weekly
+    # runs. It does not depend on opening the popup or on main-slate eligibility.
+    try:
+        result["game_record_capture"] = await asyncio.to_thread(
+            _game_record_capture, _nfl_store_config(system), date_str, result,
+            _nfl_sb_get_strict, _nfl_sb_upsert, _nfl_snapshot_kickoff, PROP_LABELS,
+            captured_at=game_record_capture_time)
+    except Exception as exc:
+        result["game_record_capture"] = {"status": "failed", "message": str(exc)}
+        print(f"[nfl_game_record] automatic capture FAILED: {exc}")
     # Coach is independent of the main whole-slate gate. Every fresh daily or
     # weekly run banks all eligible presets before their own included kickoffs.
     # Never make persistence depend on which category the browser opens.
@@ -6200,6 +6216,8 @@ async def _run_pipeline_unlocked(date_str: str, progress=None, simulate: bool = 
     board_saved = await asyncio.to_thread(
         _nfl_save_board_snapshots, date_str, result, system)
     missing_snapshots = []
+    if result.get("game_record_capture", {}).get("status") == "failed":
+        missing_snapshots.append("80–100% per-game Track Record")
     if not board_saved and result.get("game_predictions"):
         missing_snapshots.append("per-game board snapshots")
     if official_capture and not picks_saved:
@@ -8828,7 +8846,8 @@ def _nfl_snapshot_kickoff(value):
 def _nfl_save_board_snapshots(date_str: str, result: dict, system: str = "OLD"):
     """Save the latest completed board separately for every unstarted game."""
     cfg = _nfl_store_config(system)
-    predictions = result.get("game_predictions") or []
+    predictions = [g for g in _game_record_sources(result, _nfl_snapshot_kickoff)
+                   if "proj_away" in g and "proj_home" in g]
     now = datetime.now(timezone.utc)
     rows = []
     for prediction in predictions:
@@ -8839,7 +8858,7 @@ def _nfl_save_board_snapshots(date_str: str, result: dict, system: str = "OLD"):
             continue
         def _same_game(item):
             return (
-                str(item.get("game_start") or "") == start
+                _nfl_snapshot_kickoff(item.get("game_start") or item.get("start")) == kickoff
                 and (not game or str(item.get("game") or "") == game)
             )
         mini = {
