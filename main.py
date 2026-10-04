@@ -12,6 +12,10 @@ from functools import partial
 from typing import Dict, List, Optional
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
+from nfl_receiving_boards import (
+    RECEIVING_MARKETS, RECEIVING_POSITIONS,
+    mark_receiving_picks, split_receiving_records,
+)
 
 import httpx
 from fastapi import FastAPI, Request, HTTPException
@@ -5977,6 +5981,7 @@ async def _run_pipeline_unlocked(date_str: str, progress=None, simulate: bool = 
     picks   = sorted([r for r in all_results
                       if r.get("pick") and r.get("betQualified", True)],
                      key=lambda x: abs(x.get("gap") or 0), reverse=True)
+    mark_receiving_picks(picks)
     td_picks = sorted(
         [r for r in all_results
          if r.get("market") == "player_anytime_td"
@@ -7329,7 +7334,15 @@ _NFL_BET_LEDGER_DATE = "2000-01-01"
 _NFL_BET_LEDGER_PREFIX = "__my_bets__:"
 _NFL_BET_STAT_KEYS = tuple(PROP_MARKETS)
 _NFL_STAT_LABEL = dict(PROP_LABELS)
-_NFL_CAT_ORDER = [PROP_LABELS[m] for m in PROP_MARKETS]
+_NFL_CAT_ORDER = [
+    category
+    for market in PROP_MARKETS
+    for category in (
+        [PROP_LABELS[market]]
+        + ([f"{position} {PROP_LABELS[market]}" for position in RECEIVING_POSITIONS]
+           if market in RECEIVING_MARKETS else [])
+    )
+]
 
 
 def _nfl_bet_ledger_category(user_key: str) -> str:
@@ -9174,7 +9187,9 @@ def _nfl_update_gp_ledger(include_date: str = "", system: str = "OLD"):
 def _nfl_grade_date(date_str: str, snap: list, box_override: dict = None) -> dict:
     """Grade every pick in snap against ESPN box scores.
     Groups by market+direction, ranks by score desc.
-    Top _NFL_TRK_TOP per group -> main record; extras -> NFL Overflow."""
+    Top _NFL_TRK_TOP per group -> main record; extras -> NFL Overflow.
+    New receiving snapshots are then partitioned by position using the
+    displayed cushion ranking, without changing Locks or movement records."""
     from collections import defaultdict
     box = box_override if box_override is not None else _nfl_box_lookup(date_str)
     any_game = bool(box)
@@ -9285,6 +9300,8 @@ def _nfl_grade_date(date_str: str, snap: list, box_override: dict = None) -> dic
         rec[1] for rec in sorted(
             lock_best.values(), key=lambda rec: rec[0], reverse=True)
     ]
+    main_rows, ovf_rows = split_receiving_records(
+        main_rows, ovf_rows, snap, PROP_LABELS)
     return {"any_game": any_game, "all_final": all_final,
             "main": main_rows, "overflow": ovf_rows, "locks": lock_rows}
 
@@ -9319,6 +9336,9 @@ def _nfl_detail_graded(graded: dict, include_overflow: bool = True,
             "line", "odds", "rank", "result", "actual", "profit", "pool",
             "opening_line", "current_line", "line_move",
         )}
+        if row.get("receivingBoardVersion"):
+            detail["position"] = row.get("position")
+            detail["receivingBoardVersion"] = row["receivingBoardVersion"]
         detail["observation_only"] = _nfl_td_observation_only(row)
         out.append(detail)
     return out
@@ -10919,7 +10939,7 @@ tr:last-child td{border-bottom:none}
   <div class="card" style="padding:20px 22px">
     <div style="margin-bottom:14px">
       <h2 style="font-family:'Playfair Display',serif;font-size:1.4rem;font-weight:700;color:#fff">&#128202; NFL Track Record <span id="nflTrackSystemBadge" style="color:#fbbf24;font-size:.7rem">SYSTEM: OLD</span></h2>
-      <div style="color:#7c8aa0;font-size:.76rem;margin-top:4px">Top 10 picks per category. Historical Analysis remains separate from the official pre-game record.</div>
+      <div style="color:#7c8aa0;font-size:.76rem;margin-top:4px">Top 10 picks per category. Receiving Yards and Receptions have separate WR, TE and RB lists for each side. Existing saved records keep their original format; new captures use the position split. Historical Analysis remains separate from the official pre-game record.</div>
     </div>
     <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:14px">
       <label style="color:#9ca3af;font-size:.78rem;font-weight:700;text-transform:uppercase;letter-spacing:.1em">Record</label>
@@ -10950,7 +10970,7 @@ tr:last-child td{border-bottom:none}
   <div class="card" style="padding:20px 22px;border-color:#92400e">
     <div style="margin-bottom:14px">
       <h2 style="font-family:'Playfair Display',serif;font-size:1.4rem;font-weight:700;color:#fff">&#128200; NFL Overflow Track Record <span id="nflOverflowSystemBadge" style="color:#fbbf24;font-size:.7rem">SYSTEM: OLD</span></h2>
-      <div style="color:#9a7b63;font-size:.76rem;margin-top:4px">Ranks 11+ tracked separately from each category&#39;s Top 10 picks.</div>
+      <div style="color:#9a7b63;font-size:.76rem;margin-top:4px">Ranks 11+ tracked separately from each category&#39;s Top 10 picks. New receiving captures use ranks 11–20 independently for WR, TE and RB on each side.</div>
     </div>
     <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:14px">
       <label style="color:#9ca3af;font-size:.78rem;font-weight:700;text-transform:uppercase;letter-spacing:.1em">Record</label>
@@ -11935,6 +11955,36 @@ function nflCardGrid(picks,startRank){
   if(!picks||!picks.length) return '<div class="no-picks">No qualifying picks for this market.</div>';
    startRank=(startRank==null?1:startRank);
    return '<div class="picks-grid">'+picks.map(function(p,i){return nflCard(p,startRank+i);}).join('')+'</div>';
+}
+function _nflReceivingPosition(p){
+  var fields=[p.position,p.roster_position,p.positionGroup,p.defPositionGroup];
+  for(var i=0;i<fields.length;i++){
+    var position=String(fields[i]||'').toUpperCase().trim();
+    if(position==='HB'||position==='FB')position='RB';
+    if(position==='WR'||position==='TE'||position==='RB')return position;
+  }
+  return 'UNVERIFIED';
+}
+function _nflReceivingSections(m,all,sectionIndex){
+  var html='',positions=['WR','TE','RB','UNVERIFIED'];
+  positions.forEach(function(position){
+    var rows=all.filter(function(p){return _nflReceivingPosition(p)===position;});
+    if(!rows.length)return;
+    var label=position==='UNVERIFIED'?'Position Unverified':position;
+    ['OVER','UNDER'].forEach(function(side){
+      var selected=rows.filter(function(p){return p.pick===side;});
+      if(!selected.length)return;
+      var primary=selected.slice(0,10),overflow=selected.slice(10,20);
+      var arrow=side==='OVER'?'⬆':'⬇';
+      var key='recv_'+sectionIndex+'_'+position+'_'+side.toLowerCase();
+      html+=_collapseSec(key,arrow+' '+_mIcon(m)+' Top 10 '+label+' '+m+' — '+side+'S',
+        nflCardGrid(primary,1),true);
+      if(overflow.length)html+=_collapseSec(key+'_overflow',
+        arrow+' '+label+' '+m+' '+side+'S — Overflow ('+overflow.length+' more)',
+        nflCardGrid(overflow,11),false);
+    });
+  });
+  return html;
 }
 function _nflRoleRiskBoard(rows){
   var allSeen={},allPlayers=(rows||[]).filter(function(p){
@@ -13577,6 +13627,11 @@ function _nflPaint(q){
   h+=_collapseSec('biggest_under_movement','⬇ Biggest Under Line Movement',_nflMovementBoard(picks,'UNDER'),true);
   _MORDER.forEach(function(m,i){
     var all=(byM[m]||[]).filter(function(p){return !_nflGameDone(p);});
+    if(m==='Rec Yds'||m==='Receptions'){
+      var receivingHtml=_nflReceivingSections(m,all,i);
+      if(receivingHtml){hasCards=true;h+=receivingHtml;}
+      return;
+    }
     var overs =all.filter(function(p){return p.pick==='OVER';});
     var unders=all.filter(function(p){return p.pick==='UNDER';});
     if(!overs.length&&!unders.length) return;
@@ -14364,6 +14419,15 @@ function _nflTrkListHtml(decided,stake){
     'Anytime TD':'#fbbf24','Tackles+Ast':'#fb923c','Sacks':'#f97316',
     'Def INT':'#f43f5e','Kick Pts':'#facc15','FG Made':'#fde047',
     '80-100% Locks':'#facc15'};
+  ['Rec Yds','Receptions'].forEach(function(market){
+    var index=catOrder.indexOf(market);
+    var positionCategories=['WR','TE','RB','Position Unverified'].map(function(position){
+      var label=position+' '+market;
+      catColors[label]=catColors[market];
+      return label;
+    });
+    if(index>=0)catOrder.splice.apply(catOrder,[index+1,0].concat(positionCategories));
+  });
   var groups={},order=[];
   function baseCategory(cat){
     return String(cat||'Other').replace(/\s+\((Over|Under)\)$/i,'');
