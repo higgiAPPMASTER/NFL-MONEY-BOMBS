@@ -7912,6 +7912,8 @@ def _nfl_capture_opening_lines(date_str: str, result: dict) -> bool:
     Wednesday captures Thursday, Friday captures Sunday, and Saturday captures
     Monday. A later run on the same capture day replaces the earlier one so the
     baseline includes the fullest sportsbook board available that day.
+    Saturday also captures Sunday only if its opening baseline is absent;
+    that fallback never replaces an existing baseline.
     """
     try:
         target = datetime.strptime(date_str, "%Y-%m-%d").date()
@@ -7924,8 +7926,26 @@ def _nfl_capture_opening_lines(date_str: str, result: dict) -> bool:
         5: 2,  # Saturday -> Monday
     }
     offset = weekday_to_offset.get(capture_day.weekday())
-    if offset is None or target != capture_day + timedelta(days=offset):
+    saturday_fallback = (
+        capture_day.weekday() == 5
+        and target == capture_day + timedelta(days=1))
+    if not saturday_fallback and (
+            offset is None or target != capture_day + timedelta(days=offset)):
         return False
+    if saturday_fallback:
+        existing = _nfl_sb_get_strict("mpa_track_ledger", {
+            "app": f"eq.{_NFL_LINE_MOVEMENT_APP}",
+            "date": f"eq.{date_str}",
+            "category": f"eq.{_NFL_LINE_OPEN_CATEGORY}",
+            "side": "eq.ALL", "select": "detail", "limit": "1",
+        })
+        if existing is None:
+            print(f"[nfl_opening] Saturday fallback NOT CONFIRMED: "
+                  f"cannot check existing Sunday baseline -> {date_str}")
+            return False
+        if existing:
+            print(f"[nfl_opening] existing Sunday baseline kept -> {date_str}")
+            return True
     lines, seen = [], set()
     for row in result.get("all") or []:
         key = _nfl_line_identity(row)
@@ -7957,7 +7977,7 @@ def _nfl_capture_opening_lines(date_str: str, result: dict) -> bool:
         })
     if not lines:
         return False
-    return _nfl_sb_upsert("mpa_track_ledger", [{
+    row = {
         "app": _NFL_LINE_MOVEMENT_APP,
         "date": date_str,
         "category": _NFL_LINE_OPEN_CATEGORY,
@@ -7965,14 +7985,27 @@ def _nfl_capture_opening_lines(date_str: str, result: dict) -> bool:
         "wins": 0, "losses": 0, "locked": True,
         "detail": {
             "captured_at": datetime.now(timezone.utc).isoformat(),
-            "source": {
+            "source": "saturday_fallback_for_sunday" if saturday_fallback else {
                 2: "wednesday_for_thursday",
                 4: "friday_for_sunday",
                 5: "saturday_for_monday",
             }[capture_day.weekday()],
             "lines": lines,
         },
-    }], on_conflict="app,date,category,side")
+    }
+    if saturday_fallback:
+        # Insert-only at the database too: a concurrent capture must not turn
+        # the earlier absent-row check into an overwrite of genuine openings.
+        inserted = _nfl_sb_insert_ignore(
+            "mpa_track_ledger", [row], "app,date,category,side")
+        if inserted is None:
+            print(f"[nfl_opening] Saturday fallback NOT CONFIRMED -> {date_str}")
+            return False
+        print(f"[nfl_opening] Saturday Sunday baseline "
+              f"{'saved' if inserted else 'kept'} -> {date_str}")
+        return True
+    return _nfl_sb_upsert(
+        "mpa_track_ledger", [row], on_conflict="app,date,category,side")
 
 
 def _nfl_attach_line_movement(date_str: str, result: dict) -> dict:
@@ -11617,7 +11650,7 @@ async function pollJob(){
       document.getElementById('runBtn').textContent='Run Picks';
       document.getElementById('statusMsg').textContent=
         d.result&&d.result.week_mode
-          ?'Full NFL week loaded. The scheduled opening snapshot was saved only for the eligible game date: Wednesday→Thursday, Friday→Sunday, or Saturday→Monday.'
+          ?'Full NFL week loaded. Opening-line capture rules: Wednesday→Thursday, Friday→Sunday, Saturday→Monday; Saturday also captures Sunday when no opening baseline exists.'
           :
         d.result&&d.result.historicalTrackRecord
           ?'HISTORICAL REPLAY — this run excludes the selected date from model inputs and is excluded from the official Track Record.'
