@@ -9059,6 +9059,109 @@ def _nfl_list_snap_dates(system: str = "OLD") -> list:
     })
 
 
+def _nfl_record_snapshot(date_str: str, system: str = "OLD") -> list:
+    """Read genuine saved pregame selections, without running/capturing picks.
+
+    A complete official snapshot remains authoritative. If it is missing (or
+    only contains TD observations), use the actual persisted per-game picks,
+    provided their capture timestamp precedes that individual game's kickoff.
+    Never use the raw candidate pool, a current rerun, or another system.
+    """
+    cfg = _nfl_store_config(system)
+    stored = _nfl_sb_get_strict("mpa_track_ledger", {
+        "app": f"eq.{cfg['app']}", "category": f"eq.{cfg['picks']}",
+        "side": "eq.ALL", "date": f"eq.{date_str}",
+        "select": "detail", "limit": "1",
+    })
+    if stored is None:
+        raise RuntimeError("Could not confirm the saved NFL pregame record. No picks were regenerated.")
+    snapshot = stored[0].get("detail") if stored else []
+    if not isinstance(snapshot, list):
+        raise RuntimeError("Saved NFL pregame selections are unreadable.")
+    if any(not isinstance(p, dict) for p in snapshot):
+        raise RuntimeError("A saved NFL pregame selection is unreadable.")
+    if any(p.get("market") in PROP_LABELS and not _nfl_td_observation_only(p)
+           for p in snapshot):
+        return snapshot
+    boards = _nfl_sb_get_strict("mpa_track_ledger", {
+        "app": f"eq.{cfg['app']}", "date": f"eq.{date_str}",
+        "category": f"like.{cfg['board']}*", "side": "eq.ALL",
+        "select": "app,date,category,detail", "limit": "64",
+    })
+    if boards is None:
+        raise RuntimeError("Could not read the saved NFL game boards. This does not mean the picks are missing.")
+    latest = {}
+    for saved in boards:
+        part = saved.get("detail")
+        if (saved.get("app") != cfg["app"] or saved.get("date") != date_str
+                or not isinstance(part, dict) or part.get("date") != date_str
+                or part.get("simulation") or part.get("historical")):
+            raise RuntimeError("A saved NFL board does not match the requested official date/system.")
+        if part.get("system") and str(part["system"]).upper() != str(system).upper():
+            raise RuntimeError("Saved NFL board system does not match.")
+        captured = _nfl_snapshot_kickoff(part.get("saved_board_captured_at"))
+        picks = part.get("picks") or []
+        if not isinstance(picks, list) or any(not isinstance(p, dict) for p in picks):
+            raise RuntimeError("Saved NFL board selections are unreadable.")
+        groups = {}
+        # Include empty game groups so a newer genuine empty pregame board
+        # does not accidentally resurrect an older selection for that game.
+        for game in part.get("games") or []:
+            start = _nfl_snapshot_kickoff(game.get("game_start"))
+            if start and game.get("game"):
+                groups.setdefault((str(game["game"]), start), [])
+        for pick in picks:
+            start = _nfl_snapshot_kickoff(pick.get("game_start"))
+            game = str(pick.get("game") or "")
+            if not captured or not start or not game or captured >= start:
+                raise RuntimeError("A saved NFL selection cannot be verified as pre-kickoff. No replacement picks were created.")
+            if pick.get("market") not in PROP_LABELS:
+                raise RuntimeError("A saved NFL market could not be matched safely.")
+            groups.setdefault((game, start), []).append(pick)
+        if not captured and groups:
+            raise RuntimeError("A saved NFL board has no verified capture timestamp.")
+        for key, game_picks in groups.items():
+            if captured >= key[1]:
+                raise RuntimeError("A saved NFL game board was not captured before kickoff.")
+            if key not in latest or captured > latest[key][0]:
+                latest[key] = (captured, game_picks)
+    recovered = []
+    seen = set()
+    for _, picks in latest.values():
+        for pick in picks:
+            key = (_nfl_player_name_key(pick.get("name") or ""),
+                   pick.get("market"), str(pick.get("pick") or "OVER").upper(),
+                   str(pick.get("line")), str(pick.get("game")),
+                   str(pick.get("game_start")))
+            if key not in seen:
+                seen.add(key)
+                recovered.append({**pick, "recovered_from_pregame_board": True})
+    return recovered or snapshot
+
+
+def _nfl_record_has_regular_props(detail) -> bool:
+    return any(isinstance(p, dict) and p.get("market") in PROP_LABELS
+               and not _nfl_td_observation_only(p) for p in (detail or []))
+
+
+def _nfl_record_row_identity(row):
+    return (_nfl_player_name_key(row.get("name") or ""),
+            row.get("market"), row.get("category"), row.get("side"),
+            str(row.get("line")))
+
+
+def _nfl_record_preserve_results(rows: list, saved: list) -> list:
+    """Keep genuine already-settled results while newly recovered rows wait."""
+    known = {_nfl_record_row_identity(r): r for r in (saved or [])
+             if isinstance(r, dict) and r.get("result") in ("WIN", "LOSS", "PUSH")}
+    for row in rows:
+        previous = known.get(_nfl_record_row_identity(row))
+        if previous and row.get("result") == "PENDING":
+            for key in ("result", "actual", "profit"):
+                row[key] = previous.get(key)
+    return rows
+
+
 def _nfl_restore_td_observations_from_board(
         date_str: str, snapshot: list, system: str = "OLD") -> list:
     """Repair display-only TD rows from durable pre-kickoff game boards."""
@@ -9322,7 +9425,11 @@ def _nfl_grade_date(date_str: str, snap: list, box_override: dict = None) -> dic
     from collections import defaultdict
     box = box_override if box_override is not None else _nfl_box_lookup(date_str)
     any_game = bool(box)
-    all_final = any_game and all(v.get("final", False) for v in box.values())
+    # Individual final-player rows do not prove the entire slate is final:
+    # an unstarted late game may have no player rows yet.
+    all_final = (any_game and bool((_NFL_BOX_CACHE.get(date_str) or {}).get("final"))
+                 if box_override is None else
+                 any_game and all(v.get("final", False) for v in box.values()))
 
     by_group: dict = defaultdict(list)
     for p in (snap or []):
@@ -9640,11 +9747,21 @@ def _nfl_update_track_ledger(include_date: str = "", system: str = "OLD"):
         locked = {r["date"] for r in (locked_rows or [])}
         upserts = []
         for d in _nfl_list_snap_dates(system):
-            if d > today or (d == today and d != include_date) or d in locked:
+            if d > today or (d == today and d != include_date):
                 continue
-            snap = _nfl_load_picks_snapshot(d, system)
-            official_snapshot_saved = bool(snap)
-            snap = _nfl_restore_td_observations_from_board(d, snap, system)
+            if d in locked:
+                if d != include_date:
+                    continue
+                current = _nfl_sb_get_strict("mpa_track_ledger", {
+                    "app": f"eq.{cfg['app']}", "date": f"eq.{d}",
+                    "category": f"eq.{cfg['detail']}", "side": "eq.ALL",
+                    "select": "detail", "limit": "1",
+                })
+                if current is None:
+                    raise RuntimeError("Could not check the saved NFL record before recovery.")
+                if current and _nfl_record_has_regular_props(current[0].get("detail")):
+                    continue
+            snap = _nfl_record_snapshot(d, system)
             if not snap:
                 continue
             try:
@@ -9652,7 +9769,7 @@ def _nfl_update_track_ledger(include_date: str = "", system: str = "OLD"):
             except Exception as e:
                 print(f"[nfl_track] grade failed {d}: {e}")
                 continue
-            if d == include_date and official_snapshot_saved:
+            if d == include_date:
                 selected_grade[d] = graded
             if not graded.get("any_game"):
                 continue
@@ -9898,8 +10015,11 @@ async def nfl_track_record(grade: bool = False, date_str: str = "", system: str 
     selected_grade = {}
     if grade:
         loop = asyncio.get_running_loop()
-        selected_grade = await loop.run_in_executor(
-            None, _nfl_update_track_ledger, date_str, system) or {}
+        try:
+            selected_grade = await loop.run_in_executor(
+                None, _nfl_update_track_ledger, date_str or _nfl_today(), system) or {}
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
     else:
         _bt_th.Thread(target=_nfl_update_track_ledger, args=("", system), daemon=True).start()
     cfg = _nfl_store_config(system)
@@ -9917,27 +10037,23 @@ async def nfl_track_record(grade: bool = False, date_str: str = "", system: str 
         for r in (led_rows or [])
     }
     selected_date = date_str or _nfl_today()
-    if selected_date not in detail_by_date and selected_date not in selected_grade:
-        saved = _nfl_sb_get_strict("mpa_track_ledger", {
-            "app": f"eq.{cfg['app']}", "category": f"eq.{cfg['picks']}",
-            "side": "eq.ALL", "date": f"eq.{selected_date}",
-            "select": "detail", "limit": "1",
-        })
-        if saved is None:
-            raise HTTPException(status_code=503, detail="Could not confirm saved pregame picks. Please retry Get Results.")
-        snapshot = saved[0].get("detail") if saved else []
-        if not isinstance(snapshot, list):
-            raise HTTPException(status_code=503, detail="Saved pregame picks could not be read. Please retry Get Results.")
+    needs_recovery = not _nfl_record_has_regular_props(detail_by_date.get(selected_date))
+    if needs_recovery and selected_date not in selected_grade:
+        try:
+            snapshot = await asyncio.to_thread(_nfl_record_snapshot, selected_date, system)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
         if snapshot:
             # Display only: no live stats lookup, model run, or snapshot write.
             selected_grade[selected_date] = _nfl_grade_date(
                 selected_date, snapshot, box_override={})
     pending_overflow = {}
     for d, graded in selected_grade.items():
-        if d in detail_by_date:
+        if d in detail_by_date and _nfl_record_has_regular_props(detail_by_date[d]):
             continue  # Finalized ledger rows always win; never duplicate a date.
-        detail_by_date[d] = _nfl_detail_graded(
-            graded, include_overflow=False, include_pending=True)
+        detail_by_date[d] = _nfl_record_preserve_results(
+            _nfl_detail_graded(graded, include_overflow=False, include_pending=True),
+            detail_by_date.get(d) or [])
         pending_overflow[d] = _nfl_detail_graded(
             graded, overflow_only=True, include_pending=True)
     dates = sorted(detail_by_date.keys(), reverse=True)
@@ -10000,6 +10116,10 @@ async def nfl_track_record(grade: bool = False, date_str: str = "", system: str 
         }
         for r in (overflow_rows or []) if r.get("date")
     ]
+    for saved in overflow_dates:
+        if saved["date"] in pending_overflow:
+            recovered = pending_overflow[saved["date"]]
+            saved["detail"] = _nfl_record_preserve_results(recovered, saved["detail"])
     saved_overflow_dates = {r["date"] for r in overflow_dates}
     overflow_dates.extend(
         {"date": d, "detail": rows}
