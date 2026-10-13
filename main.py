@@ -7032,12 +7032,12 @@ def _nfl_write_job_response(job_id: str, result: dict) -> pathlib.Path:
 
 
 def _nfl_week_dates(anchor_date: str) -> list:
-    """Return the NFL display week containing anchor_date: Wednesday–Tuesday."""
+    """Return the NFL display week: Tuesday up to, but not including, next Tuesday."""
     try:
         anchor = datetime.strptime(anchor_date, "%Y-%m-%d").date()
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail="A valid NFL date is required")
-    start = anchor - timedelta(days=(anchor.weekday() - 2) % 7)
+    start = anchor - timedelta(days=(anchor.weekday() - 1) % 7)
     return [(start + timedelta(days=offset)).isoformat() for offset in range(7)]
 
 
@@ -7090,7 +7090,7 @@ def _nfl_merge_week_results(anchor_date: str, daily_results: list,
         })
         if error:
             notes.append(f"{ds}: {error}")
-            # A date with no NFL slate is expected in the Wednesday–Tuesday
+            # A date with no NFL slate is expected in the Tuesday–Monday
             # display week.  Other errors represent an incomplete week even
             # when other dates produced perfectly usable boards.
             if "No NFL games found" not in error:
@@ -7145,7 +7145,7 @@ def _nfl_merge_week_results(anchor_date: str, daily_results: list,
     merged["failed_date_count"] = len(failed_dates)
     merged["week_notice"] = (
         ("INCOMPLETE — " if failed_dates else "") +
-        f"Full NFL week: {dates[0]} through {dates[-1]} (Wednesday–Tuesday). "
+        f"Full NFL week: {dates[0]} through {dates[-1]} (Tuesday–Monday; next Tuesday starts a new week). "
         f"{len(merged['games'])} games loaded. Opening lines are stored by game "
         "date; Coach presets are tracked automatically before their included "
         "kickoffs, while this weekly run does not lock the main official pick tracker."
@@ -7986,7 +7986,7 @@ def _nfl_opening_lines(date_str: str) -> dict:
 def _nfl_capture_opening_lines(date_str: str, result: dict) -> bool:
     """Save the scheduled pregame baseline for Thursday, Sunday, or Monday.
 
-    Wednesday captures Thursday, Friday captures Sunday, and Saturday captures
+    Tuesday captures Thursday, Friday captures Sunday, and Saturday captures
     Monday. A later run on the same capture day replaces the earlier one so the
     baseline includes the fullest sportsbook board available that day.
     Saturday also captures Sunday only if its opening baseline is absent;
@@ -7998,7 +7998,7 @@ def _nfl_capture_opening_lines(date_str: str, result: dict) -> bool:
         return False
     capture_day = _nfl_today_date()
     weekday_to_offset = {
-        2: 1,  # Wednesday -> Thursday
+        1: 2,  # Tuesday -> Thursday
         4: 2,  # Friday -> Sunday
         5: 2,  # Saturday -> Monday
     }
@@ -8063,7 +8063,7 @@ def _nfl_capture_opening_lines(date_str: str, result: dict) -> bool:
         "detail": {
             "captured_at": datetime.now(timezone.utc).isoformat(),
             "source": "saturday_fallback_for_sunday" if saturday_fallback else {
-                2: "wednesday_for_thursday",
+                1: "tuesday_for_thursday",
                 4: "friday_for_sunday",
                 5: "saturday_for_monday",
             }[capture_day.weekday()],
@@ -11846,7 +11846,7 @@ function _nflRunScopeChanged(){
   if(typeof _nflPerfectParlayInvalidate==='function')_nflPerfectParlayInvalidate('scope');
   var hint=document.getElementById('runScopeHint'),week=_nflRunScope()==='week';
   if(hint)hint.textContent=week
-    ?'Runs the NFL week containing this date: Wednesday through Tuesday, including Monday Night Football.'
+    ?'Runs Tuesday through Monday; the next Tuesday starts a new week. Includes Thursday, Sunday and Monday Night Football.'
     :'Runs only the selected calendar date.';
 }
 
@@ -11862,7 +11862,7 @@ async function runPicks(){
   btn.disabled=true;
   btn.innerHTML='<span class="spinner"></span>Running...';
   status.innerHTML='<span class="spinner"></span>'+(scope==='week'
-    ?'Running the full Wednesday–Tuesday NFL week...'
+    ?'Running the full Tuesday–Monday NFL week...'
     :'Fetching prop lines and loading NFL stats...');
   document.getElementById('results').innerHTML='';
   try{
@@ -11947,7 +11947,7 @@ async function pollJob(){
       document.getElementById('runBtn').textContent='Run Picks';
       document.getElementById('statusMsg').textContent=
         d.result&&d.result.week_mode
-          ?'Full NFL week loaded. Coach presets are captured automatically before their included kickoffs; check the Coach capture status below. Opening-line rules: Wednesday→Thursday, Friday→Sunday, Saturday→Monday; Saturday also captures Sunday when its baseline is missing.'
+          ?'Full NFL week loaded. Coach presets are captured automatically before their included kickoffs; check the Coach capture status below. Opening-line rules: Tuesday→Thursday, Friday→Sunday, Saturday→Monday; Saturday also captures Sunday when its baseline is missing.'
           :
         d.result&&d.result.historicalTrackRecord
           ?'HISTORICAL REPLAY — this run excludes the selected date from model inputs and is excluded from the official Track Record.'
@@ -12004,7 +12004,7 @@ async function getPicks(){
   btn.disabled=true;
   btn.innerHTML='<span class="spinner"></span>'+(isHistorical?'Replaying...':'Loading...');
   status.innerHTML='<span class="spinner"></span>'+(scope==='week'
-    ?'Loading saved Wednesday–Tuesday boards...'
+    ?'Loading saved Tuesday–Monday boards...'
     :isHistorical
     ?'Building point-in-time picks and grading the historical results...'
     :'Loading saved picks...');
@@ -13084,7 +13084,7 @@ function _nflCoachGameTiles(p){
 function _nflCoachLineMovement(p){
   var s=p.source||{};
   if(!s.lineMovementAvailable||s.openingLine==null||s.currentLine==null){
-    return '<div>No scheduled opening line is stored for this exact player and market. Use Full Week on Wednesday for Thursday games, Friday for Sunday games, or Saturday for Monday games; then Run Picks on game day for the comparison.</div>';
+    return '<div>No scheduled opening line is stored for this exact player and market. Use Full Week on Tuesday for Thursday games, Friday for Sunday games, or Saturday for Monday games; then Run Picks on game day for the comparison.</div>';
   }
   var open=Number(s.openingLine),current=Number(s.currentLine),move=Number(s.lineMove||0);
   var direction=move>0?'UP':(move<0?'DOWN':'UNCHANGED');
