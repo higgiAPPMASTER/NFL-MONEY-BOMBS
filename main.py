@@ -11073,7 +11073,7 @@ tr:last-child td{border-bottom:none}
       </select>
       <select id="runScope" class="date-input" onchange="_nflRunScopeChanged()" style="min-width:190px">
         <option value="day">Selected day only</option>
-        <option value="week">Full week · Wed–Tue</option>
+        <option value="week">Full week · Tue–Mon</option>
       </select>
     </div>
     <div id="runScopeHint" style="color:#6b7280;font-size:.72rem;margin:-5px 0 14px">Runs only the selected calendar date.</div>
