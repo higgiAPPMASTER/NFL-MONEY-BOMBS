@@ -8526,6 +8526,9 @@ def _nfl_coach_hist_candidates(picks):
             "current_line": pick.get("currentLine", pick.get("realLine")),
             "line_move": pick.get("lineMove"),
             "line_movement_available": bool(pick.get("lineMovementAvailable")),
+            "role_rank": pick.get("roleRank"),
+            "team_option_rank": pick.get("teamOptionRank"),
+            "depth_rank": pick.get("depthRank"),
             "is_rookie": bool(pick.get("rookieVerified")
                               and pick.get("isRookie")),
             "rookie_verified": bool(pick.get("rookieVerified")),
@@ -8583,16 +8586,43 @@ def _nfl_coach_team_market_key(row):
     return (team, str(market or row.get("market_label") or ""), side)
 
 
+def _nfl_coach_team_role_rank(row):
+    """Team pecking order: receiving option # for receiving markets, else
+    position rank (WR1/RB1), else ESPN depth rank. None when unknown."""
+    fields = ("role_rank", "depth_rank")
+    if _nfl_coach_hist_family(row.get("market_label")) == "rec":
+        fields = ("team_option_rank",) + fields
+    for field in fields:
+        try:
+            value = int(float(row.get(field)))
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    return None
+
+
 def _nfl_coach_one_per_team_market(rows):
-    out, seen = [], set()
-    for row in rows:
+    """Keep one row per team/market/side. Overs: the team's top-ranked
+    player (WR1 over WR2) wins; unknown roles and Unders keep Coach order."""
+    winners = {}
+    for index, row in enumerate(rows):
         key = _nfl_coach_team_market_key(row)
-        if key is not None:
-            if key in seen:
-                continue
-            seen.add(key)
-        out.append(row)
-    return out
+        if key is None:
+            continue
+        prior = winners.get(key)
+        if prior is None:
+            winners[key] = index
+            continue
+        if key[2] != "OVER":
+            continue
+        rank = _nfl_coach_team_role_rank(row)
+        prior_rank = _nfl_coach_team_role_rank(rows[prior])
+        if rank is not None and (prior_rank is None or rank < prior_rank):
+            winners[key] = index
+    keep = set(winners.values())
+    return [row for index, row in enumerate(rows)
+            if _nfl_coach_team_market_key(row) is None or index in keep]
 
 
 def _nfl_coach_hist_select(candidates, category, alternate=False):
@@ -11934,14 +11964,29 @@ function _nflCoachTeamMarketKey(p){
   var m=String((p&&p.market)||'').toLowerCase().replace('alternate','').replace(/[^a-z0-9]+/g,' ').trim();
   return t+'|'+m+'|'+String((p&&(p.side||p.dir))||'').toUpperCase();
 }
+function _nflCoachTeamRoleRank(p){
+  var src=(p&&(p.source||p.coachDetail&&p.coachDetail.source))||{};
+  var fields=['roleRank','depthRank'];
+  if(_nflCoachFamily(p&&p.market)==='rec')fields.unshift('teamOptionRank');
+  for(var i=0;i<fields.length;i++){
+    var v=p[fields[i]];if(v==null||v==='')v=src[fields[i]];
+    var n=parseInt(v,10);
+    if(isFinite(n)&&n>0)return n;
+  }
+  return null;
+}
 function _nflCoachOnePerTeamMarket(rows){
-  var seen={};
-  return (rows||[]).filter(function(p){
+  rows=rows||[];
+  var winners={};
+  rows.forEach(function(p,i){
     var k=_nflCoachTeamMarketKey(p);
-    if(!k)return true;
-    if(seen[k])return false;
-    seen[k]=1;return true;
+    if(!k)return;
+    if(winners[k]==null){winners[k]=i;return;}
+    if(String(p.side||p.dir||'').toUpperCase()!=='OVER')return;
+    var r=_nflCoachTeamRoleRank(p),pr=_nflCoachTeamRoleRank(rows[winners[k]]);
+    if(r!=null&&(pr==null||r<pr))winners[k]=i;
   });
+  return rows.filter(function(p,i){var k=_nflCoachTeamMarketKey(p);return !k||winners[k]===i;});
 }
 function _nflCoachParlayCandidates(){
   if(typeof _nflCoachProps!=='function'||typeof _nflCoachSafest!=='function')return [];
@@ -13481,6 +13526,7 @@ function _nflCoachProps(sourceCandidates){
       recentTotal:Number(p.vsLineTotal||p.totB||0),oppRate:Number(p.rateA||0),
       oppHits:Number(p.hitsA||0),oppTotal:Number(p.totA||0),book:side==='UNDER'?(p.under_book||''):(p.over_book||''),
       isAlternate:!!p.isAlternate,game_start:p.game_start||'',
+      roleRank:p.roleRank,teamOptionRank:p.teamOptionRank,depthRank:p.depthRank,
       isRookie:p.isRookie===true,rookieVerified:p.rookieVerified===true,
        openingLine:p.openingLine,currentLine:p.currentLine!=null?p.currentLine:p.realLine,
        lineMove:p.lineMove,lineMovementAvailable:!!p.lineMovementAvailable,
@@ -13892,7 +13938,7 @@ function _nflCoachRender(question,rows,total,mode,isAlternate,target){
     :(isAlternate
       ?'I checked '+total+' genuine alternate-line candidates for the safer-value sweet spot. Every result is priced -1000 or better, has at least 85% app probability, at least 70% sportsbook-implied probability, and positive Coach Edge; each player can appear once per qualifying market, using that player-market’s largest-edge line, with a maximum of 10 plays.'
       :'I checked '+total+' priced NFL board plays and ranked the matching positive Coach Edge results. Coach Edge is probability edge, not guaranteed monetary profit.');
-  summary+=' To avoid stacked plays, only one player per team is suggested for each market and side.';
+  summary+=' To avoid stacked plays, only one player per team is suggested for each market and side; on Overs the higher-ranked teammate (e.g. WR1 over WR2) takes priority.';
   if(!rows.length){el.innerHTML='<div class="nfl-coach-question">'+_esc(question)+'</div><div class="nfl-coach-summary">'+(mode==='hundred'?'No loaded Coach-eligible NFL play currently has an exact 100.0% app hit rate.':(mode.indexOf('movement_')===0?'No qualifying opening-to-current line moves captured yet.':'No loaded priced NFL prop matched that request.'))+'</div>';return;}
   var cards=rows.map(function(p,i){
     var s=p.source||{},head=_esc(s.head||''),logo='https://a.espncdn.com/i/teamlogos/nfl/500/'+_logoAbbr(p.team)+'.png';
