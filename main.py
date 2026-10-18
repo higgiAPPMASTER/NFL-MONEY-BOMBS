@@ -8572,6 +8572,29 @@ def _nfl_coach_tracking_candidates(picks):
         for row in _nfl_coach_hist_candidates(picks)
     ]
 
+def _nfl_coach_team_market_key(row):
+    """One Coach play per team for each market and side (e.g. one CHI WR
+    Receiving Yards Over); other markets/sides from that team stay eligible."""
+    team = str(row.get("team") or "").strip().upper()
+    if not team:
+        return None
+    market = _nfl_coach_market_key(row.get("market") or row.get("market_label"))
+    side = str(row.get("side") or row.get("pick") or "").upper()
+    return (team, str(market or row.get("market_label") or ""), side)
+
+
+def _nfl_coach_one_per_team_market(rows):
+    out, seen = [], set()
+    for row in rows:
+        key = _nfl_coach_team_market_key(row)
+        if key is not None:
+            if key in seen:
+                continue
+            seen.add(key)
+        out.append(row)
+    return out
+
+
 def _nfl_coach_hist_select(candidates, category, alternate=False):
     if category == "app_hit_rate_100":
         rows = [
@@ -8590,7 +8613,7 @@ def _nfl_coach_hist_select(candidates, category, alternate=False):
                 continue
             seen_players.add(player_key)
             unique.append(row)
-        return unique
+        return _nfl_coach_one_per_team_market(unique)
     family = {
         "passing": "pass", "rushing": "rush", "receiving": "rec",
         "defense": "def", "kicking": "kick", "td_scorers": "td",
@@ -8645,6 +8668,7 @@ def _nfl_coach_hist_select(candidates, category, alternate=False):
             continue
         seen_players.add(player_key)
         unique.append(row)
+    unique = _nfl_coach_one_per_team_market(unique)
     limit = 10
     return unique[:limit]
 
@@ -11904,6 +11928,21 @@ function _nflNormalParlayCandidates(){
   });
   return out;
 }
+function _nflCoachTeamMarketKey(p){
+  var t=String((p&&p.team)||'').trim().toUpperCase();
+  if(!t)return '';
+  var m=String((p&&p.market)||'').toLowerCase().replace('alternate','').replace(/[^a-z0-9]+/g,' ').trim();
+  return t+'|'+m+'|'+String((p&&(p.side||p.dir))||'').toUpperCase();
+}
+function _nflCoachOnePerTeamMarket(rows){
+  var seen={};
+  return (rows||[]).filter(function(p){
+    var k=_nflCoachTeamMarketKey(p);
+    if(!k)return true;
+    if(seen[k])return false;
+    seen[k]=1;return true;
+  });
+}
 function _nflCoachParlayCandidates(){
   if(typeof _nflCoachProps!=='function'||typeof _nflCoachSafest!=='function')return [];
   function leg(p){
@@ -11915,10 +11954,10 @@ function _nflCoachParlayCandidates(){
   }
   function select(rows,sorter,limit){
     var seen={};
-    return rows.slice().sort(sorter).filter(function(p){
+    return _nflCoachOnePerTeamMarket(rows.slice().sort(sorter).filter(function(p){
       var key=String(p.player||'').trim().toLowerCase();
       if(!key||seen[key])return false;seen[key]=1;return true;
-    }).slice(0,limit||5);
+    })).slice(0,limit||5);
   }
   var allCoach=_nflCoachSafest(_nflCoachProps()).filter(function(p){
     return _nflGameFilterOn('parlay',p.team,p.opponent);
@@ -13829,8 +13868,9 @@ function buildNflPerfectParlay(){
   });
   var pool=Object.keys(byPlayer).map(function(k){return byPlayer[k];});
   pool.sort(function(a,b){return b.appProb-a.appProb||b.edge-a.edge||String(a.player).localeCompare(String(b.player));});
+  pool=_nflCoachOnePerTeamMarket(pool);
   if(pool.length<requested){
-    _nflPerfectParlayCommit('<div><div class="nfl-coach-question">&#10024; Perfect Parlay · '+requested+' Legs</div><div class="nfl-coach-summary">Only '+pool.length+' unique player'+(pool.length===1?'':'s')+' from the currently displayed boards qualify with an exact genuine standard-line price of -1000 or better and positive Coach Edge. Choose fewer legs or broaden the filters.</div><button onclick="showNflPerfectParlayBuilder()" style="background:#1e293b;color:#fff;border:1px solid #475569;border-radius:8px;padding:9px 12px;font-weight:900;cursor:pointer">Edit parlay options</button></div>');return;
+    _nflPerfectParlayCommit('<div><div class="nfl-coach-question">&#10024; Perfect Parlay · '+requested+' Legs</div><div class="nfl-coach-summary">Only '+pool.length+' unique player'+(pool.length===1?'':'s')+' (one per team for each market and side) from the currently displayed boards qualify with an exact genuine standard-line price of -1000 or better and positive Coach Edge. Choose fewer legs or broaden the filters.</div><button onclick="showNflPerfectParlayBuilder()" style="background:#1e293b;color:#fff;border:1px solid #475569;border-radius:8px;padding:9px 12px;font-weight:900;cursor:pointer">Edit parlay options</button></div>');return;
   }
   __nflPerfectParlayPool=pool.slice();__nflPerfectParlayLegs=pool.slice(0,requested);__nflPerfectParlayNotice='';
   __nflPerfectParlayBoard={state:window._nflState,signature:_nflPerfectParlayBoardSignature()};
@@ -13852,6 +13892,7 @@ function _nflCoachRender(question,rows,total,mode,isAlternate,target){
     :(isAlternate
       ?'I checked '+total+' genuine alternate-line candidates for the safer-value sweet spot. Every result is priced -1000 or better, has at least 85% app probability, at least 70% sportsbook-implied probability, and positive Coach Edge; each player can appear once per qualifying market, using that player-market’s largest-edge line, with a maximum of 10 plays.'
       :'I checked '+total+' priced NFL board plays and ranked the matching positive Coach Edge results. Coach Edge is probability edge, not guaranteed monetary profit.');
+  summary+=' To avoid stacked plays, only one player per team is suggested for each market and side.';
   if(!rows.length){el.innerHTML='<div class="nfl-coach-question">'+_esc(question)+'</div><div class="nfl-coach-summary">'+(mode==='hundred'?'No loaded Coach-eligible NFL play currently has an exact 100.0% app hit rate.':(mode.indexOf('movement_')===0?'No qualifying opening-to-current line moves captured yet.':'No loaded priced NFL prop matched that request.'))+'</div>';return;}
   var cards=rows.map(function(p,i){
     var s=p.source||{},head=_esc(s.head||''),logo='https://a.espncdn.com/i/teamlogos/nfl/500/'+_logoAbbr(p.team)+'.png';
@@ -13904,15 +13945,15 @@ function generateNflCoachCategories(){
     answer.innerHTML='<div class="nfl-coach-question">Top 10 · Each Selected Category</div>'
       +'<div class="nfl-coach-summary">'+markets.length+' selected market categories · '+_esc(sides.join(' / '))
       +(rookie&&rookie.checked?' · verified rookies only':'')
-      +'. Each market has its own Top 10 ranked by positive Coach Edge, with one strongest play per player within that market. Standard sportsbook lines only; odds -1000 or better. These lists do not change tracked presets.</div>';
+      +'. Each market has its own Top 10 ranked by positive Coach Edge, with one strongest play per player and one player per team on each side within that market. Standard sportsbook lines only; odds -1000 or better. These lists do not change tracked presets.</div>';
     var shown=[];
     markets.forEach(function(market){
       var pool=candidates.filter(function(p){return String(p.market)===market;}),seenPlayers={};
-      var rows=pool.filter(function(p){
+      var rows=_nflCoachOnePerTeamMarket(pool.filter(function(p){
         var key=String(p.player||'').trim().toLowerCase();
         if(!key||seenPlayers[key])return false;
         seenPlayers[key]=1;return true;
-      }).slice(0,10);
+      })).slice(0,10);
       var section=document.createElement('section');
       section.style.cssText='margin-top:18px;padding-top:12px;border-top:1px solid #263244';
       _nflCoachRender(market+' · Top 10 · '+rows.length+' qualifying play'+(rows.length===1?'':'s'),rows,pool.length,'edge',false,section);
@@ -13984,7 +14025,8 @@ function askNflTdCoach(){
     var key=String(p.player||'').trim().toLowerCase();
     if(!key||seen[key])return false;
     seen[key]=1;return true;
-  }).slice(0,10);
+  });
+  shown=_nflCoachOnePerTeamMarket(shown).slice(0,10);
   _nflCoachRender(q,shown,props.length,'td_probability',false);
   _nflCoachAutomaticStatus();
   return shown;
@@ -14157,6 +14199,7 @@ function askNflCoach(options){
       if(!key||hundredSeen[key])return false;
       hundredSeen[key]=1;return true;
     });
+    rows=_nflCoachOnePerTeamMarket(rows);
     _nflCoachRender(question,rows,candidates.length,'hundred',false);
     return rows;
   }
@@ -14178,6 +14221,7 @@ function askNflCoach(options){
     if(!key||seenPlayers[key])return false;
     seenPlayers[key]=1;return true;
   });
+  rows=_nflCoachOnePerTeamMarket(rows);
   var shown=rows.slice(0,f.limit);_nflCoachRender(question,shown,candidates.length,f.mode,options.alternate===true);return shown;
 }
 var _nflCoachTrackData=null,_nflCoachTrackTabMode='cat';
