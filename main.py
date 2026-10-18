@@ -5923,6 +5923,235 @@ def _nfl_attach_funnels(result: dict, rankings: dict, df=None, schedule_rows=Non
     return result
 
 
+# ── Hot / Cold / Double Cold (NHL-style form boards, every line market) ──────
+_NFL_HC_FORMS = (("HOT", "Hot", "OVER"), ("COLD", "Cold", "UNDER"),
+                 ("DOUBLE", "Double Cold", "UNDER"))
+_NFL_HC_FORM_LABEL = {code: label for code, label, _ in _NFL_HC_FORMS}
+_NFL_HC_PASS_MARKETS = frozenset((
+    "player_pass_yds", "player_pass_tds", "player_pass_completions",
+    "player_pass_attempts", "player_reception_yds", "player_receptions"))
+_NFL_HC_RUSH_MARKETS = frozenset((
+    "player_rush_yds", "player_rush_attempts", "player_rush_reception_yds"))
+_NFL_HC_CATEGORY_PREFIXES = ("Hot ", "Cold ", "Double Cold ")
+
+
+def _nfl_hc_category(form: str, market: str) -> str:
+    return f"{_NFL_HC_FORM_LABEL.get(form, form)} {PROP_LABELS.get(market, market)}"
+
+
+def _nfl_is_spotlight_category(category) -> bool:
+    """Isolated spotlight records that never enter Track Record totals."""
+    cat = str(category or "")
+    return (cat in _NFL_FUNNEL_CATEGORIES
+            or cat.startswith(_NFL_HC_CATEGORY_PREFIXES))
+
+
+def _nfl_hc_min_games(week) -> int:
+    try:
+        return 2 if int(week or 0) <= 3 else 3
+    except (TypeError, ValueError):
+        return 3
+
+
+def _nfl_hc_stat_value(row, market):
+    col = PROP_TO_COL.get(market)
+    if market == "player_rush_reception_yds":
+        total = 0.0
+        for key in ("rushing_yards", "receiving_yards"):
+            try:
+                part = float(row.get(key))
+            except (TypeError, ValueError):
+                part = 0.0
+            total += part if math.isfinite(part) else 0.0
+        return total
+    try:
+        value = float(row.get(col))
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) else None
+
+
+def _nfl_attach_hot_cold(result: dict, rankings: dict, df=None, season=None,
+                         week=None, stype="REG", point_in_time: bool = False) -> dict:
+    """Hot = met the Over in >=80% of the last (up to) 5 current-season games
+    and averaged over the line; Cold = same for the Under; Double Cold = Cold
+    plus matchup support. Ranking/selection only; never alters model picks."""
+    result["hot_cold"] = []
+    picks = [p for p in (result.get("all") or [])
+             if isinstance(p, dict) and not p.get("isAlternate")
+             and p.get("market") in PROP_LABELS
+             and p.get("market") != "player_anytime_td"
+             and p.get("realLine") is not None and p.get("pid")]
+    if df is None or not picks or "player_id" not in df.columns:
+        return result
+    try:
+        season = int(season if season is not None else _cur_season)
+    except (TypeError, ValueError):
+        season = int(_cur_season)
+    pids = {str(p.get("pid")) for p in picks}
+    cols = [c for c in ("player_id", "season", "week", "season_type", "opponent_team",
+                        "recent_team", "home_away", "passing_yards", "passing_tds",
+                        "completions", "attempts", "interceptions", "rushing_yards",
+                        "carries", "receiving_yards", "receptions", "tackles_assists",
+                        "def_sacks", "def_ints", "kicking_points", "fg_made")
+            if c in df.columns]
+    sub = df[df["player_id"].astype(str).isin(pids)][cols]
+    sub = _nfl_stats_before_game(sub, season, week or 1, stype)
+    logs = {}
+    for row in sub.to_dict("records"):
+        logs.setdefault(str(row.get("player_id")), []).append(row)
+    for rows in logs.values():
+        rows.sort(key=lambda r: (int(r.get("season") or 0), int(r.get("week") or 0)),
+                  reverse=True)
+    teams = (rankings or {}).get("teams") or {}
+    minimum = _nfl_hc_min_games(week)
+    post = str(stype or "REG").upper() == "POST"
+    out, seen = [], set()
+    for pick in picks:
+        market = pick["market"]
+        key = (str(pick.get("pid")), market)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            line = float(pick.get("realLine"))
+        except (TypeError, ValueError):
+            continue
+        history = logs.get(str(pick.get("pid"))) or []
+        current = [r for r in history if int(r.get("season") or 0) == season
+                   and (post or str(r.get("season_type") or "REG").upper() == "REG")]
+        recent_rows, recent = [], []
+        for r in current:
+            value = _nfl_hc_stat_value(r, market)
+            if value is None:
+                continue
+            recent_rows.append(r)
+            recent.append(value)
+            if len(recent) == 5:
+                break
+        if len(recent) < minimum:
+            continue
+        opponent = _nfl_rank_norm(pick.get("opponent"))
+        versus = []
+        for r in history:
+            if _nfl_rank_norm(r.get("opponent_team")) != opponent:
+                continue
+            value = _nfl_hc_stat_value(r, market)
+            if value is not None:
+                versus.append((r, value))
+            if len(versus) == 5:
+                break
+        average = sum(recent) / len(recent)
+        try:
+            base_prob = float(pick.get("dispScore") if pick.get("dispScore") is not None
+                              else pick.get("score"))
+        except (TypeError, ValueError):
+            base_prob = None
+        pick_side = str(pick.get("pick") or "OVER").upper()
+        opp_ranks = (teams.get(opponent) or {}).get("ranks") or {}
+        n_teams = len(teams) or 32
+        for side, form in (("OVER", "HOT"), ("UNDER", "COLD")):
+            hits = sum(v > line if side == "OVER" else v < line for v in recent)
+            if hits * 5 < len(recent) * 4:
+                continue
+            if not (average > line if side == "OVER" else average < line):
+                continue
+            opp_hits = sum(v > line if side == "OVER" else v < line for _, v in versus)
+            opp_rate = opp_hits / len(versus) * 100 if versus else None
+            support = ""
+            if side == "UNDER":
+                if len(versus) >= 2 and opp_rate is not None and opp_rate >= 70:
+                    support = f"{opp_hits}/{len(versus)} under vs {opponent}"
+                elif market in _NFL_HC_PASS_MARKETS and (opp_ranks.get("defPass") or 99) <= 10:
+                    support = f"{opponent} #{opp_ranks['defPass']} pass D"
+                elif market in _NFL_HC_RUSH_MARKETS and (opp_ranks.get("defRush") or 99) <= 10:
+                    support = f"{opponent} #{opp_ranks['defRush']} run D"
+            probability = None
+            if base_prob is not None and 0 < base_prob <= 100:
+                probability = base_prob if side == pick_side else 100.0 - base_prob
+            raw_odds = pick.get("realOdds") if side == "OVER" else pick.get("realUnderOdds")
+            try:
+                odds = int(float(raw_odds)) if raw_odds is not None else None
+            except (TypeError, ValueError):
+                odds = None
+            if odds is not None and (odds < -1000 or -100 < odds < 100):
+                odds = None
+            implied = _nfl_coach_hist_implied(odds) if odds is not None else None
+            edge = (round(probability - implied, 2)
+                    if probability is not None and implied is not None else None)
+            margin = abs(average - line) / max(abs(line), 0.5) * 100
+            strength = round(hits / len(recent) * 60 + min(100.0, margin) * 0.4, 2)
+            row = {
+                "hcRow": True, "hcForm": form,
+                "name": pick.get("name", ""), "pid": pick.get("pid"),
+                "team": pick.get("team", ""), "opponent": pick.get("opponent", ""),
+                "position": pick.get("position") or pick.get("roster_position", ""),
+                "head": pick.get("head", ""), "homeRoad": pick.get("homeRoad"),
+                "game": pick.get("game", ""), "game_start": pick.get("game_start", ""),
+                "home_abbr": pick.get("home_abbr", ""), "away_abbr": pick.get("away_abbr", ""),
+                "market": market, "mkt": pick.get("mkt") or PROP_LABELS[market],
+                "label": pick.get("mkt") or PROP_LABELS[market],
+                "pick": side, "line": line, "realLine": line, "dispLine": line,
+                "realOdds": odds if side == "OVER" else None,
+                "realUnderOdds": odds if side == "UNDER" else None,
+                "over_odds": odds if side == "OVER" else None,
+                "under_odds": odds if side == "UNDER" else None,
+                "over_book": pick.get("over_book", "") if side == "OVER" else "",
+                "under_book": pick.get("under_book", "") if side == "UNDER" else "",
+                "score": probability, "dispScore": probability,
+                "implied": round(implied, 2) if implied is not None else None,
+                "edge": edge, "hcStrength": strength,
+                "hcHits": hits, "hcTotal": len(recent), "hcAvg": round(average, 2),
+                "hcPushes": sum(v == line for v in recent),
+                "hcGames": [{"d": f"W{int(r.get('week') or 0)}",
+                             "opp": _nfl_rank_norm(r.get("opponent_team")),
+                             "v": round(v, 1)} for r, v in zip(recent_rows, recent)],
+                "hcOppHits": opp_hits, "hcOppTotal": len(versus),
+                "hcOppRate": round(opp_rate, 1) if opp_rate is not None else None,
+                "hcSupport": support,
+                "roleRank": pick.get("roleRank"), "teamOptionRank": pick.get("teamOptionRank"),
+                "depthRank": pick.get("depthRank"),
+                "isRookie": pick.get("isRookie"), "rookieVerified": pick.get("rookieVerified"),
+                "slate_date": pick.get("slate_date", ""),
+            }
+            if pick.get("system") == "NEW":
+                row["system"] = "NEW"
+            out.append(row)
+            if form == "COLD" and support:
+                out.append({**row, "hcForm": "DOUBLE"})
+    ranked = []
+    groups = {}
+    for row in out:
+        groups.setdefault((row["hcForm"], row["market"]), []).append(row)
+    for rows in groups.values():
+        rows.sort(key=lambda r: (r["hcStrength"],
+                                 r["edge"] if r["edge"] is not None else -999,
+                                 r["score"] or 0), reverse=True)
+        for rank, row in enumerate(rows[:20], 1):
+            row["hcRank"] = rank
+            row["hcCategory"] = _nfl_hc_category(row["hcForm"], row["market"])
+            ranked.append(row)
+    # Tag the board plays so Coach/parlays can read each side's form.
+    index = {}
+    for row in ranked:
+        index.setdefault((str(row["pid"]), row["market"], row["pick"]), []).append(
+            {"form": row["hcForm"], "rank": row["hcRank"],
+             "strength": row["hcStrength"], "hits": row["hcHits"],
+             "total": row["hcTotal"], "avg": row["hcAvg"]})
+    for pick in result.get("all") or []:
+        if not isinstance(pick, dict) or pick.get("isAlternate"):
+            continue
+        tags = {}
+        for side in ("OVER", "UNDER"):
+            found = index.get((str(pick.get("pid")), pick.get("market"), side))
+            if found:
+                tags[side] = found
+        if tags:
+            pick["hc"] = tags
+    result["hot_cold"] = ranked
+    return result
+
+
 def _nfl_rank_week_games(schedule_rows) -> list:
     """This NFL week's games (current week = week of the next unplayed or
     today's game), read from the cached free nflverse schedule."""
@@ -6569,7 +6798,15 @@ async def _run_pipeline_unlocked(date_str: str, progress=None, simulate: bool = 
             _nfl_attach_funnels, result, team_rankings, df, rank_schedule,
             prop_season, prop_week, prop_type, bool(simulate))
     except Exception as exc:
+        team_rankings = {}
         print(f"[NFL funnels] skipped: {exc}")
+    try:
+        await asyncio.to_thread(
+            _nfl_attach_hot_cold, result, team_rankings, df,
+            prop_season, prop_week, prop_type, bool(simulate))
+    except Exception as exc:
+        result["hot_cold"] = []
+        print(f"[NFL hot/cold] skipped: {exc}")
     await asyncio.to_thread(_nfl_json_ready, result)
     if system == "NEW":
         result["system"] = "NEW"
@@ -6586,7 +6823,8 @@ async def _run_pipeline_unlocked(date_str: str, progress=None, simulate: bool = 
         _p("Building Historical Edge Coach recommendations…")
         historical_coach = await _nfl_build_historical_coach(
             date_str, picks, espn_games, analysis_df, roster_map, replay_box,
-            target_teams, target_positions, system)
+            target_teams, target_positions, system,
+            hot_cold=result.get("hot_cold") or [])
         historical_coach_saved = await asyncio.to_thread(
             _nfl_save_historical_coach, date_str, historical_coach, system)
         result["historical_saved"] = historical_saved
@@ -8587,7 +8825,10 @@ _NFL_COACH_HIST_APP = "nfl_coach_historical"
 _NFL_COACH_CATS = ("app_hit_rate_100", "safest_bets", "coach_edge", "alt_line_edge",
                    "coach_over_movement", "coach_under_movement", "passing",
                    "rushing", "receiving", "defense", "kicking",
-                   "td_scorers", "best_unders", "rookie_plays", "matchup_funnels")
+                   "td_scorers", "best_unders", "rookie_plays", "matchup_funnels",
+                   "hot_form", "cold_form", "double_cold_form")
+_NFL_COACH_HC_CATS = {"hot_form": "HOT", "cold_form": "COLD",
+                      "double_cold_form": "DOUBLE"}
 _NFL_COACH_CAPTURE_GUARD_SECONDS = 120
 _NFL_OBSERVATION_ONLY_TRACK_MARKETS = frozenset((
     "player_anytime_td",
@@ -8672,9 +8913,54 @@ def _nfl_coach_hist_family(label):
         return "kick"
     return ""
 
+def _nfl_coach_hc_candidate(pick):
+    """Coach row for one saved Hot/Cold/Double Cold play (its own side/price)."""
+    side = str(pick.get("pick") or "").upper()
+    odds = pick.get("realUnderOdds") if side == "UNDER" else pick.get("realOdds")
+    implied = _nfl_coach_hist_implied(odds)
+    try:
+        line = float(pick.get("realLine", pick.get("line")))
+        probability = float(pick.get("score"))
+    except (TypeError, ValueError):
+        return None
+    if side not in ("OVER", "UNDER") or implied is None or probability <= 0:
+        return None
+    row = {
+        "player": pick.get("name", ""), "team": pick.get("team", ""),
+        "opponent": pick.get("opponent", ""), "game": pick.get("game", ""),
+        "game_start": pick.get("game_start", ""), "market": pick.get("market", ""),
+        "market_label": pick.get("mkt", pick.get("label", "NFL Prop")),
+        "side": side, "line": line, "odds": int(float(odds)),
+        "book": pick.get("under_book", "") if side == "UNDER" else pick.get("over_book", ""),
+        "model_probability": max(0.0, min(100.0, probability)),
+        "implied_probability": implied, "alternate": False,
+        "source_market": pick.get("market", ""),
+        "role_rank": pick.get("roleRank"), "team_option_rank": pick.get("teamOptionRank"),
+        "depth_rank": pick.get("depthRank"),
+        "is_rookie": bool(pick.get("rookieVerified") and pick.get("isRookie")),
+        "rookie_verified": bool(pick.get("rookieVerified")),
+        "hc_only": True, "hc_form": pick.get("hcForm"),
+        "hc_rank": pick.get("hcRank"), "hc_strength": pick.get("hcStrength"),
+        "hc_hits": pick.get("hcHits"), "hc_total": pick.get("hcTotal"),
+        "hc_avg": pick.get("hcAvg"), "hc_support": pick.get("hcSupport", ""),
+    }
+    row["coach_edge"] = row["model_probability"] - implied
+    return row
+
+
 def _nfl_coach_hist_candidates(picks):
     selected, seen = [], set()
     for pick in picks or []:
+        if pick.get("hcRow"):
+            row = _nfl_coach_hc_candidate(pick)
+            if row is None:
+                continue
+            key = (row["player"], row["market"], row["side"], row["line"],
+                   row["odds"], row["hc_form"])
+            if key not in seen:
+                seen.add(key)
+                selected.append(row)
+            continue
         if (pick.get("betQualified") is False
                 or pick.get("roleRiskBlockPremium") is True):
             continue
@@ -8820,6 +9106,23 @@ def _nfl_coach_funnel_score(row):
 
 
 def _nfl_coach_hist_select(candidates, category, alternate=False):
+    if category in _NFL_COACH_HC_CATS:
+        # Hot/Cold/Double Cold: every form play qualifies, edge or not; ranked
+        # by form strength, one per player, one per team/market/side, Top 10.
+        form = _NFL_COACH_HC_CATS[category]
+        rows = [dict(row) for row in candidates
+                if row.get("hc_only") and row.get("hc_form") == form]
+        rows.sort(key=lambda x: (float(x.get("hc_strength") or 0),
+                                 float(x.get("coach_edge") or 0)), reverse=True)
+        unique, seen_players = [], set()
+        for row in rows:
+            player_key = _nfl_player_name_key(row.get("player"))
+            if not player_key or player_key in seen_players:
+                continue
+            seen_players.add(player_key)
+            unique.append(row)
+        return _nfl_coach_one_per_team_market(unique)[:10]
+    candidates = [row for row in candidates if not row.get("hc_only")]
     if category == "matchup_funnels":
         # Every funnel-side standard play qualifies, edge or not; ranked by
         # Funnel Score, one play per player, one per team/market/side, Top 10.
@@ -8947,11 +9250,12 @@ def _nfl_coach_filter_candidates(candidates, filters):
 
 async def _nfl_build_historical_coach(
         date_str, picks, games, df, roster_map, replay_box, target_teams,
-        target_positions=None, system="OLD"):
+        target_positions=None, system="OLD", hot_cold=None):
     system = "NEW" if str(system).upper() == "NEW" else "OLD"
     target_positions = target_positions or {}
     def _build_standard():
-        standard = _nfl_coach_tracking_candidates(picks)
+        standard = _nfl_coach_tracking_candidates(
+            list(picks or []) + list(hot_cold or []))
         return {
             category: _nfl_coach_hist_select(standard, category)
             for category in _NFL_COACH_CATS if category != "alt_line_edge"
@@ -9181,9 +9485,9 @@ def _nfl_auto_capture_coach_categories(
         return {category: "invalid_date" for category in categories}
     if slate_date < _nfl_today_date():
         return {category: "not_pregame" for category in categories}
-    source = (
+    source = list(
         result.get("coach_candidates") or result.get("all")
-        or result.get("picks") or [])
+        or result.get("picks") or []) + list(result.get("hot_cold") or [])
     cfg = _nfl_store_config(system)
     now = datetime.now(timezone.utc)
     candidates = []
@@ -9399,10 +9703,12 @@ def _nfl_save_board_snapshots(date_str: str, result: dict, system: str = "OLD"):
             )
         mini = {
             key: value for key, value in result.items()
-            if key not in ("picks", "all", "td_picks", "game_predictions", "games")
+            if key not in ("picks", "all", "td_picks", "game_predictions", "games",
+                           "hot_cold")
         }
         mini.update({
             "date": date_str,
+            "hot_cold": [p for p in (result.get("hot_cold") or []) if _same_game(p)],
             "picks": [p for p in (result.get("picks") or []) if _same_game(p)],
             "all": [p for p in (result.get("all") or []) if _same_game(p)],
             "td_picks": [p for p in (result.get("td_picks") or []) if _same_game(p)],
@@ -9477,8 +9783,11 @@ def _nfl_load_board_snapshots(date_str: str, system: str = "OLD"):
                     "home_abbr": pick.get("home_abbr", ""),
                     "away_abbr": pick.get("away_abbr", ""),
                 }
+        hot_cold = [pick for pick in official if pick.get("hcRow")]
+        official = [pick for pick in official if not pick.get("hcRow")]
         return {
             "date": date_str, "picks": official, "all": official,
+            "hot_cold": hot_cold,
             "td_picks": [
                 pick for pick in official
                 if pick.get("market") == "player_anytime_td"
@@ -9492,9 +9801,10 @@ def _nfl_load_board_snapshots(date_str: str, system: str = "OLD"):
         or [""]))
     merged = {
         key: value for key, value in parts[-1].items()
-        if key not in ("picks", "all", "td_picks", "game_predictions", "games")
+        if key not in ("picks", "all", "td_picks", "game_predictions", "games",
+                       "hot_cold")
     }
-    for key in ("picks", "all", "td_picks", "game_predictions", "games"):
+    for key in ("picks", "all", "td_picks", "game_predictions", "games", "hot_cold"):
         merged[key] = [
             item for part in parts for item in (part.get(key) or [])
         ]
@@ -9516,6 +9826,12 @@ def _nfl_save_picks_snapshot(date_str: str, result: dict, system: str = "OLD"):
     ]
     if not picks:
         return False
+    # Hot/Cold rows ride in the same frozen pregame snapshot (flagged hcRow)
+    # so their own records settle from the identical capture.
+    picks.extend(
+        {**row, "snapshot_captured_at": captured_at.isoformat(),
+         "observation_only": False}
+        for row in (result.get("hot_cold") or []) if isinstance(row, dict))
     with _NFL_PICKS_SNAPSHOT_LOCK:
         identity = {
             "app": f"eq.{cfg['app']}", "category": f"eq.{cfg['picks']}",
@@ -9617,7 +9933,7 @@ def _nfl_record_snapshot(date_str: str, system: str = "OLD") -> list:
     if any(not isinstance(p, dict) for p in snapshot):
         raise RuntimeError("A saved NFL pregame selection is unreadable.")
     if any(p.get("market") in PROP_LABELS and not _nfl_td_observation_only(p)
-           for p in snapshot):
+           and not p.get("hcRow") for p in snapshot):
         return snapshot
     boards = _nfl_sb_get_strict("mpa_track_ledger", {
         "app": f"eq.{cfg['app']}", "date": f"eq.{date_str}",
@@ -9636,7 +9952,9 @@ def _nfl_record_snapshot(date_str: str, system: str = "OLD") -> list:
         if part.get("system") and str(part["system"]).upper() != str(system).upper():
             raise RuntimeError("Saved NFL board system does not match.")
         captured = _nfl_snapshot_kickoff(part.get("saved_board_captured_at"))
-        picks = part.get("picks") or []
+        picks = list(part.get("picks") or []) + [
+            {**row, "hcRow": True} for row in (part.get("hot_cold") or [])
+            if isinstance(row, dict)]
         if not isinstance(picks, list) or any(not isinstance(p, dict) for p in picks):
             raise RuntimeError("Saved NFL board selections are unreadable.")
         groups = {}
@@ -9668,7 +9986,7 @@ def _nfl_record_snapshot(date_str: str, system: str = "OLD") -> list:
             key = (_nfl_player_name_key(pick.get("name") or ""),
                    pick.get("market"), str(pick.get("pick") or "OVER").upper(),
                    str(pick.get("line")), str(pick.get("game")),
-                   str(pick.get("game_start")))
+                   str(pick.get("game_start")), str(pick.get("hcForm") or ""))
             if key not in seen:
                 seen.add(key)
                 recovered.append({**pick, "recovered_from_pregame_board": True})
@@ -9677,6 +9995,8 @@ def _nfl_record_snapshot(date_str: str, system: str = "OLD") -> list:
 
 def _nfl_record_has_regular_props(detail) -> bool:
     return any(isinstance(p, dict) and p.get("market") in PROP_LABELS
+               and not p.get("hcRow")
+               and not _nfl_is_spotlight_category(p.get("category"))
                and not _nfl_td_observation_only(p) for p in (detail or []))
 
 
@@ -9968,9 +10288,13 @@ def _nfl_grade_date(date_str: str, snap: list, box_override: dict = None) -> dic
                  any_game and all(v.get("final", False) for v in box.values()))
 
     by_group: dict = defaultdict(list)
+    hc_snap = []
     for p in (snap or []):
         mk = p.get("market") or p.get("mkt") or ""
         if mk not in PROP_LABELS:
+            continue
+        if p.get("hcRow"):
+            hc_snap.append(p)
             continue
         direction = (p.get("pick") or "OVER").upper()
         by_group[(mk, direction)].append(p)
@@ -10102,8 +10426,59 @@ def _nfl_grade_date(date_str: str, snap: list, box_override: dict = None) -> dic
             lock_best.values(), key=lambda rec: rec[0], reverse=True)
     ]
     main_rows, ovf_rows = split_receiving_records(
-        main_rows, ovf_rows, snap, PROP_LABELS)
+        main_rows, ovf_rows, [p for p in (snap or []) if not p.get("hcRow")],
+        PROP_LABELS)
     main_rows.extend(funnel_rows)
+
+    # Hot / Cold / Double Cold: own categories per market; ranks 1-10 in the
+    # main record, 11-20 in NFL Overflow; never in either book's totals.
+    hc_seen = set()
+    for p in hc_snap:
+        mk = p.get("market")
+        form = str(p.get("hcForm") or "").upper()
+        direction = str(p.get("pick") or "").upper()
+        try:
+            hc_rank = int(p.get("hcRank") or 0)
+        except (TypeError, ValueError):
+            hc_rank = 0
+        if form not in _NFL_HC_FORM_LABEL or direction not in ("OVER", "UNDER") or not 1 <= hc_rank <= 20:
+            continue
+        ident = (_norm(p.get("name") or ""), mk, form)
+        if ident in hc_seen:
+            continue
+        hc_seen.add(ident)
+        st = (box or {}).get((p.get("name") or "").lower().strip(), {})
+        odds = p.get("over_odds") if direction == "OVER" else p.get("under_odds")
+        line_raw = p.get("line") if p.get("line") is not None else p.get("realLine")
+        result_val = actual = profit = None
+        if st.get("final") and line_raw is not None:
+            actual = st.get(mk)
+            if actual is not None:
+                try:
+                    fl = float(line_raw)
+                    if actual == fl:
+                        result_val = "PUSH"
+                    elif direction == "OVER":
+                        result_val = "WIN" if actual > fl else "LOSS"
+                    else:
+                        result_val = "WIN" if actual < fl else "LOSS"
+                    if result_val and odds is not None:
+                        profit = round(_nfl_american_profit(odds, _NFL_TRK_STAKE, result_val), 2)
+                except Exception:
+                    pass
+        row = {
+            "name": p.get("name", ""), "team": p.get("team", ""),
+            "category": _nfl_hc_category(form, mk), "side": direction, "market": mk,
+            "line": line_raw, "odds": odds, "rank": hc_rank,
+            "result": result_val, "actual": actual, "profit": profit,
+            "hc_form": form,
+        }
+        if p.get("system") == "NEW":
+            row["system"] = "NEW"
+        if hc_rank <= 10:
+            main_rows.append(row)
+        else:
+            ovf_rows.append({**row, "pool": "NFL Overflow"})
     return {"any_game": any_game, "all_final": all_final,
             "main": main_rows, "overflow": ovf_rows, "locks": lock_rows}
 
@@ -10139,7 +10514,7 @@ def _nfl_detail_graded(graded: dict, include_overflow: bool = True,
             "name", "team", "category", "side", "market",
             "line", "odds", "rank", "result", "actual", "profit", "pool",
             "opening_line", "current_line", "line_move",
-            "funnel", "funnel_strength", "funnel_score",
+            "funnel", "funnel_strength", "funnel_score", "hc_form",
         )}
         if row.get("receivingBoardVersion"):
             detail["position"] = row.get("position")
@@ -10184,7 +10559,8 @@ def _nfl_historical_replay_payload(result: dict, espn_games: list = None,
         date_str, [
             {**pick, "observation_only": _nfl_td_observation_only(pick)}
             for pick in (result.get("picks") or [])
-        ], box_override=replay_box)
+        ] + [dict(row) for row in (result.get("hot_cold") or [])
+             if isinstance(row, dict)], box_override=replay_box)
     detail = _nfl_detail_graded(graded, include_overflow=False)
     overflow_detail = _nfl_detail_graded(graded, overflow_only=True)
 
@@ -10630,7 +11006,7 @@ async def nfl_track_record(grade: bool = False, date_str: str = "", system: str 
         decided = [r for r in det if not _nfl_td_observation_only(r)
                    and r.get("result") in ("WIN","LOSS")
                    and r.get("category") not in _NFL_MOVEMENT_CATEGORIES
-                   and r.get("category") not in _NFL_FUNNEL_CATEGORIES]
+                   and not _nfl_is_spotlight_category(r.get("category"))]
         wins   = sum(1 for r in decided if r["result"] == "WIN")
         losses = len(decided) - wins
         priced = [r for r in decided if r.get("odds") is not None]
@@ -11472,6 +11848,7 @@ tr:last-child td{border-bottom:none}
         <button type="button" role="menuitem" class="nfl-menu-item" style="--c:#1d4ed8" onclick="_nflNavGo(_nflNavHistorical)">&#128218; Historical Analysis</button>
         <div class="nfl-menu-head">Tools</div>
         <button type="button" role="menuitem" class="nfl-menu-item" style="--c:#be185d" onclick="_nflNavGo(_nflNavFunnelPicks)">&#127919; Matchup Funnels Picks</button>
+        <button type="button" role="menuitem" class="nfl-menu-item" style="--c:#ea580c" onclick="_nflNavGo(_nflNavHotCold)">&#128293; Hot / &#10052;&#65039; Cold Picks</button>
         <button type="button" role="menuitem" class="nfl-menu-item" style="--c:#db2777" onclick="_nflNavGo(openNflTeamRanks)">&#128202; Team Rankings</button>
         <button type="button" role="menuitem" class="nfl-menu-item admin-only" style="--c:#0e7490" onclick="_nflNavGo(openNflMyBets)">&#128176; My Bets</button>
       </div>
@@ -11521,6 +11898,18 @@ function _nflNavFunnelPicks(){
   }
   body.style.display='block';
   var car=document.getElementById('car_matchup_funnels');if(car)car.textContent='▾';
+  var hdr=body.previousElementSibling||body;
+  hdr.style.scrollMarginTop='90px';
+  hdr.scrollIntoView({behavior:'smooth',block:'start'});
+}
+function _nflNavHotCold(){
+  var body=document.getElementById('sec_hot_cold');
+  if(!body){
+    _nflNavNotice('&#128293; Hot / &#10052;&#65039; Cold Picks','No pick board is loaded yet. Press <b>Run Picks</b> for today and the <b>&#128293; Hot / &#10052;&#65039; Cold</b> section appears on the board under Matchup Funnels. Boards created before this update need one fresh Run Picks.');
+    return;
+  }
+  body.style.display='block';
+  var car=document.getElementById('car_hot_cold');if(car)car.textContent='▾';
   var hdr=body.previousElementSibling||body;
   hdr.style.scrollMarginTop='90px';
   hdr.scrollIntoView({behavior:'smooth',block:'start'});
@@ -11819,6 +12208,9 @@ document.addEventListener('keydown',function(e){if(e.key==='Escape')_nflNavGo(nu
       <button class="nfl-coach-preset" onclick="askNflTdCoach()" style="border-color:#eab308;color:#fde68a">TD Scorers · Top 10</button>
       <button class="nfl-coach-preset" onclick="askNflCoachPreset('Show the best under plays','best_unders')">Best unders</button>
       <button class="nfl-coach-preset" onclick="askNflFunnelCoach()" style="border-color:#be185d;color:#fbcfe8">&#127919; Matchup Funnels · Top 10</button>
+      <button class="nfl-coach-preset" onclick="askNflHotColdCoach('HOT')" style="border-color:#ea580c;color:#fed7aa">&#128293; Hot · Top 10</button>
+      <button class="nfl-coach-preset" onclick="askNflHotColdCoach('COLD')" style="border-color:#2563eb;color:#bfdbfe">&#10052;&#65039; Cold · Top 10</button>
+      <button class="nfl-coach-preset" onclick="askNflHotColdCoach('DOUBLE')" style="border-color:#0891b2;color:#a5f3fc">&#129482; Double Cold · Top 10</button>
     </div>
      <div class="nfl-coach-filter-box" id="nflCoachFilterBox">
        <div class="nfl-coach-filter-head">
@@ -12039,8 +12431,8 @@ function _nflLeg(p){
   var odds=(dir==='OVER')?p.realOdds:(dir==='UNDER')?p.realUnderOdds:null;var dec=_amToDec(odds);
   return {player:p.name,team:p.team||'',opp:p.opponent||'',market:p.mkt||p.label||'',dir:dir,line:line,rate:Math.round(rate||0),odds:odds,book:_nflSideBook(p,dir),dec:dec,hasOdds:!!dec,source:'normal',detail:p};
 }
-function _nflParlayCatKey(c){return String(c.market||'NFL Prop')+'|'+String(c.dir||'');}
-function _nflParlayCatLabel(c){return String(c.market||'NFL Prop')+(c.dir?' · '+c.dir:'');}
+function _nflParlayCatKey(c){return String(c.parlayCat||c.market||'NFL Prop')+'|'+String(c.dir||'');}
+function _nflParlayCatLabel(c){return String(c.parlayCat||c.market||'NFL Prop')+(c.dir?' · '+c.dir:'');}
 window.__NFL_GAME_FILTERS__={parlay:{},coach:{}};
 function _nflGameKey(team,opp){
   return [String(team||'').toUpperCase(),String(opp||'').toUpperCase()].sort().join('|');
@@ -12208,6 +12600,14 @@ function _nflNormalParlayCandidates(){
     if(!_floorOk(c.odds))return;
     out.push(c);
   });
+  // Hot / Cold / Double Cold: each category's Top 10 + Overflow (ranks 1-20).
+  _nflHcRowsAll().forEach(function(r){
+    if(!r.name||!r.pick||!(r.hcRank>=1&&r.hcRank<=20))return;
+    var c=_nflLeg(r);
+    if(!c.dir||!_floorOk(c.odds))return;
+    c.parlayCat=_nflHcCat(r);
+    out.push(c);
+  });
   return out;
 }
 function _nflCoachTeamMarketKey(p){
@@ -12274,6 +12674,9 @@ function _nflCoachParlayCandidates(){
     td_scorers:select(allCoach.filter(function(p){return _nflCoachFamily(p.market)==='td'&&p.side==='OVER';}),byProbability,10),
     best_unders:select(positive.filter(function(p){return p.side==='UNDER';}),byEdge,5),
     matchup_funnels:select(allCoach.filter(function(p){return p.funnelMatch&&!p.isAlternate;}),function(a,b){return _nflFunnelCoachScore(b)-_nflFunnelCoachScore(a)||b.appProb-a.appProb;},10),
+    hot_form:_nflHcCoachPick(_nflHcCoachProps('HOT'),null,'parlay'),
+    cold_form:_nflHcCoachPick(_nflHcCoachProps('COLD'),null,'parlay'),
+    double_cold_form:_nflHcCoachPick(_nflHcCoachProps('DOUBLE'),null,'parlay'),
     alt_line_edge:((window.__NFL_ALT_PARLAY_DATE__===((document.getElementById('datePicker')||{}).value||window.__NFL_DATE__||''))
       ?(window.__NFL_ALT_PARLAY_CANDIDATES__||[]):[]).filter(function(p){
       return p&&_nflGameFilterOn('parlay',p.team,p.opponent)
@@ -12302,6 +12705,7 @@ var _NFL_PARLAY_COACH_CATS=[
   {key:'td_scorers',label:'TD Scorers'},
   {key:'best_unders',label:'Best Unders'}
   ,{key:'matchup_funnels',label:'Matchup Funnels'}
+  ,{key:'hot_form',label:'Hot · Top 10'},{key:'cold_form',label:'Cold · Top 10'},{key:'double_cold_form',label:'Double Cold · Top 10'}
   ,{key:'coach_over_movement',label:'Biggest Over Line Movement'}
   ,{key:'coach_under_movement',label:'Biggest Under Line Movement'}
 ];
@@ -12515,7 +12919,7 @@ function _nflSystemChanged(){
     window.__NFL_ALT_COACH_RUN__.cancelled=true;
     try{window.__NFL_ALT_COACH_RUN__.requestController.abort();}catch(e){}
   }
-  window._nflState=null;window.__NFL_PLAYS__=[];window.__NFLLAD__={};
+  window._nflState=null;window.__NFL_PLAYS__=[];window.__NFL_HOT_COLD__=[];window.__NFLLAD__={};
   window.__NFL_GP__=[];window.__NFL_GP_BET__={};window.__NFL_BET_SRC__={};
   window.__NFL_ALT_PARLAY_CANDIDATES__=[];window.__NFL_ALT_PARLAY_DATE__='';
   window.__NFL_LAST_ALT_COACH__=[];window.__NFL_LAST_ALT_COACH_DATE__='';
@@ -13456,6 +13860,92 @@ function _nflFunnelBoard(picks){
   if(ovf.length)html+='<div style="font-size:.7rem;font-weight:900;color:#f9a8d4;letter-spacing:.08em;margin:16px 0 4px">OVERFLOW &middot; RANKS 11&#8211;20</div>'+nflCardGrid(ovf,11);
   return html;
 }
+var _nflHcForm='HOT',_nflHcMarket='',_nflHcEdge='ALL';
+var _NFL_HC_FORM_LBL={HOT:'Hot',COLD:'Cold',DOUBLE:'Double Cold'};
+function _nflHcRowsAll(){
+  return (window.__NFL_HOT_COLD__||[]).filter(function(r){return r&&r.hcRow&&!_nflGameDone(r);});
+}
+function _nflHcCat(r){return (_NFL_HC_FORM_LBL[r.hcForm]||r.hcForm)+' '+(r.mkt||r.label||'');}
+function _nflHcSet(kind,val){
+  if(kind==='f')_nflHcForm=val;else if(kind==='m')_nflHcMarket=val;else _nflHcEdge=val;
+  var body=document.getElementById('sec_hot_cold');if(body)body.innerHTML=_nflHotColdBoard();
+}
+function _nflHcCard(r,i){
+  var hot=r.hcForm==='HOT',dbl=r.hcForm==='DOUBLE';
+  var col=hot?'#fb923c':(dbl?'#22d3ee':'#60a5fa');
+  var tag=hot?'&#128293; HOT':(dbl?'&#129482; DOUBLE COLD':'&#10052;&#65039; COLD');
+  var odds=_nflSideOdds(r,r.pick),book=_nflSideBook(r,r.pick);
+  var sideWord=r.pick==='OVER'?'Over':'Under';
+  var logo='https://a.espncdn.com/i/teamlogos/nfl/500/'+_logoAbbr(r.opponent)+'.png';
+  var chips=(r.hcGames||[]).map(function(g){
+    var v=Number(g.v),line=Number(r.realLine);
+    var res=v===line?'push':((r.pick==='OVER')===(v>line)?'hit':'miss');
+    var bg=res==='hit'?'rgba(74,222,128,.16)':(res==='miss'?'rgba(248,113,113,.16)':'rgba(148,163,184,.16)');
+    var fc=res==='hit'?'#4ade80':(res==='miss'?'#f87171':'#cbd5e1');
+    return '<span title="'+_esc(g.d+' vs '+g.opp)+'" style="display:inline-flex;flex-direction:column;align-items:center;min-width:42px;padding:3px 5px;border-radius:7px;background:'+bg+';color:'+fc+';font-size:.66rem;font-weight:800">'+_esc(String(g.v))+'<small style="color:#94a3b8;font-weight:700">'+_esc(g.d)+' '+_esc(g.opp)+'</small></span>';
+  }).join('');
+  var opp=r.hcOppTotal?r.hcOppHits+'/'+r.hcOppTotal+' '+sideWord+(r.hcOppRate!=null?' ('+Math.round(r.hcOppRate)+'%)':''):'No meetings';
+  var prob=r.score!=null?Number(r.score).toFixed(1)+'%':'Unavailable';
+  var edge=r.edge!=null?(Number(r.edge)>0?'+':'')+Number(r.edge).toFixed(1)+' pts':'Unavailable';
+  var row=function(k,v){return '<div style="display:flex;justify-content:space-between;gap:10px;padding:4px 0;border-top:1px solid #1f2937;font-size:.72rem"><span style="color:#94a3b8">'+k+'</span><b style="color:#e5e7eb;text-align:right">'+v+'</b></div>';};
+  var pos=String(r.position||'').toUpperCase();
+  return '<article style="background:#0f141c;border:1px solid '+col+'55;border-radius:14px;padding:12px;display:flex;flex-direction:column;gap:6px">'
+    +'<div style="display:flex;align-items:center;gap:10px"><div style="position:relative;width:46px;height:46px;border-radius:50%;background:#1f2937;overflow:hidden;flex-shrink:0;display:flex;align-items:center;justify-content:center;color:#94a3b8;font-weight:900;font-size:.8rem">'+_esc(_initials(r.name))
+    +(r.head?'<img src="'+_esc(r.head)+'" alt="" style="position:absolute;inset:0;width:100%;height:100%;object-fit:cover" onerror="this.style.display=&quot;none&quot;"/>':'')+'</div>'
+    +'<div style="min-width:0;flex:1"><div style="font-weight:900;color:#fff;font-size:.9rem">'+(i!=null?i+'. ':'')+_esc(r.name)+'</div>'
+    +'<div style="font-size:.68rem;color:#94a3b8;display:flex;align-items:center;gap:5px;flex-wrap:wrap">'+(pos?'<b style="color:#cbd5e1">'+_esc(pos)+'</b>':'')+_esc(r.team)+' '+(r.homeRoad==='H'?'vs':'at')+' <img src="'+_esc(logo)+'" alt="" style="width:16px;height:16px" onerror="this.style.display=&quot;none&quot;"/>'+_esc(r.opponent)+'</div></div>'
+    +'<span style="font-size:.62rem;font-weight:900;color:'+col+';border:1px solid '+col+';border-radius:999px;padding:2px 7px;white-space:nowrap">'+tag+'</span></div>'
+    +(r.hcSupport?'<div style="font-size:.66rem;font-weight:800;color:#67e8f9">Matchup supports: '+_esc(r.hcSupport)+'</div>':'')
+    +'<div style="font-size:.8rem;font-weight:900;color:'+(r.pick==='OVER'?'#4ade80':'#f87171')+'">'+_esc(r.mkt||r.label||'')+' &middot; '+r.pick+' '+_esc(String(r.realLine))+'</div>'
+    +'<div style="display:flex;gap:4px;flex-wrap:wrap">'+chips+'</div>'
+    +row('Last '+r.hcTotal+' this season (any venue)',r.hcHits+'/'+r.hcTotal+' '+sideWord+' &middot; avg '+_esc(String(r.hcAvg))+(Number(r.hcPushes)?' &middot; '+r.hcPushes+' push':''))
+    +row('Vs '+_esc(r.opponent)+' (last 5 meetings)',opp+(r.hcOppTotal&&r.hcOppTotal<3?' <span style="color:#fbbf24">small sample</span>':''))
+    +row(r.pick+' odds',odds!=null?_esc(String(odds))+' &middot; '+_esc(book||'Book unavailable'):'Odds unavailable')
+    +row('App estimate',prob)
+    +row('Edge','<span style="color:'+(r.edge!=null&&r.edge>0?'#4ade80':'#f87171')+'">'+edge+'</span>')
+    +'<div style="display:flex;justify-content:flex-end;margin-top:4px">'+_nflBetBtn(r,r.pick)+'</div>'
+    +'</article>';
+}
+function _nflHotColdBoard(){
+  var all=window.__NFL_HOT_COLD__;
+  var d=(window._nflState||{}).d||{};
+  if(!Array.isArray(d.hot_cold))return '<div class="no-picks" style="padding:24px">This board was created before Hot / Cold existed. Run the slate again to build it.</div>';
+  var rows=_nflHcRowsAll();
+  var markets=[],seenM={};
+  rows.forEach(function(r){var m=r.mkt||r.label||'';if(m&&!seenM[m]){seenM[m]=1;markets.push(m);}});
+  var order=(typeof _MORDER!=='undefined'&&_MORDER)||[];
+  markets.sort(function(a,b){var ia=order.indexOf(a),ib=order.indexOf(b);return (ia<0?99:ia)-(ib<0?99:ib)||a.localeCompare(b);});
+  if(_nflHcMarket&&markets.indexOf(_nflHcMarket)<0)_nflHcMarket='';
+  function btn(kind,val,label,cur){
+    var on=cur===val;
+    return '<button type="button" onclick="_nflHcSet(&#39;'+kind+'&#39;,&#39;'+val+'&#39;)" aria-pressed="'+on+'" style="background:'+(on?'#ea580c':'#111827')+';color:'+(on?'#fff':'#cbd5e1')+';border:1px solid '+(on?'#ea580c':'#374151')+';border-radius:8px;padding:5px 10px;font-size:.72rem;font-weight:800;cursor:pointer">'+label+'</button>';
+  }
+  var counts={};rows.forEach(function(r){if(r.hcForm===_nflHcForm){var m=r.mkt||r.label||'';counts[m]=(counts[m]||0)+1;}});
+  var sel='<select onchange="_nflHcSet(&#39;m&#39;,this.value)" style="background:#111827;color:#e5e7eb;border:1px solid #374151;border-radius:8px;padding:5px 8px;font-size:.74rem;font-weight:700">'
+    +'<option value=""'+(_nflHcMarket===''?' selected':'')+'>All categories</option>'
+    +markets.map(function(m){return '<option value="'+_esc(m)+'"'+(_nflHcMarket===m?' selected':'')+'>'+_esc(m)+' ('+(counts[m]||0)+')</option>';}).join('')+'</select>';
+  var h='<div style="padding:10px 0 4px;color:#94a3b8;font-size:.74rem;line-height:1.45">Every prop category with a genuine sportsbook line. Recent form = the true last 5 current-season games (all venues, before this game; minimum '+(rows.length&&rows[0].hcTotal<3?'2':'3')+'). <b style="color:#fb923c">Hot</b>: at least 80% Over (2/2, 3/3, 4/4 or 4/5) and averaging over the line. <b style="color:#60a5fa">Cold</b>: the same for the Under. <b style="color:#22d3ee">Double Cold</b>: Cold plus matchup support (70%+ Under in 2+ meetings with this opponent, or a top-10 pass/run defense for that market); Double Cold also appears in Cold. Top 10 per category; ranks 11&#8211;20 are Overflow. History is not a prediction; pushes are not wins. Anytime TD is excluded.</div>'
+    +'<div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:8px 0">'
+    +'<span style="font-size:.7rem;color:#94a3b8;font-weight:800">Form</span>'+btn('f','HOT','&#128293; Hot',_nflHcForm)+btn('f','COLD','&#10052;&#65039; Cold',_nflHcForm)+btn('f','DOUBLE','&#129482; Double Cold',_nflHcForm)
+    +'<span style="font-size:.7rem;color:#94a3b8;font-weight:800;margin-left:6px">Category</span>'+sel
+    +'<span style="font-size:.7rem;color:#94a3b8;font-weight:800;margin-left:6px">View</span>'+btn('e','ALL','All qualifying',_nflHcEdge)+btn('e','POS','Positive Edge Only',_nflHcEdge)
+    +'</div>';
+  var list=(_nflHcMarket?[_nflHcMarket]:markets);
+  var any=false,grid='display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:10px';
+  list.forEach(function(m){
+    var picked=rows.filter(function(r){return r.hcForm===_nflHcForm&&(r.mkt||r.label)===m;});
+    if(_nflHcEdge==='POS')picked=picked.filter(function(r){return r.edge!=null&&Number(r.edge)>0;});
+    picked.sort(function(a,b){return (a.hcRank||99)-(b.hcRank||99);});
+    if(!picked.length)return;
+    any=true;
+    var top=picked.filter(function(r){return (r.hcRank||99)<=10;}),ovf=picked.filter(function(r){return (r.hcRank||99)>10;});
+    h+='<div style="font-size:.74rem;font-weight:900;color:#fb923c;letter-spacing:.06em;margin:14px 0 6px">'+_esc((_NFL_HC_FORM_LBL[_nflHcForm]||'')+' '+m).toUpperCase()+' &middot; TOP 10 ('+top.length+')</div>';
+    h+=top.length?'<div style="'+grid+'">'+top.map(function(r){return _nflHcCard(r,r.hcRank);}).join('')+'</div>':'<div style="color:#64748b;font-size:.72rem">No Top 10 plays in this view.</div>';
+    if(ovf.length)h+='<details style="margin:10px 0"><summary style="cursor:pointer;color:#fdba74;font-weight:800;font-size:.74rem">Overflow &middot; ranks 11&#8211;20 ('+ovf.length+')</summary><div style="'+grid+';margin-top:10px">'+ovf.map(function(r){return _nflHcCard(r,r.hcRank);}).join('')+'</div></details>';
+  });
+  if(!any)h+='<div class="no-picks" style="padding:20px">No '+(_NFL_HC_FORM_LBL[_nflHcForm]||'')+' plays'+(_nflHcEdge==='POS'?' with positive edge':'')+' on this slate'+(_nflHcMarket?' for '+_esc(_nflHcMarket):'')+'.</div>';
+  return h;
+}
 function openNflTeamRanks(){
   var ov=document.getElementById('nfl-teamrank-modal');
   if(!ov){
@@ -13817,7 +14307,7 @@ function _nflCoachProps(sourceCandidates){
     var line=p.realLine!=null?p.realLine:p.dispLine;
     var prob=Number(p.dispScore!=null?p.dispScore:p.score);
     if(line==null||implied==null||!isFinite(prob)||prob<=0)return;
-    var key=String(p.pid||p.name)+'|'+String(p.mkt||p.label)+'|'+side+'|'+line+'|'+odds;
+    var key=String(p.pid||p.name)+'|'+String(p.mkt||p.label)+'|'+side+'|'+line+'|'+odds+(p.hcRow?'|'+p.hcForm:'');
     if(seen[key])return;seen[key]=1;
     out.push({
       player:p.name||'',position:p.position||p.roster_position||'',team:p.team||'',opponent:p.opponent||p.opp||'',
@@ -13834,7 +14324,8 @@ function _nflCoachProps(sourceCandidates){
       isRookie:p.isRookie===true,rookieVerified:p.rookieVerified===true,
        openingLine:p.openingLine,currentLine:p.currentLine!=null?p.currentLine:p.realLine,
        lineMove:p.lineMove,lineMovementAvailable:!!p.lineMovementAvailable,
-        slate_date:p.slate_date||'',source:p
+        slate_date:p.slate_date||'',source:p,
+      hcForm:p.hcRow?p.hcForm:'',hcStrength:p.hcStrength,hcHits:p.hcHits,hcTotal:p.hcTotal,hcAvg:p.hcAvg,hcSupport:p.hcSupport||''
     });
   });
   out.forEach(function(p){p.edge=p.appProb-p.implied;});
@@ -14237,6 +14728,8 @@ function _nflCoachRender(question,rows,total,mode,isAlternate,target){
     ?'Every displayed Coach-eligible NFL play with an exact 100.0% app hit rate is shown. This category is not capped at 10 and does not remove additional markets from the same player.'
     :mode==='funnel'
     ?'Every funnel-side play from the loaded board (pass funnel: QB pass yds Over, WR/TE rec yds Over, RB rush yds Under; run funnel is the reverse), ranked by Funnel Score: 45% app hit %, 20% matchup strength, 15% team role, 20% history vs similar defenses at today&#39;s line. Positive Coach Edge is not required; edge stays visible for context.'
+    :mode==='hc'
+    ?'Every Hot / Cold / Double Cold play from the loaded board across all categories (genuine sportsbook lines only; at least 80% of the last 5 current-season games on the side and averaging past the line), ranked by form strength. Positive Coach Edge is not required; app probability, implied probability and edge stay visible.'
     :mode==='td_probability'
     ?'I ranked every genuine Anytime TD OVER price from the complete analyzed slate by app touchdown probability and kept the Top 10. Positive Coach Edge is not required; implied probability and Coach Edge remain visible for context.'
     :mode==='safe'
@@ -14259,7 +14752,7 @@ function _nflCoachRender(question,rows,total,mode,isAlternate,target){
       +'<span style="color:'+statusColor+';font-weight:800">'+_esc(status)+'</span>'
       +'<span>'+_esc(p.team)+' vs '+_esc(p.opponent)+'</span>'+(venue?'<span>· '+venue+'</span>':'')+(p.slate_date?'<span>· '+_esc(p.slate_date)+'</span>':'')+'</span></span></span>'
       +'<span class="nfl-coach-pickmeta">'+_esc(p.market)+(p.isAlternate?' · <b style="color:#fbbf24">ALT LINE</b>':'')+'<br><b style="color:'+(p.side==='OVER'?'#4ade80':'#f87171')+'">'+p.side+' '+p.line+' · '+_nflCoachOdds(p.odds)+'</b><br><small style="color:#94a3b8">'+_esc(p.book||'Book unavailable')+'</small></span></summary>'
-      +'<div class="nfl-coach-copy">'+(mode==='funnel'&&p.funnel?'<b style="color:#f472b6">&#127919; '+(p.funnel.type==='PASS'?'PASS':'RUN')+' FUNNEL · '+_esc(p.funnel.strength||'')+(p.funnelScore!=null?' · Funnel score '+Number(p.funnelScore).toFixed(1):'')+'</b>'+(p.funnelDetail?' <span style="color:#f9a8d4">('+_esc(p.funnelDetail.label)+': '+p.funnelDetail.hits+'/'+p.funnelDetail.games+')</span>':'')+'<br>':'')+(mode==='safe'?'<b style="color:#fbbf24">Safety rank: '+p.implied.toFixed(1)+'% sportsbook-implied.</b> ':'')
+      +'<div class="nfl-coach-copy">'+(mode==='hc'&&p.hcForm?'<b style="color:'+(p.hcForm==='HOT'?'#fb923c':'#60a5fa')+'">'+({HOT:'&#128293; HOT',COLD:'&#10052;&#65039; COLD',DOUBLE:'&#129482; DOUBLE COLD'}[p.hcForm]||'')+' · '+p.hcHits+'/'+p.hcTotal+' '+(p.side==='OVER'?'Over':'Under')+' last '+p.hcTotal+' · avg '+_esc(String(p.hcAvg))+'</b>'+(p.hcSupport?' <span style="color:#67e8f9">('+_esc(p.hcSupport)+')</span>':'')+'<br>':'')+(mode==='funnel'&&p.funnel?'<b style="color:#f472b6">&#127919; '+(p.funnel.type==='PASS'?'PASS':'RUN')+' FUNNEL · '+_esc(p.funnel.strength||'')+(p.funnelScore!=null?' · Funnel score '+Number(p.funnelScore).toFixed(1):'')+'</b>'+(p.funnelDetail?' <span style="color:#f9a8d4">('+_esc(p.funnelDetail.label)+': '+p.funnelDetail.hits+'/'+p.funnelDetail.games+')</span>':'')+'<br>':'')+(mode==='safe'?'<b style="color:#fbbf24">Safety rank: '+p.implied.toFixed(1)+'% sportsbook-implied.</b> ':'')
       +'App probability '+p.appProb.toFixed(1)+'% vs '+p.implied.toFixed(1)+'% implied = <b style="color:'+(p.edge>=0?'#4ade80':'#f87171')+'">'+_nflCoachSigned(p.edge)+' Coach Edge points</b>.'
       +(mode.indexOf('movement_')===0&&p.lineMove!=null?' <span style="color:#fbbf24">Opening '+p.openingLine+' → current '+p.currentLine+' ('+(p.lineMove>=0?'+':'')+Number(p.lineMove).toFixed(2)+')</span>':'')+'</div>'
      +_nflCoachAccordions(p)+'</details>';
@@ -14380,6 +14873,32 @@ function askNflFunnelCoach(){
   });
   shown=_nflCoachOnePerTeamMarket(shown).slice(0,10);
   _nflCoachRender(q,shown,props.length,'funnel',false);
+  _nflCoachAutomaticStatus();
+  return shown;
+}
+function _nflHcCoachProps(form){
+  return _nflCoachProps(_nflHcRowsAll().filter(function(r){return r.hcForm===form;}));
+}
+function _nflHcCoachPick(props,sides,scope){
+  var seen={};
+  var rows=props.filter(function(p){
+    return (!sides||sides.indexOf(p.side)>=0)&&_nflGameFilterOn(scope,p.team,p.opponent);
+  }).sort(function(a,b){
+    return Number(b.hcStrength||0)-Number(a.hcStrength||0)||b.edge-a.edge;
+  }).filter(function(p){
+    var key=String(p.player||'').trim().toLowerCase();
+    if(!key||seen[key])return false;
+    seen[key]=1;return true;
+  });
+  return _nflCoachOnePerTeamMarket(rows).slice(0,10);
+}
+function askNflHotColdCoach(form){
+  var label={HOT:'Hot',COLD:'Cold',DOUBLE:'Double Cold'}[form]||'Hot';
+  var q='Show the Top 10 '+label+' plays across every category';
+  var input=document.getElementById('nflCoachInput');if(input)input.value=q;
+  var props=_nflHcCoachProps(form);
+  var shown=_nflHcCoachPick(props,_nflCoachSelectedSides(),'coach');
+  _nflCoachRender(q,shown,props.length,'hc',false);
   _nflCoachAutomaticStatus();
   return shown;
 }
@@ -14604,6 +15123,7 @@ var _NFL_COACH_TRACK_LABELS={
   rushing:'Rushing',receiving:'Receiving',defense:'Best Defense Plays',
    kicking:'Best Kicker Plays',td_scorers:'TD Scorers',best_unders:'Best Unders',
    rookie_plays:'Rookie Plays',matchup_funnels:'Matchup Funnels',
+   hot_form:'Hot · Top 10',cold_form:'Cold · Top 10',double_cold_form:'Double Cold · Top 10',
    coach_over_movement:'Biggest Over Line Movement',coach_under_movement:'Biggest Under Line Movement'
 };
 function _nflCoachTrackLabel(category){return _NFL_COACH_TRACK_LABELS[category]||String(category||'Coach').replace(/_/g,' ');}
@@ -14854,6 +15374,7 @@ function renderResults(d){
   var systemBadge=document.getElementById('nflSystemBadge');
   if(systemBadge){systemBadge.textContent='SYSTEM: '+(d.system||_nflSystem());systemBadge.style.color=(d.system||_nflSystem())==='NEW'?'#67e8f9':'#fbbf24';}
   window.__NFL_PLAYS__=d.all||[];
+  window.__NFL_HOT_COLD__=Array.isArray(d.hot_cold)?d.hot_cold:[];
   window.__NFL_DATE__=d.anchor_date||d.date||'';
   _renderNflParlayFilters();
   _nflCoachAutomaticStatus();
@@ -14981,6 +15502,7 @@ function _nflPaint(q){
   // Finished games (kickoff + 4h elapsed) drop off the board.
   var hasCards=false;
   h+=_collapseSec('matchup_funnels','&#127919; Matchup Funnels',_nflFunnelBoard(picks),true);
+  h+=_collapseSec('hot_cold','&#128293; Hot / &#10052;&#65039; Cold',_nflHotColdBoard(),true);
   h+=_collapseSec('biggest_over_movement','⬆ Biggest Over Line Movement',_nflMovementBoard(picks,'OVER'),true);
   h+=_collapseSec('biggest_under_movement','⬇ Biggest Under Line Movement',_nflMovementBoard(picks,'UNDER'),true);
   _MORDER.forEach(function(m,i){
@@ -15673,7 +16195,7 @@ function renderNflTrackDay(){
 }
 function _nflRoiFocusSummary(decided,stake){
   var focus=decided.filter(function(r){
-    return !r.observation_only&&r.category!=='80-100% Locks'&&String(r.category||'').indexOf('Matchup Funnels')!==0
+    return !r.observation_only&&r.category!=='80-100% Locks'&&!_nflSpotlightCat(r.category)
       &&r.side==='UNDER'&&r.odds!=null&&Number(r.odds)>=-150;
   });
   if(!focus.length) return '';
@@ -15701,7 +16223,7 @@ function _nflRenderRecordBook(decided,stake,label,sumEl,bodyEl,isOverflow,source
       +(isOverflow?'overflow ':'')+'picks for '+label+'.</p>';
     bodyEl.innerHTML='';return;
   }
-  var counted=decided.filter(function(r){return !r.observation_only&&String(r.category||'').indexOf('Matchup Funnels')!==0;});
+  var counted=decided.filter(function(r){return !r.observation_only&&!_nflSpotlightCat(r.category);});
   var settled=counted.filter(function(r){return r.result==='WIN'||r.result==='LOSS';});
   var pending=counted.filter(function(r){return r.result==='PENDING';}).length;
   var observations=decided.filter(function(r){return r.observation_only;}).length;
@@ -15773,6 +16295,10 @@ function _nflTrkCatHtml(decided,stake){
       +'<div class="nfl-trk-table-scroll"><table class="nfl-trk-tbl nfl-trk-compact"><thead><tr><th>Date</th><th>Player</th><th>Team</th><th>Pick</th><th>Odds / Book</th><th>Actual</th><th>Result / P&L</th></tr></thead><tbody>'+detail+'</tbody></table></div></details>';
   }).join('');
 }
+function _nflSpotlightCat(cat){
+  cat=String(cat||'');
+  return cat.indexOf('Matchup Funnels')===0||cat.indexOf('Hot ')===0||cat.indexOf('Cold ')===0||cat.indexOf('Double Cold ')===0;
+}
 function _nflTrkListHtml(decided,stake){
   if(!decided.length) return '<p style="color:#6b7280;padding:20px;text-align:center">No saved picks yet.</p>';
   var catOrder=['Pass Yds','Pass TDs','Completions','Pass Att','INT Thrown',
@@ -15793,6 +16319,11 @@ function _nflTrkListHtml(decided,stake){
       return label;
     });
     if(index>=0)catOrder.splice.apply(catOrder,[index+1,0].concat(positionCategories));
+  });
+  [['Hot','#fb923c'],['Cold','#60a5fa'],['Double Cold','#22d3ee']].forEach(function(f){
+    ['Pass Yds','Pass TDs','Completions','Pass Att','INT Thrown','Rush Yds','RB Total Yds','Rush Att','Rec Yds','Receptions','Tackles+Ast','Sacks','Def INT','Kick Pts','FG Made'].forEach(function(m){
+      catOrder.push(f[0]+' '+m);catColors[f[0]+' '+m]=f[1];
+    });
   });
   var groups={},order=[];
   function baseCategory(cat){
