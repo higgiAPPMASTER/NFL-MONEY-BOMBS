@@ -8587,7 +8587,7 @@ _NFL_COACH_HIST_APP = "nfl_coach_historical"
 _NFL_COACH_CATS = ("app_hit_rate_100", "safest_bets", "coach_edge", "alt_line_edge",
                    "coach_over_movement", "coach_under_movement", "passing",
                    "rushing", "receiving", "defense", "kicking",
-                   "td_scorers", "best_unders", "rookie_plays")
+                   "td_scorers", "best_unders", "rookie_plays", "matchup_funnels")
 _NFL_COACH_CAPTURE_GUARD_SECONDS = 120
 _NFL_OBSERVATION_ONLY_TRACK_MARKETS = frozenset((
     "player_anytime_td",
@@ -8710,6 +8710,10 @@ def _nfl_coach_hist_candidates(picks):
             "role_rank": pick.get("roleRank"),
             "team_option_rank": pick.get("teamOptionRank"),
             "depth_rank": pick.get("depthRank"),
+            "funnel_match": bool(pick.get("funnelMatch")) and not pick.get("isAlternate"),
+            "funnel_score": pick.get("funnelScore"),
+            "funnel_type": (pick.get("funnel") or {}).get("type") if isinstance(pick.get("funnel"), dict) else None,
+            "funnel_strength": (pick.get("funnel") or {}).get("strength") if isinstance(pick.get("funnel"), dict) else None,
             "is_rookie": bool(pick.get("rookieVerified")
                               and pick.get("isRookie")),
             "rookie_verified": bool(pick.get("rookieVerified")),
@@ -8741,6 +8745,8 @@ def _nfl_coach_hist_candidates(picks):
             "book": pick.get("under_book", "") if other_side == "UNDER" else pick.get("over_book", ""),
             "model_probability": max(0.0, min(100.0, 100.0 - probability)),
             "implied_probability": other_implied,
+            # Funnel alignment belongs to the app's pick side only.
+            "funnel_match": False,
         })
         opposite["coach_edge"] = opposite["model_probability"] - other_implied
         key = (opposite["player"], opposite["market"], other_side, line, opposite["odds"])
@@ -8806,7 +8812,30 @@ def _nfl_coach_one_per_team_market(rows):
             if _nfl_coach_team_market_key(row) is None or index in keep]
 
 
+def _nfl_coach_funnel_score(row):
+    try:
+        return float(row.get("funnel_score"))
+    except (TypeError, ValueError):
+        return float(row.get("model_probability") or 0)
+
+
 def _nfl_coach_hist_select(candidates, category, alternate=False):
+    if category == "matchup_funnels":
+        # Every funnel-side standard play qualifies, edge or not; ranked by
+        # Funnel Score, one play per player, one per team/market/side, Top 10.
+        rows = [dict(row) for row in candidates
+                if row.get("funnel_match") and not row.get("alternate")]
+        rows.sort(key=lambda x: (_nfl_coach_funnel_score(x),
+                                 float(x.get("model_probability") or 0)),
+                  reverse=True)
+        unique, seen_players = [], set()
+        for row in rows:
+            player_key = _nfl_player_name_key(row.get("player"))
+            if not player_key or player_key in seen_players:
+                continue
+            seen_players.add(player_key)
+            unique.append(row)
+        return _nfl_coach_one_per_team_market(unique)[:10]
     if category == "app_hit_rate_100":
         rows = [
             dict(row) for row in candidates
@@ -11789,6 +11818,7 @@ document.addEventListener('keydown',function(e){if(e.key==='Escape')_nflNavGo(nu
       <button class="nfl-coach-preset" onclick="askNflCoachPreset('Show the best kicker prop plays','kicking')">Best Kicker Plays</button>
       <button class="nfl-coach-preset" onclick="askNflTdCoach()" style="border-color:#eab308;color:#fde68a">TD Scorers · Top 10</button>
       <button class="nfl-coach-preset" onclick="askNflCoachPreset('Show the best under plays','best_unders')">Best unders</button>
+      <button class="nfl-coach-preset" onclick="askNflFunnelCoach()" style="border-color:#be185d;color:#fbcfe8">&#127919; Matchup Funnels · Top 10</button>
     </div>
      <div class="nfl-coach-filter-box" id="nflCoachFilterBox">
        <div class="nfl-coach-filter-head">
@@ -12243,6 +12273,7 @@ function _nflCoachParlayCandidates(){
     kicking:select(positive.filter(function(p){return _nflCoachFamily(p.market)==='kick';}),byEdge,5),
     td_scorers:select(allCoach.filter(function(p){return _nflCoachFamily(p.market)==='td'&&p.side==='OVER';}),byProbability,10),
     best_unders:select(positive.filter(function(p){return p.side==='UNDER';}),byEdge,5),
+    matchup_funnels:select(allCoach.filter(function(p){return p.funnelMatch&&!p.isAlternate;}),function(a,b){return _nflFunnelCoachScore(b)-_nflFunnelCoachScore(a)||b.appProb-a.appProb;},10),
     alt_line_edge:((window.__NFL_ALT_PARLAY_DATE__===((document.getElementById('datePicker')||{}).value||window.__NFL_DATE__||''))
       ?(window.__NFL_ALT_PARLAY_CANDIDATES__||[]):[]).filter(function(p){
       return p&&_nflGameFilterOn('parlay',p.team,p.opponent)
@@ -12270,6 +12301,7 @@ var _NFL_PARLAY_COACH_CATS=[
   {key:'kicking',label:'Best Kicker Plays'},
   {key:'td_scorers',label:'TD Scorers'},
   {key:'best_unders',label:'Best Unders'}
+  ,{key:'matchup_funnels',label:'Matchup Funnels'}
   ,{key:'coach_over_movement',label:'Biggest Over Line Movement'}
   ,{key:'coach_under_movement',label:'Biggest Under Line Movement'}
 ];
@@ -13798,6 +13830,7 @@ function _nflCoachProps(sourceCandidates){
       oppHits:Number(p.hitsA||0),oppTotal:Number(p.totA||0),book:side==='UNDER'?(p.under_book||''):(p.over_book||''),
       isAlternate:!!p.isAlternate,game_start:p.game_start||'',
       roleRank:p.roleRank,teamOptionRank:p.teamOptionRank,depthRank:p.depthRank,
+      funnelMatch:!!p.funnelMatch&&!p.isAlternate,funnelScore:p.funnelScore,funnel:p.funnel||null,funnelDetail:p.funnelDetail||null,
       isRookie:p.isRookie===true,rookieVerified:p.rookieVerified===true,
        openingLine:p.openingLine,currentLine:p.currentLine!=null?p.currentLine:p.realLine,
        lineMove:p.lineMove,lineMovementAvailable:!!p.lineMovementAvailable,
@@ -13815,7 +13848,7 @@ function _nflCoachSafest(props){
     var odds=_nflCoachNum(p.oppositeOdds);if(odds==null)return;
     var side=p.side==='OVER'?'UNDER':'OVER',k=p.player+'|'+p.market+'|'+side+'|'+p.line+'|'+odds;
     if(seen[k])return;seen[k]=1;
-    var q=Object.assign({},p,{side:side,odds:odds,oppositeOdds:p.odds,implied:_nflCoachImplied(odds),
+    var q=Object.assign({},p,{side:side,odds:odds,oppositeOdds:p.odds,implied:_nflCoachImplied(odds),funnelMatch:false,
       appProb:Math.max(0,Math.min(100,100-p.appProb)),
       recentRate:p.recentTotal?Math.max(0,100-p.recentRate):0,
       recentHits:p.recentTotal?Math.max(0,p.recentTotal-p.recentHits):0,
@@ -14202,6 +14235,8 @@ function _nflCoachRender(question,rows,total,mode,isAlternate,target){
     ?'A negative Under line move means the sportsbook lowered the required number after opening. That often reflects market action or a lower expectation, but it is not a guarantee—and the lower current number is harder for an Under.'
     :mode==='hundred'
     ?'Every displayed Coach-eligible NFL play with an exact 100.0% app hit rate is shown. This category is not capped at 10 and does not remove additional markets from the same player.'
+    :mode==='funnel'
+    ?'Every funnel-side play from the loaded board (pass funnel: QB pass yds Over, WR/TE rec yds Over, RB rush yds Under; run funnel is the reverse), ranked by Funnel Score: 45% app hit %, 20% matchup strength, 15% team role, 20% history vs similar defenses at today&#39;s line. Positive Coach Edge is not required; edge stays visible for context.'
     :mode==='td_probability'
     ?'I ranked every genuine Anytime TD OVER price from the complete analyzed slate by app touchdown probability and kept the Top 10. Positive Coach Edge is not required; implied probability and Coach Edge remain visible for context.'
     :mode==='safe'
@@ -14210,7 +14245,7 @@ function _nflCoachRender(question,rows,total,mode,isAlternate,target){
       ?'I checked '+total+' genuine alternate-line candidates for the safer-value sweet spot. Every result is priced -1000 or better, has at least 85% app probability, at least 70% sportsbook-implied probability, and positive Coach Edge; each player can appear once per qualifying market, using that player-market’s largest-edge line, with a maximum of 10 plays.'
       :'I checked '+total+' priced NFL board plays and ranked the matching positive Coach Edge results. Coach Edge is probability edge, not guaranteed monetary profit.');
   summary+=' To avoid stacked plays, only one player per team is suggested for each market and side; on Overs the higher-ranked teammate (e.g. WR1 over WR2) takes priority.';
-  if(!rows.length){el.innerHTML='<div class="nfl-coach-question">'+_esc(question)+'</div><div class="nfl-coach-summary">'+(mode==='hundred'?'No loaded Coach-eligible NFL play currently has an exact 100.0% app hit rate.':(mode.indexOf('movement_')===0?'No qualifying opening-to-current line moves captured yet.':'No loaded priced NFL prop matched that request.'))+'</div>';return;}
+  if(!rows.length){el.innerHTML='<div class="nfl-coach-question">'+_esc(question)+'</div><div class="nfl-coach-summary">'+(mode==='funnel'?'No funnel-side plays on the loaded board. Funnel plays are tagged by Run Picks; boards created before the funnel update need one fresh run.':mode==='hundred'?'No loaded Coach-eligible NFL play currently has an exact 100.0% app hit rate.':(mode.indexOf('movement_')===0?'No qualifying opening-to-current line moves captured yet.':'No loaded priced NFL prop matched that request.'))+'</div>';return;}
   var cards=rows.map(function(p,i){
     var s=p.source||{},head=_esc(s.head||''),logo='https://a.espncdn.com/i/teamlogos/nfl/500/'+_logoAbbr(p.team)+'.png';
     var venue=s.homeRoad==='H'?'HOME':(s.homeRoad==='R'?'AWAY':'');
@@ -14224,7 +14259,7 @@ function _nflCoachRender(question,rows,total,mode,isAlternate,target){
       +'<span style="color:'+statusColor+';font-weight:800">'+_esc(status)+'</span>'
       +'<span>'+_esc(p.team)+' vs '+_esc(p.opponent)+'</span>'+(venue?'<span>· '+venue+'</span>':'')+(p.slate_date?'<span>· '+_esc(p.slate_date)+'</span>':'')+'</span></span></span>'
       +'<span class="nfl-coach-pickmeta">'+_esc(p.market)+(p.isAlternate?' · <b style="color:#fbbf24">ALT LINE</b>':'')+'<br><b style="color:'+(p.side==='OVER'?'#4ade80':'#f87171')+'">'+p.side+' '+p.line+' · '+_nflCoachOdds(p.odds)+'</b><br><small style="color:#94a3b8">'+_esc(p.book||'Book unavailable')+'</small></span></summary>'
-      +'<div class="nfl-coach-copy">'+(mode==='safe'?'<b style="color:#fbbf24">Safety rank: '+p.implied.toFixed(1)+'% sportsbook-implied.</b> ':'')
+      +'<div class="nfl-coach-copy">'+(mode==='funnel'&&p.funnel?'<b style="color:#f472b6">&#127919; '+(p.funnel.type==='PASS'?'PASS':'RUN')+' FUNNEL · '+_esc(p.funnel.strength||'')+(p.funnelScore!=null?' · Funnel score '+Number(p.funnelScore).toFixed(1):'')+'</b>'+(p.funnelDetail?' <span style="color:#f9a8d4">('+_esc(p.funnelDetail.label)+': '+p.funnelDetail.hits+'/'+p.funnelDetail.games+')</span>':'')+'<br>':'')+(mode==='safe'?'<b style="color:#fbbf24">Safety rank: '+p.implied.toFixed(1)+'% sportsbook-implied.</b> ':'')
       +'App probability '+p.appProb.toFixed(1)+'% vs '+p.implied.toFixed(1)+'% implied = <b style="color:'+(p.edge>=0?'#4ade80':'#f87171')+'">'+_nflCoachSigned(p.edge)+' Coach Edge points</b>.'
       +(mode.indexOf('movement_')===0&&p.lineMove!=null?' <span style="color:#fbbf24">Opening '+p.openingLine+' → current '+p.currentLine+' ('+(p.lineMove>=0?'+':'')+Number(p.lineMove).toFixed(2)+')</span>':'')+'</div>'
      +_nflCoachAccordions(p)+'</details>';
@@ -14326,6 +14361,27 @@ function askNflMovementCoach(side){
   _nflCoachRender(q,rows,props.length,side==='OVER'?'movement_over':'movement_under',false);
   _nflCoachAutomaticStatus();
   return rows;
+}
+function _nflFunnelCoachScore(p){var v=Number(p.funnelScore);return isFinite(v)?v:Number(p.appProb||0);}
+function askNflFunnelCoach(){
+  var q='Show the Top 10 Matchup Funnel plays by Funnel Score';
+  var input=document.getElementById('nflCoachInput');if(input)input.value=q;
+  var props=_nflCoachVisibleProps(_nflCoachProps());
+  var selectedSides=_nflCoachSelectedSides(),seen={};
+  var shown=props.filter(function(p){
+    return p.funnelMatch&&!p.isAlternate&&selectedSides.indexOf(p.side)>=0
+      &&_nflGameFilterOn('coach',p.team,p.opponent);
+  }).sort(function(a,b){
+    return _nflFunnelCoachScore(b)-_nflFunnelCoachScore(a)||b.appProb-a.appProb;
+  }).filter(function(p){
+    var key=String(p.player||'').trim().toLowerCase();
+    if(!key||seen[key])return false;
+    seen[key]=1;return true;
+  });
+  shown=_nflCoachOnePerTeamMarket(shown).slice(0,10);
+  _nflCoachRender(q,shown,props.length,'funnel',false);
+  _nflCoachAutomaticStatus();
+  return shown;
 }
 function askNflTdCoach(){
   var q='Show the Top 10 Anytime TD scorers by app probability';
@@ -14547,7 +14603,7 @@ var _NFL_COACH_TRACK_LABELS={
   alt_line_edge:'Best Alt-Line Edge Plays',passing:'Passing',
   rushing:'Rushing',receiving:'Receiving',defense:'Best Defense Plays',
    kicking:'Best Kicker Plays',td_scorers:'TD Scorers',best_unders:'Best Unders',
-   rookie_plays:'Rookie Plays',
+   rookie_plays:'Rookie Plays',matchup_funnels:'Matchup Funnels',
    coach_over_movement:'Biggest Over Line Movement',coach_under_movement:'Biggest Under Line Movement'
 };
 function _nflCoachTrackLabel(category){return _NFL_COACH_TRACK_LABELS[category]||String(category||'Coach').replace(/_/g,' ');}
