@@ -5538,6 +5538,8 @@ async def _build_nfl_game_predictions(espn_games: list, df, date_str: str,
 # separately tracked Matchup Funnels spotlight category.
 _NFL_TEAM_RANK_CACHE: dict = {}
 _NFL_FUNNEL_CATEGORY = "Matchup Funnels"
+_NFL_FUNNEL_OVERFLOW_CATEGORY = "Matchup Funnels Overflow"
+_NFL_FUNNEL_CATEGORIES = frozenset((_NFL_FUNNEL_CATEGORY, _NFL_FUNNEL_OVERFLOW_CATEGORY))
 _NFL_FUNNEL_PLAYS = {
     "PASS": (("player_pass_yds", "OVER", ("QB",)),
              ("player_reception_yds", "OVER", ("WR", "TE")),
@@ -5753,12 +5755,129 @@ def _nfl_funnel_aligned(pick: dict, funnel: Optional[dict]) -> bool:
                for m, s, positions in _NFL_FUNNEL_PLAYS.get(funnel["type"], ()))
 
 
-def _nfl_attach_funnels(result: dict, rankings: dict) -> dict:
-    """Tag picks and game cards; never alters picks, scores or ordering."""
+def _nfl_funnel_phase(market: str) -> str:
+    return "rush" if str(market or "") == "player_rush_yds" else "pass"
+
+
+def _nfl_funnel_role_rank(pick: dict):
+    fields = ("roleRank", "depthRank")
+    if str(pick.get("market") or "") == "player_reception_yds":
+        fields = ("teamOptionRank",) + fields
+    for field in fields:
+        try:
+            value = int(float(pick.get(field)))
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    return None
+
+
+def _nfl_funnel_history_index(df, picks, season, week, stype, point_in_time):
+    """Compact per-player game logs (this + last regular season) for the
+    aligned funnel players only; point-in-time for historical replays."""
+    pids = {str(p.get("pid")) for p in picks if p.get("pid")}
+    if df is None or not pids or "player_id" not in df.columns:
+        return {}
+    cols = [c for c in ("player_id", "season", "week", "season_type", "opponent_team",
+                        "passing_yards", "rushing_yards", "receiving_yards")
+            if c in df.columns]
+    sub = df[df["player_id"].astype(str).isin(pids)][cols]
+    if point_in_time:
+        sub = _nfl_stats_before_game(sub, season, week, stype)
+    seasons = sub["season"].fillna(0).astype(int)
+    sub = sub[seasons.isin([int(season), int(season) - 1])]
+    if "season_type" in sub.columns:
+        sub = sub[sub["season_type"].fillna("REG").astype(str).str.upper() == "REG"]
+    index = {}
+    for row in sub.to_dict("records"):
+        index.setdefault(str(row.get("player_id")), []).append(row)
+    return index
+
+
+def _nfl_funnel_score(pick, funnel, rankings, prior_rankings, history_rows):
+    """Funnel score (0-100) = 45% app hit % + 20% matchup strength +
+    15% team role + 20% history vs similar defenses. Ranking only."""
+    teams = rankings.get("teams") or {}
+    n = max(2, len(teams))
+    market = str(pick.get("market") or "")
+    side = str(pick.get("pick") or pick.get("side") or "").upper()
+    phase = _nfl_funnel_phase(market)
+    def_key = "defPass" if phase == "pass" else "defRush"
+    off_key = "offPass" if phase == "pass" else "offRush"
+    d_rank = (teams.get(_nfl_rank_norm(pick.get("opponent"))) or {}).get("ranks", {}).get(def_key)
+    o_rank = (teams.get(_nfl_rank_norm(pick.get("team"))) or {}).get("ranks", {}).get(off_key)
+    over = side == "OVER"
+    def_part = 50.0 if d_rank is None else (
+        (d_rank - 1) / (n - 1) * 100 if over else (n - d_rank) / (n - 1) * 100)
+    if o_rank is None:
+        matchup = def_part
+    else:
+        off_part = (n - o_rank) / (n - 1) * 100 if over else (o_rank - 1) / (n - 1) * 100
+        matchup = 0.7 * def_part + 0.3 * off_part
+    role_rank = _nfl_funnel_role_rank(pick)
+    if role_rank is None:
+        role = 50.0
+    elif over:
+        role = {1: 100.0, 2: 75.0, 3: 55.0}.get(role_rank, 35.0)
+    else:
+        role = {1: 35.0, 2: 55.0}.get(role_rank, 70.0)
+
+    stat_col = PROP_TO_COL.get(market)
+    try:
+        line = float(pick.get("realLine") if pick.get("realLine") is not None
+                     else pick.get("line", pick.get("dispLine")))
+    except (TypeError, ValueError):
+        line = None
+    hits = games = 0
+    season_now = rankings.get("season")
+    for row in history_rows or []:
+        if line is None or not stat_col:
+            break
+        try:
+            value = float(row.get(stat_col))
+            row_season = int(row.get("season"))
+        except (TypeError, ValueError):
+            continue
+        if value != value:
+            continue
+        table = rankings if row_season == season_now else prior_rankings
+        opp = ((table or {}).get("teams") or {}).get(_nfl_rank_norm(row.get("opponent_team")))
+        rank = ((opp or {}).get("ranks") or {}).get(def_key)
+        size = len((table or {}).get("teams") or {}) or 32
+        if rank is None:
+            continue
+        similar = rank >= size - 9 if over else rank <= 12
+        if not similar or value == line:
+            continue
+        games += 1
+        if (value > line) if over else (value < line):
+            hits += 1
+    history = (hits + 1) / (games + 2) * 100
+    try:
+        app_prob = float(pick.get("score") if pick.get("score") is not None
+                         else pick.get("dispScore"))
+    except (TypeError, ValueError):
+        app_prob = 50.0
+    score = 0.45 * app_prob + 0.20 * matchup + 0.15 * role + 0.20 * history
+    phase_word = "pass" if phase == "pass" else "run"
+    return round(score, 1), {
+        "hits": hits, "games": games, "line": line,
+        "label": (f"vs bottom-10 {phase_word} D" if over
+                  else f"vs top-12 {phase_word} D"),
+        "matchup": round(matchup, 1), "role": round(role, 1),
+        "history": round(history, 1), "roleRank": role_rank,
+    }
+
+
+def _nfl_attach_funnels(result: dict, rankings: dict, df=None, schedule_rows=None,
+                        season=None, week=None, stype="REG",
+                        point_in_time: bool = False) -> dict:
+    """Tag picks and game cards; never alters picks, model scores or ordering."""
     if not isinstance(result, dict) or not (rankings or {}).get("teams"):
         return result
     result["team_rank_basis"] = rankings.get("basis")
-    seen = set()
+    seen, aligned = set(), []
     for bucket in ("picks", "all"):
         for pick in result.get(bucket) or []:
             if not isinstance(pick, dict) or id(pick) in seen:
@@ -5767,6 +5886,27 @@ def _nfl_attach_funnels(result: dict, rankings: dict) -> dict:
             funnel = _nfl_funnel_for(pick.get("team"), pick.get("opponent"), rankings)
             pick["funnel"] = funnel
             pick["funnelMatch"] = _nfl_funnel_aligned(pick, funnel)
+            if pick["funnelMatch"]:
+                aligned.append(pick)
+    if aligned:
+        try:
+            basis = int(rankings.get("season") or season or _cur_season)
+            prior = (_nfl_team_rankings(df, schedule_rows, basis - 1)
+                     if df is not None else {})
+            index = _nfl_funnel_history_index(
+                df, aligned, season if season is not None else basis,
+                week, stype, point_in_time)
+        except Exception as exc:
+            print(f"[NFL funnels] history unavailable: {exc}")
+            prior, index = {}, {}
+        for pick in aligned:
+            try:
+                score, detail = _nfl_funnel_score(
+                    pick, pick["funnel"], rankings, prior,
+                    index.get(str(pick.get("pid"))) or [])
+                pick["funnelScore"], pick["funnelDetail"] = score, detail
+            except Exception as exc:
+                print(f"[NFL funnels] score skipped for {pick.get('name')}: {exc}")
     teams = rankings.get("teams") or {}
     for game in result.get("game_predictions") or []:
         if not isinstance(game, dict):
@@ -5783,6 +5923,44 @@ def _nfl_attach_funnels(result: dict, rankings: dict) -> dict:
     return result
 
 
+def _nfl_rank_week_games(schedule_rows) -> list:
+    """This NFL week's games (current week = week of the next unplayed or
+    today's game), read from the cached free nflverse schedule."""
+    today = _nfl_today()
+    season = int(_cur_season)
+    rows = []
+    for game in schedule_rows or []:
+        try:
+            if int(game.get("season") or 0) != season:
+                continue
+        except (TypeError, ValueError):
+            continue
+        rows.append(game)
+    upcoming = sorted(
+        (g for g in rows if str(g.get("gameday") or "") >= today),
+        key=lambda g: (str(g.get("gameday") or ""), str(g.get("gametime") or "")))
+    if not upcoming:
+        return []
+    week = str(upcoming[0].get("week") or "")
+    gtype = str(upcoming[0].get("game_type") or "")
+    out = []
+    for game in sorted(rows, key=lambda g: (str(g.get("gameday") or ""),
+                                            str(g.get("gametime") or ""))):
+        if str(game.get("week") or "") != week or str(game.get("game_type") or "") != gtype:
+            continue
+        out.append({
+            "away": _nfl_rank_norm(game.get("away_team")),
+            "home": _nfl_rank_norm(game.get("home_team")),
+            "date": str(game.get("gameday") or ""),
+            "time": str(game.get("gametime") or ""),
+            "weekday": str(game.get("weekday") or "")[:3],
+            "week": week, "gameType": gtype,
+            "final": game.get("home_score") not in (None, "")
+                     and game.get("away_score") not in (None, ""),
+        })
+    return out
+
+
 @app.get("/api/nfl/team-rankings")
 async def nfl_team_rankings_route():
     """Read-only current-season team pass/rush offense and defense table."""
@@ -5793,6 +5971,7 @@ async def nfl_team_rankings_route():
     data = await asyncio.to_thread(_nfl_team_rankings, df, schedule_rows, _cur_season)
     if not data.get("teams"):
         raise HTTPException(status_code=503, detail="Team rankings are unavailable; please retry")
+    data = {**data, "weekGames": await asyncio.to_thread(_nfl_rank_week_games, schedule_rows)}
     return JSONResponse(data, headers={"Cache-Control": "no-store"})
 
 
@@ -6386,7 +6565,9 @@ async def _run_pipeline_unlocked(date_str: str, progress=None, simulate: bool = 
         team_rankings = await asyncio.to_thread(
             _nfl_team_rankings, df, rank_schedule, prop_season, prop_week,
             prop_type, bool(simulate))
-        await asyncio.to_thread(_nfl_attach_funnels, result, team_rankings)
+        await asyncio.to_thread(
+            _nfl_attach_funnels, result, team_rankings, df, rank_schedule,
+            prop_season, prop_week, prop_type, bool(simulate))
     except Exception as exc:
         print(f"[NFL funnels] skipped: {exc}")
     await asyncio.to_thread(_nfl_json_ready, result)
@@ -9807,7 +9988,9 @@ def _nfl_grade_date(date_str: str, snap: list, box_override: dict = None) -> dic
             if p.get("funnelMatch") and isinstance(p.get("funnel"), dict):
                 row["funnel"] = p["funnel"].get("type")
                 row["funnel_strength"] = p["funnel"].get("strength")
-                row["funnel_score"] = float(p.get("score") or p.get("dispScore") or 0)
+                row["funnel_score"] = float(
+                    p.get("funnelScore") if p.get("funnelScore") is not None
+                    else (p.get("score") or p.get("dispScore") or 0))
             if p.get("system") == "NEW":
                 row["system"] = "NEW"
                 row["model_version"] = p.get("model_version", "NEW-v2-ewma-weather")
@@ -9864,7 +10047,7 @@ def _nfl_grade_date(date_str: str, snap: list, box_override: dict = None) -> dic
 
     # Matchup Funnels: isolated spotlight copies of already-generated
     # standard-line plays on the funnel side. One strongest play per player,
-    # Top 10 by the app's existing probability; never counted in totals.
+    # ranked by funnel score: Top 10 + Overflow 11-20; never in totals.
     funnel_best = {}
     for row in main_rows + ovf_rows:
         if not row.get("funnel") or row.get("category") in _NFL_MOVEMENT_CATEGORIES:
@@ -9877,9 +10060,12 @@ def _nfl_grade_date(date_str: str, snap: list, box_override: dict = None) -> dic
     funnel_rows = []
     for funnel_rank, row in enumerate(sorted(
             funnel_best.values(),
-            key=lambda r: float(r.get("funnel_score") or 0), reverse=True)[:10], 1):
+            key=lambda r: float(r.get("funnel_score") or 0), reverse=True)[:20], 1):
         copy_row = {k: v for k, v in row.items() if k != "pool"}
-        copy_row.update({"category": _NFL_FUNNEL_CATEGORY, "rank": funnel_rank})
+        copy_row.update({
+            "category": (_NFL_FUNNEL_CATEGORY if funnel_rank <= 10
+                         else _NFL_FUNNEL_OVERFLOW_CATEGORY),
+            "rank": funnel_rank})
         funnel_rows.append(copy_row)
 
     lock_rows = [
@@ -9924,7 +10110,7 @@ def _nfl_detail_graded(graded: dict, include_overflow: bool = True,
             "name", "team", "category", "side", "market",
             "line", "odds", "rank", "result", "actual", "profit", "pool",
             "opening_line", "current_line", "line_move",
-            "funnel", "funnel_strength",
+            "funnel", "funnel_strength", "funnel_score",
         )}
         if row.get("receivingBoardVersion"):
             detail["position"] = row.get("position")
@@ -10415,7 +10601,7 @@ async def nfl_track_record(grade: bool = False, date_str: str = "", system: str 
         decided = [r for r in det if not _nfl_td_observation_only(r)
                    and r.get("result") in ("WIN","LOSS")
                    and r.get("category") not in _NFL_MOVEMENT_CATEGORIES
-                   and r.get("category") != _NFL_FUNNEL_CATEGORY]
+                   and r.get("category") not in _NFL_FUNNEL_CATEGORIES]
         wins   = sum(1 for r in decided if r["result"] == "WIN")
         losses = len(decided) - wins
         priced = [r for r in decided if r.get("odds") is not None]
@@ -11256,6 +11442,7 @@ tr:last-child td{border-bottom:none}
         <button type="button" role="menuitem" class="nfl-menu-item" style="--c:#be185d" onclick="_nflNavGo(_nflNavFunnels)">&#127919; Matchup Funnels Record</button>
         <button type="button" role="menuitem" class="nfl-menu-item" style="--c:#1d4ed8" onclick="_nflNavGo(_nflNavHistorical)">&#128218; Historical Analysis</button>
         <div class="nfl-menu-head">Tools</div>
+        <button type="button" role="menuitem" class="nfl-menu-item" style="--c:#be185d" onclick="_nflNavGo(_nflNavFunnelPicks)">&#127919; Matchup Funnels Picks</button>
         <button type="button" role="menuitem" class="nfl-menu-item" style="--c:#db2777" onclick="_nflNavGo(openNflTeamRanks)">&#128202; Team Rankings</button>
         <button type="button" role="menuitem" class="nfl-menu-item admin-only" style="--c:#0e7490" onclick="_nflNavGo(openNflMyBets)">&#128176; My Bets</button>
       </div>
@@ -11284,16 +11471,51 @@ function _nflNavSetSource(v){
 function _nflNavTrack(){_nflNavSetSource('official');_nflNavScroll('nfl-main-track-card');}
 function _nflNavOverflow(){_nflNavScroll('nfl-overflow-track-card');}
 function _nflNavHistorical(){_nflNavSetSource('historical');_nflNavScroll('nfl-main-track-card');}
-function _nflNavFunnels(){
+function _nflNavNotice(title,msg){
+  var ov=document.getElementById('nfl-nav-notice');
+  if(!ov){
+    ov=document.createElement('div');ov.id='nfl-nav-notice';
+    ov.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:10002;display:flex;padding:16px;box-sizing:border-box';
+    ov.onclick=function(e){if(e.target===ov)ov.style.display='none';};
+    document.body.appendChild(ov);
+  }
+  ov.style.display='flex';
+  ov.innerHTML='<div style="margin:auto;max-width:460px;background:#0b1222;border:1px solid #be185d;border-radius:14px;padding:20px 22px;color:#e2e8f0;font-size:.86rem;line-height:1.5">'
+    +'<div style="font-weight:950;color:#f472b6;font-size:1rem;margin-bottom:8px">'+title+'</div>'+msg
+    +'<div style="text-align:right;margin-top:14px"><button onclick="document.getElementById(&#39;nfl-nav-notice&#39;).style.display=&#39;none&#39;" style="background:#be185d;color:#fff;border:0;border-radius:8px;padding:8px 16px;font-weight:900;cursor:pointer">OK</button></div></div>';
+}
+function _nflNavFunnelPicks(){
+  var body=document.getElementById('sec_matchup_funnels');
+  if(!body){
+    _nflNavNotice('&#127919; Matchup Funnels Picks','No pick board is loaded yet. Press <b>Run Picks</b> for today and the <b>&#127919; Matchup Funnels</b> section appears on the board, above the line-movement boards. Boards created before the funnel update need one fresh Run Picks to tag funnel plays.');
+    return;
+  }
+  body.style.display='block';
+  var car=document.getElementById('car_matchup_funnels');if(car)car.textContent='▾';
+  var hdr=body.previousElementSibling||body;
+  hdr.style.scrollMarginTop='90px';
+  hdr.scrollIntoView({behavior:'smooth',block:'start'});
+}
+function _nflNavFindFunnelRecord(){
+  var hit=null;
+  document.querySelectorAll('#nflTrkBody .nfl-trk-group-name').forEach(function(el){
+    if(!hit&&String(el.textContent||'').trim()==='Matchup Funnels')hit=el;
+  });
+  return hit;
+}
+async function _nflNavFunnels(){
   _nflNavSetSource('official');
   var t=document.getElementById('nflTrkBtnCat');if(t)t.click();
-  setTimeout(function(){
-    var hit=null;
-    document.querySelectorAll('#nflTrkBody .nfl-trk-group-name').forEach(function(el){
-      if(!hit&&String(el.textContent||'').trim()==='Matchup Funnels')hit=el;
-    });
-    if(hit)hit.scrollIntoView({behavior:'smooth',block:'center'});else _nflNavScroll('nfl-main-track-card');
-  },250);
+  var hit=_nflNavFindFunnelRecord();
+  if(!hit&&typeof loadNflTrackRecord==='function'){
+    _nflNavScroll('nfl-main-track-card');
+    try{await loadNflTrackRecord();}catch(e){}
+    await new Promise(function(r){setTimeout(r,250);});
+    hit=_nflNavFindFunnelRecord();
+  }
+  if(hit){hit.scrollIntoView({behavior:'smooth',block:'center'});return;}
+  _nflNavScroll('nfl-main-track-card');
+  _nflNavNotice('&#127919; Matchup Funnels Record','No Matchup Funnels results are saved for this period yet. Funnel plays are captured starting with the first slate you <b>Run Picks</b> on after this update; they show here as their own categories (Top 10 and Overflow 11&#8211;20) once those games finish and you press <b>Get Results</b>. They are never added to the Track Record totals.');
 }
 document.addEventListener('click',function(e){
   var m=document.getElementById('nflNavMenu');
@@ -12697,7 +12919,10 @@ function nflCard(p,i){
     var dcol=p.defAdj>0?'#4ade80':'#f87171';
     defChip='<div style="font-size:.62rem;font-weight:800;color:'+dcol+';margin-top:2px">vs #'+p.defRank+' '+(p.defLbl||'D')+' · '+(p.defAdj>0?'+':'')+p.defAdj+'% projection'+(p.defAllowed!=null?' · '+p.defAllowed+' allowed':'')+'</div>';
   }
-  var funnelChip=(p.funnelMatch&&p.funnel)?'<div style="font-size:.62rem;font-weight:900;color:#f472b6;margin-top:2px">&#127919; '+(p.funnel.type==='PASS'?'PASS':'RUN')+' FUNNEL &middot; '+_esc(p.funnel.strength)+' &middot; '+_esc(p.funnel.defense)+' #'+p.funnel.defPassRank+' vs pass / #'+p.funnel.defRushRank+' vs run</div>':'';
+  var fd=p.funnelDetail||null;
+  var funnelChip=(p.funnelMatch&&p.funnel)?'<div style="font-size:.62rem;font-weight:900;color:#f472b6;margin-top:2px">&#127919; '+(p.funnel.type==='PASS'?'PASS':'RUN')+' FUNNEL &middot; '+_esc(p.funnel.strength)+' &middot; '+_esc(p.funnel.defense)+' #'+p.funnel.defPassRank+' vs pass / #'+p.funnel.defRushRank+' vs run'
+    +(p.funnelScore!=null?' &middot; Funnel score '+Number(p.funnelScore).toFixed(1):'')
+    +(fd?'<br><span style="color:#f9a8d4;font-weight:800">'+_esc(fd.label)+': '+fd.hits+'/'+fd.games+' '+String(p.pick||'').toLowerCase()+(fd.line!=null?' '+fd.line:'')+' (this + last season)</span>':'')+'</div>':'';
   var roleChip=p.role?'<div style="font-size:.62rem;font-weight:800;color:#93c5fd;margin-top:2px">'+_esc(p.role)+(p.teamOptionRank!=null?' · team receiving option #'+p.teamOptionRank:'')+' · '+Math.round(Number(p.roleConfidence||0)*100)+'% role confidence</div>':'';
   var riskStatus=String(p.roleRiskStatus||'').toUpperCase();
   var riskChip=(riskStatus==='WATCH'||riskStatus==='AVOID')
@@ -13133,7 +13358,7 @@ function _nflGpBetPanel(g,idx){
     +'<summary>TRACK SPORTSBOOK LINES &#183; &#9733; MODEL PICK</summary>'
     +'<div class="nfl-gp-track-body">'+rows+'</div></details>';
 }
-var _nflTeamRanksData=null,_nflTeamRanksLoading=null,_nflTeamRanksFailed=false,_nflTeamRanksMode='season',_nflTeamRanksSort={k:'offPass',dir:1};
+var _nflTeamRanksData=null,_nflTeamRanksLoading=null,_nflTeamRanksFailed=false,_nflTeamRanksMode='season',_nflTeamRanksSort={k:'offPass',dir:1},_nflTeamRanksGame='';
 function _nflRound1(s){return String(s==null?'':s).replace(/[0-9]+[.][0-9]{3,}/g,function(m){return (Math.round(Number(m)*10)/10).toFixed(1);});}
 function _nflTodayEt(){try{return new Date().toLocaleDateString('en-CA',{timeZone:'America/New_York'});}catch(e){return '';}}
 function _nflLiveRanksOk(){var d=String(window.__NFL_DATE__||'').slice(0,10),t=_nflTodayEt();return !d||!t||d>=t;}
@@ -13179,6 +13404,7 @@ function _nflFunnelLine(f){
   return '<div style="margin-top:6px;padding:6px 8px;border-radius:7px;border:1px solid rgba(244,114,182,.4);background:rgba(244,114,182,.08);color:'+c+';font-size:.66rem;font-weight:800;line-height:1.4">&#127919; '+(pass?'Pass funnel':'Run funnel')+' &middot; '+_esc(f.strength)+': '+_esc(f.defense)+' #'+f.defPassRank+' vs pass, #'+f.defRushRank+' vs run &rarr; '+_esc(f.offense)+' should '+(pass?'throw':'run')+'</div>';
 }
 function _nflGpFunnelHtml(g){var fs=_nflGpFunnels(g);return _nflFunnelLine(fs[0])+_nflFunnelLine(fs[1]);}
+function _nflFunnelRankVal(p){return Number(p.funnelScore!=null?p.funnelScore:(p.score||p.dispScore||0));}
 function _nflFunnelBoard(picks){
   var best={},tagged=false;
   (picks||[]).forEach(function(p){
@@ -13186,14 +13412,17 @@ function _nflFunnelBoard(picks){
     if(!p||_nflGameDone(p)||!p.funnelMatch||!p.funnel||p.isAlternate)return;
     var key=String(p.name||'').toLowerCase().replace(/[^a-z0-9]+/g,'');
     if(!key)return;
-    var sc=Number(p.score||p.dispScore||0);
-    if(!best[key]||sc>Number(best[key].score||best[key].dispScore||0))best[key]=p;
+    if(!best[key]||_nflFunnelRankVal(p)>_nflFunnelRankVal(best[key]))best[key]=p;
   });
   var rows=Object.keys(best).map(function(k){return best[k];}).sort(function(a,b){
-    return Number(b.score||b.dispScore||0)-Number(a.score||a.dispScore||0);
-  }).slice(0,10);
+    return _nflFunnelRankVal(b)-_nflFunnelRankVal(a);
+  }).slice(0,20);
   if(!rows.length)return '<div class="no-picks" style="padding:24px">'+(tagged?'No funnel-side plays on this slate.':'This board was created before Matchup Funnels existed. Run the slate again to tag funnel plays.')+'</div>';
-  return '<div style="padding:10px 0 4px;color:#94a3b8;font-size:.76rem;line-height:1.45">Pass funnel: the defense ranks bottom 8 vs the pass and top 12 vs the run &rarr; QB pass yds Over, WR/TE rec yds Over, RB rush yds Under. Run funnel is the reverse. STRONG = defense bottom 5 in that phase and offense top 10. Same app picks and lines, one play per player, ranked by hit %. Separate record, not counted in Track Record totals.</div>'+nflCardGrid(rows,1);
+  var top=rows.slice(0,10),ovf=rows.slice(10);
+  var html='<div style="padding:10px 0 4px;color:#94a3b8;font-size:.76rem;line-height:1.45">Pass funnel: the defense ranks bottom 8 vs the pass and top 12 vs the run &rarr; QB pass yds Over, WR/TE rec yds Over, RB rush yds Under. Run funnel is the reverse. STRONG = defense bottom 5 in that phase and offense top 10. Ranked by <b style="color:#f472b6">Funnel Score</b>: 45% app hit %, 20% matchup strength, 15% team role (WR1/RB1 first on Overs), 20% the player&#39;s history vs similar defenses at today&#39;s line. Same app lines, one play per player. Top 10 and Overflow (11&#8211;20) each have their own record, not counted in Track Record totals.</div>'
+    +'<div style="font-size:.7rem;font-weight:900;color:#f472b6;letter-spacing:.08em;margin:10px 0 4px">TOP 10</div>'+nflCardGrid(top,1);
+  if(ovf.length)html+='<div style="font-size:.7rem;font-weight:900;color:#f9a8d4;letter-spacing:.08em;margin:16px 0 4px">OVERFLOW &middot; RANKS 11&#8211;20</div>'+nflCardGrid(ovf,11);
+  return html;
 }
 function openNflTeamRanks(){
   var ov=document.getElementById('nfl-teamrank-modal');
@@ -13214,6 +13443,41 @@ function openNflTeamRanks(){
   });
 }
 function _nflTeamRanksSetMode(m){_nflTeamRanksMode=m;_nflTeamRanksRender();}
+function _nflTeamRanksSetGame(v){_nflTeamRanksGame=v||'';_nflTeamRanksRender();}
+function _nflTeamRanksGameLabel(g){
+  var dt=g.date?new Date(g.date+'T12:00:00Z'):null;
+  var day=dt&&isFinite(dt)?dt.toLocaleDateString('en-US',{weekday:'short',month:'short',day:'numeric',timeZone:'UTC'}):'';
+  var tm='';
+  if(g.time){var hp=String(g.time).split(':'),h=parseInt(hp[0],10);if(isFinite(h))tm=' '+((h%12)||12)+':'+(hp[1]||'00')+(h>=12?' PM':' AM')+' ET';}
+  return g.away+' @ '+g.home+(day?' · '+day+tm:'')+(g.final?' · Final':'');
+}
+function _nflTeamRanksMatchup(d,away,home,l4){
+  function rec(t){var b=d.teams[t];return b?(l4?b.l4:b):null;}
+  var a=rec(away),h=rec(home),n=d.teamCount||32;
+  if(!a||!h)return '<div style="color:#fbbf24;font-size:.78rem;margin-bottom:10px">No '+(l4?'last-4 ':'')+'stats yet for one of these teams.</div>';
+  var rows=[['Pass Off yds/g','off','pass','offPass'],['Rush Off yds/g','off','rush','offRush'],['Total Off','off','total','offTotal'],
+    ['Pts/g','off','ppg','offPpg'],['Pass %','off','passRate',null],['Pass Def allowed/g','def','pass','defPass'],
+    ['Rush Def allowed/g','def','rush','defRush'],['Total Def allowed','def','total','defTotal'],['Pts allowed/g','def','ppg','defPpg']];
+  function cell(r,x){
+    var v=(r[x[1]]||{})[x[2]],rk=x[3]?(r.ranks||{})[x[3]]:null;
+    return (v==null?'—':Number(v).toFixed(1)+(x[2]==='passRate'?'%':''))+(x[3]?' <span style="font-size:.66rem;font-weight:900;color:'+_nflRankColor(rk,n)+'">#'+(rk!=null?rk:'—')+'</span>':'');
+  }
+  var td='padding:6px 10px;border-bottom:1px solid #1f2937;color:#e2e8f0;white-space:nowrap';
+  var html='<div style="margin-bottom:12px;border:1px solid #334155;border-radius:12px;overflow:hidden;background:#0b1220">'
+    +'<table style="width:100%;border-collapse:collapse;font-size:.78rem"><thead><tr>'
+    +'<th style="'+td+';text-align:right;color:#fff;font-size:.95rem;font-weight:950">'+_esc(away)+'</th>'
+    +'<th style="'+td+';text-align:center;color:#94a3b8;font-size:.64rem">'+(l4?'LAST 4 GAMES':'SEASON')+' &middot; '+a.games+' / '+h.games+' GP</th>'
+    +'<th style="'+td+';text-align:left;color:#fff;font-size:.95rem;font-weight:950">'+_esc(home)+'</th></tr></thead><tbody>';
+  rows.forEach(function(x){
+    html+='<tr><td style="'+td+';text-align:right">'+cell(a,x)+'</td><td style="'+td+';text-align:center;color:#94a3b8;font-size:.68rem;font-weight:800">'+x[0]+'</td><td style="'+td+'">'+cell(h,x)+'</td></tr>';
+  });
+  html+='</tbody></table></div>';
+  var sa=d.teams[away],sh=d.teams[home];
+  var f1=_nflFunnelJs(sa,sh,away,home,n),f2=_nflFunnelJs(sh,sa,home,away,n);
+  html+=(f1||f2)?_nflFunnelLine(f1)+_nflFunnelLine(f2)
+    :'<div style="color:#94a3b8;font-size:.72rem;margin-bottom:6px">No pass/run funnel in this matchup (season ranks).</div>';
+  return '<div style="margin-bottom:12px">'+html+'</div>';
+}
 function _nflTeamRanksSortBy(k){
   if(_nflTeamRanksSort.k===k)_nflTeamRanksSort.dir=-_nflTeamRanksSort.dir;else _nflTeamRanksSort={k:k,dir:1};
   _nflTeamRanksRender();
@@ -13230,7 +13494,11 @@ function _nflTeamRanksRender(){
     {k:'offPpg',label:'Pts/g',s:'off',f:'ppg'},
     {k:'defPass',label:'Pass Def allowed/g',s:'def',f:'pass'},{k:'defRush',label:'Rush Def allowed/g',s:'def',f:'rush'},
     {k:'defTotal',label:'Total Def allowed',s:'def',f:'total'},{k:'defPpg',label:'Pts allowed/g',s:'def',f:'ppg'}];
+  var games=Array.isArray(d.weekGames)?d.weekGames:[],pick=null;
+  games.forEach(function(g){if(g.away+'@'+g.home===_nflTeamRanksGame)pick=g;});
+  if(!pick)_nflTeamRanksGame='';
   var rows=Object.keys(d.teams).map(function(t){var base=d.teams[t];var rec=l4?base.l4:base;return rec?{team:t,rec:rec}:null;}).filter(Boolean);
+  if(pick)rows=rows.filter(function(r){return r.team===pick.away||r.team===pick.home;});
   var sk=_nflTeamRanksSort.k,dir=_nflTeamRanksSort.dir,col=cols.filter(function(c){return c.k===sk;})[0]||cols[2];
   function sortVal(r){
     if(col.k==='team')return r.team;
@@ -13242,8 +13510,11 @@ function _nflTeamRanksRender(){
   var th='padding:7px 8px;color:#94a3b8;font-size:.64rem;text-align:left;border-bottom:1px solid #334155;cursor:pointer;white-space:nowrap;position:sticky;top:0;background:#0b1220';
   var html='<div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:10px">'
     +['season','l4'].map(function(m){var on=_nflTeamRanksMode===m;return '<button onclick="_nflTeamRanksSetMode(&#39;'+m+'&#39;)" style="padding:6px 12px;border-radius:8px;border:1px solid '+(on?'#6366f1':'#334155')+';background:'+(on?'#4f46e5':'#111827')+';color:#fff;font-weight:800;font-size:.75rem;cursor:pointer">'+(m==='season'?'Season':'Last 4 games')+'</button>';}).join('')
+    +(games.length?'<select onchange="_nflTeamRanksSetGame(this.value)" style="background:#111827;color:#fff;border:1px solid '+(pick?'#be185d':'#334155')+';border-radius:8px;padding:6px 10px;font-weight:800;font-size:.75rem;cursor:pointer"><option value="">All teams &middot; Week '+_esc(games[0].week)+' games &#9662;</option>'
+      +games.map(function(g){var v=g.away+'@'+g.home;return '<option value="'+_esc(v)+'"'+(v===_nflTeamRanksGame?' selected':'')+'>'+_esc(_nflTeamRanksGameLabel(g))+'</option>';}).join('')+'</select>':'')
     +'<span style="color:#94a3b8;font-size:.72rem">'+_esc(d.basis||'')+' &middot; Offense #1 = most yards/points; Defense #1 = fewest allowed. <span style="color:#4ade80">Green = top 10</span>, <span style="color:#f87171">red = bottom 8</span>. Tap a column to sort.</span></div>';
-  var gp=window.__NFL_GP__||[],fl=[];
+  if(pick)html+=_nflTeamRanksMatchup(d,pick.away,pick.home,l4);
+  var gp=pick?[]:(window.__NFL_GP__||[]),fl=[];
   if(_nflLiveRanksOk())gp.forEach(function(g){_nflGpFunnels(g).forEach(function(f){if(f)fl.push(f);});});
   if(fl.length)html+='<div style="margin-bottom:10px"><div style="font-size:.66rem;color:#f472b6;font-weight:900;letter-spacing:.08em;margin-bottom:4px">TODAY&#39;S FUNNEL MATCHUPS</div>'+fl.map(_nflFunnelLine).join('')+'</div>';
   html+='<div style="overflow:auto;max-height:65vh;border:1px solid #1e293b;border-radius:10px"><table style="width:100%;border-collapse:collapse;font-size:.76rem"><thead><tr>'
@@ -15346,7 +15617,7 @@ function renderNflTrackDay(){
 }
 function _nflRoiFocusSummary(decided,stake){
   var focus=decided.filter(function(r){
-    return !r.observation_only&&r.category!=='80-100% Locks'&&r.category!=='Matchup Funnels'
+    return !r.observation_only&&r.category!=='80-100% Locks'&&String(r.category||'').indexOf('Matchup Funnels')!==0
       &&r.side==='UNDER'&&r.odds!=null&&Number(r.odds)>=-150;
   });
   if(!focus.length) return '';
@@ -15374,7 +15645,7 @@ function _nflRenderRecordBook(decided,stake,label,sumEl,bodyEl,isOverflow,source
       +(isOverflow?'overflow ':'')+'picks for '+label+'.</p>';
     bodyEl.innerHTML='';return;
   }
-  var counted=decided.filter(function(r){return !r.observation_only&&r.category!=='Matchup Funnels';});
+  var counted=decided.filter(function(r){return !r.observation_only&&String(r.category||'').indexOf('Matchup Funnels')!==0;});
   var settled=counted.filter(function(r){return r.result==='WIN'||r.result==='LOSS';});
   var pending=counted.filter(function(r){return r.result==='PENDING';}).length;
   var observations=decided.filter(function(r){return r.observation_only;}).length;
@@ -15450,14 +15721,14 @@ function _nflTrkListHtml(decided,stake){
   if(!decided.length) return '<p style="color:#6b7280;padding:20px;text-align:center">No saved picks yet.</p>';
   var catOrder=['Pass Yds','Pass TDs','Completions','Pass Att','INT Thrown',
     'Rush Yds','RB Total Yds','Rush Att','Rec Yds','Receptions','Anytime TD','Tackles+Ast',
-    'Sacks','Def INT','Kick Pts','FG Made','80-100% Locks','Matchup Funnels'];
+    'Sacks','Def INT','Kick Pts','FG Made','80-100% Locks','Matchup Funnels','Matchup Funnels Overflow'];
   var catColors={'Pass Yds':'#38bdf8','Pass TDs':'#818cf8','Completions':'#60a5fa',
     'Pass Att':'#22d3ee','INT Thrown':'#f87171','Rush Yds':'#34d399',
     'RB Total Yds':'#10b981',
     'Rush Att':'#2dd4bf','Rec Yds':'#a78bfa','Receptions':'#c084fc',
     'Anytime TD':'#fbbf24','Tackles+Ast':'#fb923c','Sacks':'#f97316',
     'Def INT':'#f43f5e','Kick Pts':'#facc15','FG Made':'#fde047',
-    '80-100% Locks':'#facc15','Matchup Funnels':'#f472b6'};
+    '80-100% Locks':'#facc15','Matchup Funnels':'#f472b6','Matchup Funnels Overflow':'#f9a8d4'};
   ['Rec Yds','Receptions'].forEach(function(market){
     var index=catOrder.indexOf(market);
     var positionCategories=['WR','TE','RB','Position Unverified'].map(function(position){
