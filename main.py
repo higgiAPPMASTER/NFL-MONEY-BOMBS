@@ -12487,7 +12487,7 @@ document.addEventListener('keydown',function(e){if(e.key==='Escape')_nflNavGo(nu
     <div class="ncx-tabs" role="tablist">
       <button type="button" class="ncx-tab active" data-ncx-tab="top" onclick="_ncxTab('top')">&#11088; Top Picks <span>6</span></button>
       <button type="button" class="ncx-tab" data-ncx-tab="pos" onclick="_ncxTab('pos')">&#127944; By Position <span>6</span></button>
-      <button type="button" class="ncx-tab" data-ncx-tab="trd" onclick="_ncxTab('trd')">&#128200; Trends &amp; Form <span>6</span></button>
+      <button type="button" class="ncx-tab" data-ncx-tab="trd" onclick="_ncxTab('trd')">&#128293; Hot / Cold &amp; Trends <span>6</span></button>
     </div>
     <div class="nfl-coach-presets ncx-panels">
       <div class="ncx-grid" data-ncx-panel="top">
@@ -12507,12 +12507,12 @@ document.addEventListener('keydown',function(e){if(e.key==='Escape')_nflNavGo(nu
         <button type="button" class="nfl-coach-preset ncx-preset" style="--c:#eab308" onclick="askNflTdCoach()"><b class="ncx-t">TD Scorers · Top 10</b><small>Anytime touchdown predictor</small></button>
       </div>
       <div class="ncx-grid" data-ncx-panel="trd" hidden>
-        <button type="button" class="nfl-coach-preset ncx-preset" style="--c:#22c55e" onclick="askNflMovementCoach('OVER')"><b class="ncx-t">Biggest Over Line Movement</b><small>Lines that jumped since open</small></button>
-        <button type="button" class="nfl-coach-preset ncx-preset" style="--c:#f87171" onclick="askNflMovementCoach('UNDER')"><b class="ncx-t">Biggest Under Line Movement</b><small>Lines that dropped since open</small></button>
-        <button type="button" class="nfl-coach-preset ncx-preset" style="--c:#ec4899" onclick="askNflFunnelCoach()"><b class="ncx-t">&#127919; Matchup Funnels · Top 10</b><small>Pass and run funnel defenses</small></button>
         <button type="button" class="nfl-coach-preset ncx-preset" style="--c:#f97316" onclick="askNflHotColdCoach('HOT')"><b class="ncx-t">&#128293; Hot · Top 10</b><small>Players clearing their line lately</small></button>
         <button type="button" class="nfl-coach-preset ncx-preset" style="--c:#3b82f6" onclick="askNflHotColdCoach('COLD')"><b class="ncx-t">&#10052;&#65039; Cold · Top 10</b><small>Players falling short lately</small></button>
         <button type="button" class="nfl-coach-preset ncx-preset" style="--c:#06b6d4" onclick="askNflHotColdCoach('DOUBLE')"><b class="ncx-t">&#129482; Double Cold · Top 10</b><small>The deepest slumps</small></button>
+        <button type="button" class="nfl-coach-preset ncx-preset" style="--c:#22c55e" onclick="askNflMovementCoach('OVER')"><b class="ncx-t">Biggest Over Line Movement</b><small>Lines that jumped since open</small></button>
+        <button type="button" class="nfl-coach-preset ncx-preset" style="--c:#f87171" onclick="askNflMovementCoach('UNDER')"><b class="ncx-t">Biggest Under Line Movement</b><small>Lines that dropped since open</small></button>
+        <button type="button" class="nfl-coach-preset ncx-preset" style="--c:#ec4899" onclick="askNflFunnelCoach()"><b class="ncx-t">&#127919; Matchup Funnels · Top 10</b><small>Pass and run funnel defenses</small></button>
       </div>
     </div>
     <div class="ncx-bar nfl-coach-filter-box" id="nflCoachFilterBox">
