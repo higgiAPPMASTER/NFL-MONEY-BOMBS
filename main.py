@@ -8893,7 +8893,7 @@ _NFL_COACH_CATS = ("app_hit_rate_100", "safest_bets", "coach_edge", "alt_line_ed
                    "coach_over_movement", "coach_under_movement", "passing",
                    "rushing", "receiving", "defense", "kicking",
                    "td_scorers", "best_unders", "rookie_plays", "matchup_funnels",
-                   "hot_form", "cold_form", "double_cold_form")
+                   "hot_form", "cold_form", "double_cold_form", "game_team_best")
 _NFL_COACH_HC_CATS = {"hot_form": "HOT", "cold_form": "COLD",
                       "double_cold_form": "DOUBLE"}
 _NFL_COACH_CAPTURE_GUARD_SECONDS = 120
@@ -9190,6 +9190,30 @@ def _nfl_coach_hist_select(candidates, category, alternate=False):
             unique.append(row)
         return _nfl_coach_one_per_team_market(unique)[:10]
     candidates = [row for row in candidates if not row.get("hc_only")]
+    if category == "game_team_best":
+        # Best play per game and per team: every team's strongest positive
+        # Coach Edge standard play (the game best is always one of its two
+        # team bests). Coach Edge ranking, one play per player, one per
+        # team/market/side, then one per team; no Top 10 cap.
+        rows = [dict(row) for row in candidates
+                if not row.get("alternate") and row.get("coach_edge", 0) > 0]
+        rows.sort(key=lambda x: (x["coach_edge"], x["model_probability"]),
+                  reverse=True)
+        unique, seen_players = [], set()
+        for row in rows:
+            player_key = str(row.get("player") or "").strip().lower()
+            if not player_key or player_key in seen_players:
+                continue
+            seen_players.add(player_key)
+            unique.append(row)
+        best, seen_teams = [], set()
+        for row in _nfl_coach_one_per_team_market(unique):
+            team = str(row.get("team") or "").strip().upper()
+            if not team or team in seen_teams:
+                continue
+            seen_teams.add(team)
+            best.append(row)
+        return best
     if category == "matchup_funnels":
         # Every funnel-side standard play qualifies, edge or not; ranked by
         # Funnel Score, one play per player, one per team/market/side, Top 10.
@@ -11782,6 +11806,20 @@ tr:last-child td{border-bottom:none}
 .lad-stat .v{font-weight:700}
 .nfl-coach{border:1px solid rgba(56,189,248,.45)!important;background:linear-gradient(145deg,#101827,#0b1220)!important}
 .nfl-coach-presets{display:flex;gap:7px;flex-wrap:wrap;margin:14px 0 10px}
+.ngt-wrap{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:10px;margin:12px 0}
+.ngt-card{background:#0b1220;border:1px solid #263244;border-radius:12px;padding:10px 12px}
+.ngt-head{color:#7dd3fc;font-weight:900;font-size:.8rem;letter-spacing:.04em;margin-bottom:6px;padding-bottom:6px;border-bottom:1px solid #1e293b}
+.ngt-row{display:grid;grid-template-columns:84px 1fr auto auto;gap:8px;align-items:center;padding:6px 0;font-size:.72rem;color:#cbd5e1;border-bottom:1px dashed #1e293b}
+.ngt-row:last-child{border-bottom:0}
+.ngt-tag{font-size:.58rem;font-weight:900;text-transform:uppercase;letter-spacing:.07em;border-radius:6px;padding:3px 6px;text-align:center;background:#111827;color:#94a3b8}
+.ngt-g{background:rgba(234,88,12,.18);color:#fdba74}
+.ngt-link{background:none;border:0;padding:0;color:#f1f5f9;font-weight:900;cursor:pointer;text-decoration:underline dotted;font-size:.74rem}
+.ngt-mk{color:#94a3b8}
+.ngt-same{font-size:.55rem;color:#fdba74;border:1px solid rgba(234,88,12,.45);border-radius:999px;padding:1px 5px}
+.ngt-odds{white-space:nowrap;font-weight:800;color:#e2e8f0}
+.ngt-edge{white-space:nowrap;font-weight:900}
+.ngt-none{grid-column:2/5;color:#64748b;font-style:italic}
+@media(max-width:620px){.ngt-wrap{grid-template-columns:1fr}.ngt-row{grid-template-columns:72px 1fr auto}.ngt-edge{grid-column:2/4;text-align:right}}
 .nfl-coach-preset{background:#111827;color:#cbd5e1;border:1px solid #334155;border-radius:999px;padding:7px 11px;font-size:.69rem;font-weight:900;cursor:pointer}
 .nfl-coach-preset:hover{border-color:#38bdf8;color:#bae6fd}
 .nfl-coach-filter-box{margin:10px 0 12px;padding:11px 12px;border:1px solid rgba(56,189,248,.28);border-radius:10px;background:rgba(7,13,24,.62)}
@@ -12378,6 +12416,7 @@ document.addEventListener('keydown',function(e){if(e.key==='Escape')_nflNavGo(nu
       <button class="nfl-coach-preset" onclick="askNflCoachPreset('Show every play with a 100% App Hit Rate','app_hit_rate_100')" style="border-color:#22c55e;color:#bbf7d0">100% App Hit Rate</button>
       <button class="nfl-coach-preset" onclick="askNflCoachPreset('Show me the safest bets','safest_bets')">Safest bets</button>
       <button class="nfl-coach-preset" onclick="askNflCoachPreset('Show the best positive Coach Edge plays','coach_edge')">Coach Edge</button>
+      <button class="nfl-coach-preset" onclick="askNflGameTeamCoach()" style="border-color:#c2410c;color:#fed7aa">&#127944; Best Play Each Game &amp; Team</button>
        <button class="nfl-coach-preset" onclick="askNflMovementCoach('OVER')" style="border-color:#22c55e;color:#bbf7d0">Biggest Over Line Movement</button>
        <button class="nfl-coach-preset" onclick="askNflMovementCoach('UNDER')" style="border-color:#f87171;color:#fecaca">Biggest Under Line Movement</button>
       <button class="nfl-coach-preset" id="nflAltCoachBtn" onclick="askNflAltCoach()" style="border-color:#f59e0b;color:#fde68a">Best Alt-Line Edge Plays · Top 10</button>
@@ -12873,6 +12912,7 @@ function _nflCoachParlayCandidates(){
     hot_form:_nflHcCoachPick(_nflHcCoachProps('HOT'),null,'parlay'),
     cold_form:_nflHcCoachPick(_nflHcCoachProps('COLD'),null,'parlay'),
     double_cold_form:_nflHcCoachPick(_nflHcCoachProps('DOUBLE'),null,'parlay'),
+    game_team_best:_nflGameTeamBest(allCoach),
     alt_line_edge:((window.__NFL_ALT_PARLAY_DATE__===((document.getElementById('datePicker')||{}).value||window.__NFL_DATE__||''))
       ?(window.__NFL_ALT_PARLAY_CANDIDATES__||[]):[]).filter(function(p){
       return p&&_nflGameFilterOn('parlay',p.team,p.opponent)
@@ -12906,6 +12946,7 @@ var _NFL_PARLAY_COACH_CATS=[
   ,{key:'hot_form',label:'Hot · Top 10'},{key:'cold_form',label:'Cold · Top 10'},{key:'double_cold_form',label:'Double Cold · Top 10'}
   ,{key:'coach_over_movement',label:'Biggest Over Line Movement'}
   ,{key:'coach_under_movement',label:'Biggest Under Line Movement'}
+  ,{key:'game_team_best',label:'Best Play Each Game & Team'}
 ];
 window.__NFL_PARLAY_FILTERS__={normal:{},coach:{}};
 window.__NFL_PARLAY_ODDS_MODE__='all';
@@ -14925,6 +14966,8 @@ function _nflCoachRender(question,rows,total,mode,isAlternate,target){
     ?'Every funnel-side play from the loaded board (pass funnel: QB pass yds Over, WR/TE rec yds Over, RB rush yds Under; run funnel is the reverse), ranked by Funnel Score: 45% app hit %, 20% matchup strength, 15% team role, 20% history vs similar defenses at today&#39;s line. Positive Coach Edge is not required; edge stays visible for context.'
     :mode==='hc'
     ?'Every Hot / Cold / Double Cold play from the loaded board across all categories (genuine sportsbook lines only; at least 80% of the last 5 current-season games on the side and averaging past the line), ranked by form strength. Positive Coach Edge is not required; app probability, implied probability and edge stay visible.'
+    :mode==='game_team'
+    ?'Each game shows its single best play plus each team&#39;s best play, using Coach Edge rules: positive Coach Edge, genuine standard sportsbook lines, one play per player. Full details for every play are listed below the game boxes.'
     :mode==='td_probability'
     ?'I ranked every genuine Anytime TD OVER price from the complete analyzed slate by app touchdown probability and kept the Top 10. Positive Coach Edge is not required; implied probability and Coach Edge remain visible for context.'
     :mode==='safe'
@@ -15030,6 +15073,76 @@ function _nflCoachAutomaticStatus(){
 function _nflCoachTrackedCategory(category){
   var rookie=document.getElementById('nflCoachRookieOnly');
   return rookie&&rookie.checked?'rookie_plays':category;
+}
+function _nflGameTeamAsked(q){
+  q=String(q||'').toLowerCase();
+  return /(each|every) +(nfl +)?(game|team|matchup)/.test(q)
+    ||/(play|plays|pick|picks|bet|bets|prop|props) +(per|by|for) +(each +)?(game|team|matchup)/.test(q);
+}
+// Each team's strongest positive Coach Edge standard play; the game best is
+// always one of its two team bests. Same ranking/dedupe rules as Coach Edge.
+function _nflGameTeamBest(pool){
+  var seen={},teams={};
+  var rows=(pool||[]).filter(function(p){return !p.isAlternate&&!p.alternate&&!p.hcForm&&p.edge>0;})
+    .sort(function(a,b){return b.edge-a.edge||b.appProb-a.appProb;})
+    .filter(function(p){var k=String(p.player||'').trim().toLowerCase();if(!k||seen[k])return false;seen[k]=1;return true;});
+  return _nflCoachOnePerTeamMarket(rows).filter(function(p){
+    var t=String(p.team||'').toUpperCase();if(!t||teams[t])return false;teams[t]=1;return true;
+  });
+}
+function _nflGameTeamJump(i){
+  var cards=document.querySelectorAll('#nflCoachAnswer details.nfl-coach-play'),c=cards[Number(i)];
+  if(!c)return;c.open=true;if(c.scrollIntoView)c.scrollIntoView({behavior:'smooth',block:'center'});
+}
+function askNflGameTeamCoach(question){
+  question=question||'Show the best play for each game and each team';
+  var input=document.getElementById('nflCoachInput');if(input)input.value=question;
+  window.__NFL_COACH_VIEW_SEQ__=(window.__NFL_COACH_VIEW_SEQ__||0)+1;
+  var selectedSides=_nflCoachSelectedSides();
+  var props=_nflCoachVisibleProps(_nflCoachProps());
+  var pool=_nflCoachSafest(props).filter(function(p){
+    return selectedSides.indexOf(String(p.side||'').toUpperCase())>=0&&_nflGameFilterOn('coach',p.team,p.opponent);
+  });
+  var best=_nflGameTeamBest(pool),games={},order=[];
+  best.forEach(function(p){
+    var t=String(p.team||'').toUpperCase(),o=String(p.opponent||'').toUpperCase(),key=[t,o].sort().join('|');
+    if(!games[key]){games[key]={best:p,teams:{},home:'',away:'',start:String(p.game_start||'')};order.push(key);}
+    var g=games[key];g.teams[t]=p;if(!(o in g.teams))g.teams[o]=null;
+    var hr=(p.source||{}).homeRoad;
+    if(hr==='H'){g.home=t;g.away=o;}else if(hr==='R'){g.away=t;g.home=o;}
+  });
+  order.sort(function(a,b){return games[a].start.localeCompare(games[b].start)||a.localeCompare(b);});
+  var rows=[];
+  order.forEach(function(key){
+    var g=games[key];rows.push(g.best);
+    Object.keys(g.teams).forEach(function(t){var p=g.teams[t];if(p&&p!==g.best)rows.push(p);});
+  });
+  _nflCoachRender(question,rows,pool.length,'game_team',false);
+  var el=document.getElementById('nflCoachAnswer');
+  if(el&&rows.length){
+    var line=function(tag,p,cls,same){
+      if(!p)return '<div class="ngt-row"><span class="ngt-tag">'+_esc(tag)+'</span><span class="ngt-none">No positive-edge play</span></div>';
+      var i=rows.indexOf(p);
+      return '<div class="ngt-row"><span class="ngt-tag '+cls+'">'+_esc(tag)+'</span>'
+        +'<span class="ngt-play"><button type="button" class="ngt-link" onclick="_nflGameTeamJump('+i+')">'+(i+1)+'. '+_esc(p.player)+'</button> '
+        +'<span class="ngt-mk">'+_esc(p.market)+'</span> <b style="color:'+(p.side==='OVER'?'#4ade80':'#f87171')+'">'+p.side+' '+p.line+'</b>'
+        +(same?' <span class="ngt-same">game best</span>':'')+'</span>'
+        +'<span class="ngt-odds">'+_nflCoachOdds(p.odds)+'</span>'
+        +'<span class="ngt-edge" style="color:'+(p.edge>=0?'#4ade80':'#f87171')+'">'+_nflCoachSigned(p.edge)+'</span></div>';
+    };
+    var html='<div class="ngt-wrap">'+order.map(function(key){
+      var g=games[key],ts=Object.keys(g.teams);
+      if(g.away&&g.home)ts=[g.away,g.home].filter(function(t){return t in g.teams;}).concat(ts.filter(function(t){return t!==g.away&&t!==g.home;}));
+      var label=g.away&&g.home?g.away+' @ '+g.home:ts.join(' vs ');
+      return '<div class="ngt-card"><div class="ngt-head">'+_esc(label)+'</div>'
+        +line('Game best',g.best,'ngt-g',false)
+        +ts.map(function(t){return line(t+' best',g.teams[t],'ngt-t',g.teams[t]===g.best);}).join('')+'</div>';
+    }).join('')+'</div>';
+    var sum=el.querySelector('.nfl-coach-summary');
+    if(sum)sum.insertAdjacentHTML('afterend',html);
+  }
+  _nflCoachAutomaticStatus();
+  return rows;
 }
 function askNflCoachPreset(q,category){
   var input=document.getElementById('nflCoachInput');if(input)input.value=q;
@@ -15247,6 +15360,7 @@ function askNflCoach(options){
   options=options||{};
   window.__NFL_COACH_VIEW_SEQ__=(window.__NFL_COACH_VIEW_SEQ__||0)+1;
   var input=document.getElementById('nflCoachInput'),question=String(input&&input.value||'').trim();if(!question){if(input)input.focus();return;}
+  if(!options.alternate&&!Array.isArray(options.props)&&_nflGameTeamAsked(question))return askNflGameTeamCoach(question);
   var props=Array.isArray(options.props)?options.props:_nflCoachProps();
   props=_nflCoachVisibleProps(props);
   var exactHundred=/100(?:\\.0)?\\s*%?\\s*(?:app\\s*)?(?:hit\\s*rate|probability)/i.test(question);
@@ -15319,6 +15433,7 @@ var _NFL_COACH_TRACK_LABELS={
    kicking:'Best Kicker Plays',td_scorers:'TD Scorers',best_unders:'Best Unders',
    rookie_plays:'Rookie Plays',matchup_funnels:'Matchup Funnels',
    hot_form:'Hot · Top 10',cold_form:'Cold · Top 10',double_cold_form:'Double Cold · Top 10',
+   game_team_best:'Best Play Each Game & Team',
    coach_over_movement:'Biggest Over Line Movement',coach_under_movement:'Biggest Under Line Movement'
 };
 function _nflCoachTrackLabel(category){return _NFL_COACH_TRACK_LABELS[category]||String(category||'Coach').replace(/_/g,' ');}
