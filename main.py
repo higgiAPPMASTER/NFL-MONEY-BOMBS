@@ -14248,38 +14248,50 @@ function _nflHcSet(kind,val){
 function _nflHcCard(r,i){
   var hot=r.hcForm==='HOT',dbl=r.hcForm==='DOUBLE';
   var col=hot?'#fb923c':(dbl?'#22d3ee':'#60a5fa');
+  var rgb=hot?'251,146,60':(dbl?'34,211,238':'96,165,250');
   var tag=hot?'&#128293; HOT':(dbl?'&#129482; DOUBLE COLD':'&#10052;&#65039; COLD');
   var odds=_nflSideOdds(r,r.pick),book=_nflSideBook(r,r.pick);
   var sideWord=r.pick==='OVER'?'Over':'Under';
-  var logo='https://a.espncdn.com/i/teamlogos/nfl/500/'+_logoAbbr(r.opponent)+'.png';
+  var logo='https://a.espncdn.com/i/teamlogos/nfl/500/'+_logoAbbr(r.team)+'.png';
   var chips=(r.hcGames||[]).map(function(g){
     var v=Number(g.v),line=Number(r.realLine);
     var res=v===line?'push':((r.pick==='OVER')===(v>line)?'hit':'miss');
     var bg=res==='hit'?'rgba(74,222,128,.16)':(res==='miss'?'rgba(248,113,113,.16)':'rgba(148,163,184,.16)');
     var fc=res==='hit'?'#4ade80':(res==='miss'?'#f87171':'#cbd5e1');
-    return '<span title="'+_esc(g.d+' vs '+g.opp)+'" style="display:inline-flex;flex-direction:column;align-items:center;min-width:42px;padding:3px 5px;border-radius:7px;background:'+bg+';color:'+fc+';font-size:.66rem;font-weight:800">'+_esc(String(g.v))+'<small style="color:#94a3b8;font-weight:700">'+_esc(g.d)+' '+_esc(g.opp)+'</small></span>';
+    return '<span title="'+_esc(g.d+' vs '+g.opp)+'" style="display:inline-flex;flex-direction:column;align-items:center;min-width:40px;padding:3px 4px;border-radius:7px;background:'+bg+';color:'+fc+';font-size:.66rem;font-weight:800">'+_esc(String(g.v))+'<small style="color:#94a3b8;font-weight:700;font-size:.54rem">'+_esc(g.d)+' '+_esc(g.opp)+'</small></span>';
   }).join('');
-  var opp=r.hcOppTotal?r.hcOppHits+'/'+r.hcOppTotal+' '+sideWord+(r.hcOppRate!=null?' ('+Math.round(r.hcOppRate)+'%)':''):'No meetings';
-  var prob=r.score!=null?Number(r.score).toFixed(1)+'%':'Unavailable';
-  var edge=r.edge!=null?(Number(r.edge)>0?'+':'')+Number(r.edge).toFixed(1)+' pts':'Unavailable';
-  var row=function(k,v){return '<div style="display:flex;justify-content:space-between;gap:10px;padding:4px 0;border-top:1px solid #1f2937;font-size:.72rem"><span style="color:#94a3b8">'+k+'</span><b style="color:#e5e7eb;text-align:right">'+v+'</b></div>';};
+  var li=[];
+  li.push((hot?'&#128293; ':'&#10052;&#65039; ')+sideWord+' in <b>'+r.hcHits+' of last '+r.hcTotal+'</b> games this season &middot; avg <b>'+_esc(String(r.hcAvg))+'</b>'+(Number(r.hcPushes)?' &middot; '+r.hcPushes+' push':''));
+  li.push('&#127386; vs '+_esc(r.opponent)+': '+(r.hcOppTotal?'<b>'+r.hcOppHits+'/'+r.hcOppTotal+' '+sideWord+'</b>'+(r.hcOppRate!=null?' ('+Math.round(r.hcOppRate)+'%)':'')+(r.hcOppTotal<3?' <span style="color:#fbbf24">small sample</span>':''):'no recent meetings'));
+  if(r.hcSupport)li.push('&#128737;&#65039; Matchup supports: <b>'+_esc(r.hcSupport)+'</b>');
+  var why='<div class="nfw-box" style="background:rgba('+rgb+',.07);border-color:rgba('+rgb+',.35)">'
+    +'<div class="nfw-head" style="color:'+col+'"><span>Why '+_esc(r.pick)+' '+_esc(String(r.realLine))+'</span><span class="nfw-score" style="color:'+col+'">'+tag+'</span></div>'
+    +'<ul class="nfw-list">'+li.map(function(x){return '<li style="border-top-color:rgba('+rgb+',.15)">'+x+'</li>';}).join('')+'</ul>'
+    +(chips?'<div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:6px">'+chips+'</div>':'')+'</div>';
+  var prob=r.score!=null?Number(r.score).toFixed(1)+'%':'—';
+  var edgeTxt=r.edge!=null?(Number(r.edge)>0?'+':'')+Number(r.edge).toFixed(1)+' pts':'—';
+  var edgeCls=r.edge!=null&&Number(r.edge)>0?'green':'red';
   var pos=String(r.position||'').toUpperCase();
-  return '<article style="background:#0f141c;border:1px solid '+col+'55;border-radius:14px;padding:12px;display:flex;flex-direction:column;gap:6px">'
-    +'<div style="display:flex;align-items:center;gap:10px"><div style="position:relative;width:46px;height:46px;border-radius:50%;background:#1f2937;overflow:hidden;flex-shrink:0;display:flex;align-items:center;justify-content:center;color:#94a3b8;font-weight:900;font-size:.8rem">'+_esc(_initials(r.name))
-    +(r.head?'<img src="'+_esc(r.head)+'" alt="" style="position:absolute;inset:0;width:100%;height:100%;object-fit:cover" onerror="this.style.display=&quot;none&quot;"/>':'')+'</div>'
-    +'<div style="min-width:0;flex:1"><div style="font-weight:900;color:#fff;font-size:.9rem">'+(i!=null?i+'. ':'')+_esc(r.name)+'</div>'
-    +'<div style="font-size:.68rem;color:#94a3b8;display:flex;align-items:center;gap:5px;flex-wrap:wrap">'+(pos?'<b style="color:#cbd5e1">'+_esc(pos)+'</b>':'')+_esc(r.team)+' '+(r.homeRoad==='H'?'vs':'at')+' <img src="'+_esc(logo)+'" alt="" style="width:16px;height:16px" onerror="this.style.display=&quot;none&quot;"/>'+_esc(r.opponent)+'</div></div>'
-    +'<span style="font-size:.62rem;font-weight:900;color:'+col+';border:1px solid '+col+';border-radius:999px;padding:2px 7px;white-space:nowrap">'+tag+'</span></div>'
-    +(r.hcSupport?'<div style="font-size:.66rem;font-weight:800;color:#67e8f9">Matchup supports: '+_esc(r.hcSupport)+'</div>':'')
-    +'<div style="font-size:.8rem;font-weight:900;color:'+(r.pick==='OVER'?'#4ade80':'#f87171')+'">'+_esc(r.mkt||r.label||'')+' &middot; '+r.pick+' '+_esc(String(r.realLine))+'</div>'
-    +'<div style="display:flex;gap:4px;flex-wrap:wrap">'+chips+'</div>'
-    +row('Last '+r.hcTotal+' this season (any venue)',r.hcHits+'/'+r.hcTotal+' '+sideWord+' &middot; avg '+_esc(String(r.hcAvg))+(Number(r.hcPushes)?' &middot; '+r.hcPushes+' push':''))
-    +row('Vs '+_esc(r.opponent)+' (last 5 meetings)',opp+(r.hcOppTotal&&r.hcOppTotal<3?' <span style="color:#fbbf24">small sample</span>':''))
-    +row(r.pick+' odds',odds!=null?_esc(String(odds))+' &middot; '+_esc(book||'Book unavailable'):'Odds unavailable')
-    +row('App estimate',prob)
-    +row('Edge','<span style="color:'+(r.edge!=null&&r.edge>0?'#4ade80':'#f87171')+'">'+edge+'</span>')
-    +'<div style="display:flex;justify-content:flex-end;margin-top:4px">'+_nflBetBtn(r,r.pick)+'</div>'
-    +'</article>';
+  var ha=r.homeRoad==='H',hasHA=r.homeRoad==='H'||r.homeRoad==='R';
+  var lineHtml='<span class="ln">'+_esc(String(r.realLine))+'</span> <span class="od">'+(odds!=null?_esc(String(odds))+' &middot; '+_esc(book||'Book unavailable'):'Odds unavailable')+'</span>';
+  return '<div class="pick-card '+_accFor(r.mkt)+'" style="border-color:rgba('+rgb+',.4)">'
+    +'<div class="pc-rank">'+(i!=null?i:'')+'</div>'
+    +'<div class="pc-top"><div class="hs-wrap"><span class="hs-ini">'+_esc(_initials(r.name))+'</span>'
+    +(r.head?'<img class="hs-img" src="'+_esc(r.head)+'" onerror="this.style.display=&#39;none&#39;"/>':'')
+    +'<img class="pc-logo" src="'+_esc(logo)+'" onerror="this.style.display=&#39;none&#39;"/></div>'
+    +'<div class="pc-id"><div class="pc-name">'+_esc(r.name)+'</div>'
+    +'<div class="pc-meta">'+(pos?'<span class="pc-pos">'+_esc(pos)+'</span>':'')+_esc(r.team)+' vs '+_esc(r.opponent)+' '+(hasHA?'<span class="'+(ha?'home':'away')+'">'+(ha?'HOME':'AWAY')+'</span>':'')+'</div>'
+    +'<div class="pc-mkt">'+_esc(r.mkt||r.label||'')+' &middot; '+_esc(r.pick)+'</div></div></div>'
+    +why
+    +'<div class="pc-line-row"><span>'+lineHtml+'</span><span class="od">Odds / Book</span></div>'
+    +'<div class="pc-stats">'
+    +'<div class="pc-stat"><div class="k">Last '+r.hcTotal+' &middot; '+sideWord+'</div><div class="v" style="color:'+col+'">'+r.hcHits+'/'+r.hcTotal+'</div></div>'
+    +'<div class="pc-stat"><div class="k">Last '+r.hcTotal+' avg</div><div class="v gold">'+_esc(String(r.hcAvg))+'</div></div>'
+    +'<div class="pc-stat"><div class="k">App estimate</div><div class="v">'+prob+'</div></div>'
+    +'<div class="pc-stat"><div class="k">Edge</div><div class="v" style="color:'+(edgeCls==='green'?'#4ade80':'#f87171')+'">'+edgeTxt+'</div></div>'
+    +'</div>'
+    +'<div class="pc-foot"><span class="pc-score">'+prob+'</span><span style="display:flex;gap:6px">'+_nflBetBtn(r,r.pick)+'</span></div>'
+    +'</div>';
 }
 function _nflHotColdBoard(){
   var all=window.__NFL_HOT_COLD__;
@@ -14299,14 +14311,18 @@ function _nflHotColdBoard(){
   var sel='<select onchange="_nflHcSet(&#39;m&#39;,this.value)" style="background:#111827;color:#e5e7eb;border:1px solid #374151;border-radius:8px;padding:5px 8px;font-size:.74rem;font-weight:700">'
     +'<option value=""'+(_nflHcMarket===''?' selected':'')+'>All categories</option>'
     +markets.map(function(m){return '<option value="'+_esc(m)+'"'+(_nflHcMarket===m?' selected':'')+'>'+_esc(m)+' ('+(counts[m]||0)+')</option>';}).join('')+'</select>';
-  var h='<div style="padding:10px 0 4px;color:#94a3b8;font-size:.74rem;line-height:1.45">Every prop category with a genuine sportsbook line. Recent form = the true last 5 current-season games (all venues, before this game; minimum '+(rows.length&&rows[0].hcTotal<3?'2':'3')+'). <b style="color:#fb923c">Hot</b>: at least 80% Over (2/2, 3/3, 4/4 or 4/5) and averaging over the line. <b style="color:#60a5fa">Cold</b>: the same for the Under. <b style="color:#22d3ee">Double Cold</b>: Cold plus matchup support (70%+ Under in 2+ meetings with this opponent, or a top-10 pass/run defense for that market); Double Cold also appears in Cold. Top 10 per category; ranks 11&#8211;20 are Overflow. History is not a prediction; pushes are not wins. Anytime TD is excluded.</div>'
+  var h='<ul class="nfw-intro" style="background:rgba(251,146,60,.06);border-color:rgba(251,146,60,.28)">'
+    +'<li>&#128293; <b style="color:#fb923c">Hot</b>: went Over in 80%+ of the last 5 games this season (min '+(rows.length&&rows[0].hcTotal<3?'2':'3')+') and averages over the line</li>'
+    +'<li>&#10052;&#65039; <b style="color:#60a5fa">Cold</b>: the same for the Under</li>'
+    +'<li>&#129482; <b style="color:#22d3ee">Double Cold</b>: Cold plus matchup support (70%+ Under in 2+ meetings, or a top-10 pass/run D); also shows in Cold</li>'
+    +'<li>&#9989; Genuine sportsbook lines only &middot; Top 10 per category, ranks 11&#8211;20 are Overflow &middot; pushes are not wins &middot; Anytime TD excluded</li></ul>'
     +'<div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:8px 0">'
     +'<span style="font-size:.7rem;color:#94a3b8;font-weight:800">Form</span>'+btn('f','HOT','&#128293; Hot',_nflHcForm)+btn('f','COLD','&#10052;&#65039; Cold',_nflHcForm)+btn('f','DOUBLE','&#129482; Double Cold',_nflHcForm)
     +'<span style="font-size:.7rem;color:#94a3b8;font-weight:800;margin-left:6px">Category</span>'+sel
     +'<span style="font-size:.7rem;color:#94a3b8;font-weight:800;margin-left:6px">View</span>'+btn('e','ALL','All qualifying',_nflHcEdge)+btn('e','POS','Positive Edge Only',_nflHcEdge)
     +'</div>';
   var list=(_nflHcMarket?[_nflHcMarket]:markets);
-  var any=false,grid='display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:10px';
+  var any=false;
   list.forEach(function(m){
     var picked=rows.filter(function(r){return r.hcForm===_nflHcForm&&(r.mkt||r.label)===m;});
     if(_nflHcEdge==='POS')picked=picked.filter(function(r){return r.edge!=null&&Number(r.edge)>0;});
@@ -14315,8 +14331,8 @@ function _nflHotColdBoard(){
     any=true;
     var top=picked.filter(function(r){return (r.hcRank||99)<=10;}),ovf=picked.filter(function(r){return (r.hcRank||99)>10;});
     h+='<div style="font-size:.74rem;font-weight:900;color:#fb923c;letter-spacing:.06em;margin:14px 0 6px">'+_esc((_NFL_HC_FORM_LBL[_nflHcForm]||'')+' '+m).toUpperCase()+' &middot; TOP 10 ('+top.length+')</div>';
-    h+=top.length?'<div style="'+grid+'">'+top.map(function(r){return _nflHcCard(r,r.hcRank);}).join('')+'</div>':'<div style="color:#64748b;font-size:.72rem">No Top 10 plays in this view.</div>';
-    if(ovf.length)h+='<details style="margin:10px 0"><summary style="cursor:pointer;color:#fdba74;font-weight:800;font-size:.74rem">Overflow &middot; ranks 11&#8211;20 ('+ovf.length+')</summary><div style="'+grid+';margin-top:10px">'+ovf.map(function(r){return _nflHcCard(r,r.hcRank);}).join('')+'</div></details>';
+    h+=top.length?'<div class="picks-grid">'+top.map(function(r){return _nflHcCard(r,r.hcRank);}).join('')+'</div>':'<div style="color:#64748b;font-size:.72rem">No Top 10 plays in this view.</div>';
+    if(ovf.length)h+='<details style="margin:10px 0"><summary style="cursor:pointer;color:#fdba74;font-weight:800;font-size:.74rem">Overflow &middot; ranks 11&#8211;20 ('+ovf.length+')</summary><div class="picks-grid" style="margin-top:10px">'+ovf.map(function(r){return _nflHcCard(r,r.hcRank);}).join('')+'</div></details>';
   });
   if(!any)h+='<div class="no-picks" style="padding:20px">No '+(_NFL_HC_FORM_LBL[_nflHcForm]||'')+' plays'+(_nflHcEdge==='POS'?' with positive edge':'')+' on this slate'+(_nflHcMarket?' for '+_esc(_nflHcMarket):'')+'.</div>';
   return h;
