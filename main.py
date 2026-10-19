@@ -11806,6 +11806,16 @@ tr:last-child td{border-bottom:none}
 .lad-stat .v{font-weight:700}
 .nfl-coach{border:1px solid rgba(56,189,248,.45)!important;background:linear-gradient(145deg,#101827,#0b1220)!important}
 .nfl-coach-presets{display:flex;gap:7px;flex-wrap:wrap;margin:14px 0 10px}
+.nfw-intro{list-style:none;margin:10px 0 4px;padding:10px 12px;background:rgba(244,114,182,.06);border:1px solid rgba(244,114,182,.25);border-radius:10px;color:#cbd5e1;font-size:.74rem;line-height:1.5}
+.nfw-intro li{margin:2px 0}
+.nfw-box{margin:8px 0 4px;padding:8px 10px;border-radius:9px;background:rgba(244,114,182,.07);border:1px solid rgba(244,114,182,.3)}
+.nfw-head{display:flex;justify-content:space-between;align-items:center;gap:8px;color:#f472b6;font-size:.64rem;font-weight:900;letter-spacing:.07em;text-transform:uppercase;margin-bottom:4px}
+.nfw-score{color:#f9a8d4;font-size:.6rem;letter-spacing:.03em;text-transform:none}
+.nfw-list{list-style:none;margin:0;padding:0}
+.nfw-list li{color:#e2e8f0;font-size:.68rem;line-height:1.4;padding:3px 0;border-top:1px dashed rgba(244,114,182,.15)}
+.nfw-list li:first-child{border-top:0}
+.nfw-list b{color:#fff}
+.nfw-strong{background:#f472b6;color:#1f0a14;border-radius:4px;padding:0 4px;font-size:.56rem;font-weight:900}
 .ncx-head{display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:14px;align-items:center}
 .ncx-badge{width:48px;height:48px;border-radius:14px;display:grid;place-items:center;font-size:1.5rem;background:radial-gradient(circle at 30% 25%,rgba(56,189,248,.35),rgba(124,58,237,.25));border:1px solid rgba(125,211,252,.4);box-shadow:0 0 22px rgba(56,189,248,.18)}
 .ncx-kicker{color:#38bdf8;font-size:.62rem;font-weight:900;letter-spacing:.12em;text-transform:uppercase}
@@ -13659,6 +13669,28 @@ function _nflOffenseContextHtml(p){
     +card('Entire offense total yards','contextOffenseYards','team passing + rushing yards; no receiving double-count')
     +'</div></div>';
 }
+function _nflFunnelWhy(p,riskStatus){
+  var f=p.funnel||{},fd=p.funnelDetail||null,pass=f.type==='PASS';
+  var side=String(p.pick||'').toUpperCase(),line=p.dispLine!=null?p.dispLine:(fd&&fd.line);
+  var opp=_esc(f.defense||p.opponent||'Opponent'),off=_esc(f.offense||p.team||'');
+  var li=[];
+  li.push('&#127919; '+opp+' is <b>#'+f.defPassRank+' vs pass</b> but <b>#'+f.defRushRank+' vs run</b> &rarr; '+off+' should <b>'+(pass?'throw':'run')+'</b>'+(f.strength==='STRONG'?' <span class="nfw-strong">STRONG</span>':''));
+  if(p.defRank!=null){
+    var lbl=String(p.defLbl||''),mid=lbl.indexOf(' · '),tail=' allowed/game',txt;
+    if(lbl.indexOf('vs ')===0&&mid>0&&lbl.slice(-tail.length)===tail){
+      var pos=lbl.slice(3,mid),stat=lbl.slice(mid+3,lbl.length-tail.length);
+      txt=opp+' allows '+(p.defAllowed!=null?'<b>'+_esc(p.defAllowed)+'</b> ':'')+_esc(stat)+'/game to '+_esc(pos)+'s (#'+p.defRank+')';
+    }else txt=opp+' '+_esc(lbl||'defense')+' ranks #'+p.defRank+(p.defAllowed!=null?' · '+_esc(p.defAllowed)+' allowed':'');
+    if(p.defAdj)txt+=' &rarr; '+(p.defAdj>0?'+':'')+p.defAdj+'% projection';
+    li.push('&#128737;&#65039; '+txt);
+  }
+  if(p.role)li.push('&#128100; '+_esc(p.role)+(p.teamOptionRank!=null?' · '+off+'&#39;s #'+p.teamOptionRank+' receiving option':''));
+  if(fd&&fd.games)li.push('&#128200; '+(side==='UNDER'?'Under':'Over')+' '+_esc(fd.line!=null?fd.line:line)+' in <b>'+fd.hits+' of '+fd.games+'</b> games '+_esc(fd.label)+' (last 2 seasons)');
+  if(riskStatus==='WATCH'||riskStatus==='AVOID')li.push('<span style="color:'+(riskStatus==='AVOID'?'#fca5a5':'#fde68a')+'">&#9888;&#65039; Role '+riskStatus.toLowerCase()+': '+_esc((p.roleRiskReasons||[])[0]||'review expected usage')+'</span>');
+  return '<div class="nfw-box"><div class="nfw-head"><span>Why '+_esc(side)+' '+_esc(line!=null?line:'')+'</span>'
+    +(p.funnelScore!=null?'<span class="nfw-score">Funnel score '+Number(p.funnelScore).toFixed(1)+'</span>':'')+'</div>'
+    +'<ul class="nfw-list">'+li.map(function(x){return '<li>'+x+'</li>';}).join('')+'</ul></div>';
+}
 function nflCard(p,i){
   var key=_ladKey(p); window.__NFLLAD__[key]=p;
   var ha=p.homeRoad==='H';
@@ -13692,6 +13724,11 @@ function nflCard(p,i){
   var riskChip=(riskStatus==='WATCH'||riskStatus==='AVOID')
     ?'<div style="margin-top:5px;padding:5px 7px;border-radius:6px;border:1px solid '+(riskStatus==='AVOID'?'rgba(248,113,113,.55)':'rgba(251,191,36,.5)')+';background:'+(riskStatus==='AVOID'?'rgba(127,29,29,.18)':'rgba(120,80,0,.15)')+';color:'+(riskStatus==='AVOID'?'#fca5a5':'#fde68a')+';font-size:.62rem;font-weight:900">ROLE '+riskStatus+' · '+_esc((p.roleRiskReasons||[])[0]||'Review expected usage')+'</div>'
     :'';
+  var whyBox='';
+  if(window.__NFL_FUNNEL_WHY__&&p.funnelMatch&&p.funnel){
+    whyBox=_nflFunnelWhy(p,riskStatus);
+    roleChip='';riskChip='';defChip='';funnelChip='';
+  }
   return `
    <div class="pick-card ${_accFor(p.mkt)}">
      <div class="pc-rank">${i}</div>
@@ -13709,6 +13746,7 @@ function nflCard(p,i){
          ${defChip}${funnelChip}
        </div>
      </div>
+     ${whyBox}
      <div class="pc-tagrow">${fmtTag(p.tag)}</div>
       <div class="pc-line-row"><span>${lineHtml}</span><span class="od">Odds / Book</span></div>
       ${p.lineMovementAvailable&&p.openingLine!=null?`<div style="font-size:.68rem;color:#fbbf24;margin-top:5px;font-weight:800">Opening ${p.openingLine} → Current ${p.currentLine} (${Number(p.lineMove)>=0?'+':''}${Number(p.lineMove).toFixed(2)} pts)</div>`:''}
@@ -14183,9 +14221,18 @@ function _nflFunnelBoard(picks){
   }).slice(0,20);
   if(!rows.length)return '<div class="no-picks" style="padding:24px">'+(tagged?'No funnel-side plays on this slate.':'This board was created before Matchup Funnels existed. Run the slate again to tag funnel plays.')+'</div>';
   var top=rows.slice(0,10),ovf=rows.slice(10);
-  var html='<div style="padding:10px 0 4px;color:#94a3b8;font-size:.76rem;line-height:1.45">Pass funnel: the defense ranks bottom 8 vs the pass and top 12 vs the run &rarr; QB pass yds Over, WR/TE rec yds Over, RB rush yds Under. Run funnel is the reverse. STRONG = defense bottom 5 in that phase and offense top 10. Ranked by <b style="color:#f472b6">Funnel Score</b>: 45% app hit %, 20% matchup strength, 15% team role (WR1/RB1 first on Overs), 20% the player&#39;s history vs similar defenses at today&#39;s line. Same app lines, one play per player. Top 10 and Overflow (11&#8211;20) each have their own record, not counted in Track Record totals.</div>'
-    +'<div style="font-size:.7rem;font-weight:900;color:#f472b6;letter-spacing:.08em;margin:10px 0 4px">TOP 10</div>'+nflCardGrid(top,1);
-  if(ovf.length)html+='<div style="font-size:.7rem;font-weight:900;color:#f9a8d4;letter-spacing:.08em;margin:16px 0 4px">OVERFLOW &middot; RANKS 11&#8211;20</div>'+nflCardGrid(ovf,11);
+  var html='<ul class="nfw-intro">'
+    +'<li>&#127919; <b>Pass funnel</b>: defense is weak vs the pass (bottom 8) but strong vs the run (top 12) &rarr; QB pass yds Over, WR/TE rec yds Over, RB rush yds Under</li>'
+    +'<li>&#127939; <b>Run funnel</b>: the reverse</li>'
+    +'<li>&#128170; <b>STRONG</b>: defense bottom 5 in that phase and offense top 10</li>'
+    +'<li>&#128202; Ranked by <b style="color:#f472b6">Funnel Score</b>: 45% app hit %, 20% matchup, 15% team role, 20% history vs similar defenses at today&#39;s line</li>'
+    +'<li>&#9989; Same app lines, one play per player. Top 10 and Overflow (11&#8211;20) have their own records, not in Track Record totals</li></ul>'
+    +'<div style="font-size:.7rem;font-weight:900;color:#f472b6;letter-spacing:.08em;margin:10px 0 4px">TOP 10</div>';
+  window.__NFL_FUNNEL_WHY__=true;
+  try{
+    html+=nflCardGrid(top,1);
+    if(ovf.length)html+='<div style="font-size:.7rem;font-weight:900;color:#f9a8d4;letter-spacing:.08em;margin:16px 0 4px">OVERFLOW &middot; RANKS 11&#8211;20</div>'+nflCardGrid(ovf,11);
+  }finally{window.__NFL_FUNNEL_WHY__=false;}
   return html;
 }
 var _nflHcForm='HOT',_nflHcMarket='',_nflHcEdge='ALL';
