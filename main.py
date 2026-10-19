@@ -11806,6 +11806,65 @@ tr:last-child td{border-bottom:none}
 .lad-stat .v{font-weight:700}
 .nfl-coach{border:1px solid rgba(56,189,248,.45)!important;background:linear-gradient(145deg,#101827,#0b1220)!important}
 .nfl-coach-presets{display:flex;gap:7px;flex-wrap:wrap;margin:14px 0 10px}
+.ncx-head{display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:14px;align-items:center}
+.ncx-badge{width:48px;height:48px;border-radius:14px;display:grid;place-items:center;font-size:1.5rem;background:radial-gradient(circle at 30% 25%,rgba(56,189,248,.35),rgba(124,58,237,.25));border:1px solid rgba(125,211,252,.4);box-shadow:0 0 22px rgba(56,189,248,.18)}
+.ncx-kicker{color:#38bdf8;font-size:.62rem;font-weight:900;letter-spacing:.12em;text-transform:uppercase}
+.ncx-title{font-family:'Playfair Display',serif;color:#fff;font-size:1.5rem;margin:2px 0 0;line-height:1.15}
+.ncx-sub{color:#94a3b8;font-size:.74rem;margin-top:3px}
+.ncx-parlay{background:linear-gradient(135deg,#0369a1,#7c3aed);color:#fff;border:1px solid rgba(125,211,252,.5);border-radius:10px;padding:10px 14px;font-size:.74rem;font-weight:900;cursor:pointer;white-space:nowrap;box-shadow:0 6px 18px rgba(124,58,237,.25)}
+.ncx-parlay:hover{filter:brightness(1.12)}
+.ncx-tabs{display:flex;gap:4px;margin:18px 0 0;padding:4px;background:#0a101c;border:1px solid #1e293b;border-radius:12px}
+.ncx-tab{flex:1;background:transparent;border:0;border-radius:9px;color:#94a3b8;font-size:.74rem;font-weight:900;padding:9px 8px;cursor:pointer;white-space:nowrap}
+.ncx-tab span{display:inline-block;margin-left:4px;background:#1e293b;color:#cbd5e1;border-radius:999px;padding:1px 7px;font-size:.6rem}
+.ncx-tab:hover{color:#e2e8f0}
+.ncx-tab.active{background:linear-gradient(135deg,rgba(56,189,248,.2),rgba(124,58,237,.18));color:#fff;box-shadow:inset 0 0 0 1px rgba(125,211,252,.35)}
+.ncx-tab.active span{background:#38bdf8;color:#0b1220}
+.nfl-coach-presets.ncx-panels{display:block;margin:10px 0 12px}
+.ncx-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}
+.ncx-grid[hidden]{display:none}
+.nfl-coach-preset.ncx-preset{position:relative;text-align:left;border-radius:12px;padding:11px 12px 11px 15px;background:linear-gradient(135deg,#0f1726,#0b111d);border:1px solid #1f2b3d;color:#e2e8f0;overflow:hidden;transition:transform .12s ease,border-color .12s ease,box-shadow .12s ease}
+.ncx-preset:before{content:"";position:absolute;left:0;top:0;bottom:0;width:4px;background:var(--c)}
+.ncx-preset b{display:block;font-size:.76rem;font-weight:900;color:#f8fafc}
+.ncx-preset small{display:block;font-size:.64rem;font-weight:600;color:#8b9ab0;margin-top:3px}
+.nfl-coach-preset.ncx-preset:hover{transform:translateY(-1px);border-color:var(--c);box-shadow:0 6px 16px rgba(0,0,0,.35)}
+.nfl-coach-preset.ncx-preset.active{border-color:var(--c);background:linear-gradient(135deg,rgba(56,189,248,.1),#0b111d);box-shadow:0 0 0 1px var(--c) inset}
+.ncx-preset:disabled{opacity:.6;cursor:wait}
+.ncx-bar.nfl-coach-filter-box{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:0 0 10px;padding:8px;border:1px solid #1e293b;border-radius:12px;background:#0a101c}
+.ncx-seg{display:inline-flex;gap:4px;padding:3px;background:#0f1726;border:1px solid #1e293b;border-radius:10px}
+.ncx-pill{position:relative;cursor:pointer}
+.ncx-pill input{position:absolute;opacity:0;pointer-events:none}
+.ncx-pill span{display:inline-block;padding:6px 11px;border-radius:8px;font-size:.66rem;font-weight:900;letter-spacing:.05em;color:#64748b;border:1px solid transparent}
+.ncx-pill.over input:checked+span{background:rgba(34,197,94,.16);color:#86efac;border-color:rgba(34,197,94,.5)}
+.ncx-pill.under input:checked+span{background:rgba(248,113,113,.16);color:#fca5a5;border-color:rgba(248,113,113,.5)}
+.ncx-pill.rookie input:checked+span{background:rgba(167,139,250,.18);color:#ddd6fe;border-color:rgba(167,139,250,.55)}
+.ncx-pill input:focus-visible+span{outline:2px solid #38bdf8;outline-offset:1px}
+.ncx-pop{position:relative}
+.ncx-pop>summary{list-style:none;display:flex;align-items:center;gap:7px;cursor:pointer;background:#0f1726;border:1px solid #1e293b;border-radius:10px;padding:7px 11px;white-space:nowrap}
+.ncx-pop>summary::-webkit-details-marker{display:none}
+.ncx-pop>summary:after{content:"▾";color:#60a5fa;font-size:.7rem}
+.ncx-pop[open]>summary{border-color:#38bdf8}
+.ncx-pop-k{color:#64748b;font-size:.6rem;font-weight:900;letter-spacing:.08em;text-transform:uppercase}
+.ncx-pop-v{color:#e2e8f0;font-size:.7rem;font-weight:800;max-width:180px;overflow:hidden;text-overflow:ellipsis}
+.ncx-pop-v.warn{color:#fca5a5}
+.ncx-pop-panel{position:absolute;left:0;top:calc(100% + 6px);z-index:60;width:min(420px,88vw);background:#0b1220;border:1px solid #334155;border-radius:12px;padding:12px;box-shadow:0 16px 40px rgba(0,0,0,.55)}
+.ncx-pop-panel.ncx-pop-wide{width:min(640px,90vw)}
+.ncx-pop-row{display:flex;align-items:center;gap:7px;flex-wrap:wrap;margin-bottom:9px}
+.ncx-pop-label{color:#64748b;font-size:.6rem;font-weight:900;letter-spacing:.08em;text-transform:uppercase}
+.ncx-pop-panel .nfl-coach-market-list{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:6px}
+.ncx-gen{margin-left:auto;background:linear-gradient(135deg,#0284c7,#0369a1);color:#fff;border:1px solid #38bdf8;border-radius:10px;padding:8px 13px;font-size:.7rem;font-weight:900;cursor:pointer;white-space:nowrap}
+.ncx-gen:hover{filter:brightness(1.12)}
+.ncx-ask{display:flex;align-items:center;gap:8px;background:#0a101c;border:1px solid #1e293b;border-radius:12px;padding:6px 6px 6px 12px}
+.ncx-ask:focus-within{border-color:#38bdf8;box-shadow:0 0 0 3px rgba(56,189,248,.12)}
+.ncx-ask-ico{font-size:1rem;opacity:.8}
+.ncx-ask .nfl-coach-send{align-self:stretch;padding:10px 20px;font-size:.8rem;background:linear-gradient(135deg,#0284c7,#7c3aed)}
+.ncx-ask .nfl-coach-input{flex:1;min-width:0;background:transparent!important;border:0!important;box-shadow:none!important;outline:none}
+.ncx-how{margin-top:8px;color:#64748b;font-size:.65rem;line-height:1.45}
+.ncx-how>summary{cursor:pointer;color:#7c8aa0;font-weight:800;list-style:none;display:inline-block}
+.ncx-how>summary::-webkit-details-marker{display:none}
+.ncx-how>div{margin-top:6px}
+@media(max-width:760px){.ncx-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:620px){.ncx-head{grid-template-columns:auto minmax(0,1fr)}.ncx-parlay{grid-column:1/-1;width:100%}.ncx-tab{font-size:.66rem;padding:8px 4px}.ncx-tab span{display:none}.ncx-gen{margin-left:0;width:100%}.ncx-pop{flex:1}.ncx-pop>summary{justify-content:space-between}.ncx-pop-panel{position:fixed;left:5vw;right:5vw;top:15vh;width:auto!important;max-height:70vh;overflow:auto}.ncx-ask{flex-wrap:wrap}.ncx-ask .nfl-coach-send{width:100%;margin-top:0}}
+@media(max-width:420px){.ncx-grid{grid-template-columns:1fr}}
 .ngt-wrap{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:10px;margin:12px 0}
 .ngt-card{background:#0b1220;border:1px solid #263244;border-radius:12px;padding:10px 12px}
 .ngt-head{color:#7dd3fc;font-weight:900;font-size:.8rem;letter-spacing:.04em;margin-bottom:6px;padding-bottom:6px;border-bottom:1px solid #1e293b}
@@ -12405,70 +12464,81 @@ document.addEventListener('keydown',function(e){if(e.key==='Escape')_nflNavGo(nu
     <div id="parlayResult" style="margin-top:16px;text-align:left"></div>
   </div>
   </div>
-  <div class="card nfl-coach" id="nflCoachCard" style="max-width:960px;margin:0 auto 16px">
-    <div style="display:grid;grid-template-columns:minmax(0,1fr) auto;column-gap:12px;row-gap:6px;align-items:start">
-       <div><div style="color:#38bdf8;font-size:.66rem;font-weight:900;letter-spacing:.12em;text-transform:uppercase">Grounded NFL analysis</div>
-       <h2 style="font-family:'Playfair Display',serif;color:#fff;font-size:1.35rem;margin-top:4px">The Edge Coach · NFL Props Analyst</h2></div>
-       <button type="button" id="nflPerfectParlayOpen" onclick="showNflPerfectParlayBuilder()" style="background:linear-gradient(135deg,#0369a1,#7c3aed);color:#fff;border:1px solid rgba(125,211,252,.5);border-radius:8px;padding:8px 12px;font-size:.72rem;font-weight:900;cursor:pointer;white-space:nowrap">&#10024; Perfect Parlay</button>
-       <div style="grid-column:1/-1;color:#94a3b8;font-size:.76rem;margin-top:5px">Find safer sportsbook sides or scan every supported market for positive Coach Edge. Choose Over, Under, categories, and games above.</div>
-    </div>
-    <div class="nfl-coach-presets">
-      <button class="nfl-coach-preset" onclick="askNflCoachPreset('Show every play with a 100% App Hit Rate','app_hit_rate_100')" style="border-color:#22c55e;color:#bbf7d0">100% App Hit Rate</button>
-      <button class="nfl-coach-preset" onclick="askNflCoachPreset('Show me the safest bets','safest_bets')">Safest bets</button>
-      <button class="nfl-coach-preset" onclick="askNflCoachPreset('Show the best positive Coach Edge plays','coach_edge')">Coach Edge</button>
-      <button class="nfl-coach-preset" onclick="askNflGameTeamCoach()" style="border-color:#c2410c;color:#fed7aa">&#127944; Best Play Each Game &amp; Team</button>
-       <button class="nfl-coach-preset" onclick="askNflMovementCoach('OVER')" style="border-color:#22c55e;color:#bbf7d0">Biggest Over Line Movement</button>
-       <button class="nfl-coach-preset" onclick="askNflMovementCoach('UNDER')" style="border-color:#f87171;color:#fecaca">Biggest Under Line Movement</button>
-      <button class="nfl-coach-preset" id="nflAltCoachBtn" onclick="askNflAltCoach()" style="border-color:#f59e0b;color:#fde68a">Best Alt-Line Edge Plays · Top 10</button>
-      <button class="nfl-coach-preset" onclick="askNflCoachPreset('Show the best passing plays','passing')">Passing</button>
-      <button class="nfl-coach-preset" onclick="askNflCoachPreset('Show the best rushing plays','rushing')">Rushing</button>
-      <button class="nfl-coach-preset" onclick="askNflCoachPreset('Show the best receiving plays','receiving')">Receiving</button>
-      <button class="nfl-coach-preset" onclick="askNflCoachPreset('Show the best defensive player prop plays','defense')">Best Defense Plays</button>
-      <button class="nfl-coach-preset" onclick="askNflCoachPreset('Show the best kicker prop plays','kicking')">Best Kicker Plays</button>
-      <button class="nfl-coach-preset" onclick="askNflTdCoach()" style="border-color:#eab308;color:#fde68a">TD Scorers · Top 10</button>
-      <button class="nfl-coach-preset" onclick="askNflCoachPreset('Show the best under plays','best_unders')">Best unders</button>
-      <button class="nfl-coach-preset" onclick="askNflFunnelCoach()" style="border-color:#be185d;color:#fbcfe8">&#127919; Matchup Funnels · Top 10</button>
-      <button class="nfl-coach-preset" onclick="askNflHotColdCoach('HOT')" style="border-color:#ea580c;color:#fed7aa">&#128293; Hot · Top 10</button>
-      <button class="nfl-coach-preset" onclick="askNflHotColdCoach('COLD')" style="border-color:#2563eb;color:#bfdbfe">&#10052;&#65039; Cold · Top 10</button>
-      <button class="nfl-coach-preset" onclick="askNflHotColdCoach('DOUBLE')" style="border-color:#0891b2;color:#a5f3fc">&#129482; Double Cold · Top 10</button>
-    </div>
-     <div class="nfl-coach-filter-box" id="nflCoachFilterBox">
-       <div class="nfl-coach-filter-head">
-         <div><div class="nfl-coach-filter-title">Coach sides, rookies &amp; market categories</div>
-         <div class="nfl-coach-filter-help">Rookie combines with any selected category—for example Rookie + Receptions—and applies before Coach ranking, distinct-player dedupe, and the Top 10 cap. Rookie status uses ESPN roster experience. Genuine sportsbook quotes only.</div></div>
-       </div>
-        <div class="nfl-coach-filter-row nfl-coach-side-controls" aria-label="Coach sides">
-         <span style="color:#64748b;font-size:.62rem;font-weight:900;text-transform:uppercase;letter-spacing:.08em">Sides</span>
-          <div class="nfl-coach-filter-actions"><button type="button" onclick="_nflCoachSetSides(true)">All sides</button><button type="button" onclick="_nflCoachSetSides(false)">No sides</button></div>
-         <label class="nfl-coach-filter-label side-over"><input type="checkbox" class="nfl-coach-side-choice" data-side="OVER" checked onchange="_nflCoachSelectionChanged()"> OVER</label>
-         <label class="nfl-coach-filter-label side-under"><input type="checkbox" class="nfl-coach-side-choice" data-side="UNDER" checked onchange="_nflCoachSelectionChanged()"> UNDER</label>
-         <label class="nfl-coach-filter-label" style="border-color:#a78bfa;color:#ddd6fe"><input type="checkbox" id="nflCoachRookieOnly" class="nfl-coach-rookie-choice" onchange="_nflCoachSelectionChanged()"> ROOKIE</label>
-       </div>
-       <div class="nfl-coach-filter-row">
-         <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;width:100%">
-           <span style="color:#64748b;font-size:.62rem;font-weight:900;text-transform:uppercase;letter-spacing:.08em">Markets</span>
-           <div class="nfl-coach-filter-actions"><button type="button" onclick="_nflCoachSetMarkets(true)">All categories</button><button type="button" onclick="_nflCoachSetMarkets(false)">No categories</button></div>
-         </div>
-         <div id="nflCoachMarkets" class="nfl-coach-market-list" aria-label="Coach market categories"></div>
-         <div id="nflCoachMarketQuick" class="nfl-coach-filter-quick" aria-label="Coach market shortcuts"></div>
-       </div>
-       <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:14px">
-         <button type="button" id="nflCoachGenerateCategories" onclick="generateNflCoachCategories()" style="background:linear-gradient(135deg,#0284c7,#0369a1);color:#fff;border:1px solid #38bdf8;border-radius:8px;padding:10px 14px;font-weight:900;cursor:pointer">Generate Top 10 · Each Selected Category</button>
-         <span class="nfl-coach-filter-help">Positive Coach Edge · separate Top 10 per market · uses selected sides, Rookie and games.</span>
-       </div>
-     </div>
-    <details class="nfl-parlay-filter-group nfl-game-filter-dropdown" style="margin:10px 0 12px;border-color:rgba(56,189,248,.35)">
-      <summary><span style="color:#7dd3fc">Choose Games for Coach</span><span id="nflCoachGamesSummary" class="nfl-game-filter-summary">Run picks to load games</span></summary>
-      <div class="nfl-game-filter-panel">
-        <div class="nfl-parlay-filter-actions"><button type="button" onclick="_nflGameSetAll('coach',true)">All</button><button type="button" onclick="_nflGameSetAll('coach',false)">None</button></div>
-        <div id="nflCoachGames" class="nfl-game-filter-list"><div class="nfl-parlay-cat-empty">Run today&#39;s picks to load games.</div></div>
+  <div class="card nfl-coach ncx" id="nflCoachCard" style="max-width:960px;margin:0 auto 16px">
+    <div class="ncx-head">
+      <div class="ncx-badge">&#127944;</div>
+      <div class="ncx-titles">
+        <div class="ncx-kicker">Grounded NFL analysis · genuine sportsbook prices</div>
+        <h2 class="ncx-title">The Edge Coach</h2>
+        <div class="ncx-sub">Pick a play type below. Sides, markets and games in the filter bar apply to every option.</div>
       </div>
-    </details>
-    <div class="nfl-coach-row">
-      <input id="nflCoachInput" class="nfl-coach-input" placeholder="Example: Safest rushing unders from -300 to -150" onkeydown="if(event.key==='Enter')askNflCoach()"/>
+      <button type="button" id="nflPerfectParlayOpen" class="ncx-parlay" onclick="showNflPerfectParlayBuilder()">&#10024; Perfect Parlay</button>
+    </div>
+    <div class="ncx-tabs" role="tablist">
+      <button type="button" class="ncx-tab active" data-ncx-tab="top" onclick="_ncxTab('top')">&#11088; Top Picks <span>6</span></button>
+      <button type="button" class="ncx-tab" data-ncx-tab="pos" onclick="_ncxTab('pos')">&#127944; By Position <span>6</span></button>
+      <button type="button" class="ncx-tab" data-ncx-tab="trd" onclick="_ncxTab('trd')">&#128200; Trends &amp; Form <span>6</span></button>
+    </div>
+    <div class="nfl-coach-presets ncx-panels">
+      <div class="ncx-grid" data-ncx-panel="top">
+        <button type="button" class="nfl-coach-preset ncx-preset" style="--c:#22c55e" onclick="askNflCoachPreset('Show every play with a 100% App Hit Rate','app_hit_rate_100')"><b class="ncx-t">100% App Hit Rate</b><small>Plays the app hits every time</small></button>
+        <button type="button" class="nfl-coach-preset ncx-preset" style="--c:#38bdf8" onclick="askNflCoachPreset('Show me the safest bets','safest_bets')"><b class="ncx-t">Safest Bets</b><small>Highest implied win chance first</small></button>
+        <button type="button" class="nfl-coach-preset ncx-preset" style="--c:#a78bfa" onclick="askNflCoachPreset('Show the best positive Coach Edge plays','coach_edge')"><b class="ncx-t">Coach Edge</b><small>Biggest app-vs-book probability gap</small></button>
+        <button type="button" class="nfl-coach-preset ncx-preset" style="--c:#f97316" onclick="askNflGameTeamCoach()"><b class="ncx-t">&#127944; Best Play Each Game &amp; Team</b><small>Top play per game and per team</small></button>
+        <button type="button" class="nfl-coach-preset ncx-preset" style="--c:#f87171" onclick="askNflCoachPreset('Show the best under plays','best_unders')"><b class="ncx-t">Best Unders</b><small>Strongest Under sides on the board</small></button>
+        <button type="button" class="nfl-coach-preset ncx-preset" style="--c:#f59e0b" onclick="askNflAltCoach()" id="nflAltCoachBtn"><b class="ncx-t">Best Alt-Line Edge Plays · Top 10</b><small>Genuine alternate-line ladders</small></button>
+      </div>
+      <div class="ncx-grid" data-ncx-panel="pos" hidden>
+        <button type="button" class="nfl-coach-preset ncx-preset" style="--c:#60a5fa" onclick="askNflCoachPreset('Show the best passing plays','passing')"><b class="ncx-t">Passing</b><small>QB yards, TDs, attempts &amp; completions</small></button>
+        <button type="button" class="nfl-coach-preset ncx-preset" style="--c:#34d399" onclick="askNflCoachPreset('Show the best rushing plays','rushing')"><b class="ncx-t">Rushing</b><small>Rush yards, attempts &amp; RB total yards</small></button>
+        <button type="button" class="nfl-coach-preset ncx-preset" style="--c:#c084fc" onclick="askNflCoachPreset('Show the best receiving plays','receiving')"><b class="ncx-t">Receiving</b><small>Receptions &amp; receiving yards</small></button>
+        <button type="button" class="nfl-coach-preset ncx-preset" style="--c:#94a3b8" onclick="askNflCoachPreset('Show the best defensive player prop plays','defense')"><b class="ncx-t">Best Defense Plays</b><small>Tackles, sacks &amp; interceptions</small></button>
+        <button type="button" class="nfl-coach-preset ncx-preset" style="--c:#fbbf24" onclick="askNflCoachPreset('Show the best kicker prop plays','kicking')"><b class="ncx-t">Best Kicker Plays</b><small>Kicking points &amp; field goals</small></button>
+        <button type="button" class="nfl-coach-preset ncx-preset" style="--c:#eab308" onclick="askNflTdCoach()"><b class="ncx-t">TD Scorers · Top 10</b><small>Anytime touchdown predictor</small></button>
+      </div>
+      <div class="ncx-grid" data-ncx-panel="trd" hidden>
+        <button type="button" class="nfl-coach-preset ncx-preset" style="--c:#22c55e" onclick="askNflMovementCoach('OVER')"><b class="ncx-t">Biggest Over Line Movement</b><small>Lines that jumped since open</small></button>
+        <button type="button" class="nfl-coach-preset ncx-preset" style="--c:#f87171" onclick="askNflMovementCoach('UNDER')"><b class="ncx-t">Biggest Under Line Movement</b><small>Lines that dropped since open</small></button>
+        <button type="button" class="nfl-coach-preset ncx-preset" style="--c:#ec4899" onclick="askNflFunnelCoach()"><b class="ncx-t">&#127919; Matchup Funnels · Top 10</b><small>Pass and run funnel defenses</small></button>
+        <button type="button" class="nfl-coach-preset ncx-preset" style="--c:#f97316" onclick="askNflHotColdCoach('HOT')"><b class="ncx-t">&#128293; Hot · Top 10</b><small>Players clearing their line lately</small></button>
+        <button type="button" class="nfl-coach-preset ncx-preset" style="--c:#3b82f6" onclick="askNflHotColdCoach('COLD')"><b class="ncx-t">&#10052;&#65039; Cold · Top 10</b><small>Players falling short lately</small></button>
+        <button type="button" class="nfl-coach-preset ncx-preset" style="--c:#06b6d4" onclick="askNflHotColdCoach('DOUBLE')"><b class="ncx-t">&#129482; Double Cold · Top 10</b><small>The deepest slumps</small></button>
+      </div>
+    </div>
+    <div class="ncx-bar nfl-coach-filter-box" id="nflCoachFilterBox">
+      <div class="ncx-seg nfl-coach-side-controls" aria-label="Coach sides">
+        <label class="ncx-pill over"><input type="checkbox" class="nfl-coach-side-choice" data-side="OVER" checked onchange="_nflCoachSelectionChanged()"><span>OVER</span></label>
+        <label class="ncx-pill under"><input type="checkbox" class="nfl-coach-side-choice" data-side="UNDER" checked onchange="_nflCoachSelectionChanged()"><span>UNDER</span></label>
+        <label class="ncx-pill rookie"><input type="checkbox" id="nflCoachRookieOnly" class="nfl-coach-rookie-choice" onchange="_nflCoachSelectionChanged()"><span>ROOKIE</span></label>
+      </div>
+      <details class="ncx-pop">
+        <summary><span class="ncx-pop-k">Markets</span><span id="ncxMarketsCount" class="ncx-pop-v">All</span></summary>
+        <div class="ncx-pop-panel ncx-pop-wide">
+          <div class="ncx-pop-row"><span class="ncx-pop-label">Markets</span><div class="nfl-coach-filter-actions"><button type="button" onclick="_nflCoachSetMarkets(true)">All categories</button><button type="button" onclick="_nflCoachSetMarkets(false)">No categories</button></div>
+          <span class="ncx-pop-label" style="margin-left:auto">Sides</span><div class="nfl-coach-filter-actions"><button type="button" onclick="_nflCoachSetSides(true)">All sides</button><button type="button" onclick="_nflCoachSetSides(false)">No sides</button></div></div>
+          <div id="nflCoachMarkets" class="nfl-coach-market-list" aria-label="Coach market categories"></div>
+          <div id="nflCoachMarketQuick" class="nfl-coach-filter-quick" aria-label="Coach market shortcuts"></div>
+          <div class="nfl-coach-filter-help" style="margin-top:9px">Rookie combines with any selected category (for example Rookie + Receptions) and applies before Coach ranking, distinct-player dedupe and the Top 10 cap. Rookie status uses ESPN roster experience. Genuine sportsbook quotes only.</div>
+        </div>
+      </details>
+      <details class="ncx-pop">
+        <summary><span class="ncx-pop-k">Games</span><span id="nflCoachGamesSummary" class="ncx-pop-v">Run picks to load games</span></summary>
+        <div class="ncx-pop-panel">
+          <div class="nfl-parlay-filter-actions" style="display:flex;justify-content:flex-end;gap:5px;margin-bottom:9px"><button type="button" onclick="_nflGameSetAll('coach',true)">All</button><button type="button" onclick="_nflGameSetAll('coach',false)">None</button></div>
+          <div id="nflCoachGames" class="nfl-game-filter-list"><div class="nfl-parlay-cat-empty">Run today&#39;s picks to load games.</div></div>
+        </div>
+      </details>
+      <button type="button" id="nflCoachGenerateCategories" class="ncx-gen" onclick="generateNflCoachCategories()" title="Positive Coach Edge · separate Top 10 per market · uses selected sides, Rookie and games">&#9889; Top 10 · Each Selected Market</button>
+    </div>
+    <div class="ncx-ask">
+      <span class="ncx-ask-ico">&#128172;</span>
+      <input id="nflCoachInput" class="nfl-coach-input" placeholder="Ask the Coach, e.g. Safest rushing unders from -300 to -150" onkeydown="if(event.key==='Enter')askNflCoach()"/>
       <button class="nfl-coach-send" onclick="askNflCoach()">Analyze</button>
     </div>
-     <div style="color:#64748b;font-size:.65rem;line-height:1.45;margin-top:8px">Requires a loaded NFL board and genuine sportsbook prices. Safest Bets ranks the selected sides by implied probability; Coach Edge equals app probability minus sportsbook-implied probability. Filters stay active for every preset, including TD and alternate-line Top 10.</div>
+    <details class="ncx-how">
+      <summary>&#9432; How it works</summary>
+      <div>Requires a loaded NFL board and genuine sportsbook prices. Safest Bets ranks the selected sides by implied probability; Coach Edge equals app probability minus sportsbook-implied probability. Filters stay active for every preset, including TD and alternate-line Top 10. Top 10 · Each Selected Market builds a separate positive-edge Top 10 for every checked market.</div>
+    </details>
     <div id="nflCoachAnswer" class="nfl-coach-answer"></div>
     <div id="nflCoachCaptureStatus" style="min-height:1.2em;margin-top:8px;color:#94a3b8;font-size:.7rem"></div>
   </div>
@@ -12723,7 +12793,25 @@ function _nflCoachSaveFilterPrefs(){
   window.__NFL_COACH_FILTER_PREFS__={sides:sides,markets:markets,rookieOnly:!!(rookie&&rookie.checked)};
   try{localStorage.setItem(_NFL_COACH_FILTER_STORAGE,JSON.stringify(window.__NFL_COACH_FILTER_PREFS__));}catch(e){}
 }
-function _nflCoachSelectionChanged(){_nflCoachSaveFilterPrefs();}
+function _nflCoachSelectionChanged(){_nflCoachSaveFilterPrefs();_ncxPaintCounts();}
+function _ncxBtnText(btn,text){(btn.querySelector('.ncx-t')||btn).textContent=text;}
+function _ncxPaintCounts(){
+  var el=document.getElementById('ncxMarketsCount');
+  if(!el)return;
+  var all=document.querySelectorAll('.nfl-coach-market-choice'),on=0;
+  all.forEach(function(cb){if(cb.checked)on++;});
+  el.textContent=!all.length?'Run picks to load':on===all.length?'All '+all.length:on===0?'None selected':on+' of '+all.length;
+  el.classList.toggle('warn',!!all.length&&on===0);
+}
+function _ncxTab(key){
+  document.querySelectorAll('.ncx-tab').forEach(function(t){t.classList.toggle('active',t.getAttribute('data-ncx-tab')===key);});
+  document.querySelectorAll('.ncx-grid').forEach(function(g){g.hidden=g.getAttribute('data-ncx-panel')!==key;});
+}
+document.addEventListener('click',function(e){
+  var preset=e.target&&e.target.closest?e.target.closest('.ncx-preset'):null;
+  if(preset){document.querySelectorAll('.ncx-preset.active').forEach(function(b){if(b!==preset)b.classList.remove('active');});preset.classList.add('active');}
+  document.querySelectorAll('.ncx-pop[open]').forEach(function(d){if(!d.contains(e.target))d.removeAttribute('open');});
+});
 function _nflCoachSetSides(on){
   document.querySelectorAll('.nfl-coach-side-choice').forEach(function(cb){cb.checked=!!on;});
   _nflCoachSelectionChanged();
@@ -12769,6 +12857,7 @@ function _nflCoachRenderMarketFilters(){
       +'<button type="button" onclick="_nflCoachSetMarketFamily(\\'kick\\')">Kicker family</button>'
       +'<button type="button" onclick="_nflCoachSetMarketFamily(\\'td\\')">TD family</button>';
   }
+  _ncxPaintCounts();
 }
 function _nflCoachSelectedSides(){
   var nodes=document.querySelectorAll('.nfl-coach-side-choice'),out=[];
@@ -15239,10 +15328,10 @@ async function askNflAltCoach(){
     if(active.requestController)active.requestController.abort();
     if(answer&&(window.__NFL_COACH_VIEW_SEQ__||0)===active.viewSeq){answer.style.display='block';answer.innerHTML='<div class="nfl-coach-summary">Alternate-line polling cancelled. The shared background scan continues; no cancelled result was shown or captured. Click again to check it.</div>';}
     if(captureStatus){captureStatus.textContent='Polling cancelled; the shared alternate scan continues in the background.';captureStatus.style.color='#fbbf24';}
-    if(btn){btn.disabled=false;btn.textContent='Best Alt-Line Edge Plays · Top 10';}
+    if(btn){btn.disabled=false;_ncxBtnText(btn,'Best Alt-Line Edge Plays · Top 10');}
     return;
   }
-  var oldText=btn?btn.textContent:'Best Alt-Line Edge Plays · Top 10';
+  var oldText=btn?(btn.querySelector('.ncx-t')||btn).textContent:'Best Alt-Line Edge Plays · Top 10';
   var dateEl=document.getElementById('datePicker');
   var date=(dateEl&&dateEl.value)||window.__NFL_DATE__||'';
   var run={date:date,system:_nflSystem(),generation:_nflSystemGeneration,
@@ -15253,7 +15342,7 @@ async function askNflAltCoach(){
   window.__NFL_ALT_COACH_RUN__=run;
   window.__NFL_COACH_CAPTURE_SEQ__=(window.__NFL_COACH_CAPTURE_SEQ__||0)+1;
   if(captureStatus){captureStatus.textContent='';captureStatus.style.color='';}
-  if(btn){btn.disabled=false;btn.textContent='Cancel alternate-line scan';}
+  if(btn){btn.disabled=false;_ncxBtnText(btn,'Cancel alternate-line scan');}
   var lastAlt=(window.__NFL_LAST_ALT_COACH_DATE__===date&&Array.isArray(window.__NFL_LAST_ALT_COACH__))
     ?window.__NFL_LAST_ALT_COACH__: [];
     if(answer&&!lastAlt.length){answer.style.display='block';answer.innerHTML='<div class="nfl-coach-summary">Loading automatically generated alternate-line results. If the Run Picks scan is still running, this view checks its progress. Opening this category does not launch or save a scan. Click again to stop waiting.</div>';}
@@ -15353,7 +15442,7 @@ async function askNflAltCoach(){
     }else if(answer&&(window.__NFL_COACH_VIEW_SEQ__||0)===run.viewSeq)answer.innerHTML='<div class="nfl-coach-summary" style="color:'+(kind==='cancelled'?'#fbbf24':'#f87171')+'">'+_esc(msg)+'</div>';
   }finally{
     if(window.__NFL_ALT_COACH_RUN__===run)delete window.__NFL_ALT_COACH_RUN__;
-    if(btn){btn.disabled=false;btn.textContent=oldText;}
+    if(btn){btn.disabled=false;_ncxBtnText(btn,oldText);}
   }
 }
 function askNflCoach(options){
