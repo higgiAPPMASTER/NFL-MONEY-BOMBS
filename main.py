@@ -5540,6 +5540,14 @@ _NFL_TEAM_RANK_CACHE: dict = {}
 _NFL_FUNNEL_CATEGORY = "Matchup Funnels"
 _NFL_FUNNEL_OVERFLOW_CATEGORY = "Matchup Funnels Overflow"
 _NFL_FUNNEL_CATEGORIES = frozenset((_NFL_FUNNEL_CATEGORY, _NFL_FUNNEL_OVERFLOW_CATEGORY))
+# ROI Focus board: UNDER picks priced -150 or better, one strongest market per
+# player. Tracked as its own spotlight record (Top 10 + Overflow 11+), never in
+# Track Record totals because every row duplicates a normal market pick.
+_NFL_ROI_FOCUS_CATEGORY = "ROI Focus"
+_NFL_ROI_FOCUS_OVERFLOW_CATEGORY = "ROI Focus Overflow"
+_NFL_ROI_FOCUS_CATEGORIES = frozenset((_NFL_ROI_FOCUS_CATEGORY, _NFL_ROI_FOCUS_OVERFLOW_CATEGORY))
+_NFL_ROI_FOCUS_MIN_ODDS = -150
+_NFL_ROI_FOCUS_MARKER = "__roi_focus__"
 _NFL_FUNNEL_PLAYS = {
     "PASS": (("player_pass_yds", "OVER", ("QB",)),
              ("player_reception_yds", "OVER", ("WR", "TE")),
@@ -5943,7 +5951,66 @@ def _nfl_is_spotlight_category(category) -> bool:
     """Isolated spotlight records that never enter Track Record totals."""
     cat = str(category or "")
     return (cat in _NFL_FUNNEL_CATEGORIES
+            or cat in _NFL_ROI_FOCUS_CATEGORIES
             or cat.startswith(_NFL_HC_CATEGORY_PREFIXES))
+
+
+def _nfl_roi_focus_identity(name, market, side, line):
+    return (_norm(name or ""), str(market or ""), str(side or "").upper(), str(line))
+
+
+def _nfl_roi_focus_rows(snap, graded_rows) -> list:
+    """Rebuild the displayed ROI Focus board from a saved pregame snapshot.
+
+    Same rule as the board: UNDER, genuine under price -150 or better, ranked
+    by score (then cushion), one play per player. Results/odds/profit come from
+    the already-graded market row for that exact pick, so nothing is regraded."""
+    candidates = []
+    for p in (snap or []):
+        if not isinstance(p, dict) or p.get("hcRow"):
+            continue
+        mk = p.get("market") or p.get("mkt") or ""
+        if mk not in PROP_LABELS or _nfl_td_observation_only(p):
+            continue
+        if str(p.get("pick") or "").upper() != "UNDER":
+            continue
+        odds = p.get("under_odds")
+        if odds is None:
+            odds = p.get("realUnderOdds")
+        try:
+            if odds is None or float(odds) < _NFL_ROI_FOCUS_MIN_ODDS:
+                continue
+            score = float(p.get("score") or p.get("dispScore") or 0)
+            cushion = -float(p.get("gap") or 0)
+        except (TypeError, ValueError):
+            continue
+        candidates.append((score, cushion, p))
+    candidates.sort(key=lambda c: (c[0], c[1]), reverse=True)
+    by_identity = {}
+    for row in graded_rows or []:
+        if row.get("category") in _NFL_MOVEMENT_CATEGORIES or _nfl_is_spotlight_category(row.get("category")):
+            continue
+        by_identity.setdefault(_nfl_roi_focus_identity(
+            row.get("name"), row.get("market"), row.get("side"), row.get("line")), row)
+    out, seen = [], set()
+    for _score, _cushion, p in candidates:
+        key = _norm(p.get("name") or "")
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        line_raw = p.get("line") or p.get("realLine")
+        base = by_identity.get(_nfl_roi_focus_identity(
+            p.get("name"), p.get("market") or p.get("mkt"), "UNDER", line_raw))
+        if base is None:
+            continue  # push/void/unsettled rows are not stored in locked detail
+        rank = len(out) + 1
+        row = {k: v for k, v in base.items() if k not in ("pool", "position", "receivingBoardVersion")}
+        row.update({
+            "category": (_NFL_ROI_FOCUS_CATEGORY if rank <= 10
+                         else _NFL_ROI_FOCUS_OVERFLOW_CATEGORY),
+            "rank": rank})
+        out.append(row)
+    return out
 
 
 def _nfl_hc_min_games(week) -> int:
@@ -10429,6 +10496,7 @@ def _nfl_grade_date(date_str: str, snap: list, box_override: dict = None) -> dic
         main_rows, ovf_rows, [p for p in (snap or []) if not p.get("hcRow")],
         PROP_LABELS)
     main_rows.extend(funnel_rows)
+    main_rows.extend(_nfl_roi_focus_rows(snap, main_rows + ovf_rows))
 
     # Hot / Cold / Double Cold: own categories per market; ranks 1-10 in the
     # main record, 11-20 in NFL Overflow; never in either book's totals.
@@ -10495,6 +10563,8 @@ def _nfl_aggregate_graded(graded: dict) -> dict:
             rec[0] += 1
         else:
             rec[1] += 1
+    # Marks ledgers that already contain the ROI Focus record (backfill guard).
+    agg.setdefault(_NFL_ROI_FOCUS_MARKER, {"ALL": [0, 0]})
     return agg
 
 def _nfl_detail_graded(graded: dict, include_overflow: bool = True,
@@ -10675,6 +10745,50 @@ def _nfl_historical_replay_payload(result: dict, espn_games: list = None,
 # ── Track ledger update ───────────────────────────────────────────────────────
 _NFL_TRK_LOCK = _bt_th.Lock()
 
+def _nfl_backfill_roi_focus(d: str, cfg: dict, system: str, agg) -> list:
+    """Add the ROI Focus record to an already-locked official date.
+
+    Reads only saved Supabase data: the pregame snapshot picks the ROI Focus
+    plays and the locked main + overflow rows supply their final results.
+    Returns the upserts (empty when the saved data cannot be confirmed)."""
+    try:
+        snap = _nfl_record_snapshot(d, system)
+    except RuntimeError as exc:
+        print(f"[nfl_track] ROI Focus backfill skipped {d}: {exc}")
+        return []
+    rows = {}
+    for key in ("detail", "overflow"):
+        saved = _nfl_sb_get_strict("mpa_track_ledger", {
+            "app": f"eq.{cfg['app']}", "date": f"eq.{d}",
+            "category": f"eq.{cfg[key]}", "side": "eq.ALL",
+            "select": "detail", "limit": "1",
+        })
+        if saved is None:
+            return []
+        part = saved[0].get("detail") if saved else []
+        rows[key] = part if isinstance(part, list) else []
+    detail = [r for r in rows["detail"]
+              if isinstance(r, dict) and r.get("category") not in _NFL_ROI_FOCUS_CATEGORIES]
+    focus = _nfl_roi_focus_rows(snap, detail + [
+        r for r in rows["overflow"] if isinstance(r, dict)])
+    new_agg = dict(agg) if isinstance(agg, dict) else {}
+    for cat in _NFL_ROI_FOCUS_CATEGORIES:
+        new_agg.pop(cat, None)
+    for row in focus:
+        if _nfl_td_observation_only(row) or row.get("result") not in ("WIN", "LOSS"):
+            continue
+        rec = new_agg.setdefault(row["category"], {}).setdefault("UNDER", [0, 0])
+        rec[0 if row["result"] == "WIN" else 1] += 1
+    new_agg[_NFL_ROI_FOCUS_MARKER] = {"ALL": [0, 0]}
+    print(f"[nfl_track] ROI Focus backfilled {d}: {len(focus)} plays")
+    return [
+        {"app": cfg["app"], "date": d, "category": cfg["ledger"], "side": "ALL",
+         "wins": 0, "losses": 0, "locked": True, "detail": new_agg},
+        {"app": cfg["app"], "date": d, "category": cfg["detail"], "side": "ALL",
+         "wins": 0, "losses": 0, "locked": True, "detail": detail + focus},
+    ]
+
+
 def _nfl_update_track_ledger(include_date: str = "", system: str = "OLD"):
     """Grade all saved pick snapshots for past dates not yet locked.
     Safe to call repeatedly — locked dates are skipped."""
@@ -10685,10 +10799,15 @@ def _nfl_update_track_ledger(include_date: str = "", system: str = "OLD"):
         cfg = _nfl_store_config(system)
         locked_rows = _nfl_sb_get("mpa_track_ledger", {
             "app": f"eq.{cfg['app']}", "category": f"eq.{cfg['ledger']}",
-            "locked": "eq.true", "select": "date", "limit": "500",
+            "locked": "eq.true", "select": "date,detail", "limit": "500",
         })
         locked = {r["date"] for r in (locked_rows or [])}
         upserts = []
+        # Existing official dates get the ROI Focus record once, from saved data.
+        for r in locked_rows or []:
+            agg = r.get("detail")
+            if r.get("date") and not (isinstance(agg, dict) and _NFL_ROI_FOCUS_MARKER in agg):
+                upserts += _nfl_backfill_roi_focus(r["date"], cfg, system, agg)
         for d in _nfl_list_snap_dates(system):
             if d > today or (d == today and d != include_date):
                 continue
@@ -10737,7 +10856,7 @@ def _nfl_update_track_ledger(include_date: str = "", system: str = "OLD"):
         if upserts:
             for i in range(0, len(upserts), 10):
                 _nfl_sb_upsert("mpa_track_ledger", upserts[i:i+10], "app,date,category,side")
-            print(f"[nfl_track] saved {len(upserts)//3} official dates into main and overflow records")
+            print(f"[nfl_track] saved {len(upserts)} official record rows (main, overflow, ROI Focus)")
     try:
         _nfl_update_gp_ledger(include_date, system)
     except Exception as e:
@@ -11542,6 +11661,11 @@ body.is-admin .admin-only{display:inline-block !important}
 body.is-admin .nfl-menu-item.admin-only{display:flex !important}
 #parlayCard{display:none}
 body.is-admin #parlayCard{display:block}
+.nfl-parlay-ov,.nfl-tool-ov{display:none;position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:150;overflow:auto;padding:16px;box-sizing:border-box}
+.nfl-parlay-ov.open,.nfl-tool-ov.open{display:flex}
+.nfl-tool-card{position:relative;margin:auto;width:100%;max-width:900px;background:#080b12;border:1px solid #26334a;border-radius:16px;padding:clamp(14px,2.5vw,22px);box-sizing:border-box}
+.nfl-parlay-ov #parlayCard{position:relative;margin:auto !important;width:100%}
+.nfl-parlay-x{position:absolute;top:10px;right:10px;background:#1f2937;color:#e5e7eb;border:1px solid #374151;border-radius:8px;width:30px;height:30px;font-weight:900;cursor:pointer}
 /* chips + sections + games */
 .chips{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:12px;margin-bottom:28px}
 .chip{background:#161616;border:1px solid #262626;border-top:3px solid #f59e0b;border-radius:14px;padding:16px 10px;text-align:center}
@@ -11844,9 +11968,12 @@ tr:last-child td{border-bottom:none}
         <button type="button" role="menuitem" class="nfl-menu-item" style="--c:#6d28d9" onclick="_nflNavGo(openNflGpRecord)">&#128302; GP Record</button>
         <button type="button" role="menuitem" class="nfl-menu-item" style="--c:#0e7490" onclick="_nflNavGo(openNflCoachTrack)">&#129504; Edge Track Record</button>
         <button type="button" role="menuitem" class="nfl-menu-item" style="--c:#ca8a04" onclick="_nflNavGo(function(){openNflGamePicksRecord();})">&#127944; 80&#8211;100% Game Record</button>
+        <button type="button" role="menuitem" class="nfl-menu-item" style="--c:#047857" onclick="_nflNavGo(_nflNavRoiFocus)">&#128176; ROI Focus Record</button>
         <button type="button" role="menuitem" class="nfl-menu-item" style="--c:#be185d" onclick="_nflNavGo(_nflNavFunnels)">&#127919; Matchup Funnels Record</button>
         <button type="button" role="menuitem" class="nfl-menu-item" style="--c:#1d4ed8" onclick="_nflNavGo(_nflNavHistorical)">&#128218; Historical Analysis</button>
         <div class="nfl-menu-head">Tools</div>
+        <button type="button" role="menuitem" class="nfl-menu-item admin-only" style="--c:#d97706" onclick="_nflNavGo(openNflParlay)">&#127920; Auto Parlay Builder</button>
+        <button type="button" role="menuitem" class="nfl-menu-item" style="--c:#eab308" onclick="_nflNavGo(openNflRoleRisk)">&#9888; Pregame Role Risk Monitor</button>
         <button type="button" role="menuitem" class="nfl-menu-item" style="--c:#be185d" onclick="_nflNavGo(_nflNavFunnelPicks)">&#127919; Matchup Funnels Picks</button>
         <button type="button" role="menuitem" class="nfl-menu-item" style="--c:#ea580c" onclick="_nflNavGo(_nflNavHotCold)">&#128293; Hot / &#10052;&#65039; Cold Picks</button>
         <button type="button" role="menuitem" class="nfl-menu-item" style="--c:#db2777" onclick="_nflNavGo(openNflTeamRanks)">&#128202; Team Rankings</button>
@@ -11869,6 +11996,29 @@ function _nflNavGo(fn){
   if(b)b.setAttribute('aria-expanded','false');
   if(typeof fn==='function')fn();
 }
+function openNflParlay(){
+  var o=document.getElementById('nflParlayOv');if(!o)return;
+  // Refresh games/categories so plays loaded after the board (Coach, alternates) are listed.
+  try{if(typeof _renderNflParlayFilters==='function')_renderNflParlayFilters();}catch(e){}
+  o.classList.add('open');
+}
+function closeNflParlay(){var o=document.getElementById('nflParlayOv');if(o)o.classList.remove('open');}
+function _nflRoleRiskPaint(){
+  var b=document.getElementById('nflRoleRiskBody');if(!b)return;
+  var html=window.__NFL_ROLE_RISK_HTML__||'';
+  b.innerHTML=html||'Run picks or load a saved NFL board first.';
+  b.querySelectorAll('details').forEach(function(d){d.open=true;});
+}
+function openNflRoleRisk(){
+  var o=document.getElementById('nflRoleRiskOv');if(!o)return;
+  _nflRoleRiskPaint();o.classList.add('open');
+}
+function closeNflRoleRisk(){var o=document.getElementById('nflRoleRiskOv');if(o)o.classList.remove('open');}
+document.addEventListener('keydown',function(e){
+  if(e.key!=='Escape'||document.getElementById('nflLadOv')||document.getElementById('nflModalOv'))return;
+  var o=document.getElementById('nflParlayOv');if(o&&o.classList.contains('open'))closeNflParlay();
+  var r=document.getElementById('nflRoleRiskOv');if(r&&r.classList.contains('open'))closeNflRoleRisk();
+});
 function _nflNavScroll(id){var el=document.getElementById(id);if(el)el.scrollIntoView({behavior:'smooth',block:'start'});}
 function _nflNavSetSource(v){
   var sel=document.getElementById('nflTrkSource');
@@ -11920,6 +12070,27 @@ function _nflNavFindFunnelRecord(){
     if(!hit&&String(el.textContent||'').trim()==='Matchup Funnels')hit=el;
   });
   return hit;
+}
+function _nflNavFindRoiRecord(){
+  var hit=null;
+  document.querySelectorAll('#nflTrkBody .nfl-trk-group-name').forEach(function(el){
+    if(!hit&&String(el.textContent||'').trim()==='ROI Focus')hit=el;
+  });
+  return hit;
+}
+async function _nflNavRoiFocus(){
+  _nflNavSetSource('official');
+  var t=document.getElementById('nflTrkBtnCat');if(t)t.click();
+  var hit=_nflNavFindRoiRecord();
+  if(!hit&&typeof loadNflTrackRecord==='function'){
+    _nflNavScroll('nfl-main-track-card');
+    try{await loadNflTrackRecord();}catch(e){}
+    await new Promise(function(r){setTimeout(r,250);});
+    hit=_nflNavFindRoiRecord();
+  }
+  if(hit){hit.scrollIntoView({behavior:'smooth',block:'center'});return;}
+  _nflNavScroll('nfl-main-track-card');
+  _nflNavNotice('&#128176; ROI Focus Record','No ROI Focus results are saved for this period. Pick a wider Period (Week/Season), or press <b>Get Results</b>. Every saved official date is filled in from its pregame picks; the ROI Focus Top 10 and Overflow show as their own categories and are never added to the Track Record totals.');
 }
 async function _nflNavFunnels(){
   _nflNavSetSource('official');
@@ -12144,7 +12315,16 @@ document.addEventListener('keydown',function(e){if(e.key==='Escape')_nflNavGo(nu
     <div class="status-msg" id="statusMsg"></div>
     <div id="nflSystemBadge" style="display:inline-block;margin-top:5px;color:#fbbf24;font-size:.72rem;font-weight:900;letter-spacing:.08em">SYSTEM: OLD</div>
   </div>
+  <div class="nfl-tool-ov" id="nflRoleRiskOv" onclick="if(event.target===this)closeNflRoleRisk()">
+    <div class="nfl-tool-card">
+      <button type="button" class="nfl-parlay-x" aria-label="Close" onclick="closeNflRoleRisk()">&#10005;</button>
+      <div style="font-size:1.1rem;font-weight:950;color:#fff;padding-right:40px">&#9888; Pregame Role Risk Monitor</div>
+      <div id="nflRoleRiskBody" style="margin-top:8px;color:#94a3b8;font-size:.8rem">Run picks or load a saved NFL board first.</div>
+    </div>
+  </div>
+  <div class="nfl-parlay-ov" id="nflParlayOv" onclick="if(event.target===this)closeNflParlay()">
   <div class="card" id="parlayCard" style="text-align:center;max-width:600px;margin:0 auto 16px">
+    <button type="button" class="nfl-parlay-x" aria-label="Close" onclick="closeNflParlay()">&#10005;</button>
     <h2 style="font-family:'Playfair Display',serif;font-size:1.3rem;font-weight:700;color:#fff;margin-bottom:6px">🎰 Auto Parlay Builder <span style="font-size:.7rem;color:#777;font-family:sans-serif">admin only</span></h2>
     <p style="font-size:.74rem;color:#888;margin-bottom:14px">Best available legs from the loaded board — priced odds combined</p>
     <div style="display:flex;gap:10px;justify-content:center;align-items:center;flex-wrap:wrap">
@@ -12185,6 +12365,7 @@ document.addEventListener('keydown',function(e){if(e.key==='Escape')_nflNavGo(nu
       </details>
     </div>
     <div id="parlayResult" style="margin-top:16px;text-align:left"></div>
+  </div>
   </div>
   <div class="card nfl-coach" id="nflCoachCard" style="max-width:960px;margin:0 auto 16px">
     <div style="display:grid;grid-template-columns:minmax(0,1fr) auto;column-gap:12px;row-gap:6px;align-items:start">
@@ -12600,6 +12781,15 @@ function _nflNormalParlayCandidates(){
     if(!_floorOk(c.odds))return;
     out.push(c);
   });
+  // ROI Focus board: UNDER priced -150 or better, one strongest play per player.
+  var roiSeen={};
+  plays.slice().filter(function(p){return p&&p.name&&_nflIsRoiFocusPick(p);}).sort(function(a,b){
+    return Number(b.score||b.dispScore||0)-Number(a.score||a.dispScore||0)||_edge(b)-_edge(a);
+  }).forEach(function(p){
+    var key=String(p.name).trim().toLowerCase();if(roiSeen[key])return;roiSeen[key]=1;
+    var c=_nflLeg(p);if(!c.dir||!_floorOk(c.odds))return;
+    c.parlayCat='ROI Focus';out.push(c);
+  });
   // Hot / Cold / Double Cold: each category's Top 10 + Overflow (ranks 1-20).
   _nflHcRowsAll().forEach(function(r){
     if(!r.name||!r.pick||!(r.hcRank>=1&&r.hcRank<=20))return;
@@ -12663,7 +12853,10 @@ function _nflCoachParlayCandidates(){
   var byEdge=function(a,b){return b.edge-a.edge||b.appProb-a.appProb;};
   var bySafe=function(a,b){return b.implied-a.implied||b.appProb-a.appProb;};
   var byProbability=function(a,b){return b.appProb-a.appProb||b.edge-a.edge;};
+  var byMove=function(a,b){return Math.abs(Number(b.lineMove))-Math.abs(Number(a.lineMove))||b.edge-a.edge;};
+  var standard=function(p){return !p.isAlternate&&!p.alternate;};
   var pools={
+    app_hit_rate_100:select(allCoach.filter(function(p){return standard(p)&&Math.abs(Number(p.appProb)-100)<=0.05;}),byEdge,1e9),
     safest_bets:select(positive,bySafe,5),
     coach_edge:select(positive,byEdge,5),
     passing:select(positive.filter(function(p){return _nflCoachFamily(p.market)==='pass';}),byEdge,5),
@@ -12673,6 +12866,9 @@ function _nflCoachParlayCandidates(){
     kicking:select(positive.filter(function(p){return _nflCoachFamily(p.market)==='kick';}),byEdge,5),
     td_scorers:select(allCoach.filter(function(p){return _nflCoachFamily(p.market)==='td'&&p.side==='OVER';}),byProbability,10),
     best_unders:select(positive.filter(function(p){return p.side==='UNDER';}),byEdge,5),
+    rookie_plays:select(positive.filter(function(p){return standard(p)&&p.isRookie===true;}),byEdge,10),
+    coach_over_movement:select(positive.filter(function(p){return standard(p)&&p.lineMovementAvailable&&p.side==='OVER'&&Number(p.lineMove)>0;}),byMove,10),
+    coach_under_movement:select(positive.filter(function(p){return standard(p)&&p.lineMovementAvailable&&p.side==='UNDER'&&Number(p.lineMove)<0;}),byMove,10),
     matchup_funnels:select(allCoach.filter(function(p){return p.funnelMatch&&!p.isAlternate;}),function(a,b){return _nflFunnelCoachScore(b)-_nflFunnelCoachScore(a)||b.appProb-a.appProb;},10),
     hot_form:_nflHcCoachPick(_nflHcCoachProps('HOT'),null,'parlay'),
     cold_form:_nflHcCoachPick(_nflHcCoachProps('COLD'),null,'parlay'),
@@ -12694,6 +12890,7 @@ function _nflCoachParlayCandidates(){
   return Object.keys(merged).map(function(key){return merged[key];});
 }
 var _NFL_PARLAY_COACH_CATS=[
+  {key:'app_hit_rate_100',label:'100% App Hit Rate'},
   {key:'safest_bets',label:'Safest Bets'},
   {key:'coach_edge',label:'Coach Edge'},
   {key:'alt_line_edge',label:'Best Alt-Line Edge Plays · Top 10'},
@@ -12704,6 +12901,7 @@ var _NFL_PARLAY_COACH_CATS=[
   {key:'kicking',label:'Best Kicker Plays'},
   {key:'td_scorers',label:'TD Scorers'},
   {key:'best_unders',label:'Best Unders'}
+  ,{key:'rookie_plays',label:'Rookie Plays'}
   ,{key:'matchup_funnels',label:'Matchup Funnels'}
   ,{key:'hot_form',label:'Hot · Top 10'},{key:'cold_form',label:'Cold · Top 10'},{key:'double_cold_form',label:'Double Cold · Top 10'}
   ,{key:'coach_over_movement',label:'Biggest Over Line Movement'}
@@ -12919,7 +13117,7 @@ function _nflSystemChanged(){
     window.__NFL_ALT_COACH_RUN__.cancelled=true;
     try{window.__NFL_ALT_COACH_RUN__.requestController.abort();}catch(e){}
   }
-  window._nflState=null;window.__NFL_PLAYS__=[];window.__NFL_HOT_COLD__=[];window.__NFLLAD__={};
+  window._nflState=null;window.__NFL_PLAYS__=[];window.__NFL_ROLE_RISK_HTML__='';_nflRoleRiskPaint();window.__NFL_HOT_COLD__=[];window.__NFLLAD__={};
   window.__NFL_GP__=[];window.__NFL_GP_BET__={};window.__NFL_BET_SRC__={};
   window.__NFL_ALT_PARLAY_CANDIDATES__=[];window.__NFL_ALT_PARLAY_DATE__='';
   window.__NFL_LAST_ALT_COACH__=[];window.__NFL_LAST_ALT_COACH_DATE__='';
@@ -14036,9 +14234,6 @@ function _nflTeamRanksRender(){
       +games.map(function(g){var v=g.away+'@'+g.home;return '<option value="'+_esc(v)+'"'+(v===_nflTeamRanksGame?' selected':'')+'>'+_esc(_nflTeamRanksGameLabel(g))+'</option>';}).join('')+'</select>':'')
     +'<span style="color:#94a3b8;font-size:.72rem">'+_esc(d.basis||'')+' &middot; Offense #1 = most yards/points; Defense #1 = fewest allowed. <span style="color:#4ade80">Green = top 10</span>, <span style="color:#f87171">red = bottom 8</span>. Tap a column to sort.</span></div>';
   if(pick)html+=_nflTeamRanksMatchup(d,pick.away,pick.home,l4);
-  var gp=pick?[]:(window.__NFL_GP__||[]),fl=[];
-  if(_nflLiveRanksOk())gp.forEach(function(g){_nflGpFunnels(g).forEach(function(f){if(f)fl.push(f);});});
-  if(fl.length)html+='<div style="margin-bottom:10px"><div style="font-size:.66rem;color:#f472b6;font-weight:900;letter-spacing:.08em;margin-bottom:4px">TODAY&#39;S FUNNEL MATCHUPS</div>'+fl.map(_nflFunnelLine).join('')+'</div>';
   html+='<div style="overflow:auto;max-height:65vh;border:1px solid #1e293b;border-radius:10px"><table style="width:100%;border-collapse:collapse;font-size:.76rem"><thead><tr>'
     +cols.map(function(c){return '<th style="'+th+'" onclick="_nflTeamRanksSortBy(&#39;'+c.k+'&#39;)">'+c.label+(c.k===sk?(dir>0?' &#9650;':' &#9660;'):'')+'</th>';}).join('')+'</tr></thead><tbody>';
   rows.forEach(function(r){
@@ -15408,7 +15603,9 @@ function _nflPaint(q){
   var allF=(d.all||[]);
 
   var h='';
-  h+=_nflRoleRiskBoard(allF);
+  // Role Risk Monitor opens from Records & Tools instead of sitting on the board.
+  window.__NFL_ROLE_RISK_HTML__=_nflRoleRiskBoard(allF);
+  _nflRoleRiskPaint();
 
   // Summary chips jump to the actual market boards; game navigation stays intact.
   h+='<div class="chips">';
@@ -16194,10 +16391,16 @@ function renderNflTrackDay(){
     false,source,_nflTrkTabMode);
 }
 function _nflRoiFocusSummary(decided,stake){
-  var focus=decided.filter(function(r){
+  // Tracked ROI Focus record (Top 10 of the board, one play per player).
+  var tracked=decided.filter(function(r){return r.category==='ROI Focus'&&!r.observation_only;});
+  var legacy=!tracked.length;
+  // Older Historical Analysis replays predate the tracked category: keep the
+  // previous market-row filter for those, clearly labelled.
+  var focus=legacy?decided.filter(function(r){
     return !r.observation_only&&r.category!=='80-100% Locks'&&!_nflSpotlightCat(r.category)
+      &&r.category!=='Biggest Over Line Movement'&&r.category!=='Biggest Under Line Movement'
       &&r.side==='UNDER'&&r.odds!=null&&Number(r.odds)>=-150;
-  });
+  }):tracked;
   if(!focus.length) return '';
   var wins=focus.filter(function(r){return r.result==='WIN';}).length;
   var losses=focus.length-wins;
@@ -16207,7 +16410,9 @@ function _nflRoiFocusSummary(decided,stake){
   return '<div style="background:rgba(6,95,70,.18);border:1px solid rgba(52,211,153,.38);border-radius:10px;padding:11px 13px;margin-bottom:10px">'
     +'<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap">'
     +'<div><div style="color:#6ee7b7;font-size:.76rem;font-weight:900;text-transform:uppercase;letter-spacing:.08em">ROI Focus</div>'
-    +'<div style="color:#a7f3d0;font-size:.71rem;margin-top:2px">UNDER picks priced -150 or better · excludes duplicate Locks rows</div></div>'
+    +'<div style="color:#a7f3d0;font-size:.71rem;margin-top:2px">'+(legacy
+      ?'UNDER market picks priced -150 or better · estimate (no tracked ROI Focus rows in this period)'
+      :'Tracked ROI Focus board · Top 10 · UNDER priced -150 or better · one play per player')+'</div></div>'
     +'<div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;font-family:monospace;font-weight:800">'
     +'<span style="color:#fff">'+wins+'-'+losses+'</span>'
     +'<span style="color:'+color+'">'+(net>=0?'+$':'-$')+Math.abs(net).toFixed(0)+'</span>'
@@ -16240,7 +16445,7 @@ function _nflRenderRecordBook(decided,stake,label,sumEl,bodyEl,isOverflow,source
     ?'<div style="background:rgba(245,158,11,.1);border:1px solid rgba(245,158,11,.35);border-radius:9px;padding:9px 12px;margin-bottom:10px;color:#fbbf24;font-size:.76rem;font-weight:800">'
       +'Historical Analysis — saved point-in-time replays; excluded from the official record.</div>'
     :'';
-  var roiFocusNotice=isOverflow?'':_nflRoiFocusSummary(settled,stake);
+  var roiFocusNotice=isOverflow?'':_nflRoiFocusSummary(decided.filter(function(r){return r.result==='WIN'||r.result==='LOSS';}),stake);
   sumEl.innerHTML=replayNotice+roiFocusNotice+'<div class="nfl-trk-sum">'
     +'<span style="color:#9ca3af;font-size:.78rem;font-weight:800">'+label+'</span>'
     +'<span style="font-size:1.05rem;font-weight:900;color:#fff"><span style="color:#4ade80">'+wins+'</span>/<span style="color:#f87171">'+(wins+losses)+'</span>'
@@ -16297,20 +16502,20 @@ function _nflTrkCatHtml(decided,stake){
 }
 function _nflSpotlightCat(cat){
   cat=String(cat||'');
-  return cat.indexOf('Matchup Funnels')===0||cat.indexOf('Hot ')===0||cat.indexOf('Cold ')===0||cat.indexOf('Double Cold ')===0;
+  return cat.indexOf('Matchup Funnels')===0||cat.indexOf('ROI Focus')===0||cat.indexOf('Hot ')===0||cat.indexOf('Cold ')===0||cat.indexOf('Double Cold ')===0;
 }
 function _nflTrkListHtml(decided,stake){
   if(!decided.length) return '<p style="color:#6b7280;padding:20px;text-align:center">No saved picks yet.</p>';
   var catOrder=['Pass Yds','Pass TDs','Completions','Pass Att','INT Thrown',
     'Rush Yds','RB Total Yds','Rush Att','Rec Yds','Receptions','Anytime TD','Tackles+Ast',
-    'Sacks','Def INT','Kick Pts','FG Made','80-100% Locks','Matchup Funnels','Matchup Funnels Overflow'];
+    'Sacks','Def INT','Kick Pts','FG Made','80-100% Locks','ROI Focus','ROI Focus Overflow','Matchup Funnels','Matchup Funnels Overflow'];
   var catColors={'Pass Yds':'#38bdf8','Pass TDs':'#818cf8','Completions':'#60a5fa',
     'Pass Att':'#22d3ee','INT Thrown':'#f87171','Rush Yds':'#34d399',
     'RB Total Yds':'#10b981',
     'Rush Att':'#2dd4bf','Rec Yds':'#a78bfa','Receptions':'#c084fc',
     'Anytime TD':'#fbbf24','Tackles+Ast':'#fb923c','Sacks':'#f97316',
     'Def INT':'#f43f5e','Kick Pts':'#facc15','FG Made':'#fde047',
-    '80-100% Locks':'#facc15','Matchup Funnels':'#f472b6','Matchup Funnels Overflow':'#f9a8d4'};
+    '80-100% Locks':'#facc15','ROI Focus':'#34d399','ROI Focus Overflow':'#6ee7b7','Matchup Funnels':'#f472b6','Matchup Funnels Overflow':'#f9a8d4'};
   ['Rec Yds','Receptions'].forEach(function(market){
     var index=catOrder.indexOf(market);
     var positionCategories=['WR','TE','RB','Position Unverified'].map(function(position){
