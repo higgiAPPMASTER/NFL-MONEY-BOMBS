@@ -11620,6 +11620,728 @@ async def nfl_coach_track_grade(request: Request, token: str = ""):
     return {"ok": True}
 
 
+# ─── NFL 10K Game Simulator (separate from the Game Predictor) ───────────────
+# On demand only. Free nfl-verse schedule/score history (already cached for
+# H2H), free kickoff weather, and ONE bulk Odds API call per run for
+# moneyline, spread and total (cached 10 minutes). Its own engine plays every
+# game 10,000 times drive by drive (touchdowns, field goals, extra points,
+# overtime and ties). Pregame picks go to their own record namespace.
+import random as _gsim_random
+import hashlib as _gsim_hashlib
+
+_NFL_GSIM_APP = "nfl_game_sim"
+_NFL_GSIM_SNAP_CAT = "__sim_snapshot__"
+_NFL_GSIM_GRADED_CAT = "__sim_graded__"
+_NFL_GSIM_N = 10000
+_NFL_GSIM_PRIOR_PTS = 22.5      # league points per team-game
+_NFL_GSIM_HFA = 1.6             # home-field edge in points (0 at neutral sites)
+_NFL_GSIM_DRIVES = 11.2         # average possessions per team
+_NFL_GSIM_PTS_PER_SCORE = 5.30  # league average points per scoring drive (TD:FG about 22:16)
+_NFL_GSIM_TD_SHARE = 22.0 / 38.0
+_NFL_GSIM_TEAM_SHAPE = 25.0     # team-night variation
+_NFL_GSIM_LOCK = _bt_th.Lock()
+_NFL_GSIM_ODDS_CACHE: Dict[str, tuple] = {}
+_NFL_GSIM_BUCKETS = ((65, "65%+"), (60, "60-65%"), (55, "55-60%"), (0, "50-55%"))
+
+
+def _nfl_gsim_bucket(prob):
+    p = float(prob or 0)
+    return next(lbl for lo, lbl in _NFL_GSIM_BUCKETS if p >= lo)
+
+
+def _nfl_gsim_clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
+def _nfl_gsim_price_ok(v):
+    try:
+        p = float(v)
+        return p != 0 and -1000 <= p and math.isfinite(p)
+    except (TypeError, ValueError):
+        return False
+
+
+def _nfl_gsim_implied(odds):
+    o = float(odds)
+    return 100.0 / (o + 100.0) if o > 0 else -o / (-o + 100.0)
+
+
+def _nfl_gsim_pct(n, d):
+    return round(n / d * 100.0, 1) if d else None
+
+
+def _nfl_gsim_history_index(rows: list, season: int, before: str) -> dict:
+    """Per-team regular-season results for this and last season, before the date."""
+    teams: Dict[str, dict] = {}
+    for r in rows or []:
+        if str(r.get("game_type") or "").upper() != "REG":
+            continue
+        try:
+            s = int(r.get("season") or 0)
+        except ValueError:
+            continue
+        if s not in (season, season - 1):
+            continue
+        day = str(r.get("gameday") or "")
+        if s == season and day >= before:
+            continue
+        hs, as_ = _nfl_score_value(r.get("home_score")), _nfl_score_value(r.get("away_score"))
+        if hs is None or as_ is None:
+            continue
+        h, a = _nfl_history_team(r.get("home_team")), _nfl_history_team(r.get("away_team"))
+        key = "cur" if s == season else "prev"
+        teams.setdefault(h, {"cur": [], "prev": []})[key].append({"date": day, "pf": hs, "pa": as_})
+        teams.setdefault(a, {"cur": [], "prev": []})[key].append({"date": day, "pf": as_, "pa": hs})
+    for t in teams.values():
+        t["cur"].sort(key=lambda x: x["date"])
+    return teams
+
+
+def _nfl_gsim_schedule_row(rows: list, season: int, home: str, away: str, day: str):
+    for r in rows or []:
+        if (str(r.get("season")) == str(season) and str(r.get("gameday") or "") == day
+                and _nfl_history_team(r.get("home_team")) == home
+                and _nfl_history_team(r.get("away_team")) == away):
+            return r
+    return None
+
+
+async def _nfl_gsim_odds(games: list) -> dict:
+    """One bulk call for every upcoming game: best allowed price per side."""
+    if not ODDS_API_KEY or not games:
+        return {}
+    hit = _NFL_GSIM_ODDS_CACHE.get("live")
+    if hit and time.time() - hit[0] < 600:
+        events = hit[1]
+    else:
+        async with httpx.AsyncClient(timeout=20) as c:
+            r = await c.get(f"{ODDS_BASE}/sports/americanfootball_nfl/odds",
+                            params={"apiKey": ODDS_API_KEY, "bookmakers": ODDS_BOOKMAKERS,
+                                    "markets": "h2h,spreads,totals", "oddsFormat": "american",
+                                    "dateFormat": "iso"})
+        if r.status_code != 200:
+            raise RuntimeError(f"Odds API HTTP {r.status_code}")
+        events = r.json() or []
+        _NFL_GSIM_ODDS_CACHE["live"] = (time.time(), events)
+    lines = {}
+    for g in games:
+        ev = None
+        for e in events:
+            if not (_match(e.get("home_team", ""), g.get("home_team", ""))
+                    and _match(e.get("away_team", ""), g.get("away_team", ""))):
+                continue
+            try:
+                a = datetime.fromisoformat(str(e.get("commence_time")).replace("Z", "+00:00"))
+                b = datetime.fromisoformat(str(g.get("start")).replace("Z", "+00:00"))
+                if abs((a - b).total_seconds()) > 12 * 3600:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            ev = e
+            break
+        if not ev:
+            continue
+        res, spreads, totals = {}, {}, {}
+        for bm in ev.get("bookmakers", []) or []:
+            bkey = bm.get("key", "")
+            for mkt in bm.get("markets", []) or []:
+                mk = mkt.get("key")
+                ocs = mkt.get("outcomes", []) or []
+                if mk == "h2h":
+                    for oc in ocs:
+                        pr = oc.get("price")
+                        if not _nfl_gsim_price_ok(pr):
+                            continue
+                        if _match(oc.get("name", ""), ev.get("home_team", "")):
+                            _take_odds(res, "home_ml", "home_ml_book", pr, bkey)
+                        elif _match(oc.get("name", ""), ev.get("away_team", "")):
+                            _take_odds(res, "away_ml", "away_ml_book", pr, bkey)
+                elif mk == "spreads":
+                    ho = next((o for o in ocs if _match(o.get("name", ""), ev.get("home_team", ""))), None)
+                    ao = next((o for o in ocs if _match(o.get("name", ""), ev.get("away_team", ""))), None)
+                    if not ho or not ao or ho.get("point") is None or ao.get("point") is None:
+                        continue
+                    pt = float(ho["point"])
+                    if float(ao["point"]) != -pt or not _nfl_gsim_price_ok(ho.get("price")) \
+                            or not _nfl_gsim_price_ok(ao.get("price")):
+                        continue
+                    row = spreads.setdefault(pt, {"n": 0})
+                    row["n"] += 1
+                    _take_odds(row, "home", "home_book", ho["price"], bkey)
+                    _take_odds(row, "away", "away_book", ao["price"], bkey)
+                elif mk == "totals":
+                    ov = next((o for o in ocs if str(o.get("name", "")).upper() == "OVER"), None)
+                    un = next((o for o in ocs if str(o.get("name", "")).upper() == "UNDER"), None)
+                    if not ov or not un or ov.get("point") is None or un.get("point") != ov.get("point"):
+                        continue
+                    if not _nfl_gsim_price_ok(ov.get("price")) or not _nfl_gsim_price_ok(un.get("price")):
+                        continue
+                    row = totals.setdefault(float(ov["point"]), {"n": 0})
+                    row["n"] += 1
+                    _take_odds(row, "over", "over_book", ov["price"], bkey)
+                    _take_odds(row, "under", "under_book", un["price"], bkey)
+        entry = {}
+        if res.get("home_ml") is not None:
+            entry.update(home_ml=res["home_ml"], home_ml_book=_book_label(res["home_ml_book"]))
+        if res.get("away_ml") is not None:
+            entry.update(away_ml=res["away_ml"], away_ml_book=_book_label(res["away_ml_book"]))
+        if spreads:
+            pt, row = max(spreads.items(), key=lambda kv: (kv[1]["n"], -abs(kv[0])))
+            entry.update(home_spread=pt, home_spread_odds=row["home"], home_spread_book=_book_label(row["home_book"]),
+                         away_spread_odds=row["away"], away_spread_book=_book_label(row["away_book"]))
+        if totals:
+            pt, row = max(totals.items(), key=lambda kv: kv[1]["n"])
+            entry.update(total=pt, over_odds=row["over"], over_book=_book_label(row["over_book"]),
+                         under_odds=row["under"], under_book=_book_label(row["under_book"]))
+        if entry:
+            entry["source"] = "live"
+            lines[(g["away_abbr"], g["home_abbr"])] = entry
+    return lines
+
+
+def _nfl_gsim_closing_lines(row: dict) -> dict:
+    """Display-only consensus lines from nfl-verse for after-the-fact sims."""
+    if not row:
+        return {}
+    out = {}
+    try:
+        if row.get("spread_line") not in ("", None):
+            out["home_spread"] = -float(row["spread_line"])
+            out["home_spread_odds"] = float(row.get("home_spread_odds")) if row.get("home_spread_odds") else None
+            out["away_spread_odds"] = float(row.get("away_spread_odds")) if row.get("away_spread_odds") else None
+        if row.get("total_line") not in ("", None):
+            out["total"] = float(row["total_line"])
+            out["over_odds"] = float(row.get("over_odds")) if row.get("over_odds") else None
+            out["under_odds"] = float(row.get("under_odds")) if row.get("under_odds") else None
+        if row.get("home_moneyline"):
+            out["home_ml"] = float(row["home_moneyline"])
+        if row.get("away_moneyline"):
+            out["away_ml"] = float(row["away_moneyline"])
+    except (TypeError, ValueError):
+        return {}
+    for k in ("home_spread_odds", "away_spread_odds", "over_odds", "under_odds", "home_ml", "away_ml"):
+        if k in out and (out[k] is None or not _nfl_gsim_price_ok(out[k])):
+            out.pop(k, None)
+    for k in ("home_ml", "away_ml", "home_spread", "total"):
+        if k in out:
+            out[k + "_book" if k in ("home_ml", "away_ml") else
+                ("home_spread_book" if k == "home_spread" else "over_book")] = "Consensus close (nfl-verse)"
+    if "home_spread" in out:
+        out["away_spread_book"] = "Consensus close (nfl-verse)"
+    if "total" in out:
+        out["under_book"] = "Consensus close (nfl-verse)"
+    if out:
+        out["source"] = "closing"
+    return out
+
+
+async def _nfl_gsim_inputs(ds: str, scope: str) -> dict:
+    dates = _nfl_week_dates(ds) if scope == "week" else [ds]
+    slates = await asyncio.gather(*[get_espn_games(d) for d in dates], return_exceptions=True)
+    games = []
+    for d, sl in zip(dates, slates):
+        if isinstance(sl, Exception):
+            if scope != "week":
+                raise RuntimeError(f"ESPN schedule unavailable for {d}")
+            continue
+        for g in sl or []:
+            g = dict(g)
+            g["slate_date"] = d
+            games.append(g)
+    if not games:
+        return {"date": ds, "games": []}
+    hist = await asyncio.wait_for(_load_nfl_games_history(), timeout=30)
+    if not hist:
+        raise RuntimeError("nfl-verse schedule history is unavailable")
+    today = _nfl_today()
+    weather = {}
+    for d in sorted({g["slate_date"] for g in games if g["slate_date"] >= today}):
+        try:
+            weather.update(await asyncio.wait_for(
+                _nfl_fetch_weather(d, [g for g in games if g["slate_date"] == d]), timeout=25) or {})
+        except Exception as exc:
+            print(f"[nfl_gamesim] weather unavailable for {d}: {exc}")
+    live_games = [g for g in games if g["slate_date"] >= today]
+    lines, odds_note = {}, ""
+    if live_games:
+        try:
+            lines = await _nfl_gsim_odds(live_games)
+        except Exception as exc:
+            odds_note = f"Sportsbook lines unavailable right now ({exc}); sims run without book comparisons."
+    return {"date": ds, "scope": scope, "games": games, "hist": hist, "weather": weather,
+            "lines": lines, "oddsNote": odds_note}
+
+
+def _nfl_gsim_team(idx: dict, team: str, lg: float):
+    t = idx.get(team) or {"cur": [], "prev": []}
+    cur, prev = t["cur"], t["prev"]
+    n = len(cur)
+    avg = lambda rs, k: sum(r[k] for r in rs) / len(rs) if rs else None
+    pf_c, pa_c = avg(cur, "pf"), avg(cur, "pa")
+    pf_p, pa_p = avg(prev, "pf"), avg(prev, "pa")
+    if pf_p is not None:   # last season regresses a third of the way to league average
+        pf_p, pa_p = lg + 0.67 * (pf_p - lg), lg + 0.67 * (pa_p - lg)
+    if pf_c is None and pf_p is None:
+        return None
+    if pf_c is None:
+        off, de, w = pf_p, pa_p, 0.0
+    elif pf_p is None:
+        w = n / (n + 3.0)
+        off, de = w * pf_c + (1 - w) * lg, w * pa_c + (1 - w) * lg
+    else:
+        w = n / (n + 6.0)
+        off, de = w * pf_c + (1 - w) * pf_p, w * pa_c + (1 - w) * pa_p
+    last3 = cur[-3:]
+    return {"off": off, "def": de, "w": w, "n": n, "pf": pf_c, "pa": pa_c,
+            "l3pf": avg(last3, "pf") if n >= 4 else None, "l3pa": avg(last3, "pa") if n >= 4 else None,
+            "rec": f"{sum(r['pf'] > r['pa'] for r in cur)}-{sum(r['pf'] < r['pa'] for r in cur)}"
+                   + (f"-{sum(r['pf'] == r['pa'] for r in cur)}" if any(r['pf'] == r['pa'] for r in cur) else "")}
+
+
+def _nfl_gsim_expected(g: dict, inp: dict, idx: dict, lg: float):
+    home, away = g["home_abbr"], g["away_abbr"]
+    th, ta = _nfl_gsim_team(idx, home, lg), _nfl_gsim_team(idx, away, lg)
+    if not th or not ta:
+        raise ValueError("no scoring history for one of the teams")
+    row = _nfl_gsim_schedule_row(inp["hist"], int(g.get("season") or 0), home, away, g["slate_date"])
+    neutral = bool(row and str(row.get("location") or "").lower() == "neutral")
+    hfa = 0.0 if neutral else _NFL_GSIM_HFA
+    factors = []
+    eh = th["off"] * ta["def"] / lg
+    ea = ta["off"] * th["def"] / lg
+    factors.append({"name": "Opponent-adjusted ratings", "home": round(eh, 1), "away": round(ea, 1),
+                    "note": f"{home} offense x {away} defense and the reverse vs league {lg:.1f} pts "
+                            f"({int(th['w'] * 100)}% / {int(ta['w'] * 100)}% this season, rest last season)"})
+    eh += hfa / 2; ea -= hfa / 2
+    factors.append({"name": "Home field", "home": round(hfa / 2, 1), "away": round(-hfa / 2, 1),
+                    "note": "Neutral site, no home edge" if neutral else f"{hfa:.1f}-point home edge"})
+    dh = da = 0.0
+    if th["l3pf"] is not None and ta["l3pf"] is not None:
+        dh = _nfl_gsim_clamp(0.15 * (th["l3pf"] - th["pf"]), -1.5, 1.5) + \
+             _nfl_gsim_clamp(0.15 * (ta["l3pa"] - ta["pa"]), -1.5, 1.5)
+        da = _nfl_gsim_clamp(0.15 * (ta["l3pf"] - ta["pf"]), -1.5, 1.5) + \
+             _nfl_gsim_clamp(0.15 * (th["l3pa"] - th["pa"]), -1.5, 1.5)
+    eh += dh; ea += da
+    factors.append({"name": "Last 3 games", "home": round(dh, 1), "away": round(da, 1),
+                    "note": f"{home} {th['rec']} · {away} {ta['rec']} this season; recent scoring vs season level"})
+    rh = ra = 0.0
+    note = "Rest unavailable"
+    try:
+        r_h, r_a = int(float(row.get("home_rest"))), int(float(row.get("away_rest")))
+        adj = _nfl_gsim_clamp(0.15 * (r_h - r_a), -1.0, 1.0)
+        rh, ra = adj / 2, -adj / 2
+        note = f"{home} {r_h} days rest · {away} {r_a} days rest"
+    except (TypeError, ValueError, AttributeError):
+        pass
+    eh += rh; ea += ra
+    factors.append({"name": "Rest", "home": round(rh, 1), "away": round(ra, 1), "note": note})
+    wkey = str(g.get("id") or f"{away}@{home}")
+    wx = (inp.get("weather") or {}).get(wkey) or {}
+    wh = wa = 0.0
+    wnote = wx.get("summary") or wx.get("reason") or "Weather not used for past or unsupported games"
+    if wx.get("status") == "OK" and not wx.get("protected"):
+        m = 1.0 - 0.12 * _nfl_gsim_clamp(float(wx.get("severity") or 0), 0, 100) / 100.0
+        wh, wa = eh * m - eh, ea * m - ea
+    eh += wh; ea += wa
+    factors.append({"name": "Weather", "home": round(wh, 1), "away": round(wa, 1), "note": wnote})
+    eh, ea = _nfl_gsim_clamp(eh, 6.0, 45.0), _nfl_gsim_clamp(ea, 6.0, 45.0)
+    return eh, ea, factors, row, neutral
+
+
+def _nfl_gsim_team_points(rng, drives, ppd):
+    s = _nfl_gsim_clamp(ppd / _NFL_GSIM_PTS_PER_SCORE, 0.03, 0.75)
+    p_td = s * _NFL_GSIM_TD_SHARE
+    pts = 0
+    for _ in range(drives):
+        r = rng.random()
+        if r < p_td:
+            pts += 6
+            k = rng.random()
+            if k < 0.905:
+                pts += 1
+            elif k < 0.955 and rng.random() < 0.48:
+                pts += 2
+        elif r < s:
+            pts += 3
+    if rng.random() < 0.012:   # safety
+        pts += 2
+    return pts
+
+
+def _nfl_gsim_run_one(g: dict, inp: dict, idx: dict, lg: float) -> dict:
+    exp_h, exp_a, factors, row, neutral = _nfl_gsim_expected(g, inp, idx, lg)
+    seed = int(_gsim_hashlib.sha256(f"{g['slate_date']}|{g['away_abbr']}@{g['home_abbr']}|"
+                                    f"{exp_h:.3f}|{exp_a:.3f}".encode()).hexdigest()[:12], 16)
+    rng = _gsim_random.Random(seed)
+    book = inp["lines"].get((g["away_abbr"], g["home_abbr"])) or {}
+    if not book and g["slate_date"] < _nfl_today():
+        book = _nfl_gsim_closing_lines(row)
+    post = str(g.get("season_type") or "REG").upper() == "POST"
+    spread, total_line = book.get("home_spread"), book.get("total")
+    n = _NFL_GSIM_N
+    home_w = away_w = ties = ot = 0
+    h_cov = a_cov = s_push = over = under = t_push = 0
+    sum_h = sum_a = 0
+    totals, margins = [], []
+    scores: Dict[str, int] = {}
+    ts = _NFL_GSIM_TEAM_SHAPE
+    ph = exp_h / (exp_h + exp_a)
+    for _ in range(n):
+        drives = max(8, int(round(rng.gauss(_NFL_GSIM_DRIVES - 0.25, 0.9))))
+        dh = drives + (1 if rng.random() < 0.25 else 0)
+        da = drives + (1 if rng.random() < 0.25 else 0)
+        h = _nfl_gsim_team_points(rng, dh, exp_h / _NFL_GSIM_DRIVES * rng.gammavariate(ts, 1.0 / ts))
+        a = _nfl_gsim_team_points(rng, da, exp_a / _NFL_GSIM_DRIVES * rng.gammavariate(ts, 1.0 / ts))
+        m = abs(h - a)
+        # Late-game decisions bunch real NFL margins on 3 and 7; independent
+        # drive draws spread them out, so nudge near-misses onto the key numbers.
+        key = 0
+        if m in (1, 2) and rng.random() < 0.45: key = 3
+        elif m in (4, 5) and rng.random() < 0.30: key = 3
+        elif m in (6, 8) and rng.random() < 0.25: key = 7
+        if key:
+            if h > a: a = h - key
+            else: h = a - key
+        if h == a:
+            ot += 1
+            if post or rng.random() < 0.92:
+                add = 3 if rng.random() < 0.6 else 6
+                if rng.random() < ph: h += add
+                else: a += add
+        m, t = h - a, h + a
+        if m > 0: home_w += 1
+        elif m < 0: away_w += 1
+        else: ties += 1
+        sum_h += h; sum_a += a
+        totals.append(t); margins.append(m)
+        k = f"{h}-{a}"
+        scores[k] = scores.get(k, 0) + 1
+        if spread is not None:
+            adj = m + float(spread)
+            if adj > 0: h_cov += 1
+            elif adj < 0: a_cov += 1
+            else: s_push += 1
+        if total_line is not None:
+            tl = float(total_line)
+            if t > tl: over += 1
+            elif t < tl: under += 1
+            else: t_push += 1
+    totals.sort()
+    H, A = g["home_abbr"], g["away_abbr"]
+    decided = home_w + away_w
+    home_pct, away_pct = _nfl_gsim_pct(home_w, n), _nfl_gsim_pct(away_w, n)
+    margin_dist = []
+    for side, lo, hi, label in (("away", 15, None, f"{A} by 15+"), ("away", 8, 14, f"{A} by 8-14"),
+                                ("away", 4, 7, f"{A} by 4-7"), ("away", 1, 3, f"{A} by 1-3"),
+                                ("home", 1, 3, f"{H} by 1-3"), ("home", 4, 7, f"{H} by 4-7"),
+                                ("home", 8, 14, f"{H} by 8-14"), ("home", 15, None, f"{H} by 15+")):
+        cnt = sum(1 for m in margins if (m > 0 if side == "home" else m < 0)
+                  and abs(m) >= lo and (hi is None or abs(m) <= hi))
+        margin_dist.append({"label": label, "side": side, "pct": _nfl_gsim_pct(cnt, n)})
+    key_numbers = [{"label": f"{H} by 3", "pct": _nfl_gsim_pct(sum(1 for m in margins if m == 3), n)},
+                   {"label": f"{H} by 7", "pct": _nfl_gsim_pct(sum(1 for m in margins if m == 7), n)},
+                   {"label": f"{A} by 3", "pct": _nfl_gsim_pct(sum(1 for m in margins if m == -3), n)},
+                   {"label": f"{A} by 7", "pct": _nfl_gsim_pct(sum(1 for m in margins if m == -7), n)}]
+    total_dist = []
+    for lo, hi, label in ((0, 30, "30 or fewer"), (31, 37, "31-37"), (38, 44, "38-44"), (45, 51, "45-51"),
+                          (52, 58, "52-58"), (59, None, "59+")):
+        cnt = sum(1 for t in totals if t >= lo and (hi is None or t <= hi))
+        has = total_line is not None and lo <= float(total_line) <= (hi if hi is not None else 999) + 0.5
+        total_dist.append({"label": label, "pct": _nfl_gsim_pct(cnt, n), "has_line": bool(has)})
+    top_scores = [{"score": k, "home": int(k.split("-")[0]), "away": int(k.split("-")[1]),
+                   "pct": _nfl_gsim_pct(v, n)}
+                  for k, v in sorted(scores.items(), key=lambda kv: (-kv[1], kv[0]))[:5]]
+
+    def edge(prob, odds):
+        if odds is None:
+            return None, None
+        imp = _nfl_gsim_implied(odds) * 100
+        return round(imp, 1), round(prob - imp, 1)
+
+    is_home = home_w >= away_w
+    win_team = H if is_home else A
+    win_prob = _nfl_gsim_pct(home_w if is_home else away_w, decided)   # ties push a moneyline
+    w_odds = book.get("home_ml" if is_home else "away_ml")
+    w_imp, w_edge = edge(win_prob, w_odds)
+    picks = {"winner": {"pick": win_team, "prob": win_prob, "odds": w_odds,
+                        "book": book.get("home_ml_book" if is_home else "away_ml_book", "") if w_odds is not None else "",
+                        "implied": w_imp, "edge": w_edge, "bucket": _nfl_gsim_bucket(win_prob)}}
+    if spread is not None:
+        home_side = h_cov >= a_cov
+        cov = h_cov if home_side else a_cov
+        prob = _nfl_gsim_pct(cov, n - s_push)
+        odds = book.get("home_spread_odds" if home_side else "away_spread_odds")
+        imp, ed = edge(prob, odds)
+        picks["ats"] = {"pick": H if home_side else A,
+                        "line": float(spread) if home_side else -float(spread),
+                        "prob": prob, "push_pct": _nfl_gsim_pct(s_push, n),
+                        "home_cover_pct": _nfl_gsim_pct(h_cov, n), "away_cover_pct": _nfl_gsim_pct(a_cov, n),
+                        "odds": odds, "book": book.get("home_spread_book" if home_side else "away_spread_book", "") if odds is not None else "",
+                        "implied": imp, "edge": ed, "bucket": _nfl_gsim_bucket(prob)}
+    if total_line is not None:
+        is_over = over >= under
+        prob = _nfl_gsim_pct(over if is_over else under, n - t_push)
+        odds = book.get("over_odds" if is_over else "under_odds")
+        imp, ed = edge(prob, odds)
+        picks["ou"] = {"pick": "OVER" if is_over else "UNDER", "line": float(total_line), "prob": prob,
+                       "over_pct": _nfl_gsim_pct(over, n), "under_pct": _nfl_gsim_pct(under, n),
+                       "push_pct": _nfl_gsim_pct(t_push, n), "odds": odds,
+                       "book": book.get("over_book" if is_over else "under_book", "") if odds is not None else "",
+                       "implied": imp, "edge": ed, "bucket": _nfl_gsim_bucket(prob)}
+    return {"sims": n, "expHome": round(exp_h, 1), "expAway": round(exp_a, 1),
+            "avgHome": round(sum_h / n, 1), "avgAway": round(sum_a / n, 1),
+            "avgTotal": round((sum_h + sum_a) / n, 1), "medTotal": totals[n // 2],
+            "homeWinPct": home_pct, "awayWinPct": away_pct, "tiePct": _nfl_gsim_pct(ties, n),
+            "otPct": _nfl_gsim_pct(ot, n), "oneScorePct": _nfl_gsim_pct(sum(1 for m in margins if 0 < abs(m) <= 8), n),
+            "marginDist": margin_dist, "keyNumbers": key_numbers, "totalDist": total_dist,
+            "topScores": top_scores, "picks": picks, "factors": factors, "neutral": neutral,
+            "lineSource": book.get("source", "")}
+
+
+def _nfl_gsim_build(inp: dict) -> dict:
+    games = inp.get("games") or []
+    if not games:
+        return {"date": inp["date"], "games": [], "sims": _NFL_GSIM_N,
+                "message": "No NFL games are scheduled for this " + ("week." if inp.get("scope") == "week" else "date.")}
+    idx_cache, out = {}, []
+    for g in games:
+        try:
+            season = int(g.get("season") or str(g["slate_date"])[:4])
+        except (TypeError, ValueError):
+            season = _cur_season
+        key = (season, g["slate_date"])
+        if key not in idx_cache:
+            idx = _nfl_gsim_history_index(inp["hist"], season, g["slate_date"])
+            cur = [r["pf"] for t in idx.values() for r in t["cur"]]
+            prev = [r["pf"] for t in idx.values() for r in t["prev"]]
+            lg = _NFL_GSIM_PRIOR_PTS
+            if prev:
+                lg = sum(prev) / len(prev)
+            if cur:
+                w = len(cur) / (len(cur) + 120.0)
+                lg = w * (sum(cur) / len(cur)) + (1 - w) * lg
+            idx_cache[key] = (idx, lg)
+        idx, lg = idx_cache[key]
+        row = {k: g.get(k) for k in ("home_team", "away_team", "home_abbr", "away_abbr", "start", "season",
+                                     "season_type", "week", "slate_date", "venue_full_name")}
+        row["gameKey"] = f"{g['slate_date']}|{g['away_abbr']}@{g['home_abbr']}"
+        row["completed"] = bool(g.get("completed"))
+        # ESPN preseason is reported as REG by the slate reader; the NFL regular
+        # season never starts before September, so July/August are preseason.
+        row["preseason"] = str(g["slate_date"])[5:7] in ("07", "08")
+        try:
+            started = datetime.now(timezone.utc) >= datetime.fromisoformat(str(g.get("start")).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            started = False
+        row["state"] = "post" if row["completed"] else ("in" if started else "pre")
+        row["homeScore"], row["awayScore"] = _nfl_score_value(g.get("home_score")), _nfl_score_value(g.get("away_score"))
+        try:
+            row["sim"] = _nfl_gsim_run_one(g, inp, idx, lg)
+            row["book"] = inp["lines"].get((g["away_abbr"], g["home_abbr"])) or (
+                _nfl_gsim_closing_lines(_nfl_gsim_schedule_row(inp["hist"], int(g.get("season") or 0),
+                                                               g["home_abbr"], g["away_abbr"], g["slate_date"]))
+                if g["slate_date"] < _nfl_today() else {})
+        except Exception as exc:
+            print(f"[nfl_gamesim] {g.get('away_abbr')}@{g.get('home_abbr')} failed: {exc}")
+            row["sim"], row["book"] = None, {}
+            row["simError"] = f"Simulation inputs were incomplete for this game ({exc})."
+        out.append(row)
+    out.sort(key=lambda r: r.get("start") or "")
+    return {"date": inp["date"], "scope": inp.get("scope", "day"), "games": out, "sims": _NFL_GSIM_N,
+            "oddsNote": inp.get("oddsNote", ""),
+            "generatedAt": datetime.utcnow().isoformat(timespec="seconds") + "Z"}
+
+
+def _nfl_gsim_compact(g):
+    s = g.get("sim") or {}
+    keep = ("expHome", "expAway", "avgHome", "avgAway", "avgTotal", "homeWinPct", "awayWinPct", "tiePct",
+            "otPct", "oneScorePct", "medTotal", "picks", "sims", "neutral")
+    return {**{k: g.get(k) for k in ("gameKey", "start", "season_type", "week", "home_abbr", "away_abbr",
+                                     "home_team", "away_team", "book")},
+            "sim": {k: s.get(k) for k in keep},
+            "saved_at": datetime.utcnow().isoformat(timespec="seconds") + "Z"}
+
+
+def _nfl_gsim_snapshot_doc(ds):
+    rows = _nfl_sb_get("mpa_track_ledger", {"app": f"eq.{_NFL_GSIM_APP}", "category": f"eq.{_NFL_GSIM_SNAP_CAT}",
+                                            "side": "eq.ALL", "date": f"eq.{ds}", "select": "detail", "limit": "1"})
+    det = (rows[0].get("detail") if rows else None) or {}
+    return det if isinstance(det, dict) else {}
+
+
+def _nfl_gsim_tip(v):
+    return datetime.fromisoformat(str(v).replace("Z", "+00:00")).astimezone(timezone.utc)
+
+
+def _nfl_gsim_save_snapshot(games):
+    """Latest pregame sim per game wins; each game freezes at kickoff.
+    Only live sportsbook-era runs are tracked (never after-the-fact dates)."""
+    now = datetime.now(timezone.utc)
+    by_date: Dict[str, dict] = {}
+    for g in games:
+        if g.get("state") != "pre" or not g.get("sim") or g.get("preseason"):
+            continue
+        try:
+            if now >= _nfl_gsim_tip(g.get("start")):
+                continue
+        except Exception:
+            continue
+        by_date.setdefault(g["slate_date"], {})[g["gameKey"]] = _nfl_gsim_compact(g)
+    for ds, fresh in by_date.items():
+        with _NFL_GSIM_LOCK:
+            doc = _nfl_gsim_snapshot_doc(ds)
+            for key, row in fresh.items():
+                old = doc.get(key)
+                if old:
+                    try:
+                        if now >= _nfl_gsim_tip(old.get("start")):
+                            continue
+                    except Exception:
+                        pass
+                doc[key] = row
+            ok = _nfl_sb_upsert("mpa_track_ledger", [{"app": _NFL_GSIM_APP, "date": ds,
+                                                      "category": _NFL_GSIM_SNAP_CAT, "side": "ALL",
+                                                      "wins": 0, "losses": 0, "locked": False, "detail": doc}],
+                                "app,date,category,side")
+        print(f"[nfl_gamesim] snapshot {'saved' if ok else 'FAILED'}: {len(fresh)} games -> {ds}")
+
+
+def _nfl_gsim_profit(odds, result):
+    """Per $100. Genuine saved prices only; no assumed price."""
+    if odds is None or not _nfl_gsim_price_ok(odds):
+        return None
+    o = float(odds)
+    if result == "WIN":
+        return round(100.0 * (o / 100.0 if o > 0 else 100.0 / -o), 2)
+    if result == "LOSS":
+        return -100.0
+    return 0.0
+
+
+def _nfl_gsim_grade(p, hs, as_):
+    home, away = p.get("home_abbr"), p.get("away_abbr")
+    sim = p.get("sim") or {}
+    picks = sim.get("picks") or {}
+    out = {"gameKey": p.get("gameKey"), "home": home, "away": away, "home_score": hs, "away_score": as_,
+           "expHome": sim.get("expHome"), "expAway": sim.get("expAway")}
+    w = picks.get("winner")
+    if w:
+        res = "PUSH" if hs == as_ else ("WIN" if w.get("pick") == (home if hs > as_ else away) else "LOSS")
+        out["winner"] = {**w, "result": res, "profit": _nfl_gsim_profit(w.get("odds"), res)}
+    s = picks.get("ats")
+    if s and s.get("line") is not None:
+        mine, theirs = (hs, as_) if s.get("pick") == home else (as_, hs)
+        adj = mine + float(s["line"]) - theirs
+        res = "PUSH" if adj == 0 else ("WIN" if adj > 0 else "LOSS")
+        out["ats"] = {**s, "result": res, "profit": _nfl_gsim_profit(s.get("odds"), res)}
+    t = picks.get("ou")
+    if t and t.get("line") is not None:
+        tot, line = hs + as_, float(t["line"])
+        res = "PUSH" if tot == line else ("WIN" if (tot > line) == (t.get("pick") == "OVER") else "LOSS")
+        out["ou"] = {**t, "result": res, "profit": _nfl_gsim_profit(t.get("odds"), res), "final_total": tot}
+    return out
+
+
+def _nfl_gsim_record() -> dict:
+    snaps = _nfl_sb_get("mpa_track_ledger", {"app": f"eq.{_NFL_GSIM_APP}", "category": f"eq.{_NFL_GSIM_SNAP_CAT}",
+                                             "select": "date,detail", "limit": "2000"}) or []
+    graded = {r.get("date"): r for r in (_nfl_sb_get("mpa_track_ledger", {
+        "app": f"eq.{_NFL_GSIM_APP}", "category": f"eq.{_NFL_GSIM_GRADED_CAT}",
+        "select": "date,detail,locked", "limit": "2000"}) or [])}
+    today = _nfl_today()
+    todo = [s for s in snaps if s.get("date") and s["date"] <= today
+            and not (graded.get(s["date"]) or {}).get("locked")]
+    for s in sorted(todo, key=lambda x: x["date"])[-21:]:
+        ds, doc = s["date"], s.get("detail") or {}
+        scores = _nfl_gp_schedule_scores(ds)
+        if not scores:
+            continue
+        rows, all_done = [], True
+        for key, p in doc.items():
+            f = scores.get((p.get("home_abbr"), p.get("away_abbr")))
+            hs = _nfl_score_value((f or {}).get("home_score"))
+            as_ = _nfl_score_value((f or {}).get("away_score"))
+            if not f or not f.get("completed") or hs is None or as_ is None:
+                all_done = False
+                continue
+            rows.append(_nfl_gsim_grade(p, hs, as_))
+        locked = all_done or (datetime.strptime(today, "%Y-%m-%d") - datetime.strptime(ds, "%Y-%m-%d")).days >= 3
+        if not rows and not locked:
+            continue
+        _nfl_sb_upsert("mpa_track_ledger", [{"app": _NFL_GSIM_APP, "date": ds, "category": _NFL_GSIM_GRADED_CAT,
+                                             "side": "ALL",
+                                             "wins": sum((r.get("winner") or {}).get("result") == "WIN" for r in rows),
+                                             "losses": sum((r.get("winner") or {}).get("result") == "LOSS" for r in rows),
+                                             "locked": locked, "detail": rows}], "app,date,category,side")
+        graded[ds] = {"date": ds, "detail": rows, "locked": locked}
+    pending = {s["date"]: (s.get("detail") or {}) for s in snaps if s.get("date")}
+    days = []
+    for ds in sorted(set(pending) | set(graded), reverse=True):
+        rows = (graded.get(ds) or {}).get("detail") or []
+        locked = bool((graded.get(ds) or {}).get("locked"))
+        done = {str(r.get("gameKey")) for r in rows}
+        waiting = [{"gameKey": key, "home": p.get("home_abbr"), "away": p.get("away_abbr"),
+                    "start": p.get("start"), "picks": (p.get("sim") or {}).get("picks") or {}}
+                   for key, p in (pending.get(ds) or {}).items() if str(key) not in done]
+        days.append({"date": ds, "games": rows, "pending": [] if locked else waiting,
+                     "noResult": len(waiting) if locked else 0, "locked": locked})
+    return {"stake": 100.0, "days": days}
+
+
+@app.get("/api/nfl/game-sim")
+async def nfl_game_sim(date_str: str = "", scope: str = "day"):
+    ds = (date_str or _nfl_today()).strip()
+    try:
+        datetime.strptime(ds, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date")
+    scope = "week" if str(scope).lower() == "week" else "day"
+    if any(job.get("status") == "running" for job in JOBS.values()):
+        raise HTTPException(status_code=409, detail="A picks run is in progress. Run the sims after it finishes.")
+    try:
+        inp = await asyncio.wait_for(_nfl_gsim_inputs(ds, scope), timeout=90)
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Simulator data took too long to load. Try again in a minute.")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Simulator data unavailable: {exc}")
+    data = await asyncio.to_thread(_nfl_gsim_build, inp)
+    if not data.get("games"):
+        return JSONResponse(data, headers={"Cache-Control": "no-store"})
+    today = _nfl_today()
+    live = [g for g in data["games"] if g.get("slate_date", "") >= today]
+    if live:
+        _bt_th.Thread(target=_nfl_gsim_save_snapshot, args=(live,), daemon=True).start()
+    docs = {}
+    for d in sorted({g["slate_date"] for g in data["games"]}):
+        try:
+            docs[d] = await asyncio.to_thread(_nfl_gsim_snapshot_doc, d)
+        except Exception:
+            docs[d] = {}
+    for g in data["games"]:
+        saved = (docs.get(g["slate_date"]) or {}).get(g["gameKey"])
+        if saved and g.get("state") != "pre":
+            g["sim"] = {**(g.get("sim") or {}), **(saved.get("sim") or {})}
+            g["book"] = saved.get("book") or g.get("book")
+            g["savedSim"] = True
+            g["savedAt"] = saved.get("saved_at")
+        if g.get("completed") and g.get("homeScore") is not None and g.get("awayScore") is not None and g.get("sim"):
+            g["result"] = _nfl_gsim_grade(g, g["homeScore"], g["awayScore"])
+        g["retro"] = (not saved) and g["slate_date"] < today
+    return JSONResponse(data, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/nfl/game-sim/record")
+async def nfl_game_sim_record():
+    try:
+        payload = await asyncio.wait_for(asyncio.to_thread(_nfl_gsim_record), timeout=60)
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Sim record took too long to load.")
+    return JSONResponse(payload, headers={"Cache-Control": "no-store"})
+
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index(admin: str = "", token: str = ""):
     today = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
@@ -12073,12 +12795,14 @@ tr:last-child td{border-bottom:none}
         <button type="button" role="menuitem" class="nfl-menu-item" style="--c:#047857" onclick="_nflNavGo(_nflNavTrack)">&#128202; Track Record</button>
         <button type="button" role="menuitem" class="nfl-menu-item" style="--c:#b45309" onclick="_nflNavGo(_nflNavOverflow)">&#11088; NFL Overflow</button>
         <button type="button" role="menuitem" class="nfl-menu-item" style="--c:#6d28d9" onclick="_nflNavGo(openNflGpRecord)">&#128302; GP Record</button>
+        <button type="button" role="menuitem" class="nfl-menu-item" style="--c:#0e7490" onclick="_nflNavGo(openNflSimRecord)">&#127922; Sim Record</button>
         <button type="button" role="menuitem" class="nfl-menu-item" style="--c:#0e7490" onclick="_nflNavGo(openNflCoachTrack)">&#129504; Edge Track Record</button>
         <button type="button" role="menuitem" class="nfl-menu-item" style="--c:#ca8a04" onclick="_nflNavGo(function(){openNflGamePicksRecord();})">&#127944; 80&#8211;100% Game Record</button>
         <button type="button" role="menuitem" class="nfl-menu-item" style="--c:#047857" onclick="_nflNavGo(_nflNavRoiFocus)">&#128176; ROI Focus Record</button>
         <button type="button" role="menuitem" class="nfl-menu-item" style="--c:#be185d" onclick="_nflNavGo(_nflNavFunnels)">&#127919; Matchup Funnels Record</button>
         <button type="button" role="menuitem" class="nfl-menu-item" style="--c:#1d4ed8" onclick="_nflNavGo(_nflNavHistorical)">&#128218; Historical Analysis</button>
         <div class="nfl-menu-head">Tools</div>
+        <button type="button" role="menuitem" class="nfl-menu-item" style="--c:#0e7490" onclick="_nflNavGo(openNflGameSim)">&#127922; 10K Game Simulator</button>
         <button type="button" role="menuitem" class="nfl-menu-item admin-only" style="--c:#d97706" onclick="_nflNavGo(openNflParlay)">&#127920; Auto Parlay Builder</button>
         <button type="button" role="menuitem" class="nfl-menu-item" style="--c:#eab308" onclick="_nflNavGo(openNflRoleRisk)">&#9888; Pregame Role Risk Monitor</button>
         <button type="button" role="menuitem" class="nfl-menu-item" style="--c:#be185d" onclick="_nflNavGo(_nflNavFunnelPicks)">&#127919; Matchup Funnels Picks</button>
@@ -12586,6 +13310,7 @@ document.addEventListener('keydown',function(e){if(e.key==='Escape')_nflNavGo(nu
   <div id="nfl-gp-card" style="display:none;max-width:1500px;margin:18px auto 0;padding:0 16px">
     <div style="display:flex;align-items:center;gap:8px;font-size:1.05rem;font-weight:900;color:#a78bfa;margin-bottom:6px;letter-spacing:0.02em"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:#a78bfa"><path d="M21.54 15H17a2 2 0 0 0-2 2v4.54"/><path d="M7 3.34V5a3 3 0 0 0 3 3v0a2 2 0 0 1 2 2v0c0 1.1.9 2 2 2v0a2 2 0 0 0 2-2c0-1.1.9-2 2-2h3.17"/><path d="M11 21.95V18a2 2 0 0 0-2-2v0a2 2 0 0 1-2-2v-1a2 2 0 0 0-2-2H2.05"/><circle cx="12" cy="12" r="10"/></svg> GAME PREDICTOR &#8212; TODAY&#39;S WINNERS</div>
     <div style="font-size:.72rem;color:#64748b;margin-bottom:14px">Model blends recent L5 form, last completed season offense/defense, home-field advantage, and venue-aware results from the last five head-to-head meetings. Tap a game for the full breakdown.</div>
+    <button type="button" onclick="openNflGameSim()" style="background:#0e7490;border:1px solid #0e7490;color:#fff;border-radius:8px;padding:7px 12px;font-size:.78rem;font-weight:800;cursor:pointer;margin:0 0 12px">&#127922; Open 10K Game Simulator</button>
     <div id="nfl-gp-body"></div>
   </div>
   <div id="nfl-td-predictor-card" class="card nfl-td-card">
@@ -16898,3 +17623,195 @@ document.addEventListener('DOMContentLoaded',function(){
 </html>"""
 
 HTML = HTML.replace("</body>", _game_record_ui() + "</body>")
+_NFL_GSIM_UI = r"""
+<style>
+.ngs{max-width:960px;margin:0 auto;padding:0 16px 32px}
+.ngs-card{background:#0b1220;border:1px solid #1e293b;border-radius:14px;padding:18px 20px;margin-bottom:14px}
+.ngs h2{font-family:'Playfair Display',serif;font-size:1.35rem;font-weight:700;color:#fff;margin:0}
+.ngs-row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.ngs-note{color:#94a3b8;font-size:.74rem;line-height:1.45;margin:8px 0}
+.ngs-btn{background:#1e293b;border:1px solid #334155;color:#e2e8f0;border-radius:8px;padding:7px 12px;font-size:.78rem;font-weight:800;cursor:pointer}
+.ngs-btn.go{background:#0e7490;border-color:#0e7490;color:#fff}
+.ngs-in{background:#0f172a;border:1px solid #334155;border-radius:8px;padding:6px 8px;color:#fff;color-scheme:dark}
+.ngs-g{background:#0f172a;border:1px solid #1e293b;border-radius:12px;padding:14px;margin:12px 0}
+.ngs-mu{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.ngs-tm{display:flex;align-items:center;gap:8px;font-weight:900;color:#f1f5f9;font-size:.95rem}
+.ngs-tm img{width:34px;height:34px}
+.ngs-mid{text-align:center;color:#94a3b8;font-size:.7rem}
+.ngs-mid b{display:block;color:#fff;font-size:1.25rem;letter-spacing:.02em}
+.ngs-bar{display:flex;height:10px;border-radius:6px;overflow:hidden;margin:10px 0 4px;background:#1e293b}
+.ngs-bar span{display:block;height:100%}
+.ngs-pk{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:8px;margin-top:10px}
+.ngs-p{background:#020617;border:1px solid #1e293b;border-radius:9px;padding:9px 10px;font-size:.74rem;color:#cbd5e1}
+.ngs-p .k{color:#64748b;font-size:.6rem;font-weight:900;letter-spacing:.08em;text-transform:uppercase}
+.ngs-p .v{color:#fff;font-weight:900;font-size:.92rem;margin:2px 0}
+.ngs-pos{color:#34d399}.ngs-neg{color:#f87171}.ngs-mut{color:#64748b}
+.ngs-tag{display:inline-block;border-radius:5px;padding:2px 7px;font-size:.6rem;font-weight:900;letter-spacing:.05em;margin-left:4px}
+.ngs-tbl{width:100%;border-collapse:collapse;font-size:.72rem;margin:6px 0 10px}
+.ngs-tbl th,.ngs-tbl td{padding:5px 6px;border-bottom:1px solid #1e293b;text-align:left;color:#cbd5e1}
+.ngs-tbl th{color:#64748b;font-size:.6rem;text-transform:uppercase}
+.ngs-h{color:#e2e8f0;font-size:.78rem;font-weight:900;margin:12px 0 4px;text-transform:uppercase;letter-spacing:.06em}
+.ngs-dist{display:grid;grid-template-columns:90px 1fr 46px;gap:6px;align-items:center;font-size:.7rem;color:#cbd5e1;margin:3px 0}
+.ngs-dist i{display:block;height:8px;border-radius:4px;background:#0e7490}
+.ngs-tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px;margin:10px 0}
+.ngs-tile{background:#020617;border:1px solid #1e293b;border-radius:10px;padding:12px}
+.ngs-tile .t{color:#94a3b8;font-size:.66rem;font-weight:900;letter-spacing:.08em;text-transform:uppercase}
+.ngs-tile .n{color:#fff;font-weight:900;font-size:1.2rem;margin:4px 0}
+@media(max-width:600px){.ngs-tm img{width:26px;height:26px}.ngs-tm{font-size:.82rem}.ngs-card{padding:14px}}
+</style>
+<div id="nfl-gsim-section" class="ngs" style="display:none">
+<div class="ngs-card">
+  <div class="ngs-row" style="justify-content:space-between">
+    <h2>&#127922; NFL 10K Game Simulator</h2>
+    <button type="button" class="ngs-btn" onclick="document.getElementById('nfl-gsim-section').style.display='none'">Close</button>
+  </div>
+  <p class="ngs-note">Plays every game 10,000 times, drive by drive (touchdowns, field goals, extra points, overtime and ties), around each team's opponent-adjusted scoring, home field, recent form, rest days and kickoff weather. Gives moneyline, spread and total calls. Separate from the Game Predictor; its pregame calls go to their own Sim Record. Injuries (including a starting QB out) are not modelled, so check news.</p>
+  <div class="ngs-row">
+    <label style="color:#94a3b8;font-size:.74rem;font-weight:800">DATE <input type="date" id="nflGsimDate" class="ngs-in"></label>
+    <label style="color:#94a3b8;font-size:.74rem;font-weight:800">SCOPE <select id="nflGsimScope" class="ngs-in"><option value="day">This date</option><option value="week">Full NFL week</option></select></label>
+    <button type="button" class="ngs-btn go" id="nflGsimRun" onclick="runNflGameSim()">&#127922; Run Sims</button>
+    <button type="button" class="ngs-btn" onclick="openNflSimRecord()">&#128202; Sim Record</button>
+  </div>
+  <div id="nflGsimBody"><p class="ngs-note">Pick a date and press Run Sims.</p></div>
+</div>
+</div>
+<div id="nfl-gsim-record-section" class="ngs" style="display:none">
+<div class="ngs-card">
+  <div class="ngs-row" style="justify-content:space-between">
+    <h2>&#127922; NFL Sim Record</h2>
+    <button type="button" class="ngs-btn" onclick="document.getElementById('nfl-gsim-record-section').style.display='none'">Close</button>
+  </div>
+  <p class="ngs-note">Pregame simulator calls saved before kickoff and graded after finals. Profit uses only the genuine saved sportsbook price for each call; calls without a price count in W/L only. Preseason games and dates simulated after the fact are never tracked. A moneyline on a tied game is a push.</p>
+  <div class="ngs-row">
+    <label style="color:#94a3b8;font-size:.74rem;font-weight:800">PERIOD <select id="nflGsimPeriod" class="ngs-in" onchange="_nflGsimRecRender()"><option value="today">Day</option><option value="week">Week</option><option value="month">Month</option><option value="all" selected>All</option></select></label>
+    <label style="color:#94a3b8;font-size:.74rem;font-weight:800">DATE <input type="date" id="nflGsimRecDate" class="ngs-in" onchange="_nflGsimRecRender()"></label>
+    <label style="color:#94a3b8;font-size:.74rem;font-weight:800">STAKE $ <input type="number" id="nflGsimStake" class="ngs-in" value="100" min="1" step="1" style="width:80px" oninput="_nflGsimRecRender()"></label>
+    <button type="button" class="ngs-btn go" onclick="loadNflSimRecord()">&#8635; Grade &amp; Refresh</button>
+  </div>
+  <div id="nflGsimRecBody"><p class="ngs-note">Loading...</p></div>
+</div>
+</div>
+<script>
+(function(){
+var S={data:null,rec:null,busy:false};
+function $(id){return document.getElementById(id);}
+function esc(v){return String(v==null?'':v).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
+function today(){return new Date().toLocaleDateString('en-CA',{timeZone:'America/New_York'});}
+function odds(o){if(o==null||o==='')return '';var n=Number(o);return (n>0?'+':'')+n;}
+function pct(v){return v==null?'-':Number(v).toFixed(1)+'%';}
+function sgn(v){return v==null?'':((v>0?'+':'')+Number(v).toFixed(1));}
+function tip(t){try{return new Date(t).toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit',timeZone:'America/New_York'})+' ET';}catch(e){return '';}}
+function line(v){var n=Number(v);return (n>0?'+':'')+n;}
+function pickBox(k,p,lbl){
+  if(!p)return '<div class="ngs-p"><div class="k">'+k+'</div><div class="v ngs-mut">No line posted</div><div class="ngs-mut">Sim % shown above</div></div>';
+  var ed=p.edge==null?'<span class="ngs-mut">No book price &middot; W/L only</span>':'Edge <b class="'+(p.edge>0?'ngs-pos':'ngs-neg')+'">'+sgn(p.edge)+' pts</b> vs '+pct(p.implied)+' implied';
+  return '<div class="ngs-p"><div class="k">'+k+'</div><div class="v">'+esc(lbl)+'</div><div>Sim <b style="color:#fff">'+pct(p.prob)+'</b>'+(p.odds!=null?' &middot; '+odds(p.odds)+(p.book?' <span class="ngs-mut">'+esc(p.book)+'</span>':''):'')+'</div><div>'+ed+'</div></div>';
+}
+function resTag(r){if(!r)return '';var c=r.result==='WIN'?'#065f46':(r.result==='LOSS'?'#7f1d1d':'#334155');return '<span class="ngs-tag" style="background:'+c+';color:#fff">'+r.result+'</span>';}
+function dist(rows,max){return rows.map(function(r){var w=max?Math.round((r.pct||0)/max*100):0;return '<div class="ngs-dist"><span>'+esc(r.label)+(r.has_line?' &#9668;':'')+'</span><i style="width:'+w+'%;background:'+(r.side==='away'?'#7c3aed':'#0e7490')+'"></i><span>'+pct(r.pct)+'</span></div>';}).join('');}
+function wkLbl(g){var t='';try{t=new Date(g.start).toLocaleString('en-US',{weekday:'short',hour:'numeric',minute:'2-digit',timeZone:'America/New_York'})+' ET';}catch(e){}return t;}
+function gameCard(g,i){
+  var s=g.sim,H=g.home_abbr,A=g.away_abbr;
+  var head='<div class="ngs-mu"><div class="ngs-tm">'+esc(A)+'</div><div class="ngs-mid">'+(g.state==='pre'?wkLbl(g):(g.completed?'FINAL':'LIVE'))+(g.state!=='pre'&&g.homeScore!=null?'<b>'+g.awayScore+' - '+g.homeScore+'</b>':'')+(g.week?'<div>Week '+esc(g.week)+'</div>':'')+(g.preseason?'<span class="ngs-tag" style="background:#78350f;color:#fde68a">PRESEASON &middot; NOT TRACKED</span>':'')+'</div><div class="ngs-tm">'+esc(H)+'</div></div>';
+  if(!s)return '<div class="ngs-g">'+head+'<p class="ngs-note">'+esc(g.simError||'Simulation unavailable for this game.')+'</p></div>';
+  var pk=s.picks||{},r=g.result||{};
+  var tags='';
+  if(g.savedSim)tags+='<span class="ngs-tag" style="background:#1e3a8a;color:#bfdbfe">SAVED PREGAME SIM</span>';
+  if(g.retro)tags+='<span class="ngs-tag" style="background:#334155;color:#cbd5e1">AFTER-THE-FACT &middot; NOT TRACKED</span>';
+  if(s.neutral)tags+='<span class="ngs-tag" style="background:#334155;color:#cbd5e1">NEUTRAL SITE</span>';
+  if(s.lineSource==='closing'||(g.book&&g.book.source==='closing'))tags+='<span class="ngs-tag" style="background:#334155;color:#cbd5e1">CLOSING LINES (NFL-VERSE)</span>';
+  var h='<div class="ngs-g">'+head;
+  h+='<div class="ngs-bar"><span style="width:'+s.awayWinPct+'%;background:#7c3aed"></span><span style="width:'+(s.tiePct||0)+'%;background:#475569"></span><span style="width:'+s.homeWinPct+'%;background:#0e7490"></span></div>';
+  h+='<div class="ngs-row" style="justify-content:space-between;font-size:.74rem;color:#cbd5e1"><span>'+esc(A)+' <b style="color:#fff">'+pct(s.awayWinPct)+'</b></span><span class="ngs-mut">Avg score '+esc(A)+' '+s.avgAway+' - '+s.avgHome+' '+esc(H)+' &middot; total '+s.avgTotal+'</span><span><b style="color:#fff">'+pct(s.homeWinPct)+'</b> '+esc(H)+'</span></div>';
+  h+='<div class="ngs-note" style="margin:6px 0 0">Overtime '+pct(s.otPct)+' &middot; Tie '+pct(s.tiePct)+' &middot; One-score game (8 or less) '+pct(s.oneScorePct)+tags+'</div>';
+  h+='<div class="ngs-pk">';
+  var w=pk.winner;h+=pickBox('Moneyline',w,w?w.pick+' ML':'');
+  var a=pk.ats;h+=pickBox('Spread',a,a?a.pick+' '+line(a.line):'');
+  var o=pk.ou;h+=pickBox('Total',o,o?o.pick+' '+o.line:'');
+  h+='</div>';
+  if(r&&(r.winner||r.ats||r.ou))h+='<div class="ngs-note">Result: ML '+resTag(r.winner)+(r.ats?' &middot; Spread '+resTag(r.ats):'')+(r.ou?' &middot; Total '+resTag(r.ou):'')+'</div>';
+  h+='<button type="button" class="ngs-btn" style="margin-top:8px" onclick="_nflGsimToggle('+i+')">Full sim report &#9662;</button><div id="nflGsimRep'+i+'" style="display:none">'+report(g)+'</div>';
+  return h+'</div>';
+}
+function report(g){
+  var s=g.sim,h='',A=g.away_abbr,H=g.home_abbr;
+  if(s.marginDist){var mx=Math.max.apply(null,s.marginDist.map(function(r){return r.pct||0;}));h+='<div class="ngs-h">Final margin</div>'+dist(s.marginDist,mx);}
+  if(s.keyNumbers)h+='<div class="ngs-note">Key numbers: '+s.keyNumbers.map(function(k){return esc(k.label)+' '+pct(k.pct);}).join(' &middot; ')+'</div>';
+  if(s.totalDist){var mt=Math.max.apply(null,s.totalDist.map(function(r){return r.pct||0;}));h+='<div class="ngs-h">Total points</div>'+dist(s.totalDist,mt)+(g.book&&g.book.total!=null?'<div class="ngs-note">&#9668; marks the posted total '+g.book.total+'.</div>':'');}
+  if(s.topScores)h+='<div class="ngs-h">Most common final scores</div><table class="ngs-tbl"><tr><th>Score ('+esc(A)+'-'+esc(H)+')</th><th>Share</th></tr>'+s.topScores.map(function(t){return '<tr><td>'+t.away+'-'+t.home+'</td><td>'+pct(t.pct)+'</td></tr>';}).join('')+'</table>';
+  var pk=s.picks||{};
+  if(pk.ats&&g.book&&g.book.home_spread!=null)h+='<div class="ngs-note">Spread: '+esc(H)+' '+line(g.book.home_spread)+' covers '+pct(pk.ats.home_cover_pct)+' &middot; '+esc(A)+' '+line(-g.book.home_spread)+' covers '+pct(pk.ats.away_cover_pct)+(pk.ats.push_pct?' &middot; Push '+pct(pk.ats.push_pct):'')+'</div>';
+  if(pk.ou)h+='<div class="ngs-note">Total '+pk.ou.line+': Over '+pct(pk.ou.over_pct)+' &middot; Under '+pct(pk.ou.under_pct)+(pk.ou.push_pct?' &middot; Push '+pct(pk.ou.push_pct):'')+'</div>';
+  if(s.factors)h+='<div class="ngs-h">What drives the sim (expected points)</div><table class="ngs-tbl"><tr><th>Factor</th><th>'+esc(A)+'</th><th>'+esc(H)+'</th><th>Detail</th></tr>'+s.factors.map(function(f,j){return '<tr><td>'+esc(f.name)+'</td><td>'+(j?sgn(f.away):f.away)+'</td><td>'+(j?sgn(f.home):f.home)+'</td><td style="color:#94a3b8">'+esc(f.note)+'</td></tr>';}).join('')+'<tr><td><b>Expected points</b></td><td><b>'+s.expAway+'</b></td><td><b>'+s.expHome+'</b></td><td style="color:#94a3b8">Before overtime is simulated</td></tr></table>';
+  if(g.savedSim)h+='<div class="ngs-note">This game has started, so the card shows the saved pregame sim'+(g.savedAt?' from '+esc(g.savedAt.replace('T',' ').replace('Z',' UTC')):'')+'.</div>';
+  return h;
+}
+window._nflGsimToggle=function(i){var e=$('nflGsimRep'+i);if(e)e.style.display=e.style.display==='none'?'block':'none';};
+window.runNflGameSim=function(){
+  if(S.busy)return;var d=$('nflGsimDate').value||today(),b=$('nflGsimBody'),btn=$('nflGsimRun');
+  S.busy=true;btn.disabled=true;btn.textContent='Simulating...';
+  b.innerHTML='<p class="ngs-note">Loading inputs and running 10,000 sims per game...</p>';
+  fetch('/api/nfl/game-sim?date_str='+encodeURIComponent(d)+'&scope='+encodeURIComponent(($('nflGsimScope')||{}).value||'day'),{credentials:'include'})
+   .then(function(r){return r.json().catch(function(){return {};}).then(function(j){if(!r.ok)throw new Error(j.detail||('HTTP '+r.status));return j;});})
+   .then(function(j){
+     S.data=j;var g=j.games||[];
+     if(!g.length){b.innerHTML='<p class="ngs-note">'+esc(j.message||'No games.')+'</p>';return;}
+     var h='<p class="ngs-note">'+g.length+' games &middot; '+(j.sims||10000).toLocaleString()+' sims each'+(j.scope==='week'?' &middot; full NFL week':'')+'</p>';
+     if(j.oddsNote)h+='<p class="ngs-note" style="color:#fbbf24">'+esc(j.oddsNote)+'</p>';
+          b.innerHTML=h+g.map(gameCard).join('');
+   })
+   .catch(function(e){b.innerHTML='<p class="ngs-note" style="color:#f87171">Could not run sims: '+esc(e.message||'request failed')+'</p>';})
+   .then(function(){S.busy=false;btn.disabled=false;btn.innerHTML='&#127922; Run Sims';});
+};
+window.openNflGameSim=function(){
+  var s=$('nfl-gsim-section');if(!s)return;s.style.display='block';
+  var dp=$('datePicker'),di=$('nflGsimDate');if(di&&!di.value)di.value=(dp&&dp.value)||today();
+  s.scrollIntoView({behavior:'smooth',block:'start'});
+};
+function inPeriod(ds,per,anchor){
+  if(per==='all')return true;if(per==='today')return ds===anchor;
+  var a=new Date(anchor+'T12:00:00'),d=new Date(ds+'T12:00:00');
+  if(per==='month')return ds.slice(0,7)===anchor.slice(0,7);
+  var st=new Date(a);st.setDate(a.getDate()-((a.getDay()+6)%7));var en=new Date(st);en.setDate(st.getDate()+6);
+  return d>=st&&d<=en;
+}
+function stake(){var v=Number(($('nflGsimStake')||{}).value);return v>0?v:100;}
+window._nflGsimRecRender=function(){
+  var b=$('nflGsimRecBody'),R=S.rec;if(!b||!R)return;
+  var per=$('nflGsimPeriod').value,anchor=$('nflGsimRecDate').value||today(),k=stake()/100;
+  var days=(R.days||[]).filter(function(d){return inPeriod(d.date,per,anchor);});
+  var M={winner:'Moneyline',ats:'Spread',ou:'Total'},agg={},bk={};
+  Object.keys(M).forEach(function(m){agg[m]={w:0,l:0,p:0,pw:0,pl:0,pr:0,profit:0};});
+  days.forEach(function(d){(d.games||[]).forEach(function(g){Object.keys(M).forEach(function(m){var x=g[m];if(!x||!x.result)return;var a=agg[m];
+    if(x.result==='WIN')a.w++;else if(x.result==='LOSS')a.l++;else a.p++;
+    if(x.profit!=null){a.pr++;a.profit+=x.profit*k;}
+    var key=m+'|'+(x.bucket||'');bk[key]=bk[key]||{m:m,b:x.bucket||'-',w:0,l:0};if(x.result==='WIN')bk[key].w++;else if(x.result==='LOSS')bk[key].l++;});});});
+  var h='<div class="ngs-tiles">'+Object.keys(M).map(function(m){var a=agg[m],n=a.w+a.l;return '<div class="ngs-tile"><div class="t">'+M[m]+'</div><div class="n">'+a.w+'-'+a.l+(a.p?'-'+a.p:'')+'</div><div style="font-size:.74rem;color:#cbd5e1">Hit rate '+(n?(a.w/n*100).toFixed(1)+'%':'-')+'</div><div style="font-size:.74rem;color:#cbd5e1">Profit <b class="'+(a.profit>=0?'ngs-pos':'ngs-neg')+'">'+(a.profit>=0?'+':'-')+'$'+Math.abs(a.profit).toFixed(2)+'</b> <span class="ngs-mut">('+a.pr+' priced)</span></div></div>';}).join('')+'</div>';
+  var bl=Object.keys(bk).sort().map(function(x){return bk[x];});
+  if(bl.length)h+='<div class="ngs-h">By sim confidence</div><table class="ngs-tbl"><tr><th>Market</th><th>Sim %</th><th>W-L</th><th>Hit %</th></tr>'+bl.map(function(r){var n=r.w+r.l;return '<tr><td>'+M[r.m]+'</td><td>'+esc(r.b)+'</td><td>'+r.w+'-'+r.l+'</td><td>'+(n?(r.w/n*100).toFixed(1)+'%':'-')+'</td></tr>';}).join('')+'</table>';
+  if(!days.length)h+='<p class="ngs-note">No saved sims in this period yet. Run Sims before kickoff to save calls.</p>';
+  days.forEach(function(d){
+    h+='<div class="ngs-h">'+esc(d.date)+(d.locked?'':' <span class="ngs-tag" style="background:#334155;color:#cbd5e1">OPEN</span>')+'</div><table class="ngs-tbl"><tr><th>Game</th><th>Final</th><th>Moneyline</th><th>Spread</th><th>Total</th></tr>';
+    function cell(x,lbl){if(!x)return '<td class="ngs-mut">-</td>';var p=x.profit==null?'<span class="ngs-mut"> W/L only</span>':' <span class="'+(x.profit>=0?'ngs-pos':'ngs-neg')+'">'+(x.profit>=0?'+':'-')+'$'+Math.abs(x.profit*k).toFixed(2)+'</span>';return '<td>'+esc(lbl)+' '+pct(x.prob)+(x.odds!=null?' ('+odds(x.odds)+')':'')+' '+resTag(x)+p+'</td>';}
+    (d.games||[]).forEach(function(g){h+='<tr><td>'+esc(g.away)+' @ '+esc(g.home)+'</td><td>'+g.away_score+'-'+g.home_score+'</td>'+cell(g.winner,g.winner?g.winner.pick:'')+cell(g.ats,g.ats?g.ats.pick+' '+line(g.ats.line):'')+cell(g.ou,g.ou?g.ou.pick+' '+g.ou.line:'')+'</tr>';});
+    (d.pending||[]).forEach(function(g){var p=g.picks||{};h+='<tr><td>'+esc(g.away)+' @ '+esc(g.home)+'</td><td class="ngs-mut">Pending</td><td>'+(p.winner?esc(p.winner.pick)+' '+pct(p.winner.prob):'-')+'</td><td>'+(p.ats?esc(p.ats.pick)+' '+line(p.ats.line)+' '+pct(p.ats.prob):'-')+'</td><td>'+(p.ou?esc(p.ou.pick)+' '+p.ou.line+' '+pct(p.ou.prob):'-')+'</td></tr>';});
+    h+='</table>'+(d.noResult?'<div class="ngs-note">'+d.noResult+' saved game(s) never went final and are excluded.</div>':'');
+  });
+  b.innerHTML=h;
+};
+window.loadNflSimRecord=function(){
+  var b=$('nflGsimRecBody');if(b)b.innerHTML='<p class="ngs-note">Grading finished games and loading the Sim Record...</p>';
+  fetch('/api/nfl/game-sim/record',{credentials:'include'})
+   .then(function(r){return r.json().catch(function(){return {};}).then(function(j){if(!r.ok)throw new Error(j.detail||('HTTP '+r.status));return j;});})
+   .then(function(j){S.rec=j;window._nflGsimRecRender();})
+   .catch(function(e){if(b)b.innerHTML='<p class="ngs-note" style="color:#f87171">Could not load Sim Record: '+esc(e.message||'request failed')+'</p>';});
+};
+window.openNflSimRecord=function(){
+  var s=$('nfl-gsim-record-section');if(!s)return;s.style.display='block';
+  var di=$('nflGsimRecDate');if(di&&!di.value)di.value=today();
+  s.scrollIntoView({behavior:'smooth',block:'start'});window.loadNflSimRecord();
+};
+})();
+</script>
+"""
+HTML = HTML.replace("</body>", _NFL_GSIM_UI + "</body>", 1)
