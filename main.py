@@ -6108,6 +6108,27 @@ def _nfl_attach_hot_cold(result: dict, rankings: dict, df=None, season=None,
                 versus.append((r, value))
             if len(versus) == 5:
                 break
+        # Display-only context: today's venue split (never used to qualify/rank).
+        venue_side = {"H": "HOME", "R": "AWAY"}.get(str(pick.get("homeRoad") or "").upper(), "")
+        venue_rows, venue_season = [], []
+        if venue_side:
+            for r in history:
+                if _nfl_history_venue(r) != venue_side:
+                    continue
+                value = _nfl_hc_stat_value(r, market)
+                if value is None:
+                    continue
+                if len(venue_rows) < 5:
+                    venue_rows.append((r, value))
+                if int(r.get("season") or 0) == season and \
+                        (post or str(r.get("season_type") or "REG").upper() == "REG"):
+                    venue_season.append(value)
+
+        def _hc_chip(r, v):
+            return {"d": f"W{int(r.get('week') or 0)} '{str(int(r.get('season') or 0))[-2:]}",
+                    "opp": _nfl_rank_norm(r.get("opponent_team")),
+                    "ha": {"HOME": "H", "AWAY": "A"}.get(_nfl_history_venue(r), ""),
+                    "v": round(v, 1)}
         average = sum(recent) / len(recent)
         try:
             base_prob = float(pick.get("dispScore") if pick.get("dispScore") is not None
@@ -6176,6 +6197,16 @@ def _nfl_attach_hot_cold(result: dict, rankings: dict, df=None, season=None,
                 "hcOppHits": opp_hits, "hcOppTotal": len(versus),
                 "hcOppRate": round(opp_rate, 1) if opp_rate is not None else None,
                 "hcSupport": support,
+                "hcOppAvg": round(sum(v for _, v in versus) / len(versus), 1) if versus else None,
+                "hcOppGames": [_hc_chip(r, v) for r, v in versus],
+                "hcVenue": venue_side,
+                "hcVenueHits": sum(v > line if side == "OVER" else v < line for _, v in venue_rows),
+                "hcVenueTotal": len(venue_rows),
+                "hcVenueAvg": round(sum(v for _, v in venue_rows) / len(venue_rows), 1) if venue_rows else None,
+                "hcVenueGames": [_hc_chip(r, v) for r, v in venue_rows],
+                "hcVenueSeasonHits": sum(v > line if side == "OVER" else v < line for v in venue_season),
+                "hcVenueSeasonTotal": len(venue_season),
+                "hcVenueSeasonAvg": round(sum(venue_season) / len(venue_season), 1) if venue_season else None,
                 "roleRank": pick.get("roleRank"), "teamOptionRank": pick.get("teamOptionRank"),
                 "depthRank": pick.get("depthRank"),
                 "isRookie": pick.get("isRookie"), "rookieVerified": pick.get("rookieVerified"),
@@ -14985,6 +15016,29 @@ function _nflHcCard(r,i){
     var fc=res==='hit'?'#4ade80':(res==='miss'?'#f87171':'#cbd5e1');
     return '<span title="'+_esc(g.d+' vs '+g.opp)+'" style="display:inline-flex;flex-direction:column;align-items:center;min-width:40px;padding:3px 4px;border-radius:7px;background:'+bg+';color:'+fc+';font-size:.66rem;font-weight:800">'+_esc(String(g.v))+'<small style="color:#94a3b8;font-weight:700;font-size:.54rem">'+_esc(g.d)+' '+_esc(g.opp)+'</small></span>';
   }).join('');
+  function hcChips(list){
+    return (list||[]).map(function(g){
+      var v=Number(g.v),line=Number(r.realLine);
+      var res=v===line?'push':((r.pick==='OVER')===(v>line)?'hit':'miss');
+      var bg=res==='hit'?'rgba(74,222,128,.16)':(res==='miss'?'rgba(248,113,113,.16)':'rgba(148,163,184,.16)');
+      var fc=res==='hit'?'#4ade80':(res==='miss'?'#f87171':'#cbd5e1');
+      var where=g.ha==='H'?'vs':(g.ha==='A'?'@':'vs');
+      return '<span title="'+_esc(g.d+' '+where+' '+g.opp)+'" style="display:inline-flex;flex-direction:column;align-items:center;min-width:46px;padding:3px 4px;border-radius:7px;background:'+bg+';color:'+fc+';font-size:.66rem;font-weight:800">'+_esc(String(g.v))+'<small style="color:#94a3b8;font-weight:700;font-size:.54rem">'+_esc(g.d)+'</small><small style="color:#94a3b8;font-weight:700;font-size:.54rem">'+_esc(where+' '+g.opp)+'</small></span>';
+    }).join('');
+  }
+  var hcHaTxt=r.homeRoad==='H'?'HOME':(r.homeRoad==='R'?'AWAY':'');
+  var extra='';
+  if(Array.isArray(r.hcOppGames)){
+    extra+='<div style="margin-top:8px;font-size:.68rem;font-weight:900;color:'+col+';letter-spacing:.04em">&#127386; VS '+_esc(r.opponent)+(r.hcOppTotal?' &middot; '+r.hcOppHits+'/'+r.hcOppTotal+' '+sideWord+' &middot; avg '+_esc(String(r.hcOppAvg)):'')+'</div>'
+      +(r.hcOppGames.length?'<div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:4px">'+hcChips(r.hcOppGames)+'</div>':'<div style="color:#64748b;font-size:.66rem;margin-top:2px">No meetings with '+_esc(r.opponent)+' in the data.</div>');
+  }
+  if(r.hcVenue){
+    extra+='<div style="margin-top:8px;font-size:.68rem;font-weight:900;color:'+col+';letter-spacing:.04em">&#127967;&#65039; '+(r.hcVenue==='HOME'?'AT HOME':'ON THE ROAD')+' (TODAY)'
+      +(r.hcVenueSeasonTotal?' &middot; this season '+r.hcVenueSeasonHits+'/'+r.hcVenueSeasonTotal+' '+sideWord+' &middot; avg '+_esc(String(r.hcVenueSeasonAvg)):' &middot; no '+(r.hcVenue==='HOME'?'home':'road')+' games this season yet')+'</div>'
+      +(r.hcVenueTotal?'<div style="color:#94a3b8;font-size:.64rem;margin-top:2px">Last '+r.hcVenueTotal+' '+(r.hcVenue==='HOME'?'home':'road')+' games: '+r.hcVenueHits+'/'+r.hcVenueTotal+' '+sideWord+' &middot; avg '+_esc(String(r.hcVenueAvg))+'</div><div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:4px">'+hcChips(r.hcVenueGames)+'</div>':'');
+  }else if(hcHaTxt&&!Array.isArray(r.hcOppGames)){
+    extra+='<div style="color:#64748b;font-size:.66rem;margin-top:6px">Run the slate again to see vs-opponent and home/away game logs on this card.</div>';
+  }
   var li=[];
   li.push((hot?'&#128293; ':'&#10052;&#65039; ')+sideWord+' in <b>'+r.hcHits+' of last '+r.hcTotal+'</b> games this season &middot; avg <b>'+_esc(String(r.hcAvg))+'</b>'+(Number(r.hcPushes)?' &middot; '+r.hcPushes+' push':''));
   li.push('&#127386; vs '+_esc(r.opponent)+': '+(r.hcOppTotal?'<b>'+r.hcOppHits+'/'+r.hcOppTotal+' '+sideWord+'</b>'+(r.hcOppRate!=null?' ('+Math.round(r.hcOppRate)+'%)':'')+(r.hcOppTotal<3?' <span style="color:#fbbf24">small sample</span>':''):'no recent meetings'));
@@ -14992,7 +15046,7 @@ function _nflHcCard(r,i){
   var why='<div class="nfw-box" style="background:rgba('+rgb+',.07);border-color:rgba('+rgb+',.35)">'
     +'<div class="nfw-head" style="color:'+col+'"><span>Why '+_esc(r.pick)+' '+_esc(String(r.realLine))+'</span><span class="nfw-score" style="color:'+col+'">'+tag+'</span></div>'
     +'<ul class="nfw-list">'+li.map(function(x){return '<li style="border-top-color:rgba('+rgb+',.15)">'+x+'</li>';}).join('')+'</ul>'
-    +(chips?'<div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:6px">'+chips+'</div>':'')+'</div>';
+    +(chips?'<div style="margin-top:6px;font-size:.68rem;font-weight:900;color:'+col+';letter-spacing:.04em">LAST '+r.hcTotal+' GAMES</div><div style="display:flex;gap:4px;flex-wrap:wrap;margin-top:4px">'+chips+'</div>':'')+extra+'</div>';
   var prob=r.score!=null?Number(r.score).toFixed(1)+'%':'—';
   var edgeTxt=r.edge!=null?(Number(r.edge)>0?'+':'')+Number(r.edge).toFixed(1)+' pts':'—';
   var edgeCls=r.edge!=null&&Number(r.edge)>0?'green':'red';
