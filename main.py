@@ -12436,9 +12436,41 @@ footer{text-align:center;padding:32px 24px;color:#4b5563;font-size:.78rem;border
 .admin-only{display:none !important}
 body.is-admin .admin-only{display:inline-block !important}
 body.is-admin .nfl-menu-item.admin-only{display:flex !important}
+#nflRecOv{position:fixed;top:80px;left:0;right:0;bottom:0;z-index:190;background:rgba(2,6,23,.88);display:none;overflow-y:auto;padding:12px;box-sizing:border-box}
+#nflRecOv.open{display:block}
+#nflRecPanel{max-width:1000px;margin:0 auto;position:relative}
+#nflRecSlot>.card,#nflRecSlot>.ngs{margin-top:0 !important;max-width:none !important}
+.nfl-rec-bar{position:sticky;top:0;z-index:5;display:flex;justify-content:flex-end;padding:4px 0 8px}
+.nfl-rec-close{background:#b91c1c;color:#fff;border:1px solid #ef4444;border-radius:9px;padding:8px 14px;font-size:.84rem;font-weight:900;cursor:pointer;box-shadow:0 4px 14px rgba(0,0,0,.45)}
+.nfl-rec-close:hover,.nfl-rec-close:focus{background:#dc2626;outline:none}
+body.nfl-rec-open{overflow:hidden}
+body.nfl-rec-open nav{z-index:195}
+.nfl-pan{display:none}
+.nfl-gbar{display:flex;gap:10px;flex-wrap:wrap;margin:6px 0 14px}
+.nfl-gchip{background:#161616;border:1px solid #262626;border-radius:10px;padding:9px 18px;white-space:nowrap;font-size:.82rem;color:#d1d5db;cursor:pointer;transition:border-color .2s;font-family:inherit}
+.nfl-gchip:hover{border-color:#f59e0b}
+.nfl-gchip.active{border-color:#f59e0b;background:rgba(245,158,11,.1)}
+.nfl-gchip b{color:#fff;font-weight:700}
+.nfl-gchip .sep{color:#6b7280;margin:0 5px}
+.nfl-fbar{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px}
+.nfl-fbtn{padding:7px 16px;border-radius:999px;border:1px solid #262626;background:#161616;color:#9ca3af;font-size:.8rem;cursor:pointer;transition:all .2s;font-weight:600;font-family:inherit;display:inline-flex;align-items:center;gap:6px}
+.nfl-fbtn.active,.nfl-fbtn:hover{background:rgba(245,158,11,.1);color:#f59e0b;border-color:rgba(245,158,11,.3)}
+.nfl-fbtn.empty{opacity:.5}
+.nfl-fbtn .n{background:#262626;color:#e5e7eb;border-radius:999px;padding:1px 7px;font-size:.66rem;font-weight:800}
+.nfl-fbtn.active .n{background:rgba(245,158,11,.25);color:#fbbf24}
+.nfl-cat-hdr{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin:8px 0 4px}
+.nfl-cat-title{font-family:'Playfair Display',serif;font-size:1.2rem;font-weight:700;color:#f59e0b}
+.nfl-cat-pill{border:1px solid rgba(245,158,11,.4);background:rgba(245,158,11,.08);color:#fbbf24;border-radius:999px;padding:4px 12px;font-size:.74rem;font-weight:800}
+body[data-nfl-pan="gp"] .nfl-pan[data-pan="gp"],body[data-nfl-pan="td"] .nfl-pan[data-pan="td"],body[data-nfl-pan="roi"] .nfl-pan[data-pan="roi"],body[data-nfl-pan="locks"] .nfl-pan[data-pan="locks"],body[data-nfl-pan="funnels"] .nfl-pan[data-pan="funnels"],body[data-nfl-pan="hc"] .nfl-pan[data-pan="hc"]{display:block;position:fixed;top:80px;left:0;right:0;bottom:0;z-index:190;overflow-y:auto;background:rgba(2,6,23,.97);padding:12px 12px 40px;box-sizing:border-box}
+.nfl-pan-bar{position:sticky;top:0;z-index:5;display:flex;justify-content:space-between;align-items:center;gap:10px;max-width:1000px;margin:0 auto;padding:4px 0 10px;background:rgba(2,6,23,.97)}
+.nfl-pan[data-pan="gp"] .nfl-pan-bar{max-width:1468px}
+.nfl-pan-title{color:#f8fafc;font-weight:900;font-size:.95rem;letter-spacing:.02em}
+.nfl-pan-inner{max-width:1000px;margin:0 auto}
+.nfl-pan-empty{display:none;max-width:1000px;margin:10px auto;padding:22px;border:1px dashed #334155;border-radius:12px;color:#94a3b8;text-align:center;font-size:.85rem}
+.nfl-pan .nfl-td-card,.nfl-pan #nfl-gp-card{margin-top:0 !important}
 #parlayCard{display:none}
 body.is-admin #parlayCard{display:block}
-.nfl-parlay-ov,.nfl-tool-ov{display:none;position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:150;overflow:auto;padding:16px;box-sizing:border-box}
+.nfl-parlay-ov,.nfl-tool-ov{display:none;position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:196;overflow:auto;padding:16px;box-sizing:border-box}
 .nfl-parlay-ov.open,.nfl-tool-ov.open{display:flex}
 .nfl-tool-card{position:relative;margin:auto;width:100%;max-width:900px;background:#080b12;border:1px solid #26334a;border-radius:16px;padding:clamp(14px,2.5vw,22px);box-sizing:border-box}
 .nfl-parlay-ov #parlayCard{position:relative;margin:auto !important;width:100%}
@@ -12822,6 +12854,13 @@ tr:last-child td{border-bottom:none}
     <div class="nfl-menu">
       <button type="button" class="nfl-nav-btn" aria-haspopup="true" aria-expanded="false" id="nflNavMenuBtn" onclick="_nflNavToggle(event)">&#9776; Records &amp; Tools &#9662;</button>
       <div class="nfl-menu-list" id="nflNavMenu" role="menu">
+        <div class="nfl-menu-head">Boards</div>
+        <button type="button" role="menuitem" class="nfl-menu-item" style="--c:#7c3aed" onclick="_nflNavGo(function(){_nflPanOpen('gp');})">&#128302; Game Predictor</button>
+        <button type="button" role="menuitem" class="nfl-menu-item" style="--c:#ca8a04" onclick="_nflNavGo(function(){_nflPanOpen('td');})">&#127944; Anytime TD Predictor</button>
+        <button type="button" role="menuitem" class="nfl-menu-item" style="--c:#047857" onclick="_nflNavGo(function(){_nflPanOpen('roi');})">&#128176; ROI Focus</button>
+        <button type="button" role="menuitem" class="nfl-menu-item" style="--c:#d97706" onclick="_nflNavGo(function(){_nflPanOpen('locks');})">&#128274; 80&#8211;100% Locks</button>
+        <button type="button" role="menuitem" class="nfl-menu-item" style="--c:#be185d" onclick="_nflNavGo(_nflNavFunnelPicks)">&#127919; Matchup Funnels</button>
+        <button type="button" role="menuitem" class="nfl-menu-item" style="--c:#ea580c" onclick="_nflNavGo(_nflNavHotCold)">&#128293; Hot / &#10052;&#65039; Cold</button>
         <div class="nfl-menu-head">Records</div>
         <button type="button" role="menuitem" class="nfl-menu-item" style="--c:#047857" onclick="_nflNavGo(_nflNavTrack)">&#128202; Track Record</button>
         <button type="button" role="menuitem" class="nfl-menu-item" style="--c:#b45309" onclick="_nflNavGo(_nflNavOverflow)">&#11088; NFL Overflow</button>
@@ -12831,13 +12870,12 @@ tr:last-child td{border-bottom:none}
         <button type="button" role="menuitem" class="nfl-menu-item" style="--c:#ca8a04" onclick="_nflNavGo(function(){openNflGamePicksRecord();})">&#127944; 80&#8211;100% Game Record</button>
         <button type="button" role="menuitem" class="nfl-menu-item" style="--c:#047857" onclick="_nflNavGo(_nflNavRoiFocus)">&#128176; ROI Focus Record</button>
         <button type="button" role="menuitem" class="nfl-menu-item" style="--c:#be185d" onclick="_nflNavGo(_nflNavFunnels)">&#127919; Matchup Funnels Record</button>
+        <button type="button" role="menuitem" class="nfl-menu-item" style="--c:#ea580c" onclick="_nflNavGo(openNflHcTrack)">&#128293; Hot / &#10052;&#65039; Cold Record</button>
         <button type="button" role="menuitem" class="nfl-menu-item" style="--c:#1d4ed8" onclick="_nflNavGo(_nflNavHistorical)">&#128218; Historical Analysis</button>
         <div class="nfl-menu-head">Tools</div>
         <button type="button" role="menuitem" class="nfl-menu-item" style="--c:#0e7490" onclick="_nflNavGo(openNflGameSim)">&#127922; 10K Game Simulator</button>
         <button type="button" role="menuitem" class="nfl-menu-item admin-only" style="--c:#d97706" onclick="_nflNavGo(openNflParlay)">&#127920; Auto Parlay Builder</button>
         <button type="button" role="menuitem" class="nfl-menu-item" style="--c:#eab308" onclick="_nflNavGo(openNflRoleRisk)">&#9888; Pregame Role Risk Monitor</button>
-        <button type="button" role="menuitem" class="nfl-menu-item" style="--c:#be185d" onclick="_nflNavGo(_nflNavFunnelPicks)">&#127919; Matchup Funnels Picks</button>
-        <button type="button" role="menuitem" class="nfl-menu-item" style="--c:#ea580c" onclick="_nflNavGo(_nflNavHotCold)">&#128293; Hot / &#10052;&#65039; Cold Picks</button>
         <button type="button" role="menuitem" class="nfl-menu-item" style="--c:#db2777" onclick="_nflNavGo(openNflTeamRanks)">&#128202; Team Rankings</button>
         <button type="button" role="menuitem" class="nfl-menu-item admin-only" style="--c:#0e7490" onclick="_nflNavGo(openNflMyBets)">&#128176; My Bets</button>
       </div>
@@ -12881,7 +12919,90 @@ document.addEventListener('keydown',function(e){
   var o=document.getElementById('nflParlayOv');if(o&&o.classList.contains('open'))closeNflParlay();
   var r=document.getElementById('nflRoleRiskOv');if(r&&r.classList.contains('open'))closeNflRoleRisk();
 });
-function _nflNavScroll(id){var el=document.getElementById(id);if(el)el.scrollIntoView({behavior:'smooth',block:'start'});}
+// Every track record opens in one closable overlay; none show on the page until chosen.
+var _NFL_REC_CARDS=['nfl-main-track-card','nfl-overflow-track-card','nfl-gp-record-section','nfl-coach-track-section','nfl-gsim-record-section','nfl-hc-track-card','nfl-gsim-section'];
+var _nflRecHome={};
+function _nflRecHost(){
+  var ov=document.getElementById('nflRecOv');
+  if(!ov){
+    ov=document.createElement('div');ov.id='nflRecOv';
+    ov.setAttribute('role','dialog');ov.setAttribute('aria-modal','true');ov.setAttribute('aria-label','Track record');
+    ov.innerHTML='<div id="nflRecPanel"><div class="nfl-rec-bar"><button type="button" class="nfl-rec-close" onclick="_nflRecClose()" aria-label="Close track record">&#10005; Close</button></div><div id="nflRecSlot"></div></div>';
+    ov.addEventListener('click',function(e){if(e.target===ov)_nflRecClose();});
+    document.body.appendChild(ov);
+  }
+  return ov;
+}
+function _nflRecReturn(){
+  var slot=document.getElementById('nflRecSlot');if(!slot)return;
+  Array.prototype.slice.call(slot.children).forEach(function(el){
+    var mark=_nflRecHome[el.id];
+    if(mark&&mark.parentNode)mark.parentNode.insertBefore(el,mark.nextSibling);
+    el.style.display='none';
+  });
+}
+function _nflRecOpen(id){
+  var el=document.getElementById(id);if(!el)return null;
+  _nflPanClose();
+  var ov=_nflRecHost(),slot=document.getElementById('nflRecSlot');
+  if(el.parentNode!==slot){
+    _nflRecReturn();
+    if(!_nflRecHome[id]&&el.parentNode){
+      var mark=document.createComment('nfl-record-home');
+      el.parentNode.insertBefore(mark,el);_nflRecHome[id]=mark;
+    }
+    slot.appendChild(el);
+  }
+  el.style.display='block';
+  ov.classList.add('open');ov.scrollTop=0;
+  document.body.classList.add('nfl-rec-open');
+  return el;
+}
+function _nflRecClose(){
+  _nflRecReturn();
+  var ov=document.getElementById('nflRecOv');if(ov)ov.classList.remove('open');
+  if(!document.body.getAttribute('data-nfl-pan'))document.body.classList.remove('nfl-rec-open');
+}
+// Boards (Game Predictor, Anytime TD, ROI Focus, Locks, Funnels, Hot/Cold) keep
+// running and rendering, but stay hidden until opened from the menu.
+var _NFL_PANS={gp:'&#128302; Game Predictor',td:'&#127944; Anytime TD Predictor',roi:'&#128176; ROI Focus',locks:'&#128274; 80&#8211;100% Locks',funnels:'&#127919; Matchup Funnels',hc:'&#128293; Hot / &#10052;&#65039; Cold'};
+function _nflPanBar(key){
+  return '<div class="nfl-pan-bar"><span class="nfl-pan-title">'+(_NFL_PANS[key]||'')+'</span><button type="button" class="nfl-rec-close" onclick="_nflPanClose()" aria-label="Close">&#10005; Close</button></div>';
+}
+function _nflPanEl(key){return document.querySelector('.nfl-pan[data-pan="'+key+'"]');}
+function _nflPanOpen(key){
+  var el=_nflPanEl(key);
+  if(!el){
+    _nflNavNotice(_NFL_PANS[key]||'Board','No pick board is loaded yet. Press <b>Run Picks</b> for today, then open it again from this menu.');
+    return;
+  }
+  if(_nflRecIsOpen())_nflRecClose();
+  var empty=el.querySelector('.nfl-pan-empty');
+  if(empty){
+    var card=document.getElementById(key==='gp'?'nfl-gp-card':'nfl-td-predictor-card');
+    var shown=card&&(key==='gp'?card.style.display!=='none':card.style.display==='block');
+    empty.style.display=shown?'none':'block';
+  }
+  document.body.setAttribute('data-nfl-pan',key);
+  document.body.classList.add('nfl-rec-open');
+  el.scrollTop=0;
+}
+function _nflPanClose(){
+  if(!document.body.getAttribute('data-nfl-pan'))return;
+  document.body.removeAttribute('data-nfl-pan');
+  if(!_nflRecIsOpen())document.body.classList.remove('nfl-rec-open');
+}
+function _nflRecIsOpen(){var ov=document.getElementById('nflRecOv');return !!(ov&&ov.classList.contains('open'));}
+document.addEventListener('keydown',function(e){
+  var pan=document.body.getAttribute('data-nfl-pan');
+  if(e.key!=='Escape'||(!_nflRecIsOpen()&&!pan))return;
+  if(document.getElementById('nflLadOv')||document.getElementById('nflModalOv')||document.querySelector('.pm-ov'))return;
+  if(pan)_nflPanClose();else _nflRecClose();
+});
+function _nflNavScroll(id){
+  if(_NFL_REC_CARDS.indexOf(id)>=0){_nflRecOpen(id);return;}
+  var el=document.getElementById(id);if(el)el.scrollIntoView({behavior:'smooth',block:'start'});
+}
 function _nflNavSetSource(v){
   var sel=document.getElementById('nflTrkSource');
   if(sel&&sel.value!==v){sel.value=v;if(typeof nflTrkSourceChanged==='function')nflTrkSourceChanged();}
@@ -12902,30 +13023,8 @@ function _nflNavNotice(title,msg){
     +'<div style="font-weight:950;color:#f472b6;font-size:1rem;margin-bottom:8px">'+title+'</div>'+msg
     +'<div style="text-align:right;margin-top:14px"><button onclick="document.getElementById(&#39;nfl-nav-notice&#39;).style.display=&#39;none&#39;" style="background:#be185d;color:#fff;border:0;border-radius:8px;padding:8px 16px;font-weight:900;cursor:pointer">OK</button></div></div>';
 }
-function _nflNavFunnelPicks(){
-  var body=document.getElementById('sec_matchup_funnels');
-  if(!body){
-    _nflNavNotice('&#127919; Matchup Funnels Picks','No pick board is loaded yet. Press <b>Run Picks</b> for today and the <b>&#127919; Matchup Funnels</b> section appears on the board, above the line-movement boards. Boards created before the funnel update need one fresh Run Picks to tag funnel plays.');
-    return;
-  }
-  body.style.display='block';
-  var car=document.getElementById('car_matchup_funnels');if(car)car.textContent='▾';
-  var hdr=body.previousElementSibling||body;
-  hdr.style.scrollMarginTop='90px';
-  hdr.scrollIntoView({behavior:'smooth',block:'start'});
-}
-function _nflNavHotCold(){
-  var body=document.getElementById('sec_hot_cold');
-  if(!body){
-    _nflNavNotice('&#128293; Hot / &#10052;&#65039; Cold Picks','No pick board is loaded yet. Press <b>Run Picks</b> for today and the <b>&#128293; Hot / &#10052;&#65039; Cold</b> section appears on the board under Matchup Funnels. Boards created before this update need one fresh Run Picks.');
-    return;
-  }
-  body.style.display='block';
-  var car=document.getElementById('car_hot_cold');if(car)car.textContent='▾';
-  var hdr=body.previousElementSibling||body;
-  hdr.style.scrollMarginTop='90px';
-  hdr.scrollIntoView({behavior:'smooth',block:'start'});
-}
+function _nflNavFunnelPicks(){_nflPanOpen('funnels');}
+function _nflNavHotCold(){_nflPanOpen('hc');}
 function _nflNavFindFunnelRecord(){
   var hit=null;
   document.querySelectorAll('#nflTrkBody .nfl-trk-group-name').forEach(function(el){
@@ -13338,12 +13437,19 @@ document.addEventListener('keydown',function(e){if(e.key==='Escape')_nflNavGo(nu
     <div id="nflCoachTrackSummary"></div>
     <div id="nflCoachTrackBody"></div>
   </div>
+  <div class="nfl-pan" data-pan="gp" onclick="if(event.target===this)_nflPanClose()">
+  <div class="nfl-pan-bar"><span class="nfl-pan-title">&#128302; Game Predictor</span><button type="button" class="nfl-rec-close" onclick="_nflPanClose()" aria-label="Close">&#10005; Close</button></div>
+  <div class="nfl-pan-empty">No Game Predictor picks are loaded yet. Press <b>Run Picks</b> for today.</div>
   <div id="nfl-gp-card" style="display:none;max-width:1500px;margin:18px auto 0;padding:0 16px">
     <div style="display:flex;align-items:center;gap:8px;font-size:1.05rem;font-weight:900;color:#a78bfa;margin-bottom:6px;letter-spacing:0.02em"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:#a78bfa"><path d="M21.54 15H17a2 2 0 0 0-2 2v4.54"/><path d="M7 3.34V5a3 3 0 0 0 3 3v0a2 2 0 0 1 2 2v0c0 1.1.9 2 2 2v0a2 2 0 0 0 2-2c0-1.1.9-2 2-2h3.17"/><path d="M11 21.95V18a2 2 0 0 0-2-2v0a2 2 0 0 1-2-2v-1a2 2 0 0 0-2-2H2.05"/><circle cx="12" cy="12" r="10"/></svg> GAME PREDICTOR &#8212; TODAY&#39;S WINNERS</div>
     <div style="font-size:.72rem;color:#64748b;margin-bottom:14px">Model blends recent L5 form, last completed season offense/defense, home-field advantage, and venue-aware results from the last five head-to-head meetings. Tap a game for the full breakdown.</div>
     <button type="button" onclick="openNflGameSim()" style="background:#0e7490;border:1px solid #0e7490;color:#fff;border-radius:8px;padding:7px 12px;font-size:.78rem;font-weight:800;cursor:pointer;margin:0 0 12px">&#127922; Open 10K Game Simulator</button>
     <div id="nfl-gp-body"></div>
   </div>
+  </div>
+  <div class="nfl-pan" data-pan="td" onclick="if(event.target===this)_nflPanClose()">
+  <div class="nfl-pan-bar"><span class="nfl-pan-title">&#127944; Anytime TD Predictor</span><button type="button" class="nfl-rec-close" onclick="_nflPanClose()" aria-label="Close">&#10005; Close</button></div>
+  <div class="nfl-pan-empty">No Anytime TD scorers are loaded yet. Press <b>Run Picks</b> for today.</div>
   <div id="nfl-td-predictor-card" class="card nfl-td-card">
     <div class="nfl-td-head">
       <div><div class="nfl-td-kicker">Touchdown Intelligence</div><h2 class="nfl-td-title">Anytime TD Predictor</h2>
@@ -13353,6 +13459,7 @@ document.addEventListener('keydown',function(e){if(e.key==='Escape')_nflNavGo(nu
     <div id="nflTdPositionFilters" role="group" aria-label="Filter Anytime TD scorers by position" style="display:flex;gap:7px;flex-wrap:wrap;margin:13px 0 2px"></div>
     <div id="nfl-td-predictor-body"></div>
   </div>
+  </div>
   <div id="results"></div>
 </main>
 <footer>
@@ -13360,8 +13467,8 @@ document.addEventListener('keydown',function(e){if(e.key==='Escape')_nflNavGo(nu
   <div>NFL Money Bombs &middot; Player Props &middot; Daily Picks</div>
   <div style="margin-top:8px;font-size:.7rem">For entertainment only. Not a betting service. Must be 18+. Please gamble responsibly.</div>
 </footer>
-<div id="nfl-track-section" style="max-width:960px;margin:18px auto 0;padding:0 16px 40px;scroll-margin-top:90px">
-  <div id="nfl-gp-record-section" class="card" style="padding:20px 22px;border-color:#4c1d95">
+<div id="nfl-track-section" style="max-width:960px;margin:0 auto;padding:0 16px;scroll-margin-top:90px">
+  <div id="nfl-gp-record-section" class="card" style="display:none;padding:20px 22px;border-color:#4c1d95">
     <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap;margin-bottom:12px">
       <div>
         <h2 style="font-family:'Playfair Display',serif;font-size:1.4rem;font-weight:700;color:#fff;display:flex;align-items:center;gap:8px"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:#a78bfa"><path d="M21.54 15H17a2 2 0 0 0-2 2v4.54"/><path d="M7 3.34V5a3 3 0 0 0 3 3v0a2 2 0 0 1 2 2v0c0 1.1.9 2 2 2v0a2 2 0 0 0 2-2c0-1.1.9-2 2-2h3.17"/><path d="M11 21.95V18a2 2 0 0 0-2-2v0a2 2 0 0 1-2-2v-1a2 2 0 0 0-2-2H2.05"/><circle cx="12" cy="12" r="10"/></svg> NFL Game Predictor Record <span style="color:#fbbf24;font-size:.7rem;font-family:sans-serif">SYSTEM: SELECTED</span></h2>
@@ -13386,7 +13493,7 @@ document.addEventListener('keydown',function(e){if(e.key==='Escape')_nflNavGo(nu
     <div id="nflGpTrkSummary"></div>
     <div id="nflGpTrkBody"></div>
   </div>
-  <div id="nfl-main-track-card" class="card" style="padding:20px 22px;scroll-margin-top:90px">
+  <div id="nfl-main-track-card" class="card" style="display:none;padding:20px 22px;scroll-margin-top:90px">
     <div style="margin-bottom:14px">
       <h2 style="font-family:'Playfair Display',serif;font-size:1.4rem;font-weight:700;color:#fff">&#128202; NFL Track Record <span id="nflTrackSystemBadge" style="color:#fbbf24;font-size:.7rem">SYSTEM: OLD</span></h2>
       <div style="color:#7c8aa0;font-size:.76rem;margin-top:4px">Top 10 picks per category. Receiving Yards and Receptions have separate WR, TE and RB lists for each side. Existing saved records keep their original format; new captures use the position split. Historical Analysis remains separate from the official pre-game record.</div>
@@ -13417,7 +13524,7 @@ document.addEventListener('keydown',function(e){if(e.key==='Escape')_nflNavGo(nu
     <div id="nflTrkSummary"></div>
     <div id="nflTrkBody"></div>
   </div>
-  <div id="nfl-overflow-track-card" class="card" style="padding:20px 22px;border-color:#92400e;scroll-margin-top:90px">
+  <div id="nfl-overflow-track-card" class="card" style="display:none;padding:20px 22px;border-color:#92400e;scroll-margin-top:90px">
     <div style="margin-bottom:14px">
       <h2 style="font-family:'Playfair Display',serif;font-size:1.4rem;font-weight:700;color:#fff">&#128200; NFL Overflow Track Record <span id="nflOverflowSystemBadge" style="color:#fbbf24;font-size:.7rem">SYSTEM: OLD</span></h2>
       <div style="color:#9a7b63;font-size:.76rem;margin-top:4px">Ranks 11+ tracked separately from each category&#39;s Top 10 picks. New receiving captures use ranks 11–20 independently for WR, TE and RB on each side.</div>
@@ -13447,6 +13554,51 @@ document.addEventListener('keydown',function(e){if(e.key==='Escape')_nflNavGo(nu
     </div>
     <div id="nflOvfSummary"></div>
     <div id="nflOvfBody"><p style="color:#94a3b8">Select the record, period, and date, then click Get Results.</p></div>
+  </div>
+  <div id="nfl-hc-track-card" class="card" style="display:none;padding:20px 22px;border-color:#c2410c">
+    <div style="margin-bottom:14px">
+      <h2 style="font-family:'Playfair Display',serif;font-size:1.4rem;font-weight:700;color:#fff">&#128293; Hot / &#10052;&#65039; Cold Track Record <span id="nflHcSystemBadge" style="color:#fbbf24;font-size:.7rem">SYSTEM: OLD</span></h2>
+      <div style="color:#9a8b7c;font-size:.76rem;margin-top:4px">Hot, Cold and Double Cold plays have their own record and are not shown or counted in the NFL Track Record, NFL Overflow or Edge Track Record. Top 10 = ranks 1&#8211;10 per category &middot; Overflow = ranks 11&#8211;20 &middot; Coach = the Hot / Cold / Double Cold &middot; Top 10 Coach presets.</div>
+    </div>
+    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:14px">
+      <label style="color:#9ca3af;font-size:.78rem;font-weight:700;text-transform:uppercase;letter-spacing:.1em">Record</label>
+      <select id="nflHcTrkSource" class="date-input" onchange="loadNflHcTrack()">
+        <option value="official">Official</option>
+        <option value="historical">Historical Analysis</option>
+      </select>
+      <label style="color:#9ca3af;font-size:.78rem;font-weight:700;text-transform:uppercase;letter-spacing:.1em">Section</label>
+      <select id="nflHcTrkTier" class="date-input" onchange="renderNflHcTrack()">
+        <option value="top10">Top 10</option>
+        <option value="overflow">Overflow 11&#8211;20</option>
+        <option value="coach">Coach presets</option>
+      </select>
+      <label style="color:#9ca3af;font-size:.78rem;font-weight:700;text-transform:uppercase;letter-spacing:.1em">Form</label>
+      <select id="nflHcTrkForm" class="date-input" onchange="renderNflHcTrack()">
+        <option value="ALL">All</option>
+        <option value="HOT">Hot</option>
+        <option value="COLD">Cold</option>
+        <option value="DOUBLE">Double Cold</option>
+      </select>
+      <label style="color:#9ca3af;font-size:.78rem;font-weight:700;text-transform:uppercase;letter-spacing:.1em">Period</label>
+      <select id="nflHcTrkPeriod" class="date-input" onchange="renderNflHcTrack()">
+        <option value="day">Day</option>
+        <option value="week">Week</option>
+        <option value="month">Month</option>
+        <option value="season">Season</option>
+        <option value="all">All Time</option>
+      </select>
+      <label style="color:#9ca3af;font-size:.78rem;font-weight:700;text-transform:uppercase;letter-spacing:.1em">Date</label>
+      <input type="date" id="nflHcTrkDate" class="date-input" style="width:auto" onchange="_nflHcTrkDayName();renderNflHcTrack()">
+      <span id="nflHcTrkDayName" style="color:#fb923c;font-weight:700;font-size:.9rem"></span>
+      <label style="color:#9ca3af;font-size:.78rem;font-weight:700;text-transform:uppercase;letter-spacing:.1em">Bet $</label>
+      <input type="number" id="nflHcTrkStake" class="date-input" value="20" min="0.01" step="0.01" style="width:105px" oninput="renderNflHcTrack()">
+      <button onclick="loadNflHcTrack()" style="background:#c2410c;color:#fff;border:none;border-radius:8px;padding:8px 14px;font-weight:700;cursor:pointer;font-size:.82rem">&#8635; Get Results</button>
+      <button id="nflHcTrkBtnCat" onclick="nflHcTrkSetTab('cat')" style="background:#c2410c;color:#fff;border:none;border-radius:8px;padding:8px 14px;font-weight:700;cursor:pointer;font-size:.82rem">By Category</button>
+      <button id="nflHcTrkBtnList" onclick="nflHcTrkSetTab('list')" style="background:#1f2937;color:#fff;border:none;border-radius:8px;padding:8px 14px;font-weight:700;cursor:pointer;font-size:.82rem">Full List</button>
+    </div>
+    <div id="nflHcTrkSections"></div>
+    <div id="nflHcTrkSummary"></div>
+    <div id="nflHcTrkBody"><p style="color:#94a3b8">Select the record, period, and date, then click Get Results.</p></div>
   </div>
 </div>
 <script>
@@ -13994,7 +14146,7 @@ function _nflSystemChanged(){
   if(typeof _nflPerfectParlayInvalidate==='function')_nflPerfectParlayInvalidate('system');
   var s=_nflSystem(),badge=document.getElementById('nflSystemBadge');
   if(badge){badge.textContent='SYSTEM: '+s;badge.style.color=s==='NEW'?'#67e8f9':'#fbbf24';}
-  ['nflCoachSystemBadge','nflTrackSystemBadge','nflOverflowSystemBadge'].forEach(function(id){
+  ['nflCoachSystemBadge','nflTrackSystemBadge','nflOverflowSystemBadge','nflHcSystemBadge'].forEach(function(id){
     var b=document.getElementById(id);if(b){b.textContent='SYSTEM: '+s;b.style.color=s==='NEW'?'#67e8f9':'#fbbf24';}
   });
   var status=document.getElementById('statusMsg');
@@ -14019,17 +14171,18 @@ function _nflSystemChanged(){
   window.__NFL_LAST_ALT_COACH__=[];window.__NFL_LAST_ALT_COACH_DATE__='';
   window.__NFL_MYBETS__=null;window._lastParlay=null;window._nflParlayLegs=[];
   _nflCoachTrackData=null;_nflTrkData=null;_nflOvfData=null;
+  _nflHcTrkData=null;_nflHcCoachData=null;_nflHcCoachErr='';_nflHcTrkLoadSeq++;
   _nflTrkReplayDate='';_nflCoachTrackTabMode='cat';_nflTrkTabMode='cat';_nflOvfTabMode='cat';
   ['results','nflBody','nflCoachAnswer','nflCoachCaptureStatus','nflCoachTrackSummary',
    'nflCoachTrackBody','nflTrkSummary','nflTrkBody','nflOvfSummary','nflOvfBody',
    'nflGpTrkSummary','nflGpTrkBody','parlayResult','nflMyBetsBody',
-   'nflHistoricalBody'].forEach(function(id){
+   'nflHistoricalBody','nflHcTrkSections','nflHcTrkSummary','nflHcTrkBody'].forEach(function(id){
      var el=document.getElementById(id);if(el)el.innerHTML='';
    });
   ['nfl-gp-modal','nfl-bet-modal','nfl-ladder-modal'].forEach(function(id){
     var el=document.getElementById(id);if(el)el.style.display='none';
   });
-  ['nflTrkSource','nflOvfSource','nflCoachTrkSource'].forEach(function(id){
+  ['nflTrkSource','nflOvfSource','nflCoachTrkSource','nflHcTrkSource'].forEach(function(id){
     var el=document.getElementById(id);if(el)el.value='official';
   });
   if(typeof _nflCoachTrackAwaitingSelection==='function')_nflCoachTrackAwaitingSelection();
@@ -14242,7 +14395,6 @@ async function getPicks(){
       _nflTrkDayName();
       renderNflTrackDay();
       renderNflGpRecord();
-      document.getElementById('nfl-gp-record-section').scrollIntoView({behavior:'smooth',block:'start'});
     }
     status.textContent=isHistorical
       ?'HISTORICAL REPLAY — picks and results reconstructed for '+date+'; not added to the official record'
@@ -14673,27 +14825,98 @@ function _marketModal(m){
 }
 function _nflJumpToMarket(index){
   var market=_MORDER[index];if(!market)return;
-  var id='nfl-market-category-'+index,target=document.getElementById(id);
-  if(!target){
-    var body=document.getElementById('nflBody');if(!body)return;
-    target=document.createElement('section');
-    target.id=id;target.tabIndex=-1;target.setAttribute('aria-label',market);
-    target.style.scrollMarginTop='96px';
-    target.innerHTML='<div class="sec">'+_mIcon(market)+' '+_esc(market)+'</div>'
-      +'<div class="no-picks" style="padding:20px">No active plays remain in this category on the displayed board.'
-      +'<div style="margin-top:10px"><button type="button" onclick="_marketModal(_MORDER['+index+'])" style="background:#1e293b;color:#cbd5e1;border:1px solid #475569;border-radius:7px;padding:7px 11px;font-weight:800;cursor:pointer">View all loaded category plays</button></div></div>';
-    var games=document.getElementById('nfl-by-game-section');
-    if(games&&games.parentNode===body)body.insertBefore(target,games);
-    else body.appendChild(target);
+  _nflCatPick('m'+index);
+  var el=document.getElementById('nflCatWrap');if(el)el.scrollIntoView({behavior:'smooth',block:'start'});
+}
+// ── Category board (NBA layout): game chips + category chips + side chooser ──
+window.__NFL_CAT__=window.__NFL_CAT__||{cat:'',side:'ALL',games:{}};
+function _nflCatGameOn(p){
+  var sel=window.__NFL_CAT__.games,keys=Object.keys(sel).filter(function(k){return sel[k];});
+  if(!keys.length)return true;
+  return !!sel[_nflGameKey(p.team,p.opponent||p.opp)];
+}
+function _nflCatGame(key){
+  var sel=window.__NFL_CAT__.games;
+  if(!key){window.__NFL_CAT__.games={};}
+  else sel[key]=!sel[key];
+  _nflCatRefresh();
+}
+function _nflCatPick(cat){window.__NFL_CAT__.cat=cat;_nflCatRefresh();}
+function _nflCatSide(side){window.__NFL_CAT__.side=side;_nflCatRefresh();}
+function _nflCatRefresh(){var el=document.getElementById('nflCatWrap');if(el)el.innerHTML=_nflCatHtml();}
+function _nflCatHtml(){
+  var st=window._nflState||{},d=st.d||{},byM=st.byM||{},picks=st.paintPicks||[],q=st.paintQ||'';
+  var cs=window.__NFL_CAT__;
+  var live=function(rows){return (rows||[]).filter(function(p){return !_nflGameDone(p)&&_nflCatGameOn(p);});};
+  var counts={};
+  _MORDER.forEach(function(m,i){counts['m'+i]=live(byM[m]).length;});
+  var movePicks=live(picks);
+  var cats=_MORDER.map(function(m,i){return {key:'m'+i,label:_mIcon(m)+' '+_esc(m),title:m,n:counts['m'+i]};});
+  cats.push({key:'move_over',label:'&#11014; Over Line Movement',title:'Biggest Over Line Movement',n:null});
+  cats.push({key:'move_under',label:'&#11015; Under Line Movement',title:'Biggest Under Line Movement',n:null});
+  var valid=cats.some(function(c){return c.key===cs.cat;});
+  if(!valid){
+    var first=cats.filter(function(c){return c.n;})[0]||cats[0];
+    cs.cat=first.key;
   }
-  target.querySelectorAll('[id^="sec_mkt_"],[id^="sec_recv_"]').forEach(function(section){
-    if(/_overflow$/.test(section.id))return;
-    section.style.display='block';
-    var caret=document.getElementById('car_'+section.id.slice(4));
-    if(caret)caret.textContent='▾';
+  // Game chips
+  var games=_nflLoadedGames(),selKeys=Object.keys(cs.games).filter(function(k){return cs.games[k];});
+  var h='<div class="nfl-gbar">';
+  h+='<button type="button" class="nfl-gchip'+(selKeys.length?'':' active')+'" onclick="_nflCatGame(&#39;&#39;)" aria-pressed="'+(!selKeys.length)+'"><b>All Games</b></button>';
+  games.forEach(function(g){
+    var on=!!cs.games[g.key],parts=g.label.split(/ @ | vs /);
+    h+='<button type="button" class="nfl-gchip'+(on?' active':'')+'" data-key="'+_esc(g.key)+'" onclick="_nflCatGame(this.getAttribute(&#39;data-key&#39;))" aria-pressed="'+on+'"><b>'+_esc(parts[0]||g.label)+'</b><span class="sep">'+(g.label.indexOf(' vs ')>=0?'vs':'@')+'</span><b>'+_esc(parts[1]||'')+'</b></button>';
   });
-  target.scrollIntoView({behavior:'smooth',block:'start'});
-  target.focus({preventScroll:true});
+  h+='</div>';
+  // Category chips
+  h+='<div class="nfl-fbar">';
+  cats.forEach(function(c){
+    h+='<button type="button" class="nfl-fbtn'+(c.key===cs.cat?' active':'')+(c.n===0?' empty':'')+'" onclick="_nflCatPick(&#39;'+c.key+'&#39;)" aria-pressed="'+(c.key===cs.cat)+'">'+c.label+(c.n!=null?'<span class="n">'+c.n+'</span>':'')+'</button>';
+  });
+  h+='</div>';
+  var isMove=cs.cat.indexOf('move_')===0;
+  if(!isMove){
+    h+='<div class="nfl-fbar" style="margin-top:-4px">';
+    [['ALL','Both'],['OVER','Over Top 10'],['UNDER','Under Top 10']].forEach(function(o){
+      h+='<button type="button" class="nfl-fbtn'+(cs.side===o[0]?' active':'')+'" style="font-size:.72rem;'+(o[0]==='OVER'?'color:#4ade80':(o[0]==='UNDER'?'color:#f87171':''))+'" onclick="_nflCatSide(&#39;'+o[0]+'&#39;)" aria-pressed="'+(cs.side===o[0])+'">'+o[1]+'</button>';
+    });
+    h+='</div>';
+  }
+  var gameNote=selKeys.length?' &middot; '+selKeys.length+' game'+(selKeys.length!==1?'s':''):'';
+  if(isMove){
+    var side=cs.cat==='move_over'?'OVER':'UNDER';
+    h+='<div class="nfl-cat-hdr"><div class="nfl-cat-title">'+(side==='OVER'?'&#11014; Biggest Over Line Movement':'&#11015; Biggest Under Line Movement')+'</div><span class="nfl-cat-pill">Top 10'+gameNote+'</span></div>';
+    h+=_nflMovementBoard(movePicks,side);
+    return h;
+  }
+  var i=Number(cs.cat.slice(1)),m=_MORDER[i];
+  var all=live(byM[m]);
+  if(cs.side!=='ALL')all=all.filter(function(p){return p.pick===cs.side;});
+  var sideTxt=cs.side==='ALL'?'Top 10 Overs &amp; Unders':(cs.side==='OVER'?'Top 10 Over':'Top 10 Under');
+  h+='<div class="nfl-cat-hdr"><div class="nfl-cat-title">'+_mIcon(m)+' '+_esc(m)+' &middot; '+sideTxt+'</div><span class="nfl-cat-pill">'+all.length+' play'+(all.length!==1?'s':'')+gameNote+'</span></div>';
+  if(!all.length){
+    h+='<div class="no-picks">No qualifying '+_esc(m)+' picks'+(q?' for "'+_esc(q)+'"':'')+(selKeys.length?' in the selected games':' for '+_esc(d.date||'today'))+'.</div>';
+    return h;
+  }
+  h+='<section id="nfl-market-category-'+i+'" tabindex="-1" aria-label="'+_esc(m)+'">';
+  if(m==='Rec Yds'||m==='Receptions'){
+    h+=_nflReceivingSections(m,all,i);
+  }else{
+    var overs=all.filter(function(p){return p.pick==='OVER';});
+    var unders=all.filter(function(p){return p.pick==='UNDER';});
+    if(overs.length){
+      var og=overs.slice(0,10),ofov=overs.slice(10,20);
+      h+=_collapseSec('mkt_ov_'+i,'&#11014; '+_mIcon(m)+' Top 10 '+_esc(m)+' &#8212; OVERS',nflCardGrid(og),true);
+      if(ofov.length)h+=_collapseSec('ovf_ov_'+i,'&#11014; '+_esc(m)+' OVERS &#8212; Overflow ('+ofov.length+' more)',nflCardGrid(ofov,11),false);
+    }
+    if(unders.length){
+      var ug=unders.slice(0,10),ufov=unders.slice(10,20);
+      h+=_collapseSec('mkt_un_'+i,'&#11015; '+_mIcon(m)+' Top 10 '+_esc(m)+' &#8212; UNDERS',nflCardGrid(ug),true);
+      if(ufov.length)h+=_collapseSec('ovf_un_'+i,'&#11015; '+_esc(m)+' UNDERS &#8212; Overflow ('+ufov.length+' more)',nflCardGrid(ufov,11),false);
+    }
+  }
+  h+='</section>';
+  return h;
 }
 function _nflJumpToGames(){
   var el=document.getElementById('nfl-by-game-section');
@@ -16392,8 +16615,7 @@ function _nflCoachTrackAwaitingSelection(){
   if(out)out.innerHTML='<p style="color:#94a3b8">Select the record, period, and date, then click Get Results.</p>';
 }
 function openNflCoachTrack(){
-  var e=document.getElementById('nfl-coach-track-section');
-  if(e){e.style.display='block';e.scrollIntoView({behavior:'smooth',block:'center'});}
+  _nflRecOpen('nfl-coach-track-section');
   _nflCoachTrkDayName();
   _nflCoachTrackAwaitingSelection();
 }
@@ -16418,9 +16640,11 @@ function loadNflCoachTrack(){
     if(out)out.innerHTML='<p style="color:#f87171">'+_esc(e.message)+'</p>';
   });
 }
-function _nflCoachTrackRows(){
+var _NFL_COACH_HC_KEYS={hot_form:'HOT',cold_form:'COLD',double_cold_form:'DOUBLE'};
+function _nflCoachTrackRows(data,hcOnly){
   var rows=[];
-  ((_nflCoachTrackData&&_nflCoachTrackData.categories)||[]).forEach(function(item){
+  ((data||_nflCoachTrackData||{}).categories||[]).forEach(function(item){
+    if(!!_NFL_COACH_HC_KEYS[item.category]!==!!hcOnly)return;
     (item.rows||[]).forEach(function(r){rows.push(Object.assign({},r,{
       category:item.category,category_label:_nflCoachTrackLabel(item.category),
       record_date:r.date||''
@@ -16469,8 +16693,8 @@ function _nflCoachTrackSummary(rows,stake,label){
     +(roi!=null?'<span style="font-family:monospace;font-weight:700;color:'+color+'">ROI '+(roi>=0?'+':'')+roi.toFixed(1)+'%</span>':'')
     +'<span style="color:#6b7280;font-size:.8rem">$'+stake+'/play · ROI uses WIN/LOSS priced plays only</span></div>';
 }
-function _nflCoachTrackCategoryHtml(rows,stake){
-  var categories=Object.keys(_NFL_COACH_TRACK_LABELS);
+function _nflCoachTrackCategoryHtml(rows,stake,cats){
+  var categories=cats||Object.keys(_NFL_COACH_TRACK_LABELS).filter(function(c){return !_NFL_COACH_HC_KEYS[c];});
   return categories.map(function(category){
     var list=rows.filter(function(r){return r.category===category;});
     var counted=list.filter(function(r){return !r.observation_only;}),observations=list.length-counted.length;
@@ -16653,11 +16877,7 @@ function _nflPaint(q){
   window.__NFL_ROLE_RISK_HTML__=_nflRoleRiskBoard(allF);
   _nflRoleRiskPaint();
 
-  // Summary chips jump to the actual market boards; game navigation stays intact.
-  h+='<div class="chips">';
-  h+='<div class="chip nfl-games-jump" role="button" tabindex="0" onclick="_nflJumpToGames()" onkeydown="if(event.key===\\'Enter\\'||event.key===\\' \\'){event.preventDefault();_nflJumpToGames()}"><div class="val">'+((d.games||[]).length)+'</div><div class="lbl">View Games</div></div>';
-  _MORDER.forEach(function(m,i){ if(byM[m]&&byM[m].length){ h+='<button type="button" class="chip" aria-label="Go to '+_esc(m)+' category" style="cursor:pointer;color:inherit;font:inherit" onclick="_nflJumpToMarket('+i+')"><div class="val">'+byM[m].length+'</div><div class="lbl">'+(_MLBL[m]||m)+'</div></button>'; }});
-  h+='</div>';
+  st.paintPicks=picks;st.paintQ=q;
 
   // ROI Focus keeps every existing market board below, but promotes the
   // conservative slice that finished positive in the saved 2025 replay:
@@ -16677,6 +16897,7 @@ function _nflPaint(q){
     this[key]=true;
     return true;
   },{});
+  var _roiStart=h.length;
   if(roiFocus.length){
     var focusTop=roiFocus.slice(0,10),focusMore=roiFocus.slice(10);
     var focusBody=nflCardGrid(focusTop,1);
@@ -16694,6 +16915,8 @@ function _nflPaint(q){
       +'<div style="background:rgba(52,211,153,.14);border:1px solid rgba(52,211,153,.35);border-radius:20px;padding:4px 12px;color:#6ee7b7;font-size:.75rem;font-weight:900">'+roiFocus.length+(d.week_mode?' this week':' today')+'</div>'
       +'</div></div>'+focusBody+'</div>';
   }
+  h=h.slice(0,_roiStart)+'<div class="nfl-pan" data-pan="roi" onclick="if(event.target===this)_nflPanClose()">'+_nflPanBar('roi')+'<div class="nfl-pan-inner">'
+    +(roiFocus.length?h.slice(_roiStart):'<div class="no-picks" style="padding:24px">No ROI Focus picks on this board.</div>')+'</div></div>';
 
   // ── 🔒 80–100% Locks — every tracked sample hit at 80%+ ─────────────────
   var lockPicks=(d.all||[]).filter(function(p){
@@ -16716,6 +16939,7 @@ function _nflPaint(q){
     if(!key||lockSeen[key])return false;
     lockSeen[key]=1;return true;
   });
+  var _lockStart=h.length;
   if(lockPicks.length){
      var lockTop=lockPicks.slice(0,20), lockMore=lockPicks.slice(20);
      var lockBody=nflCardGrid(lockTop,1);
@@ -16740,41 +16964,18 @@ function _nflPaint(q){
        +'<div id="sec_lock8100">'+lockBody+'</div>'
       +'</div>';
   }
+  h=h.slice(0,_lockStart)+'<div class="nfl-pan" data-pan="locks" onclick="if(event.target===this)_nflPanClose()">'+_nflPanBar('locks')+'<div class="nfl-pan-inner">'
+    +(lockPicks.length?h.slice(_lockStart):'<div class="no-picks" style="padding:24px">No 80&#8211;100% Locks on this board.</div>')+'</div></div>';
 
   // Card grids per market — separate OVER and UNDER boards, each top 10 + overflow.
   // Finished games (kickoff + 4h elapsed) drop off the board.
   var hasCards=false;
-  h+=_collapseSec('matchup_funnels','&#127919; Matchup Funnels',_nflFunnelBoard(picks),true);
-  h+=_collapseSec('hot_cold','&#128293; Hot / &#10052;&#65039; Cold',_nflHotColdBoard(),true);
-  h+=_collapseSec('biggest_over_movement','⬆ Biggest Over Line Movement',_nflMovementBoard(picks,'OVER'),true);
-  h+=_collapseSec('biggest_under_movement','⬇ Biggest Under Line Movement',_nflMovementBoard(picks,'UNDER'),true);
-  _MORDER.forEach(function(m,i){
-    var all=(byM[m]||[]).filter(function(p){return !_nflGameDone(p);});
-    if(m==='Rec Yds'||m==='Receptions'){
-      var receivingHtml=_nflReceivingSections(m,all,i);
-      if(receivingHtml){hasCards=true;h+='<section id="nfl-market-category-'+i+'" tabindex="-1" aria-label="'+_esc(m)+'" style="scroll-margin-top:96px">'+receivingHtml+'</section>';}
-      return;
-    }
-    var overs =all.filter(function(p){return p.pick==='OVER';});
-    var unders=all.filter(function(p){return p.pick==='UNDER';});
-    if(!overs.length&&!unders.length) return;
-    hasCards=true;
-    h+='<section id="nfl-market-category-'+i+'" tabindex="-1" aria-label="'+_esc(m)+'" style="scroll-margin-top:96px">';
-    if(overs.length){
-      var og=overs.slice(0,10), ofov=overs.slice(10,20);
-      h+=_collapseSec('mkt_ov_'+i, '⬆ '+_mIcon(m)+' Top 10 '+m+' — OVERS', nflCardGrid(og), true);
-      if(ofov.length) h+=_collapseSec('ovf_ov_'+i, '⬆ '+m+' OVERS — Overflow ('+ofov.length+' more)', nflCardGrid(ofov), false);
-    }
-    if(unders.length){
-      var ug=unders.slice(0,10), ufov=unders.slice(10,20);
-      h+=_collapseSec('mkt_un_'+i, '⬇ '+_mIcon(m)+' Top 10 '+m+' — UNDERS', nflCardGrid(ug), true);
-      if(ufov.length) h+=_collapseSec('ovf_un_'+i, '⬇ '+m+' UNDERS — Overflow ('+ufov.length+' more)', nflCardGrid(ufov), false);
-    }
-    h+='</section>';
-  });
-  if(!hasCards){
-    h+='<div class="no-picks">No qualifying picks'+(q?' for "'+q+'"':' for '+(d.date||'today'))+'.</div>';
-  }
+  h+='<div class="nfl-pan" data-pan="funnels" onclick="if(event.target===this)_nflPanClose()">'+_nflPanBar('funnels')+'<div class="nfl-pan-inner">'
+    +_collapseSec('matchup_funnels','&#127919; Matchup Funnels',_nflFunnelBoard(picks),true)+'</div></div>';
+  h+='<div class="nfl-pan" data-pan="hc" onclick="if(event.target===this)_nflPanClose()">'+_nflPanBar('hc')+'<div class="nfl-pan-inner">'
+    +_collapseSec('hot_cold','&#128293; Hot / &#10052;&#65039; Cold',_nflHotColdBoard(),true)+'</div></div>';
+  // NBA-style board: pick games + one category, then its Top 10 shows.
+  h+='<div id="nflCatWrap" style="scroll-margin-top:96px">'+_nflCatHtml()+'</div>';
 
   // Existing matchup tiles belong after the market boards. Each tile opens
   // the complete game-picks modal, so no second by-game accordion is needed.
@@ -17035,6 +17236,7 @@ function renderNflOverflowDay(){
   var selected=_nflTrkFilterDates(dates,selDate,period),rows=[];
   selected.forEach(function(d){(d.detail||[]).forEach(function(r){
     var result=String(r.result||'PENDING').toUpperCase();
+    if(_nflIsHcCat(r.category))return;
     if(result==='WIN'||result==='LOSS'||result==='PENDING')rows.push(Object.assign({},r,{record_date:d.date,result:result}));
   });});
   _nflRenderRecordBook(
@@ -17107,8 +17309,7 @@ function _nflTrkPeriodLabel(sel,period){
   return sel||'Selected Day';
 }
 function openNflTrackRecord(){
-  var sec=document.getElementById('nfl-track-section');
-  if(sec) sec.scrollIntoView({behavior:'smooth',block:'start'});
+  _nflRecOpen('nfl-main-track-card');
 }
 async function openNflLastSeason(){
   var btn=document.getElementById('lastSeasonBtn');
@@ -17139,8 +17340,7 @@ async function openNflLastSeason(){
 }
 function openNflGpRecord(){
   renderNflGpRecord();
-  var sec=document.getElementById('nfl-gp-record-section');
-  if(sec) sec.scrollIntoView({behavior:'smooth',block:'start'});
+  _nflRecOpen('nfl-gp-record-section');
 }
 function _nflTrkDayName(){
   var dp=document.getElementById('nflTrkDate'),dn=document.getElementById('nflTrkDayName');
@@ -17425,6 +17625,7 @@ function renderNflTrackDay(){
   function flatten(days){
     var out=[];
     days.forEach(function(d){(d.detail||[]).forEach(function(r){
+      if(_nflIsHcCat(r.category))return;
       out.push(Object.assign({record_date:d.date},r));
     });});
     return out.map(function(r){return Object.assign({},r,{result:String(r.result||'PENDING').toUpperCase()});})
@@ -17545,6 +17746,160 @@ function _nflTrkCatHtml(decided,stake){
       +'<span style="color:'+plColor+'">'+(roi!=null?(roi>=0?'+':'')+roi.toFixed(1)+'% ROI':'—')+'</span><span class="nfl-trk-group-toggle" aria-hidden="true"></span></div></summary>'
       +'<div class="nfl-trk-table-scroll"><table class="nfl-trk-tbl nfl-trk-compact"><thead><tr><th>Date</th><th>Player</th><th>Team</th><th>Pick</th><th>Odds / Book</th><th>Actual</th><th>Result / P&L</th></tr></thead><tbody>'+detail+'</tbody></table></div></details>';
   }).join('');
+}
+function _nflIsHcCat(cat){
+  cat=String(cat||'');
+  return cat.indexOf('Hot ')===0||cat.indexOf('Cold ')===0||cat.indexOf('Double Cold ')===0;
+}
+// ── Hot / Cold Track Record (own record; never in Track Record/Overflow/Edge) ──
+var _nflHcTrkData=null,_nflHcCoachData=null,_nflHcCoachErr='',_nflHcTrkTabMode='cat',_nflHcTrkLoadSeq=0;
+function _nflHcTrkVal(id,dflt){var el=document.getElementById(id);return el&&el.value?el.value:dflt;}
+function _nflHcTrkStake(){var n=parseFloat(_nflHcTrkVal('nflHcTrkStake','20'));return isFinite(n)&&n>0?n:20;}
+function _nflHcTrkDayName(){
+  var dp=document.getElementById('nflHcTrkDate'),dn=document.getElementById('nflHcTrkDayName');
+  if(!dp||!dn)return;
+  try{var days=['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
+    dn.textContent=dp.value?days[new Date(dp.value+'T12:00:00').getDay()]:'';}catch(e){dn.textContent='';}
+}
+function openNflHcTrack(){
+  var dp=document.getElementById('nflHcTrkDate');
+  if(dp&&!dp.value)dp.value=_nflTodayLocal();
+  _nflHcTrkDayName();
+  _nflRecOpen('nfl-hc-track-card');
+  if(!_nflHcTrkData)loadNflHcTrack();else renderNflHcTrack();
+}
+function nflHcTrkSetTab(tab){
+  _nflHcTrkTabMode=tab==='list'?'list':'cat';
+  var bc=document.getElementById('nflHcTrkBtnCat'),bl=document.getElementById('nflHcTrkBtnList');
+  if(bc)bc.style.background=_nflHcTrkTabMode==='cat'?'#c2410c':'#1f2937';
+  if(bl)bl.style.background=_nflHcTrkTabMode==='list'?'#c2410c':'#1f2937';
+  renderNflHcTrack();
+}
+async function loadNflHcTrack(){
+  var body=document.getElementById('nflHcTrkBody'),sum=document.getElementById('nflHcTrkSummary'),secs=document.getElementById('nflHcTrkSections');
+  var loadSeq=++_nflHcTrkLoadSeq;
+  var requestedSystem=_nflSystem(),requestGeneration=_nflSystemGeneration,
+      requestController=_nflTrackController(new AbortController());
+  var selected=_nflHcTrkVal('nflHcTrkDate','');
+  var source=_nflHcTrkVal('nflHcTrkSource','official')==='historical'?'historical':'official';
+  if(body)body.innerHTML='<p style="color:#9ca3af;padding:24px">Loading Hot / Cold record…</p>';
+  if(sum)sum.innerHTML='';if(secs)secs.innerHTML='';
+  var token=localStorage.getItem('__mpa_token')||'';
+  var y=selected?Number(selected.slice(0,4)):new Date().getFullYear();
+  var m=selected?Number(selected.slice(5,7)):(new Date().getMonth()+1);
+  var season=m>=9?y:y-1;
+  try{
+    var boardReq=fetch('/api/track-record?grade=true&date_str='+encodeURIComponent(selected)+'&system='+encodeURIComponent(requestedSystem),{signal:requestController.signal})
+      .then(function(r){if(!r.ok)return r.text().then(function(t){throw new Error(t||'Could not load the Hot / Cold record');});return r.json();});
+    var coachReq=fetch('/api/nfl/coach-track?grade=true&source='+encodeURIComponent(source)+'&season='+encodeURIComponent(season)+'&date_str='+encodeURIComponent(selected)+'&system='+encodeURIComponent(requestedSystem)+'&token='+encodeURIComponent(token),{headers:{'Authorization':token?'Bearer '+token:''},signal:requestController.signal})
+      .then(function(r){return r.json().then(function(x){if(!r.ok)throw new Error(x.detail||'Could not load Coach presets');return x;});})
+      .then(function(x){return {ok:true,data:x};},function(e){return {ok:false,err:(e&&e.message)||'Could not load Coach presets'};});
+    var board=await boardReq,coach=await coachReq;
+    if(loadSeq!==_nflHcTrkLoadSeq||!_nflRequestCurrent(requestGeneration,requestedSystem)
+       ||String(board.system||'OLD')!==requestedSystem)return;
+    _nflHcTrkData=board;
+    _nflHcCoachData=coach.ok&&String(coach.data.system||'OLD')===requestedSystem?coach.data:null;
+    _nflHcCoachErr=coach.ok?'':coach.err;
+    renderNflHcTrack();
+  }catch(e){
+    if(loadSeq!==_nflHcTrkLoadSeq||!_nflRequestCurrent(requestGeneration,requestedSystem))return;
+    if(body)body.innerHTML='<p style="color:#f87171;padding:16px">'+_esc((e&&e.message)||'Error loading the Hot / Cold record')+'</p>';
+  }finally{_nflUntrackController(requestController);}
+}
+function _nflHcRowForm(r,coach){
+  if(coach)return _NFL_COACH_HC_KEYS[r.category]||'';
+  var f=String(r.hc_form||'').toUpperCase();
+  if(f)return f;
+  var c=String(r.category||'');
+  return c.indexOf('Double Cold ')===0?'DOUBLE':(c.indexOf('Hot ')===0?'HOT':(c.indexOf('Cold ')===0?'COLD':''));
+}
+function _nflHcTrkRows(tier){
+  var selDate=_nflHcTrkVal('nflHcTrkDate',''),period=_nflHcTrkVal('nflHcTrkPeriod','day');
+  var hist=_nflHcTrkVal('nflHcTrkSource','official')==='historical';
+  var form=_nflHcTrkVal('nflHcTrkForm','ALL');
+  var rows=[];
+  if(tier==='coach'){
+    if(!_nflHcCoachData)return null;
+    rows=_nflCoachTrackRows(_nflHcCoachData,true).filter(function(r){
+      var d=r.record_date;
+      if(period==='all')return true;
+      if(period==='season')return _nflSeasonKey(d)===_nflSeasonKey(selDate);
+      if(period==='month')return String(d).slice(0,7)===String(selDate).slice(0,7);
+      if(period==='week')return _nflWeekKey(d)===_nflWeekKey(selDate);
+      return d===selDate;
+    });
+  }else{
+    if(!_nflHcTrkData)return [];
+    var data=_nflHcTrkData,dates;
+    if(tier==='overflow')dates=hist?(data.historical_overflow_dates||[]):(data.overflow_dates||[]);
+    else dates=hist?(data.historical_dates||[]):(data.dates||[]);
+    _nflTrkFilterDates(dates,selDate,period).forEach(function(d){(d.detail||[]).forEach(function(r){
+      if(!_nflIsHcCat(r.category))return;
+      var result=String(r.result||'PENDING').toUpperCase();
+      if(result==='WIN'||result==='LOSS'||result==='PENDING')rows.push(Object.assign({},r,{record_date:d.date,result:result}));
+    });});
+  }
+  if(form!=='ALL')rows=rows.filter(function(r){return _nflHcRowForm(r,tier==='coach')===form;});
+  return rows;
+}
+function _nflHcTrkTotals(rows,stake){
+  var counted=rows.filter(function(r){return !r.observation_only;});
+  var w=counted.filter(function(r){return r.result==='WIN';}).length;
+  var l=counted.filter(function(r){return r.result==='LOSS';}).length;
+  var pending=counted.filter(function(r){return !r.result||r.result==='PENDING';}).length;
+  var priced=counted.filter(function(r){return (r.result==='WIN'||r.result==='LOSS')&&r.odds!=null;});
+  var net=priced.reduce(function(a,r){return a+(_nflTrkProfit(r,stake)||0);},0);
+  return {w:w,l:l,pending:pending,net:net,roi:priced.length?net/(priced.length*stake)*100:null,rate:(w+l)?w/(w+l)*100:null};
+}
+function renderNflHcTrack(){
+  var sum=document.getElementById('nflHcTrkSummary'),body=document.getElementById('nflHcTrkBody'),secs=document.getElementById('nflHcTrkSections');
+  if(!sum||!body||!_nflHcTrkData)return;
+  var tier=_nflHcTrkVal('nflHcTrkTier','top10'),stake=_nflHcTrkStake();
+  var selDate=_nflHcTrkVal('nflHcTrkDate',''),period=_nflHcTrkVal('nflHcTrkPeriod','day');
+  var label=_nflTrkPeriodLabel(selDate,period);
+  var hist=_nflHcTrkVal('nflHcTrkSource','official')==='historical';
+  var tiers=[['top10','Top 10'],['overflow','Overflow 11&#8211;20'],['coach','Coach presets']];
+  if(secs)secs.innerHTML=(hist?'<div style="background:rgba(245,158,11,.1);border:1px solid rgba(245,158,11,.35);border-radius:9px;padding:9px 12px;margin-bottom:10px;color:#fbbf24;font-size:.76rem;font-weight:800">Historical Analysis &#8212; saved point-in-time replays; excluded from the official record.</div>':'')
+    +'<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">'+tiers.map(function(t){
+      var rows=_nflHcTrkRows(t[0]),on=t[0]===tier;
+      var inner;
+      if(rows==null)inner='<span style="color:#94a3b8;font-size:.72rem">'+_esc(_nflHcCoachErr||'Not loaded')+'</span>';
+      else{
+        var x=_nflHcTrkTotals(rows,stake),col=x.net>=0?'#4ade80':'#f87171';
+        inner='<span style="color:#fff;font-weight:900">'+x.w+'-'+x.l+'</span>'
+          +'<span style="color:#9ca3af">'+(x.rate!=null?x.rate.toFixed(1)+'%':'&#8212;')+'</span>'
+          +'<span style="font-family:monospace;font-weight:800;color:'+col+'">'+(x.net>=0?'+$':'-$')+Math.abs(x.net).toFixed(0)+'</span>'
+          +(x.roi!=null?'<span style="font-family:monospace;color:'+col+'">ROI '+(x.roi>=0?'+':'')+x.roi.toFixed(1)+'%</span>':'')
+          +(x.pending?'<span style="color:#fbbf24">'+x.pending+' pending</span>':'');
+      }
+      return '<button type="button" onclick="var s=document.getElementById(&#39;nflHcTrkTier&#39;);if(s){s.value=&#39;'+t[0]+'&#39;;renderNflHcTrack();}" aria-pressed="'+on+'" style="flex:1;min-width:190px;text-align:left;background:'+(on?'rgba(194,65,12,.22)':'#111827')+';border:1px solid '+(on?'#ea580c':'#293548')+';border-radius:10px;padding:9px 11px;cursor:pointer;color:#e2e8f0">'
+        +'<div style="font-size:.66rem;color:#fdba74;font-weight:900;letter-spacing:.08em;text-transform:uppercase;margin-bottom:4px">'+t[1]+'</div>'
+        +'<div style="display:flex;gap:9px;flex-wrap:wrap;align-items:center;font-size:.78rem">'+inner+'</div></button>';
+    }).join('')+'</div>';
+  var rows=_nflHcTrkRows(tier);
+  if(rows==null){
+    sum.innerHTML='';
+    body.innerHTML='<p style="color:#f87171;padding:14px">'+_esc(_nflHcCoachErr||'Coach presets could not be loaded.')+'</p>';
+    return;
+  }
+  if(!rows.length){
+    sum.innerHTML='<p style="color:#9ca3af;padding:12px;text-align:center">No '+(hist?'historical':'official')+' Hot / Cold '+(tier==='coach'?'Coach preset':(tier==='overflow'?'Overflow':'Top 10'))+' picks for '+_esc(label)+'.</p>';
+    body.innerHTML='';return;
+  }
+  var x=_nflHcTrkTotals(rows,stake),col=x.net>=0?'#4ade80':'#f87171';
+  sum.innerHTML='<div class="nfl-trk-sum">'
+    +'<span style="color:#9ca3af;font-size:.78rem;font-weight:800">'+_esc(label)+'</span>'
+    +'<span style="font-size:1.05rem;font-weight:900;color:#fff"><span style="color:#4ade80">'+x.w+'</span>/<span style="color:#f87171">'+(x.w+x.l)+'</span>'
+    +(x.rate!=null?' <span style="color:#9ca3af;font-size:.85rem;font-weight:600">('+x.rate.toFixed(1)+'%)</span>':'')+'</span>'
+    +'<span style="font-family:monospace;font-weight:800;color:'+col+'">Net '+(x.net>=0?'+$':'-$')+Math.abs(x.net).toFixed(0)+'</span>'
+    +(x.roi!=null?'<span style="font-family:monospace;font-weight:700;color:'+col+'">ROI '+(x.roi>=0?'+':'')+x.roi.toFixed(1)+'%</span>':'')
+    +(x.pending?'<span style="color:#9ca3af;font-weight:800">'+x.pending+' pending</span>':'')
+    +'<span style="color:#6b7280;font-size:.8rem">$'+stake+'/play &middot; ROI uses priced plays only &middot; pushes are not wins</span></div>';
+  if(tier==='coach'){
+    body.innerHTML=_nflCoachTrackCategoryHtml(rows,stake,Object.keys(_NFL_COACH_HC_KEYS));
+  }else{
+    body.innerHTML=_nflHcTrkTabMode==='cat'?_nflTrkCatHtml(rows,stake):_nflTrkListHtml(rows,stake);
+  }
 }
 function _nflSpotlightCat(cat){
   cat=String(cat||'');
@@ -17717,7 +18072,7 @@ _NFL_GSIM_UI = r"""
 <div class="ngs-card">
   <div class="ngs-row" style="justify-content:space-between">
     <h2>&#127922; NFL 10K Game Simulator</h2>
-    <button type="button" class="ngs-btn" onclick="document.getElementById('nfl-gsim-section').style.display='none'">Close</button>
+    <button type="button" class="ngs-btn" onclick="if(typeof _nflRecClose==='function')_nflRecClose();else document.getElementById('nfl-gsim-section').style.display='none'">Close</button>
   </div>
   <p class="ngs-note">Plays every game 10,000 times, drive by drive (touchdowns, field goals, extra points, overtime and ties), around each team's opponent-adjusted scoring, home field, recent form, rest days and kickoff weather. Gives moneyline, spread and total calls. Separate from the Game Predictor; its pregame calls go to their own Sim Record. Injuries (including a starting QB out) are not modelled, so check news.</p>
   <div class="ngs-row">
@@ -17733,7 +18088,7 @@ _NFL_GSIM_UI = r"""
 <div class="ngs-card">
   <div class="ngs-row" style="justify-content:space-between">
     <h2>&#127922; NFL Sim Record</h2>
-    <button type="button" class="ngs-btn" onclick="document.getElementById('nfl-gsim-record-section').style.display='none'">Close</button>
+    <button type="button" class="ngs-btn" onclick="if(typeof _nflRecClose==='function')_nflRecClose();else document.getElementById('nfl-gsim-record-section').style.display='none'">Close</button>
   </div>
   <p class="ngs-note">Pregame simulator calls saved before kickoff and graded after finals. Profit uses only the genuine saved sportsbook price for each call; calls without a price count in W/L only. Preseason games and dates simulated after the fact are never tracked. A moneyline on a tied game is a push.</p>
   <div class="ngs-row">
@@ -17818,9 +18173,9 @@ window.runNflGameSim=function(){
    .then(function(){S.busy=false;btn.disabled=false;btn.innerHTML='&#127922; Run Sims';});
 };
 window.openNflGameSim=function(){
-  var s=$('nfl-gsim-section');if(!s)return;s.style.display='block';
+  var s=$('nfl-gsim-section');if(!s)return;
+  if(typeof _nflRecOpen==='function')_nflRecOpen('nfl-gsim-section');else{s.style.display='block';s.scrollIntoView({behavior:'smooth',block:'start'});}
   var dp=$('datePicker'),di=$('nflGsimDate');if(di&&!di.value)di.value=(dp&&dp.value)||today();
-  s.scrollIntoView({behavior:'smooth',block:'start'});
 };
 function inPeriod(ds,per,anchor){
   if(per==='all')return true;if(per==='today')return ds===anchor;
@@ -17861,9 +18216,10 @@ window.loadNflSimRecord=function(){
    .catch(function(e){if(b)b.innerHTML='<p class="ngs-note" style="color:#f87171">Could not load Sim Record: '+esc(e.message||'request failed')+'</p>';});
 };
 window.openNflSimRecord=function(){
-  var s=$('nfl-gsim-record-section');if(!s)return;s.style.display='block';
+  var s=$('nfl-gsim-record-section');if(!s)return;
+  if(typeof _nflRecOpen==='function')_nflRecOpen('nfl-gsim-record-section');else{s.style.display='block';s.scrollIntoView({behavior:'smooth',block:'start'});}
   var di=$('nflGsimRecDate');if(di&&!di.value)di.value=today();
-  s.scrollIntoView({behavior:'smooth',block:'start'});window.loadNflSimRecord();
+  window.loadNflSimRecord();
 };
 })();
 </script>
