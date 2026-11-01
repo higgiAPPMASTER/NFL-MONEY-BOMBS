@@ -12458,6 +12458,9 @@ body.nfl-rec-open nav{z-index:195}
 .nfl-fbtn.empty{opacity:.5}
 .nfl-fbtn .n{background:#262626;color:#e5e7eb;border-radius:999px;padding:1px 7px;font-size:.66rem;font-weight:800}
 .nfl-fbtn.active .n{background:rgba(245,158,11,.25);color:#fbbf24}
+.nfl-as-item{display:flex;flex-direction:column;gap:6px;min-width:0}
+.nfl-as-strip{display:flex;gap:10px;flex-wrap:wrap;justify-content:center;background:#111827;border:1px solid #293548;border-radius:10px;padding:6px 10px;color:#cbd5e1;font-size:.72rem;font-weight:700}
+.nfl-as-item>.pick-card{flex:1}
 .nfl-cat-hdr{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin:8px 0 4px}
 .nfl-cat-title{font-family:'Playfair Display',serif;font-size:1.2rem;font-weight:700;color:#f59e0b}
 .nfl-cat-pill{border:1px solid rgba(245,158,11,.4);background:rgba(245,158,11,.08);color:#fbbf24;border-radius:999px;padding:4px 12px;font-size:.74rem;font-weight:800}
@@ -14844,6 +14847,50 @@ function _nflCatGame(key){
 function _nflCatPick(cat){window.__NFL_CAT__.cat=cat;_nflCatRefresh();}
 function _nflCatSide(side){window.__NFL_CAT__.side=side;_nflCatRefresh();}
 function _nflCatRefresh(){var el=document.getElementById('nflCatWrap');if(el)el.innerHTML=_nflCatHtml();}
+// All Stats (offense only): hotness (last-5 hit rate on the pick side vs
+// today's line) + consistency vs today's opponent (every meeting vs today's
+// line). Display-only ranking; it never changes picks, boards or records.
+var _NFL_ALLSTATS_MKTS=['Pass Yds','Pass TDs','Completions','Pass Att','INT Thrown','Rush Yds','RB Total Yds','Rush Att','Rec Yds','Receptions','Anytime TD'];
+function _nflAllStatsSide(side,v,line){
+  v=Number(v);line=Number(line);if(!isFinite(v)||!isFinite(line)||v===line)return null;
+  return side==='UNDER'?v<line:v>line;
+}
+function _nflAllStatsRate(log,side,line,count){
+  var games=(log||[]).slice(0,count||log.length),hits=0,total=0;
+  games.forEach(function(g){var h=_nflAllStatsSide(side,g&&g.v,line);if(h==null)return;total++;if(h)hits++;});
+  return {hits:hits,total:total,rate:total?hits/total*100:null};
+}
+function _nflAllStatsRows(rows){
+  var out=[];
+  (rows||[]).forEach(function(p){
+    var m=p.mkt||p.label;
+    if(_NFL_ALLSTATS_MKTS.indexOf(m)<0||!p.pick||p.roleRiskBlockPremium===true)return;
+    var line=p.realLine!=null?p.realLine:p.line;
+    var hot=_nflAllStatsRate(p.glog,p.pick,line,5);
+    var opp=Array.isArray(p.vsOppLog)?_nflAllStatsRate(p.vsOppLog,p.pick,line):{hits:Number(p.hitsA)||0,total:Number(p.totA)||0,rate:p.rateA!=null?Number(p.rateA):null};
+    if(hot.total<3||opp.total<2||hot.rate==null||opp.rate==null)return;
+    out.push({p:p,hot:hot,opp:opp,score:hot.rate*0.5+opp.rate*0.5});
+  });
+  out.sort(function(a,b){
+    return b.score-a.score||b.opp.total-a.opp.total||b.hot.total-a.hot.total
+      ||Number(b.p.vsLineRate||0)-Number(a.p.vsLineRate||0)||_edge(b.p)-_edge(a.p);
+  });
+  var seen={};
+  return out.filter(function(r){
+    var k=String(r.p.name||'').toLowerCase().replace(/[^a-z0-9]/g,'');
+    if(!k||seen[k])return false;seen[k]=1;return true;
+  });
+}
+function _nflAllStatsGrid(list,start){
+  return '<div class="picks-grid">'+list.map(function(r,i){
+    var col=r.p.pick==='UNDER'?'#f87171':'#4ade80';
+    return '<div class="nfl-as-item"><div class="nfl-as-strip">'
+      +'<span>&#128293; L5 <b style="color:'+col+'">'+r.hot.hits+'/'+r.hot.total+'</b></span>'
+      +'<span>&#127386; vs '+_esc(r.p.opponent||'')+' <b style="color:'+col+'">'+r.opp.hits+'/'+r.opp.total+'</b></span>'
+      +'<span>Score <b>'+r.score.toFixed(0)+'</b></span></div>'
+      +nflCard(r.p,start+i)+'</div>';
+  }).join('')+'</div>';
+}
 function _nflCatHtml(){
   var st=window._nflState||{},d=st.d||{},byM=st.byM||{},picks=st.paintPicks||[],q=st.paintQ||'';
   var cs=window.__NFL_CAT__;
@@ -14851,14 +14898,13 @@ function _nflCatHtml(){
   var counts={};
   _MORDER.forEach(function(m,i){counts['m'+i]=live(byM[m]).length;});
   var movePicks=live(picks);
-  var cats=_MORDER.map(function(m,i){return {key:'m'+i,label:_mIcon(m)+' '+_esc(m),title:m,n:counts['m'+i]};});
+  var allStatsList=_nflAllStatsRows(live(picks));
+  var cats=[{key:'all',label:'All Stats',title:'All Stats',n:allStatsList.length}];
+  cats=cats.concat(_MORDER.map(function(m,i){return {key:'m'+i,label:_mIcon(m)+' '+_esc(m),title:m,n:counts['m'+i]};}));
   cats.push({key:'move_over',label:'&#11014; Over Line Movement',title:'Biggest Over Line Movement',n:null});
   cats.push({key:'move_under',label:'&#11015; Under Line Movement',title:'Biggest Under Line Movement',n:null});
   var valid=cats.some(function(c){return c.key===cs.cat;});
-  if(!valid){
-    var first=cats.filter(function(c){return c.n;})[0]||cats[0];
-    cs.cat=first.key;
-  }
+  if(!valid)cs.cat='all';
   // Game chips
   var games=_nflLoadedGames(),selKeys=Object.keys(cs.games).filter(function(k){return cs.games[k];});
   var h='<div class="nfl-gbar">';
@@ -14887,6 +14933,19 @@ function _nflCatHtml(){
     var side=cs.cat==='move_over'?'OVER':'UNDER';
     h+='<div class="nfl-cat-hdr"><div class="nfl-cat-title">'+(side==='OVER'?'&#11014; Biggest Over Line Movement':'&#11015; Biggest Under Line Movement')+'</div><span class="nfl-cat-pill">Top 10'+gameNote+'</span></div>';
     h+=_nflMovementBoard(movePicks,side);
+    return h;
+  }
+  if(cs.cat==='all'){
+    var asRows=cs.side==='ALL'?allStatsList:allStatsList.filter(function(r){return r.p.pick===cs.side;});
+    var asSide=cs.side==='ALL'?'Top 10':(cs.side==='OVER'?'Top 10 Over':'Top 10 Under');
+    h+='<div class="nfl-cat-hdr"><div class="nfl-cat-title">All Stats &middot; '+asSide+' &middot; Offense</div><span class="nfl-cat-pill">'+asRows.length+' player'+(asRows.length!==1?'s':'')+gameNote+'</span></div>';
+    h+='<div style="color:#94a3b8;font-size:.74rem;line-height:1.45;margin:2px 0 10px">Offensive markets only (passing, rushing, receiving, Anytime TD). Ranked 50% <b style="color:#fb923c">hotness</b> (last 5 games on the pick side vs today&#39;s line) + 50% <b style="color:#fbbf24">consistency vs today&#39;s opponent</b> (every meeting vs today&#39;s line). Needs 3+ recent games and 2+ meetings; pushes are not counted. One play per player; Role Risk AVOID players are left out. Display only &#8212; not a tracked record.</div>';
+    if(!asRows.length){
+      h+='<div class="no-picks">No offensive picks have both a recent sample and 2+ meetings with today&#39;s opponent'+(selKeys.length?' in the selected games':'')+'.</div>';
+      return h;
+    }
+    h+=_nflAllStatsGrid(asRows.slice(0,10),1);
+    if(asRows.length>10)h+=_collapseSec('allstats_ovf','All Stats &#8212; Overflow ('+Math.min(10,asRows.length-10)+' more)',_nflAllStatsGrid(asRows.slice(10,20),11),false);
     return h;
   }
   var i=Number(cs.cat.slice(1)),m=_MORDER[i];
