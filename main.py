@@ -12464,6 +12464,92 @@ body.nfl-rec-open nav{z-index:195}
 .nfl-cat-hdr{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin:8px 0 4px}
 .nfl-cat-title{font-family:'Playfair Display',serif;font-size:1.2rem;font-weight:700;color:#f59e0b}
 .nfl-cat-pill{border:1px solid rgba(245,158,11,.4);background:rgba(245,158,11,.08);color:#fbbf24;border-radius:999px;padding:4px 12px;font-size:.74rem;font-weight:800}
+.nfl-cmd{background:linear-gradient(180deg,#141414,#0f0f0f);border:1px solid #262626;border-radius:16px;padding:14px 16px 12px;margin:4px 0 16px;box-shadow:0 10px 30px rgba(0,0,0,.35)}
+.nfl-cmd-lbl{display:flex;align-items:center;gap:7px;color:#9ca3af;font-size:.66rem;font-weight:900;letter-spacing:.14em;text-transform:uppercase;margin:0 0 8px}
+.nfl-cmd-lbl .num{display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;border-radius:50%;background:#f59e0b;color:#111;font-size:.66rem;letter-spacing:0}
+.nfl-cmd-lbl .hint{color:#6b7280;font-weight:600;letter-spacing:.02em;text-transform:none;font-size:.72rem}
+.nfl-slate{display:flex;gap:14px;overflow-x:auto;padding:2px 2px 8px;scrollbar-width:thin;scrollbar-color:#333 transparent}
+.nfl-kgrp{display:flex;flex-direction:column;gap:6px;flex:0 0 auto}
+.nfl-klbl{color:#fbbf24;font-size:.62rem;font-weight:900;letter-spacing:.12em;text-transform:uppercase;padding-left:2px;white-space:nowrap}
+.nfl-krow{display:flex;gap:8px}
+.nfl-gtile{position:relative;display:flex;align-items:center;gap:10px;background:#181818;border:1px solid #2a2a2a;border-radius:12px;padding:8px 10px;cursor:pointer;color:#e5e7eb;font-family:inherit;text-align:left;transition:border-color .15s,background .15s;flex:0 0 auto}
+.nfl-gtile:hover{border-color:#f59e0b}
+.nfl-gtile.on{border-color:#f59e0b;background:rgba(245,158,11,.12);box-shadow:0 0 0 1px rgba(245,158,11,.35) inset}
+.nfl-gtile.zero{opacity:.5}
+.nfl-gtile .tms{display:flex;flex-direction:column;gap:3px}
+.nfl-gtile .tm{display:flex;align-items:center;gap:6px;font-size:.8rem;line-height:1}
+.nfl-gtile .tm img{width:18px;height:18px;object-fit:contain}
+.nfl-gtile .tm b{color:#fff;font-weight:800;min-width:30px}
+.nfl-gtile .cnt{background:#262626;color:#e5e7eb;border-radius:999px;padding:2px 8px;font-size:.68rem;font-weight:800;align-self:flex-end}
+.nfl-gtile.on .cnt{background:#f59e0b;color:#111}
+.nfl-gtile .chk{position:absolute;top:-7px;left:-7px;width:18px;height:18px;border-radius:50%;background:#f59e0b;color:#111;font-size:.66rem;font-weight:900;display:flex;align-items:center;justify-content:center}
+.nfl-gtile.all{flex-direction:column;align-items:flex-start;justify-content:center;gap:3px;min-width:104px;align-self:flex-end;min-height:52px}
+.nfl-gtile.all b{color:#fff;font-size:.86rem}
+.nfl-gtile.all small{color:#9ca3af;font-size:.66rem}
+.nfl-gbtn{display:none;align-items:center;gap:8px;width:100%;background:#181818;border:1px solid #f59e0b;border-radius:12px;padding:11px 14px;color:#fff;font-family:inherit;font-size:.9rem;cursor:pointer}
+.nfl-gbtn span{margin-left:auto;color:#fbbf24;font-size:.75rem;font-weight:800}
+.nfl-cmd-mid{display:flex;gap:16px;align-items:flex-end;flex-wrap:wrap;margin-top:10px}
+.nfl-cmd-mkt{flex:1 1 520px;min-width:0}
+.nfl-gtabs{display:flex;gap:3px;background:#0b0b0b;border:1px solid #232323;border-radius:12px;padding:4px;overflow-x:auto;scrollbar-width:none}
+.nfl-gtabs::-webkit-scrollbar{display:none}
+.nfl-gtab{flex:1 0 auto;display:inline-flex;align-items:center;justify-content:center;gap:6px;white-space:nowrap;background:transparent;border:0;border-radius:9px;padding:8px 12px;color:#cbd5e1;font-family:inherit;font-size:.8rem;font-weight:700;cursor:pointer;transition:background .15s,color .15s}
+.nfl-gtab:hover{background:#1c1c1c;color:#fff}
+.nfl-gtab.on{background:#f59e0b;color:#111}
+.nfl-gtab.empty{opacity:.42}
+.nfl-gtab .n{background:#262626;color:#e5e7eb;border-radius:999px;padding:1px 7px;font-size:.64rem;font-weight:800}
+.nfl-gtab.on .n{background:rgba(0,0,0,.22);color:#111}
+.nfl-seg{display:flex;background:#0b0b0b;border:1px solid #232323;border-radius:12px;padding:4px;gap:3px}
+.nfl-seg button{border:0;background:transparent;border-radius:9px;padding:8px 16px;font-family:inherit;font-size:.8rem;font-weight:800;color:#cbd5e1;cursor:pointer;white-space:nowrap}
+.nfl-seg button.ov{color:#4ade80}.nfl-seg button.un{color:#f87171}
+.nfl-seg button.on{background:#262626;color:#fff;box-shadow:0 0 0 1px #3a3a3a inset}
+.nfl-seg button.ov.on{background:rgba(74,222,128,.16);color:#4ade80;box-shadow:0 0 0 1px rgba(74,222,128,.4) inset}
+.nfl-seg button.un.on{background:rgba(248,113,113,.16);color:#f87171;box-shadow:0 0 0 1px rgba(248,113,113,.4) inset}
+.nfl-mpills{display:flex;gap:8px;overflow-x:auto;scrollbar-width:none;padding:10px 0 2px}
+.nfl-mpills::-webkit-scrollbar{display:none}
+.nfl-mpill{flex:0 0 auto;display:inline-flex;align-items:center;gap:6px;white-space:nowrap;border:1px solid #2a2a2a;background:#161616;color:#d1d5db;border-radius:999px;padding:7px 14px;font-family:inherit;font-size:.78rem;font-weight:700;cursor:pointer}
+.nfl-mpill:hover{border-color:rgba(245,158,11,.5)}
+.nfl-mpill.on{border-color:#f59e0b;background:rgba(245,158,11,.12);color:#fbbf24}
+.nfl-mpill.empty{opacity:.45}
+.nfl-mpill .n{background:#262626;color:#e5e7eb;border-radius:999px;padding:1px 7px;font-size:.64rem;font-weight:800}
+.nfl-mpill.on .n{background:rgba(245,158,11,.25);color:#fbbf24}
+.nfl-showing{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:12px;padding:9px 12px;background:#0b0b0b;border:1px solid #232323;border-radius:11px;font-size:.78rem;color:#9ca3af}
+.nfl-showing .lbl b{color:#fff}
+.nfl-fchip{display:inline-flex;align-items:center;gap:6px;background:#1f1f1f;border:1px solid #333;color:#e5e7eb;border-radius:999px;padding:3px 6px 3px 10px;font-family:inherit;font-size:.72rem;font-weight:700;cursor:pointer}
+.nfl-fchip .x{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;border-radius:50%;background:#333;color:#cbd5e1;font-size:.62rem}
+.nfl-fchip:hover .x{background:#b91c1c;color:#fff}
+.nfl-restored{background:rgba(125,211,252,.1);border:1px solid rgba(125,211,252,.35);color:#7dd3fc;border-radius:999px;padding:3px 9px;font-size:.68rem;font-weight:800}
+.nfl-reset{margin-left:auto;background:transparent;border:0;color:#fbbf24;font-family:inherit;font-size:.74rem;font-weight:800;cursor:pointer;padding:3px 4px}
+.nfl-reset:hover{text-decoration:underline}
+.nfl-howto{margin:2px 0 10px}
+.nfl-howto summary{display:inline-flex;align-items:center;gap:6px;cursor:pointer;list-style:none;color:#9ca3af;font-size:.72rem;font-weight:700;border:1px solid #2a2a2a;border-radius:999px;padding:4px 11px}
+.nfl-howto summary::-webkit-details-marker{display:none}
+.nfl-howto summary:hover{color:#fbbf24;border-color:rgba(245,158,11,.45)}
+.nfl-howto>div{margin-top:8px;color:#94a3b8;font-size:.74rem;line-height:1.45;background:#0f0f0f;border:1px solid #232323;border-radius:10px;padding:10px 12px}
+.nfl-sheet-ov{position:fixed;inset:0;z-index:300;background:rgba(0,0,0,.6);display:flex;align-items:flex-end}
+.nfl-sheet{width:100%;max-height:82vh;overflow-y:auto;background:#121212;border-top:1px solid #2a2a2a;border-radius:18px 18px 0 0;padding:8px 14px 14px;box-sizing:border-box}
+.nfl-sheet .grab{width:42px;height:4px;border-radius:4px;background:#3a3a3a;margin:2px auto 10px}
+.nfl-sheet .hd{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px}
+.nfl-sheet .hd b{color:#fff;font-size:.95rem}
+.nfl-sheet .hd button{background:transparent;border:0;color:#fbbf24;font-family:inherit;font-weight:800;font-size:.8rem;cursor:pointer}
+.nfl-sheet .nfl-slate{flex-direction:column;overflow:visible;gap:12px}
+.nfl-sheet .nfl-krow{display:grid;grid-template-columns:1fr 1fr}
+.nfl-sheet .nfl-gtile{justify-content:space-between}
+.nfl-sheet .nfl-gtile.all{display:none}
+.nfl-sheet-go{position:sticky;bottom:0;width:100%;margin-top:14px;background:#f59e0b;color:#111;border:0;border-radius:12px;padding:13px;font-family:inherit;font-size:.92rem;font-weight:900;cursor:pointer}
+.nfl-toolbar .nfl-tb-title{font-family:'Playfair Display',serif;color:#f8fafc;font-size:1.15rem;font-weight:700}
+@media(max-width:640px){
+  .nfl-cmd{padding:12px 12px 10px;border-radius:14px}
+  .nfl-cmd .nfl-slate-wrap,.nfl-cmd-lbl .hint,.nfl-cmd-games-lbl{display:none}
+  .nfl-gbtn{display:flex}
+  .nfl-cmd-mid{gap:10px;margin-top:10px}
+  .nfl-cmd-mid .nfl-cmd-lbl{display:none}
+  .nfl-cmd-mkt,.nfl-cmd-side{flex:1 1 100%}
+  .nfl-gtab{flex:0 0 auto;padding:8px 11px}
+  .nfl-seg button{flex:1}
+  .nfl-reset{margin-left:0}
+  .nfl-toolbar .nfl-tb-title{font-size:1rem}
+}
+@media(min-width:641px){.nfl-sheet-ov{display:none}}
 body[data-nfl-pan="gp"] .nfl-pan[data-pan="gp"],body[data-nfl-pan="td"] .nfl-pan[data-pan="td"],body[data-nfl-pan="roi"] .nfl-pan[data-pan="roi"],body[data-nfl-pan="locks"] .nfl-pan[data-pan="locks"],body[data-nfl-pan="funnels"] .nfl-pan[data-pan="funnels"],body[data-nfl-pan="hc"] .nfl-pan[data-pan="hc"]{display:block;position:fixed;top:80px;left:0;right:0;bottom:0;z-index:190;overflow-y:auto;background:rgba(2,6,23,.97);padding:12px 12px 40px;box-sizing:border-box}
 .nfl-pan-bar{position:sticky;top:0;z-index:5;display:flex;justify-content:space-between;align-items:center;gap:10px;max-width:1000px;margin:0 auto;padding:4px 0 10px;background:rgba(2,6,23,.97)}
 .nfl-pan[data-pan="gp"] .nfl-pan-bar{max-width:1468px}
@@ -12522,7 +12608,7 @@ tr:last-child td{border-bottom:none}
 .pick-card:hover{border-color:#f59e0b;transform:translateY(-2px)}
 .pick-card.acc-rush,.pick-card.acc-rec,.pick-card.acc-pass,.pick-card.acc-recpt,
 .pick-card.acc-td,.pick-card.acc-ptd,.pick-card.acc-def,.pick-card.acc-kick{border-top:4px solid #f59e0b}
-.nfl-toolbar{display:flex;justify-content:flex-end;margin:0 0 14px}
+.nfl-toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:0 0 10px}
 #nflSearch{background:#111;color:#fff;border:1px solid #2a2a2a;border-radius:8px;padding:8px 14px;font-size:.9rem;outline:none;width:240px;max-width:60vw;font-family:'Source Sans Pro',sans-serif}
 .sec-hdr{cursor:pointer;display:flex;align-items:center;justify-content:flex-start;user-select:none}
 .sec-hdr>span:first-child{order:1;flex:0 1 auto}
@@ -14757,7 +14843,7 @@ function _collapseSec(id,title,inner,open){
          '<span class="sec-caret" id="car_'+id+'">'+car+'</span></div>'+
          '<div id="sec_'+id+'" style="display:'+disp+'">'+inner+'</div>';
 }
-function _nflMovementBoard(picks,side){
+function _nflMoveRows(picks,side){
   var rows=(picks||[]).filter(function(p){
     var move=Number(p.lineMove);
     return !_nflGameDone(p)&&p.lineMovementAvailable&&p.realLine!=null
@@ -14767,9 +14853,13 @@ function _nflMovementBoard(picks,side){
   rows=rows.filter(function(p){
     var key=[p.name||p.player,p.market||p.mkt,p.realLine,side].join('|').toLowerCase();
     if(seen[key])return false;seen[key]=1;return true;
-  }).sort(function(a,b){return Math.abs(Number(b.lineMove))-Math.abs(Number(a.lineMove));}).slice(0,10);
+  }).sort(function(a,b){return Math.abs(Number(b.lineMove))-Math.abs(Number(a.lineMove));});
+  return rows;
+}
+function _nflMovementBoard(picks,side){
+  var rows=_nflMoveRows(picks,side).slice(0,10);
   if(!rows.length)return '<div class="no-picks" style="padding:24px">No qualifying opening-to-current line moves captured yet.</div>';
-  return '<div style="padding:10px 0 4px;color:#94a3b8;font-size:.76rem;line-height:1.45">A '+side+' line move shows the sportsbook changed the required line after opening. It can reflect market action or a changed expectation, but it is not a guarantee. The current number is the number you must bet.</div>'+nflCardGrid(rows,1);
+  return '<details class="nfl-howto"><summary>&#9432; How this list is ranked</summary><div>Ranked by the biggest opening-to-current line change on the '+side+' side. A '+side+' line move shows the sportsbook changed the required line after opening. It can reflect market action or a changed expectation, but it is not a guarantee. The current number is the number you must bet.</div></details>'+nflCardGrid(rows,1);
 }
 function _secToggle(id){
   var el=document.getElementById('sec_'+id); var c=document.getElementById('car_'+id);
@@ -14833,20 +14923,138 @@ function _nflJumpToMarket(index){
 }
 // ── Category board (NBA layout): game chips + category chips + side chooser ──
 window.__NFL_CAT__=window.__NFL_CAT__||{cat:'',side:'ALL',games:{}};
+// Pick Finder command bar: games (grouped by kickoff) -> market group -> side.
+// Display-only; it never changes picks, rankings, boards or records.
+var _NFL_CMD_KEY='nfl_pick_finder_v1';
+var _NFL_MKT_GROUPS=[
+  {key:'all',label:'All Stats',icon:'&#11088;',cats:['all']},
+  {key:'pass',label:'Passing',icon:'&#127919;',mk:['Pass Yds','Pass TDs','Completions','Pass Att','INT Thrown']},
+  {key:'rush',label:'Rushing',icon:'&#127944;',mk:['Rush Yds','RB Total Yds','Rush Att']},
+  {key:'rec',label:'Receiving',icon:'&#129508;',mk:['Rec Yds','Receptions']},
+  {key:'td',label:'TDs',icon:'&#127942;',mk:['Anytime TD']},
+  {key:'def',label:'Defense',icon:'&#128737;&#65039;',mk:['Tackles+Ast','Sacks','Def INT']},
+  {key:'kick',label:'Kicking',icon:'&#129461;',mk:['Kick Pts','FG Made']},
+  {key:'move',label:'Line Moves',icon:'&#8645;',cats:['move_over','move_under']}
+];
+function _nflCmdGroups(){
+  var used={},out=[];
+  _NFL_MKT_GROUPS.forEach(function(g){
+    var cats=g.cats?g.cats.slice():g.mk.filter(function(m){return _MORDER.indexOf(m)>=0;}).map(function(m){used[m]=1;return 'm'+_MORDER.indexOf(m);});
+    out.push({key:g.key,label:g.label,icon:g.icon,cats:cats});
+  });
+  var extra=_MORDER.filter(function(m){return !used[m];}).map(function(m){return 'm'+_MORDER.indexOf(m);});
+  if(extra.length)out.splice(out.length-1,0,{key:'other',label:'Other',icon:'&#127944;',cats:extra});
+  return out.filter(function(g){return g.cats.length;});
+}
+function _nflCmdGroupOf(cat){
+  var gs=_nflCmdGroups();
+  for(var i=0;i<gs.length;i++){if(gs[i].cats.indexOf(cat)>=0)return gs[i];}
+  return gs[0];
+}
+function _nflCmdSlateKey(){var d=(window._nflState||{}).d||{};return String(d.anchor_date||d.date||'');}
+function _nflCmdSave(){
+  try{var cs=window.__NFL_CAT__;localStorage.setItem(_NFL_CMD_KEY,JSON.stringify({cat:cs.cat,side:cs.side,games:cs.games,grpLast:cs.grpLast||{},slate:_nflCmdSlateKey()}));}catch(e){}
+}
+function _nflCmdRestore(){
+  var cs=window.__NFL_CAT__,slate=_nflCmdSlateKey();
+  if(cs.loadedFor===slate)return;
+  var first=(cs.loadedFor==null);
+  cs.loadedFor=slate;cs.restored=false;
+  var saved=null;
+  try{saved=JSON.parse(localStorage.getItem(_NFL_CMD_KEY)||'null');}catch(e){saved=null;}
+  if(first&&saved){
+    if(saved.cat)cs.cat=String(saved.cat);
+    if(saved.side==='ALL'||saved.side==='OVER'||saved.side==='UNDER')cs.side=saved.side;
+    cs.grpLast=(saved.grpLast&&typeof saved.grpLast==='object')?saved.grpLast:{};
+  }
+  var games={};
+  // A new slate always starts on All Games; the same slate keeps its games.
+  if(saved&&saved.slate===slate&&saved.games&&typeof saved.games==='object'){
+    Object.keys(saved.games).forEach(function(k){if(saved.games[k])games[k]=true;});
+  }
+  cs.games=games;
+  cs.restored=!!(first&&saved&&(Object.keys(games).length||cs.side!=='ALL'));
+}
 function _nflCatGameOn(p){
   var sel=window.__NFL_CAT__.games,keys=Object.keys(sel).filter(function(k){return sel[k];});
   if(!keys.length)return true;
   return !!sel[_nflGameKey(p.team,p.opponent||p.opp)];
 }
 function _nflCatGame(key){
-  var sel=window.__NFL_CAT__.games;
-  if(!key){window.__NFL_CAT__.games={};}
-  else sel[key]=!sel[key];
+  var cs=window.__NFL_CAT__,sel=cs.games;
+  if(!key){cs.games={};}
+  else if(sel[key])delete sel[key];
+  else sel[key]=true;
+  cs.restored=false;_nflCmdSave();
   _nflCatRefresh();
 }
-function _nflCatPick(cat){window.__NFL_CAT__.cat=cat;_nflCatRefresh();}
-function _nflCatSide(side){window.__NFL_CAT__.side=side;_nflCatRefresh();}
+function _nflCatPick(cat){
+  var cs=window.__NFL_CAT__;cs.cat=cat;
+  cs.grpLast=cs.grpLast||{};cs.grpLast[_nflCmdGroupOf(cat).key]=cat;
+  _nflCmdSave();_nflCatRefresh();
+}
+function _nflCmdGroup(key){
+  var cs=window.__NFL_CAT__,g=null,counts=cs._counts||{};
+  _nflCmdGroups().forEach(function(x){if(x.key===key)g=x;});
+  if(!g)return;
+  var last=(cs.grpLast||{})[key],cat=null;
+  if(last&&g.cats.indexOf(last)>=0)cat=last;
+  if(!cat)g.cats.forEach(function(c){if(!cat&&counts[c])cat=c;});
+  _nflCatPick(cat||g.cats[0]);
+}
+function _nflCatSide(side){var cs=window.__NFL_CAT__;cs.side=side;cs.restored=false;_nflCmdSave();_nflCatRefresh();}
+function _nflCmdSheet(open){window.__NFL_CAT__.sheet=!!open;_nflCatRefresh();}
+function _nflCmdClearSearch(){var el=document.getElementById('nflSearch');if(el)el.value='';_nflPaint('');}
+function _nflCmdReset(){
+  var cs=window.__NFL_CAT__;cs.games={};cs.side='ALL';cs.restored=false;_nflCmdSave();
+  var el=document.getElementById('nflSearch');
+  if(el&&el.value){el.value='';_nflPaint('');}else _nflCatRefresh();
+}
 function _nflCatRefresh(){var el=document.getElementById('nflCatWrap');if(el)el.innerHTML=_nflCatHtml();}
+function _nflCmdGames(){
+  var d=(window._nflState||{}).d||{},starts={};
+  (d.games||[]).forEach(function(g){
+    var a=String(g.away_abbr||g.away_team||'').toUpperCase(),h=String(g.home_abbr||g.home_team||'').toUpperCase();
+    var k=_nflGameKey(a,h);if(a&&h&&g.start&&!starts[k])starts[k]=g.start;
+  });
+  return _nflLoadedGames().map(function(g){
+    var parts=g.label.split(/ @ | vs /),t=Date.parse(starts[g.key]||'');
+    return {key:g.key,label:g.label,away:parts[0]||g.label,home:parts[1]||'',t:isFinite(t)?t:null};
+  }).sort(function(a,b){return (a.t==null?9e15:a.t)-(b.t==null?9e15:b.t)||a.label.localeCompare(b.label);});
+}
+function _nflCmdWindow(t){
+  if(t==null)return 'Kickoff TBD';
+  var dt=new Date(t),hr=dt.getHours(),wd=dt.getDay();
+  var day=dt.toLocaleDateString(undefined,{weekday:'short'});
+  var tm=dt.toLocaleTimeString(undefined,{hour:'numeric',minute:'2-digit'});
+  var tag=hr>=19?(wd===0?'SNF':(wd===1?'MNF':(wd===4?'TNF':''))):'';
+  return _esc(day)+' &middot; '+_esc(tm)+(tag?' &middot; '+tag:'');
+}
+function _nflCmdLogo(abbr){
+  return '<img src="https://a.espncdn.com/i/teamlogos/nfl/500/'+_logoAbbr(abbr)+'.png" alt="" loading="lazy" onerror="this.style.visibility=&#39;hidden&#39;">';
+}
+function _nflCmdTile(g,on,n){
+  return '<button type="button" class="nfl-gtile'+(on?' on':'')+(n?'':' zero')+'" data-key="'+_esc(g.key)+'" onclick="_nflCatGame(this.getAttribute(&#39;data-key&#39;))" aria-pressed="'+on+'" title="'+_esc(g.label)+'">'
+    +(on?'<span class="chk">&#10003;</span>':'')
+    +'<span class="tms"><span class="tm">'+_nflCmdLogo(g.away)+'<b>'+_esc(g.away)+'</b></span><span class="tm">'+_nflCmdLogo(g.home)+'<b>'+_esc(g.home)+'</b></span></span>'
+    +'<span class="cnt">'+n+'</span></button>';
+}
+function _nflCmdSlateHtml(games,sel,perGame,total,anySel){
+  var h='<div class="nfl-slate">';
+  h+='<button type="button" class="nfl-gtile all'+(anySel?'':' on')+'" onclick="_nflCatGame(&#39;&#39;)" aria-pressed="'+(!anySel)+'"><b>All Games</b><small>'+games.length+' game'+(games.length!==1?'s':'')+' &middot; '+total+' play'+(total!==1?'s':'')+'</small></button>';
+  var groups=[],byLbl={};
+  games.forEach(function(g){
+    var lbl=_nflCmdWindow(g.t);
+    if(!byLbl[lbl]){byLbl[lbl]={lbl:lbl,games:[]};groups.push(byLbl[lbl]);}
+    byLbl[lbl].games.push(g);
+  });
+  groups.forEach(function(gr){
+    h+='<div class="nfl-kgrp"><div class="nfl-klbl">'+gr.lbl+'</div><div class="nfl-krow">';
+    gr.games.forEach(function(g){h+=_nflCmdTile(g,!!sel[g.key],perGame[g.key]||0);});
+    h+='</div></div>';
+  });
+  return h+'</div>';
+}
 // All Stats (offense only): hotness (last-5 hit rate on the pick side vs
 // today's line) + consistency vs today's opponent (every meeting vs today's
 // line). Display-only ranking; it never changes picks, boards or records.
@@ -14894,39 +15102,86 @@ function _nflAllStatsGrid(list,start){
 function _nflCatHtml(){
   var st=window._nflState||{},d=st.d||{},byM=st.byM||{},picks=st.paintPicks||[],q=st.paintQ||'';
   var cs=window.__NFL_CAT__;
+  _nflCmdRestore();
+  var games=_nflCmdGames(),gameBy={};
+  games.forEach(function(g){gameBy[g.key]=g;});
+  if(games.length)Object.keys(cs.games).forEach(function(k){if(!gameBy[k])delete cs.games[k];});
   var live=function(rows){return (rows||[]).filter(function(p){return !_nflGameDone(p)&&_nflCatGameOn(p);});};
+  var notDone=function(rows){return (rows||[]).filter(function(p){return !_nflGameDone(p);});};
+  var sideF=function(rows){return cs.side==='ALL'?rows:rows.filter(function(p){return p.pick===cs.side;});};
   var counts={};
-  _MORDER.forEach(function(m,i){counts['m'+i]=live(byM[m]).length;});
+  _MORDER.forEach(function(m,i){counts['m'+i]=sideF(live(byM[m])).length;});
   var movePicks=live(picks);
   var allStatsList=_nflAllStatsRows(live(picks));
-  var cats=[{key:'all',label:'All Stats',title:'All Stats',n:allStatsList.length}];
+  counts.all=(cs.side==='ALL'?allStatsList:allStatsList.filter(function(r){return r.p.pick===cs.side;})).length;
+  counts.move_over=Math.min(10,_nflMoveRows(movePicks,'OVER').length);
+  counts.move_under=Math.min(10,_nflMoveRows(movePicks,'UNDER').length);
+  cs._counts=counts;
+  var cats=[{key:'all',label:'&#11088; All Stats',title:'All Stats',n:counts.all}];
   cats=cats.concat(_MORDER.map(function(m,i){return {key:'m'+i,label:_mIcon(m)+' '+_esc(m),title:m,n:counts['m'+i]};}));
-  cats.push({key:'move_over',label:'&#11014; Over Line Movement',title:'Biggest Over Line Movement',n:null});
-  cats.push({key:'move_under',label:'&#11015; Under Line Movement',title:'Biggest Under Line Movement',n:null});
+  cats.push({key:'move_over',label:'&#11014; Over Line Movement',title:'Biggest Over Line Movement',n:counts.move_over});
+  cats.push({key:'move_under',label:'&#11015; Under Line Movement',title:'Biggest Under Line Movement',n:counts.move_under});
   var valid=cats.some(function(c){return c.key===cs.cat;});
   if(!valid)cs.cat='all';
-  // Game chips
-  var games=_nflLoadedGames(),selKeys=Object.keys(cs.games).filter(function(k){return cs.games[k];});
-  var h='<div class="nfl-gbar">';
-  h+='<button type="button" class="nfl-gchip'+(selKeys.length?'':' active')+'" onclick="_nflCatGame(&#39;&#39;)" aria-pressed="'+(!selKeys.length)+'"><b>All Games</b></button>';
-  games.forEach(function(g){
-    var on=!!cs.games[g.key],parts=g.label.split(/ @ | vs /);
-    h+='<button type="button" class="nfl-gchip'+(on?' active':'')+'" data-key="'+_esc(g.key)+'" onclick="_nflCatGame(this.getAttribute(&#39;data-key&#39;))" aria-pressed="'+on+'"><b>'+_esc(parts[0]||g.label)+'</b><span class="sep">'+(g.label.indexOf(' vs ')>=0?'vs':'@')+'</span><b>'+_esc(parts[1]||'')+'</b></button>';
-  });
-  h+='</div>';
-  // Category chips
-  h+='<div class="nfl-fbar">';
-  cats.forEach(function(c){
-    h+='<button type="button" class="nfl-fbtn'+(c.key===cs.cat?' active':'')+(c.n===0?' empty':'')+'" onclick="_nflCatPick(&#39;'+c.key+'&#39;)" aria-pressed="'+(c.key===cs.cat)+'">'+c.label+(c.n!=null?'<span class="n">'+c.n+'</span>':'')+'</button>';
-  });
-  h+='</div>';
+  var catBy={};cats.forEach(function(c){catBy[c.key]=c;});
   var isMove=cs.cat.indexOf('move_')===0;
+  var selKeys=Object.keys(cs.games).filter(function(k){return cs.games[k];});
+  // Per-game counts follow the open market + side and ignore the game selection.
+  var gameRows;
+  if(cs.cat==='all')gameRows=sideF(_nflAllStatsRows(notDone(picks)).map(function(r){return r.p;}));
+  else if(isMove)gameRows=_nflMoveRows(notDone(picks),cs.cat==='move_over'?'OVER':'UNDER');
+  else gameRows=sideF(notDone(byM[_MORDER[Number(cs.cat.slice(1))]]));
+  var perGame={},slateTotal=0;
+  gameRows.forEach(function(p){var k=_nflGameKey(p.team,p.opponent||p.opp);perGame[k]=(perGame[k]||0)+1;slateTotal++;});
+  var boardCount=counts[cs.cat]||0;
+  var unit=cs.cat==='all'?'player':'play';
+  var grp=_nflCmdGroupOf(cs.cat),groups=_nflCmdGroups();
+  // ── Command bar ──
+  var h='<div class="nfl-cmd">';
+  h+='<div class="nfl-cmd-lbl nfl-cmd-games-lbl"><span class="num">1</span>Games<span class="hint">tap one or more &middot; grouped by kickoff</span></div>';
+  h+='<button type="button" class="nfl-gbtn" onclick="_nflCmdSheet(1)">&#127944; <b>'+(selKeys.length?selKeys.length+' game'+(selKeys.length!==1?'s':''):'All games')+'</b><span>Change &#9662;</span></button>';
+  h+='<div class="nfl-slate-wrap">'+_nflCmdSlateHtml(games,cs.games,perGame,slateTotal,selKeys.length>0)+'</div>';
+  h+='<div class="nfl-cmd-mid"><div class="nfl-cmd-mkt"><div class="nfl-cmd-lbl"><span class="num">2</span>Market</div><div class="nfl-gtabs" role="tablist">';
+  groups.forEach(function(g){
+    var n=0;g.cats.forEach(function(c){n+=counts[c]||0;});
+    var on=g.key===grp.key;
+    h+='<button type="button" role="tab" class="nfl-gtab'+(on?' on':'')+(n?'':' empty')+'" onclick="_nflCmdGroup(&#39;'+g.key+'&#39;)" aria-selected="'+on+'">'+g.icon+' '+_esc(g.label)+'<span class="n">'+n+'</span></button>';
+  });
+  h+='</div></div>';
   if(!isMove){
-    h+='<div class="nfl-fbar" style="margin-top:-4px">';
-    [['ALL','Both'],['OVER','Over Top 10'],['UNDER','Under Top 10']].forEach(function(o){
-      h+='<button type="button" class="nfl-fbtn'+(cs.side===o[0]?' active':'')+'" style="font-size:.72rem;'+(o[0]==='OVER'?'color:#4ade80':(o[0]==='UNDER'?'color:#f87171':''))+'" onclick="_nflCatSide(&#39;'+o[0]+'&#39;)" aria-pressed="'+(cs.side===o[0])+'">'+o[1]+'</button>';
+    h+='<div class="nfl-cmd-side"><div class="nfl-cmd-lbl"><span class="num">3</span>Side</div><div class="nfl-seg">';
+    [['ALL','Both',''],['OVER','&#11014; Over','ov'],['UNDER','&#11015; Under','un']].forEach(function(o){
+      h+='<button type="button" class="'+o[2]+(cs.side===o[0]?' on':'')+'" onclick="_nflCatSide(&#39;'+o[0]+'&#39;)" aria-pressed="'+(cs.side===o[0])+'">'+o[1]+'</button>';
+    });
+    h+='</div></div>';
+  }
+  h+='</div>';
+  if(grp.cats.length>1){
+    h+='<div class="nfl-mpills">';
+    grp.cats.forEach(function(k){
+      var c=catBy[k];if(!c)return;
+      h+='<button type="button" class="nfl-mpill'+(k===cs.cat?' on':'')+(c.n?'':' empty')+'" onclick="_nflCatPick(&#39;'+k+'&#39;)" aria-pressed="'+(k===cs.cat)+'">'+c.label+'<span class="n">'+(c.n||0)+'</span></button>';
     });
     h+='</div>';
+  }
+  var chips='';
+  selKeys.forEach(function(k){
+    var g=gameBy[k];
+    chips+='<button type="button" class="nfl-fchip" data-key="'+_esc(k)+'" onclick="_nflCatGame(this.getAttribute(&#39;data-key&#39;))" title="Remove">'+_esc(g?g.away+' @ '+g.home:k)+'<span class="x">&#10005;</span></button>';
+  });
+  if(cs.side!=='ALL'&&!isMove)chips+='<button type="button" class="nfl-fchip" onclick="_nflCatSide(&#39;ALL&#39;)" title="Remove">'+(cs.side==='OVER'?'Overs only':'Unders only')+'<span class="x">&#10005;</span></button>';
+  if(q)chips+='<button type="button" class="nfl-fchip" onclick="_nflCmdClearSearch()" title="Remove">&#128269; '+_esc(q)+'<span class="x">&#10005;</span></button>';
+  if(chips){
+    h+='<div class="nfl-showing"><span class="lbl">Showing <b>'+boardCount+' '+unit+(boardCount!==1?'s':'')+'</b></span>'
+      +(cs.restored?'<span class="nfl-restored">&#8635; Last view restored</span>':'')
+      +chips+'<button type="button" class="nfl-reset" onclick="_nflCmdReset()">&#8634; Reset filters</button></div>';
+  }
+  h+='</div>';
+  if(cs.sheet){
+    h+='<div class="nfl-sheet-ov" onclick="if(event.target===this)_nflCmdSheet(0)"><div class="nfl-sheet" role="dialog" aria-label="Choose games"><div class="grab"></div>'
+      +'<div class="hd"><b>Choose games</b><button type="button" onclick="_nflCatGame(&#39;&#39;)">All games</button></div>'
+      +_nflCmdSlateHtml(games,cs.games,perGame,slateTotal,selKeys.length>0)
+      +'<button type="button" class="nfl-sheet-go" onclick="_nflCmdSheet(0)">Show '+boardCount+' '+unit+(boardCount!==1?'s':'')+'</button></div></div>';
   }
   var gameNote=selKeys.length?' &middot; '+selKeys.length+' game'+(selKeys.length!==1?'s':''):'';
   if(isMove){
@@ -14939,7 +15194,7 @@ function _nflCatHtml(){
     var asRows=cs.side==='ALL'?allStatsList:allStatsList.filter(function(r){return r.p.pick===cs.side;});
     var asSide=cs.side==='ALL'?'Top 10':(cs.side==='OVER'?'Top 10 Over':'Top 10 Under');
     h+='<div class="nfl-cat-hdr"><div class="nfl-cat-title">All Stats &middot; '+asSide+' &middot; Offense</div><span class="nfl-cat-pill">'+asRows.length+' player'+(asRows.length!==1?'s':'')+gameNote+'</span></div>';
-    h+='<div style="color:#94a3b8;font-size:.74rem;line-height:1.45;margin:2px 0 10px">Offensive markets only (passing, rushing, receiving, Anytime TD). Ranked 50% <b style="color:#fb923c">hotness</b> (last 5 games on the pick side vs today&#39;s line) + 50% <b style="color:#fbbf24">consistency vs today&#39;s opponent</b> (every meeting vs today&#39;s line). Needs 3+ recent games and 2+ meetings; pushes are not counted. One play per player; Role Risk AVOID players are left out. Display only &#8212; not a tracked record.</div>';
+    h+='<details class="nfl-howto"><summary>&#9432; How this list is ranked</summary><div>Offensive markets only (passing, rushing, receiving, Anytime TD). Ranked 50% <b style="color:#fb923c">hotness</b> (last 5 games on the pick side vs today&#39;s line) + 50% <b style="color:#fbbf24">consistency vs today&#39;s opponent</b> (every meeting vs today&#39;s line). Needs 3+ recent games and 2+ meetings; pushes are not counted. One play per player; Role Risk AVOID players are left out. Display only &#8212; not a tracked record.</div></details>';
     if(!asRows.length){
       h+='<div class="no-picks">No offensive picks have both a recent sample and 2+ meetings with today&#39;s opponent'+(selKeys.length?' in the selected games':'')+'.</div>';
       return h;
@@ -16908,7 +17163,7 @@ function renderResults(d){
   var legacyWarn=d.defense_legacy_warning?('<div class="err-box" style="margin-bottom:10px">'+_esc(d.defense_legacy_warning)+'</div>'):'';
   var skipped=(d.skipped_matchups||[]);
   var completenessWarn=skipped.length?('<div class="err-box" style="margin-bottom:10px"><strong>Incomplete sportsbook slate:</strong> no player props were loaded for '+skipped.map(_esc).join(', ')+'. These matchups were skipped after the sportsbook request timed out or failed.</div>'):'';
-  res.innerHTML=weekNotice+completenessWarn+legacyWarn+note+warn+'<div class="nfl-toolbar"><input id="nflSearch" type="text" placeholder="Search player…" oninput="_nflPaint(this.value)"/></div><div id="nflBody"></div>';
+  res.innerHTML=weekNotice+completenessWarn+legacyWarn+note+warn+'<div class="nfl-toolbar"><div class="nfl-tb-title">&#127944; Pick Finder</div><input id="nflSearch" type="search" autocomplete="off" placeholder="&#128269; Search player…" aria-label="Search player" oninput="_nflPaint(this.value)"/></div><div id="nflBody"></div>';
   _renderNflGamePredictor(d);
   _renderNflTdPredictor(d);
   _nflPaint('');
