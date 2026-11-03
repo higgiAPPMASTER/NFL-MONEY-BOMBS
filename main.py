@@ -12492,7 +12492,7 @@ body.nfl-rec-open nav{z-index:195}
 .nfl-cmd-mkt{flex:1 1 520px;min-width:0}
 .nfl-gtabs{display:flex;gap:3px;background:#0b0b0b;border:1px solid #232323;border-radius:12px;padding:4px;overflow-x:auto;scrollbar-width:none}
 .nfl-gtabs::-webkit-scrollbar{display:none}
-.nfl-gtab{flex:1 0 auto;display:inline-flex;align-items:center;justify-content:center;gap:6px;white-space:nowrap;background:transparent;border:0;border-radius:9px;padding:8px 12px;color:#cbd5e1;font-family:inherit;font-size:.8rem;font-weight:700;cursor:pointer;transition:background .15s,color .15s}
+.nfl-gtab{flex:1 0 auto;display:inline-flex;align-items:center;justify-content:center;gap:5px;white-space:nowrap;background:transparent;border:0;border-radius:9px;padding:8px 9px;letter-spacing:.04em;color:#cbd5e1;font-family:inherit;font-size:.8rem;font-weight:700;cursor:pointer;transition:background .15s,color .15s}
 .nfl-gtab:hover{background:#1c1c1c;color:#fff}
 .nfl-gtab.on{background:#f59e0b;color:#111}
 .nfl-gtab.empty{opacity:.42}
@@ -14927,23 +14927,23 @@ window.__NFL_CAT__=window.__NFL_CAT__||{cat:'',side:'ALL',games:{}};
 // Display-only; it never changes picks, rankings, boards or records.
 var _NFL_CMD_KEY='nfl_pick_finder_v1';
 var _NFL_MKT_GROUPS=[
-  {key:'all',label:'All Stats',icon:'&#11088;',cats:['all']},
-  {key:'pass',label:'Passing',icon:'&#127919;',mk:['Pass Yds','Pass TDs','Completions','Pass Att','INT Thrown']},
-  {key:'rush',label:'Rushing',icon:'&#127944;',mk:['Rush Yds','RB Total Yds','Rush Att']},
-  {key:'rec',label:'Receiving',icon:'&#129508;',mk:['Rec Yds','Receptions']},
-  {key:'td',label:'TDs',icon:'&#127942;',mk:['Anytime TD']},
-  {key:'def',label:'Defense',icon:'&#128737;&#65039;',mk:['Tackles+Ast','Sacks','Def INT']},
-  {key:'kick',label:'Kicking',icon:'&#129461;',mk:['Kick Pts','FG Made']},
-  {key:'move',label:'Line Moves',icon:'&#8645;',cats:['move_over','move_under']}
+  {key:'all',label:'All Stats',short:'ALL',icon:'&#11088;',cats:['all']},
+  {key:'pass',label:'Passing',short:'PASS',icon:'&#127919;',mk:['Pass Yds','Pass TDs','Completions','Pass Att','INT Thrown']},
+  {key:'rush',label:'Rushing',short:'RUSH',icon:'&#127944;',mk:['Rush Yds','RB Total Yds','Rush Att']},
+  {key:'rec',label:'Receiving',short:'REC',icon:'&#129508;',mk:['Rec Yds','Receptions']},
+  {key:'td',label:'TDs',short:'TD',icon:'&#127942;',mk:['Anytime TD']},
+  {key:'def',label:'Defense',short:'DEF',icon:'&#128737;&#65039;',mk:['Tackles+Ast','Sacks','Def INT']},
+  {key:'kick',label:'Kicking',short:'KICK',icon:'&#129461;',mk:['Kick Pts','FG Made']},
+  {key:'move',label:'Line Moves',short:'MOVES',icon:'&#8645;',cats:['move_over','move_under']}
 ];
 function _nflCmdGroups(){
   var used={},out=[];
   _NFL_MKT_GROUPS.forEach(function(g){
     var cats=g.cats?g.cats.slice():g.mk.filter(function(m){return _MORDER.indexOf(m)>=0;}).map(function(m){used[m]=1;return 'm'+_MORDER.indexOf(m);});
-    out.push({key:g.key,label:g.label,icon:g.icon,cats:cats});
+    out.push({key:g.key,label:g.label,short:g.short||g.label,icon:g.icon,cats:cats});
   });
   var extra=_MORDER.filter(function(m){return !used[m];}).map(function(m){return 'm'+_MORDER.indexOf(m);});
-  if(extra.length)out.splice(out.length-1,0,{key:'other',label:'Other',icon:'&#127944;',cats:extra});
+  if(extra.length)out.splice(out.length-1,0,{key:'other',label:'Other',short:'OTHER',icon:'&#127944;',cats:extra});
   return out.filter(function(g){return g.cats.length;});
 }
 function _nflCmdGroupOf(cat){
@@ -15145,7 +15145,7 @@ function _nflCatHtml(){
   groups.forEach(function(g){
     var n=0;g.cats.forEach(function(c){n+=counts[c]||0;});
     var on=g.key===grp.key;
-    h+='<button type="button" role="tab" class="nfl-gtab'+(on?' on':'')+(n?'':' empty')+'" onclick="_nflCmdGroup(&#39;'+g.key+'&#39;)" aria-selected="'+on+'">'+g.icon+' '+_esc(g.label)+'<span class="n">'+n+'</span></button>';
+    h+='<button type="button" role="tab" class="nfl-gtab'+(on?' on':'')+(n?'':' empty')+'" onclick="_nflCmdGroup(&#39;'+g.key+'&#39;)" aria-selected="'+on+'" title="'+_esc(g.label)+'" aria-label="'+_esc(g.label)+'">'+g.icon+' '+_esc(g.short)+'<span class="n">'+n+'</span></button>';
   });
   h+='</div></div>';
   if(!isMove){
