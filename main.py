@@ -12512,6 +12512,16 @@ body.nfl-rec-open nav{z-index:195}
 .nfl-mpill.empty{opacity:.45}
 .nfl-mpill .n{background:#262626;color:#e5e7eb;border-radius:999px;padding:1px 7px;font-size:.64rem;font-weight:800}
 .nfl-mpill.on .n{background:rgba(245,158,11,.25);color:#fbbf24}
+.nfl-posbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:10px 0 2px}
+.nfl-posbar .plbl{color:#9ca3af;font-size:.64rem;font-weight:900;letter-spacing:.14em;text-transform:uppercase;margin-right:2px}
+.nfl-posseg{display:flex;gap:3px;background:#0b0b0b;border:1px solid #232323;border-radius:999px;padding:3px}
+.nfl-posseg button{display:inline-flex;align-items:center;gap:6px;border:0;background:transparent;border-radius:999px;padding:6px 13px;font-family:inherit;font-size:.76rem;font-weight:800;letter-spacing:.04em;color:#cbd5e1;cursor:pointer;white-space:nowrap}
+.nfl-posseg button:hover{color:#fff;background:#1c1c1c}
+.nfl-posseg button.on{background:rgba(245,158,11,.14);color:#fbbf24;box-shadow:0 0 0 1px rgba(245,158,11,.55) inset}
+.nfl-posseg button.empty{opacity:.45}
+.nfl-posseg .n{background:#262626;color:#e5e7eb;border-radius:999px;padding:1px 7px;font-size:.62rem;font-weight:800}
+.nfl-posseg button.on .n{background:rgba(245,158,11,.25);color:#fbbf24}
+.nfl-posseg .ck{font-size:.66rem}
 .nfl-showing{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:12px;padding:9px 12px;background:#0b0b0b;border:1px solid #232323;border-radius:11px;font-size:.78rem;color:#9ca3af}
 .nfl-showing .lbl b{color:#fff}
 .nfl-fchip{display:inline-flex;align-items:center;gap:6px;background:#1f1f1f;border:1px solid #333;color:#e5e7eb;border-radius:999px;padding:3px 6px 3px 10px;font-family:inherit;font-size:.72rem;font-weight:700;cursor:pointer}
@@ -14953,7 +14963,7 @@ function _nflCmdGroupOf(cat){
 }
 function _nflCmdSlateKey(){var d=(window._nflState||{}).d||{};return String(d.anchor_date||d.date||'');}
 function _nflCmdSave(){
-  try{var cs=window.__NFL_CAT__;localStorage.setItem(_NFL_CMD_KEY,JSON.stringify({cat:cs.cat,side:cs.side,games:cs.games,grpLast:cs.grpLast||{},slate:_nflCmdSlateKey()}));}catch(e){}
+  try{var cs=window.__NFL_CAT__;localStorage.setItem(_NFL_CMD_KEY,JSON.stringify({cat:cs.cat,side:cs.side,games:cs.games,pos:cs.pos||{},grpLast:cs.grpLast||{},slate:_nflCmdSlateKey()}));}catch(e){}
 }
 function _nflCmdRestore(){
   var cs=window.__NFL_CAT__,slate=_nflCmdSlateKey();
@@ -14966,6 +14976,8 @@ function _nflCmdRestore(){
     if(saved.cat)cs.cat=String(saved.cat);
     if(saved.side==='ALL'||saved.side==='OVER'||saved.side==='UNDER')cs.side=saved.side;
     cs.grpLast=(saved.grpLast&&typeof saved.grpLast==='object')?saved.grpLast:{};
+    cs.pos={};
+    if(saved.pos&&typeof saved.pos==='object')_NFL_REC_POS.forEach(function(k){if(saved.pos[k])cs.pos[k]=true;});
   }
   var games={};
   // A new slate always starts on All Games; the same slate keeps its games.
@@ -14973,7 +14985,7 @@ function _nflCmdRestore(){
     Object.keys(saved.games).forEach(function(k){if(saved.games[k])games[k]=true;});
   }
   cs.games=games;
-  cs.restored=!!(first&&saved&&(Object.keys(games).length||cs.side!=='ALL'));
+  cs.restored=!!(first&&saved&&(Object.keys(games).length||cs.side!=='ALL'||_nflCmdPosSel().length));
 }
 function _nflCatGameOn(p){
   var sel=window.__NFL_CAT__.games,keys=Object.keys(sel).filter(function(k){return sel[k];});
@@ -15003,10 +15015,25 @@ function _nflCmdGroup(key){
   _nflCatPick(cat||g.cats[0]);
 }
 function _nflCatSide(side){var cs=window.__NFL_CAT__;cs.side=side;cs.restored=false;_nflCmdSave();_nflCatRefresh();}
+var _NFL_REC_POS=['WR','TE','RB'];
+function _nflCmdIsRecM(m){return m==='Rec Yds'||m==='Receptions';}
+function _nflCmdPosSel(){var ps=window.__NFL_CAT__.pos||{};return _NFL_REC_POS.filter(function(k){return ps[k];});}
+function _nflCmdPosF(rows){
+  var ps=window.__NFL_CAT__.pos||{},sel=_nflCmdPosSel();
+  if(!sel.length)return rows||[];
+  return (rows||[]).filter(function(p){return !!ps[_nflReceivingPosition(p)];});
+}
+function _nflCmdPos(pos){
+  var cs=window.__NFL_CAT__;cs.pos=cs.pos||{};
+  if(!pos)cs.pos={};
+  else if(cs.pos[pos])delete cs.pos[pos];
+  else cs.pos[pos]=true;
+  cs.restored=false;_nflCmdSave();_nflCatRefresh();
+}
 function _nflCmdSheet(open){window.__NFL_CAT__.sheet=!!open;_nflCatRefresh();}
 function _nflCmdClearSearch(){var el=document.getElementById('nflSearch');if(el)el.value='';_nflPaint('');}
 function _nflCmdReset(){
-  var cs=window.__NFL_CAT__;cs.games={};cs.side='ALL';cs.restored=false;_nflCmdSave();
+  var cs=window.__NFL_CAT__;cs.games={};cs.side='ALL';cs.pos={};cs.restored=false;_nflCmdSave();
   var el=document.getElementById('nflSearch');
   if(el&&el.value){el.value='';_nflPaint('');}else _nflCatRefresh();
 }
@@ -15109,8 +15136,9 @@ function _nflCatHtml(){
   var live=function(rows){return (rows||[]).filter(function(p){return !_nflGameDone(p)&&_nflCatGameOn(p);});};
   var notDone=function(rows){return (rows||[]).filter(function(p){return !_nflGameDone(p);});};
   var sideF=function(rows){return cs.side==='ALL'?rows:rows.filter(function(p){return p.pick===cs.side;});};
+  var recF=function(m,rows){return _nflCmdIsRecM(m)?_nflCmdPosF(rows):rows;};
   var counts={};
-  _MORDER.forEach(function(m,i){counts['m'+i]=sideF(live(byM[m])).length;});
+  _MORDER.forEach(function(m,i){counts['m'+i]=sideF(recF(m,live(byM[m]))).length;});
   var movePicks=live(picks);
   var allStatsList=_nflAllStatsRows(live(picks));
   counts.all=(cs.side==='ALL'?allStatsList:allStatsList.filter(function(r){return r.p.pick===cs.side;})).length;
@@ -15130,7 +15158,7 @@ function _nflCatHtml(){
   var gameRows;
   if(cs.cat==='all')gameRows=sideF(_nflAllStatsRows(notDone(picks)).map(function(r){return r.p;}));
   else if(isMove)gameRows=_nflMoveRows(notDone(picks),cs.cat==='move_over'?'OVER':'UNDER');
-  else gameRows=sideF(notDone(byM[_MORDER[Number(cs.cat.slice(1))]]));
+  else gameRows=sideF(recF(_MORDER[Number(cs.cat.slice(1))],notDone(byM[_MORDER[Number(cs.cat.slice(1))]])));
   var perGame={},slateTotal=0;
   gameRows.forEach(function(p){var k=_nflGameKey(p.team,p.opponent||p.opp);perGame[k]=(perGame[k]||0)+1;slateTotal++;});
   var boardCount=counts[cs.cat]||0;
@@ -15164,12 +15192,26 @@ function _nflCatHtml(){
     });
     h+='</div>';
   }
+  var openM=(!isMove&&cs.cat!=='all')?_MORDER[Number(cs.cat.slice(1))]:'';
+  var posSel=_nflCmdPosSel(),isRec=_nflCmdIsRecM(openM);
+  if(isRec){
+    var posBase=sideF(live(byM[openM])),posN={};
+    posBase.forEach(function(p){var k=_nflReceivingPosition(p);posN[k]=(posN[k]||0)+1;});
+    h+='<div class="nfl-posbar"><span class="plbl">Position</span><div class="nfl-posseg" role="group" aria-label="Receiver position">';
+    h+='<button type="button" class="'+(posSel.length?'':'on')+'" onclick="_nflCmdPos(&#39;&#39;)" aria-pressed="'+(!posSel.length)+'">ALL<span class="n">'+posBase.length+'</span></button>';
+    _NFL_REC_POS.forEach(function(k){
+      var on=!!(cs.pos||{})[k],n=posN[k]||0;
+      h+='<button type="button" class="'+(on?'on':'')+(n?'':' empty')+'" onclick="_nflCmdPos(&#39;'+k+'&#39;)" aria-pressed="'+on+'">'+(on?'<span class="ck">&#10003;</span>':'')+k+'<span class="n">'+n+'</span></button>';
+    });
+    h+='</div></div>';
+  }
   var chips='';
   selKeys.forEach(function(k){
     var g=gameBy[k];
     chips+='<button type="button" class="nfl-fchip" data-key="'+_esc(k)+'" onclick="_nflCatGame(this.getAttribute(&#39;data-key&#39;))" title="Remove">'+_esc(g?g.away+' @ '+g.home:k)+'<span class="x">&#10005;</span></button>';
   });
   if(cs.side!=='ALL'&&!isMove)chips+='<button type="button" class="nfl-fchip" onclick="_nflCatSide(&#39;ALL&#39;)" title="Remove">'+(cs.side==='OVER'?'Overs only':'Unders only')+'<span class="x">&#10005;</span></button>';
+  if(isRec)posSel.forEach(function(k){chips+='<button type="button" class="nfl-fchip" onclick="_nflCmdPos(&#39;'+k+'&#39;)" title="Remove">'+k+'s<span class="x">&#10005;</span></button>';});
   if(q)chips+='<button type="button" class="nfl-fchip" onclick="_nflCmdClearSearch()" title="Remove">&#128269; '+_esc(q)+'<span class="x">&#10005;</span></button>';
   if(chips){
     h+='<div class="nfl-showing"><span class="lbl">Showing <b>'+boardCount+' '+unit+(boardCount!==1?'s':'')+'</b></span>'
@@ -15205,11 +15247,12 @@ function _nflCatHtml(){
   }
   var i=Number(cs.cat.slice(1)),m=_MORDER[i];
   var all=live(byM[m]);
+  if(_nflCmdIsRecM(m))all=_nflCmdPosF(all);
   if(cs.side!=='ALL')all=all.filter(function(p){return p.pick===cs.side;});
   var sideTxt=cs.side==='ALL'?'Top 10 Overs &amp; Unders':(cs.side==='OVER'?'Top 10 Over':'Top 10 Under');
   h+='<div class="nfl-cat-hdr"><div class="nfl-cat-title">'+_mIcon(m)+' '+_esc(m)+' &middot; '+sideTxt+'</div><span class="nfl-cat-pill">'+all.length+' play'+(all.length!==1?'s':'')+gameNote+'</span></div>';
   if(!all.length){
-    h+='<div class="no-picks">No qualifying '+_esc(m)+' picks'+(q?' for "'+_esc(q)+'"':'')+(selKeys.length?' in the selected games':' for '+_esc(d.date||'today'))+'.</div>';
+    h+='<div class="no-picks">No qualifying '+(_nflCmdIsRecM(m)&&_nflCmdPosSel().length?_nflCmdPosSel().join('/')+' ':'')+_esc(m)+' picks'+(q?' for "'+_esc(q)+'"':'')+(selKeys.length?' in the selected games':' for '+_esc(d.date||'today'))+'.</div>';
     return h;
   }
   h+='<section id="nfl-market-category-'+i+'" tabindex="-1" aria-label="'+_esc(m)+'">';
