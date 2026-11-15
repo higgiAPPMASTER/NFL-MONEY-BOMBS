@@ -538,6 +538,10 @@ function tableHtml(rows,stake){
 function catHtml(rows,stake){
   var cats={},order=[];
   rows.forEach(function(r){var c=r.category||r.market||'Other';if(!cats[c]){cats[c]=[];order.push(c);}cats[c].push(r);});
+  order=order.map(function(c,i){return {c:c,i:i,s:stats(cats[c],stake)};}).sort(function(a,b){
+    if(a.s.rate==null&&b.s.rate!=null)return 1;if(b.s.rate==null&&a.s.rate!=null)return -1;
+    return ((b.s.rate||0)-(a.s.rate||0))||(b.s.dec-a.s.dec)||(a.i-b.i);
+  }).map(function(o){return o.c;});
   return order.map(function(c){
     var l=cats[c],s=stats(l,stake),acc=s.rate==null?'#94a3b8':s.rate>=70?'#4ade80':s.rate>=55?'#facc15':'#f87171';
     return '<details class="nfl-trk-group" open style="--trk-accent:'+acc+'"><summary class="nfl-trk-group-head"><div class="nfl-trk-group-title"><span class="nfl-trk-group-kicker">Category</span><span class="nfl-trk-group-name">'+esc(c)+'</span></div>'
