@@ -17052,6 +17052,7 @@ function _nflCoachTrackSummary(rows,stake,label){
 }
 function _nflCoachTrackCategoryHtml(rows,stake,cats){
   var categories=cats||Object.keys(_NFL_COACH_TRACK_LABELS).filter(function(c){return !_NFL_COACH_HC_KEYS[c];});
+  categories=_nflWinOrder(categories,function(c){return _nflWlOf(rows.filter(function(r){return r.category===c;}));});
   return categories.map(function(category){
     var list=rows.filter(function(r){return r.category===category;});
     var counted=list.filter(function(r){return !r.observation_only;}),observations=list.length-counted.length;
@@ -17486,7 +17487,7 @@ function renderNflMyBets(d){
     +_nflStatBox('ROI',roiTxt,roiClr)
     +'<div style="margin-left:auto"><button onclick="downloadNflMyBetsCSV()" style="background:#0e7490;color:#fff;border:none;border-radius:8px;padding:8px 12px;font-size:.78rem;font-weight:700;cursor:pointer">&#11015; CSV</button></div>'
     +'</div>';
-  var bc=(s.by_category||[]).map(function(c){
+  var bc=_nflWinOrder(s.by_category||[],function(c){return {w:c.wins,l:c.losses};}).map(function(c){
     var croi=c.roi!=null?((c.roi>0?'+':'')+c.roi+'%'):'\u2014';
     var cclr=c.roi==null?'#9ca3af':(c.roi>0?'#4ade80':(c.roi<0?'#f87171':'#facc15'));
     return '<tr><td style="font-weight:600">'+_nflEsc(c.category)+'</td>'
@@ -17531,6 +17532,23 @@ var _nflOvfData=null,_nflOvfTabMode='cat',_nflOvfLoadSeq=0;
 function _nflTrkStake(){
   var el=document.getElementById('nflTrkStake'),n=parseFloat(el&&el.value);
   return isFinite(n)&&n>0?n:20;
+}
+// Every NFL record lists its groups from highest win % to lowest; groups with
+// no decided plays go last. Ties: more decided plays first, then original order.
+function _nflWinOrder(items,wl){
+  return items.map(function(it,i){
+    var x=wl(it)||{},w=Number(x.w)||0,l=Number(x.l)||0;
+    var rate=x.rate!=null&&isFinite(Number(x.rate))?Number(x.rate):((w+l)?w/(w+l)*100:null);
+    return {it:it,i:i,rate:rate,n:w+l};
+  }).sort(function(a,b){
+    if(a.rate==null&&b.rate!=null)return 1;
+    if(b.rate==null&&a.rate!=null)return -1;
+    return ((b.rate||0)-(a.rate||0))||(b.n-a.n)||(a.i-b.i);
+  }).map(function(o){return o.it;});
+}
+function _nflWlOf(list){
+  var w=0,l=0;(list||[]).forEach(function(r){if(r&&r.observation_only)return;var res=String(r&&r.result||'').toUpperCase();if(res==='WIN'||res==='W')w++;else if(res==='LOSS'||res==='L')l++;});
+  return {w:w,l:l};
 }
 function _nflTrkProfit(r,stake){
   if(r.observation_only||r.odds==null||!(r.result==='WIN'||r.result==='LOSS')) return null;
@@ -17926,7 +17944,7 @@ function renderNflGpRecord(){
   var shown=[].concat(scopeGames).sort(function(a,b){return String(b.record_date||'').localeCompare(String(a.record_date||''));}).slice(0,80);
   var wr=rec('winner_result',scopeGames),tr=rec('total_result',scopeGames);
   sumEl.innerHTML=replay+'<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px">'
-    +statCard('Game Winners',wr,'#a78bfa')+statCard('Point Totals',tr,'#38bdf8')+'</div>'
+    +_nflWinOrder([['Game Winners',wr,'#a78bfa'],['Point Totals',tr,'#38bdf8']],function(c){return c[1];}).map(function(c){return statCard(c[0],c[1],c[2]);}).join('')+'</div>'
     +'<div style="color:#64748b;font-size:.68rem;line-height:1.5;margin:-4px 2px 13px">ROI = net profit ÷ amount risked. Units = net profit ÷ selected bet amount. Pushes return the stake. Predictions without captured odds stay in the win/loss record but are excluded from financial results.</div>';
   function badge(result){
     if(!result)return '<span style="color:#64748b;font-weight:800">PENDING</span>';
@@ -17967,8 +17985,7 @@ function renderNflGpRecord(){
       +'<div class="nfl-trk-table-scroll"><table class="nfl-trk-tbl nfl-trk-compact"><thead><tr><th>Date</th><th>Matchup</th><th>Pick</th><th>Odds / Book</th><th>Implied / Bet</th><th>Actual</th><th>Result / P&L</th></tr></thead><tbody>'+rows+'</tbody></table></div></details>';
   }
   bodyEl.innerHTML='<div style="color:#94a3b8;font-size:.72rem;font-weight:900;text-transform:uppercase;letter-spacing:.08em;margin:2px 0 8px">'+label+'</div>'
-    +gpGroup('Game Winners','winner_result','pick_abbr','final','#a78bfa',wr)
-    +gpGroup('Point Totals','total_result','total_pick','actual_total','#38bdf8',tr);
+    +_nflWinOrder([['Game Winners','winner_result','pick_abbr','final','#a78bfa',wr],['Point Totals','total_result','total_pick','actual_total','#38bdf8',tr]],function(g){return g[5];}).map(function(g){return gpGroup(g[0],g[1],g[2],g[3],g[4],g[5]);}).join('');
 }
 function renderNflTrackDay(){
   if(!_nflTrkData) return;
@@ -18072,9 +18089,7 @@ function _nflTrkCatHtml(decided,stake){
     if(r.result==='WIN') c.w++; else if(r.result==='LOSS') c.l++; else c.pending++;
     if((r.result==='WIN'||r.result==='LOSS')&&r.odds!=null){c.pl+=(_nflTrkProfit(r,stake)||0);c.staked+=stake;}
   });
-  var entries=Object.entries(cats).sort(function(a,b){
-    return ((b[1].pl/b[1].staked)||0)-((a[1].pl/a[1].staked)||0);
-  });
+  var entries=_nflWinOrder(Object.entries(cats),function(e){return {w:e[1].w,l:e[1].l};});
   return entries.map(function(e){
     var cat=e[0],c=e[1],total=c.w+c.l;
     var rate=total?(c.w/total*100):0;
@@ -18217,7 +18232,7 @@ function renderNflHcTrack(){
   var hist=_nflHcTrkVal('nflHcTrkSource','official')==='historical';
   var tiers=[['top10','Top 10'],['overflow','Overflow 11&#8211;20'],['coach','Coach presets']];
   if(secs)secs.innerHTML=(hist?'<div style="background:rgba(245,158,11,.1);border:1px solid rgba(245,158,11,.35);border-radius:9px;padding:9px 12px;margin-bottom:10px;color:#fbbf24;font-size:.76rem;font-weight:800">Historical Analysis &#8212; saved point-in-time replays; excluded from the official record.</div>':'')
-    +'<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">'+tiers.map(function(t){
+    +'<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px">'+_nflWinOrder(tiers,function(t){var r=_nflHcTrkRows(t[0]);return r?_nflWlOf(r):{};}).map(function(t){
       var rows=_nflHcTrkRows(t[0]),on=t[0]===tier;
       var inner;
       if(rows==null)inner='<span style="color:#94a3b8;font-size:.72rem">'+_esc(_nflHcCoachErr||'Not loaded')+'</span>';
@@ -18303,6 +18318,7 @@ function _nflTrkListHtml(decided,stake){
     return (idx<0?catOrder.length:idx)*2+(bits[1]==='UNDER'?1:0);
   }
   order.sort(function(a,b){return orderKey(a)-orderKey(b);});
+  order=_nflWinOrder(order,function(key){return _nflWlOf(groups[key]);});
   function money(v){return v==null?'—':(v>=0?'+$':'-$')+Math.abs(Number(v)).toFixed(2);}
   function groupBlock(key){
     var bits=key.split('|'),cat=bits[0],side=bits[1],list=groups[key].slice().sort(function(a,b){
@@ -18542,6 +18558,7 @@ function inPeriod(ds,per,anchor){
   return d>=st&&d<=en;
 }
 function stake(){var v=Number(($('nflGsimStake')||{}).value);return v>0?v:100;}
+function winSort(list,wl){return list.map(function(x,i){var o=wl(x),n=o.w+o.l;return {x:x,i:i,n:n,r:n?o.w/n:null};}).sort(function(a,b){if(a.r==null&&b.r!=null)return 1;if(b.r==null&&a.r!=null)return -1;return ((b.r||0)-(a.r||0))||(b.n-a.n)||(a.i-b.i);}).map(function(o){return o.x;});}
 window._nflGsimRecRender=function(){
   var b=$('nflGsimRecBody'),R=S.rec;if(!b||!R)return;
   var per=$('nflGsimPeriod').value,anchor=$('nflGsimRecDate').value||today(),k=stake()/100;
@@ -18552,8 +18569,8 @@ window._nflGsimRecRender=function(){
     if(x.result==='WIN')a.w++;else if(x.result==='LOSS')a.l++;else a.p++;
     if(x.profit!=null){a.pr++;a.profit+=x.profit*k;}
     var key=m+'|'+(x.bucket||'');bk[key]=bk[key]||{m:m,b:x.bucket||'-',w:0,l:0};if(x.result==='WIN')bk[key].w++;else if(x.result==='LOSS')bk[key].l++;});});});
-  var h='<div class="ngs-tiles">'+Object.keys(M).map(function(m){var a=agg[m],n=a.w+a.l;return '<div class="ngs-tile"><div class="t">'+M[m]+'</div><div class="n">'+a.w+'-'+a.l+(a.p?'-'+a.p:'')+'</div><div style="font-size:.74rem;color:#cbd5e1">Hit rate '+(n?(a.w/n*100).toFixed(1)+'%':'-')+'</div><div style="font-size:.74rem;color:#cbd5e1">Profit <b class="'+(a.profit>=0?'ngs-pos':'ngs-neg')+'">'+(a.profit>=0?'+':'-')+'$'+Math.abs(a.profit).toFixed(2)+'</b> <span class="ngs-mut">('+a.pr+' priced)</span></div></div>';}).join('')+'</div>';
-  var bl=Object.keys(bk).sort().map(function(x){return bk[x];});
+  var h='<div class="ngs-tiles">'+winSort(Object.keys(M),function(m){return agg[m];}).map(function(m){var a=agg[m],n=a.w+a.l;return '<div class="ngs-tile"><div class="t">'+M[m]+'</div><div class="n">'+a.w+'-'+a.l+(a.p?'-'+a.p:'')+'</div><div style="font-size:.74rem;color:#cbd5e1">Hit rate '+(n?(a.w/n*100).toFixed(1)+'%':'-')+'</div><div style="font-size:.74rem;color:#cbd5e1">Profit <b class="'+(a.profit>=0?'ngs-pos':'ngs-neg')+'">'+(a.profit>=0?'+':'-')+'$'+Math.abs(a.profit).toFixed(2)+'</b> <span class="ngs-mut">('+a.pr+' priced)</span></div></div>';}).join('')+'</div>';
+  var bl=winSort(Object.keys(bk).sort().map(function(x){return bk[x];}),function(r){return r;});
   if(bl.length)h+='<div class="ngs-h">By sim confidence</div><table class="ngs-tbl"><tr><th>Market</th><th>Sim %</th><th>W-L</th><th>Hit %</th></tr>'+bl.map(function(r){var n=r.w+r.l;return '<tr><td>'+M[r.m]+'</td><td>'+esc(r.b)+'</td><td>'+r.w+'-'+r.l+'</td><td>'+(n?(r.w/n*100).toFixed(1)+'%':'-')+'</td></tr>';}).join('')+'</table>';
   if(!days.length)h+='<p class="ngs-note">No saved sims in this period yet. Run Sims before kickoff to save calls.</p>';
   days.forEach(function(d){
