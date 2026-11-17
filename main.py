@@ -10021,11 +10021,14 @@ def _nfl_list_snap_dates(system: str = "OLD") -> list:
     cfg = _nfl_store_config(system)
     rows = _nfl_sb_get("mpa_track_ledger", {
         "app": f"eq.{cfg['app']}", "category": f"eq.{cfg['picks']}",
-        "side": "eq.ALL", "select": "date", "limit": "365",
+        "side": "eq.ALL", "select": "date", "order": "date.desc", "limit": "365",
     })
+    # One board row per game per date: an unordered 365-row page dropped the
+    # newest dates once the season passed ~365 game boards, so those dates were
+    # never graded. Read newest first.
     board_rows = _nfl_sb_get("mpa_track_ledger", {
         "app": f"eq.{cfg['app']}", "category": f"like.{cfg['board']}*",
-        "side": "eq.ALL", "select": "date", "limit": "365",
+        "side": "eq.ALL", "select": "date", "order": "date.desc", "limit": "1000",
     })
     return sorted({
         r["date"] for r in list(rows or []) + list(board_rows or [])
@@ -10429,7 +10432,7 @@ def _nfl_grade_date(date_str: str, snap: list, box_override: dict = None) -> dic
         dir_word = "Over" if direction == "OVER" else "Under"
         cat = f"{label} ({dir_word})"
         for rank, p in enumerate(ps, 1):
-            nk = (p.get("name") or "").lower().strip()
+            nk = _nfl_player_name_key(p.get("name") or "")
             st = (box or {}).get(nk, {})
             odds = p.get("over_odds") if direction == "OVER" else p.get("under_odds")
             line_raw = p.get("line") or p.get("realLine")
@@ -10570,7 +10573,7 @@ def _nfl_grade_date(date_str: str, snap: list, box_override: dict = None) -> dic
         if ident in hc_seen:
             continue
         hc_seen.add(ident)
-        st = (box or {}).get((p.get("name") or "").lower().strip(), {})
+        st = (box or {}).get(_nfl_player_name_key(p.get("name") or ""), {})
         odds = p.get("over_odds") if direction == "OVER" else p.get("under_odds")
         line_raw = p.get("line") if p.get("line") is not None else p.get("realLine")
         result_val = actual = profit = None
@@ -10660,6 +10663,9 @@ def _nfl_box_from_stats_rows(rows) -> dict:
             raw_name = row.get("player_display_name", "")
             name = str(raw_name).lower().strip() if raw_name is not None else ""
             if not name or name == "nan":
+                continue
+            name = _nfl_player_name_key(name)
+            if not name:
                 continue
             stats = box.setdefault(name, {"final": True})
             for market, col in PROP_TO_COL.items():
@@ -10863,7 +10869,10 @@ def _nfl_update_track_ledger(include_date: str = "", system: str = "OLD"):
             agg = r.get("detail")
             if r.get("date") and not (isinstance(agg, dict) and _NFL_ROI_FOCUS_MARKER in agg):
                 upserts += _nfl_backfill_roi_focus(r["date"], cfg, system, agg)
-        for d in _nfl_list_snap_dates(system):
+        snap_dates = _nfl_list_snap_dates(system)
+        if include_date and include_date not in snap_dates:
+            snap_dates.append(include_date)
+        for d in snap_dates:
             if d > today or (d == today and d != include_date):
                 continue
             if d in locked:
@@ -18166,12 +18175,17 @@ async function loadNflHcTrack(){
     var coachReq=fetch('/api/nfl/coach-track?grade=true&source='+encodeURIComponent(source)+'&season='+encodeURIComponent(season)+'&date_str='+encodeURIComponent(selected)+'&system='+encodeURIComponent(requestedSystem)+'&token='+encodeURIComponent(token),{headers:{'Authorization':token?'Bearer '+token:''},signal:requestController.signal})
       .then(function(r){return r.json().then(function(x){if(!r.ok)throw new Error(x.detail||'Could not load Coach presets');return x;});})
       .then(function(x){return {ok:true,data:x};},function(e){return {ok:false,err:(e&&e.message)||'Could not load Coach presets'};});
-    var board=await boardReq,coach=await coachReq;
-    if(loadSeq!==_nflHcTrkLoadSeq||!_nflRequestCurrent(requestGeneration,requestedSystem)
-       ||String(board.system||'OLD')!==requestedSystem)return;
+    _nflHcCoachData=null;_nflHcCoachErr='Loading Coach presets…';
+    coachReq.then(function(coach){
+      if(loadSeq!==_nflHcTrkLoadSeq||!_nflRequestCurrent(requestGeneration,requestedSystem))return;
+      _nflHcCoachData=coach.ok&&String(coach.data.system||'OLD')===requestedSystem?coach.data:null;
+      _nflHcCoachErr=coach.ok?(_nflHcCoachData?'':'Coach presets could not be loaded.'):coach.err;
+      if(_nflHcTrkData)renderNflHcTrack();
+    });
+    var board=await boardReq;
+    if(loadSeq!==_nflHcTrkLoadSeq||!_nflRequestCurrent(requestGeneration,requestedSystem))return;
+    if(String(board.system||'OLD')!==requestedSystem)throw new Error('The record returned a different model system. Click Get Results again.');
     _nflHcTrkData=board;
-    _nflHcCoachData=coach.ok&&String(coach.data.system||'OLD')===requestedSystem?coach.data:null;
-    _nflHcCoachErr=coach.ok?'':coach.err;
     renderNflHcTrack();
   }catch(e){
     if(loadSeq!==_nflHcTrkLoadSeq||!_nflRequestCurrent(requestGeneration,requestedSystem))return;
@@ -18251,7 +18265,7 @@ function renderNflHcTrack(){
   var rows=_nflHcTrkRows(tier);
   if(rows==null){
     sum.innerHTML='';
-    body.innerHTML='<p style="color:#f87171;padding:14px">'+_esc(_nflHcCoachErr||'Coach presets could not be loaded.')+'</p>';
+    body.innerHTML='<p style="color:'+(_nflHcCoachErr.indexOf('Loading')===0?'#9ca3af':'#f87171')+';padding:14px">'+_esc(_nflHcCoachErr||'Coach presets could not be loaded.')+'</p>';
     return;
   }
   if(!rows.length){
